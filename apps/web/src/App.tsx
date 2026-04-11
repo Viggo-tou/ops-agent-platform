@@ -1,0 +1,36 @@
+import { Navigate, Route, Routes } from "react-router-dom";
+
+import { AuthGuard } from "./components/auth/AuthGuard";
+import { AppShell } from "./components/layout/AppShell";
+import { LoginPage } from "./pages/auth/LoginPage";
+import { ChatPage } from "./pages/chat/ChatPage";
+import { HomePage } from "./pages/home/HomePage";
+import { KnowledgePage } from "./pages/knowledge/KnowledgePage";
+import { MemoryPage } from "./pages/memory/MemoryPage";
+import { SettingsPage } from "./pages/settings/SettingsPage";
+import { TaskDetailPage } from "./pages/tasks/TaskDetailPage";
+import { TaskListPage } from "./pages/tasks/TaskListPage";
+import { TaskSubmitPage } from "./pages/tasks/TaskSubmitPage";
+
+export default function App() {
+  return (
+    <Routes>
+      <Route path="/login" element={<LoginPage />} />
+      <Route element={<AuthGuard />}>
+        <Route element={<AppShell />}>
+          <Route index element={<Navigate to="/chat" replace />} />
+          <Route path="/home" element={<HomePage />} />
+          <Route path="/chat" element={<ChatPage />} />
+          <Route path="/chat/:taskId" element={<ChatPage />} />
+          <Route path="/knowledge" element={<KnowledgePage />} />
+          <Route path="/memory" element={<MemoryPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/submit" element={<TaskSubmitPage />} />
+          <Route path="/tasks" element={<TaskListPage />} />
+          <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
+          <Route path="*" element={<Navigate to="/chat" replace />} />
+        </Route>
+      </Route>
+    </Routes>
+  );
+}

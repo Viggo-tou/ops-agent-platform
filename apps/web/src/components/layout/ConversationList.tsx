@@ -1,0 +1,130 @@
+import { Link, useParams } from "react-router-dom";
+import { useMemo, useState } from "react";
+
+import { formatDateTime } from "../../lib/format";
+import type { TaskSummary } from "../../types";
+
+interface ConversationListProps {
+  conversations: TaskSummary[];
+  search: string;
+}
+
+interface ConversationGroup {
+  key: string;
+  first: TaskSummary;
+  latest: TaskSummary;
+  turns: number;
+  searchText: string;
+}
+
+const TITLE_STORAGE_KEY = "ops-agent-conversation-titles";
+
+function readTitleOverrides(): Record<string, string> {
+  try {
+    const raw = window.localStorage.getItem(TITLE_STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as Record<string, string>) : {};
+  } catch {
+    return {};
+  }
+}
+
+export function ConversationList({ conversations, search }: ConversationListProps) {
+  const { taskId } = useParams();
+  const [titleOverrides, setTitleOverrides] = useState<Record<string, string>>(() => readTitleOverrides());
+  const normalizedSearch = search.trim().toLowerCase();
+  const activeConversation = conversations.find((conversation) => conversation.id === taskId);
+  const activeSessionKey = activeConversation?.session_id ?? taskId ?? null;
+
+  const groupedConversations = useMemo<ConversationGroup[]>(() => {
+    const groups = new Map<string, TaskSummary[]>();
+
+    for (const conversation of conversations) {
+      const key = conversation.session_id ?? conversation.id;
+      groups.set(key, [...(groups.get(key) ?? []), conversation]);
+    }
+
+    return Array.from(groups.entries())
+      .map(([key, groupItems]) => {
+        const chronological = [...groupItems].sort(
+          (left, right) => new Date(left.created_at).getTime() - new Date(right.created_at).getTime(),
+        );
+        const latestFirst = [...groupItems].sort(
+          (left, right) => new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime(),
+        );
+        return {
+          key,
+          first: chronological[0],
+          latest: latestFirst[0],
+          turns: groupItems.length,
+          searchText: groupItems
+            .map((item) => [item.title, item.scenario, item.status, item.plan_provider_name ?? "", item.session_id ?? ""].join(" "))
+            .join(" ")
+            .toLowerCase(),
+        };
+      })
+      .sort((left, right) => new Date(right.latest.updated_at).getTime() - new Date(left.latest.updated_at).getTime());
+  }, [conversations]);
+
+  const filtered = useMemo(
+    () =>
+      groupedConversations.filter((conversation) => {
+        const title = titleOverrides[conversation.key] ?? conversation.first.title;
+        if (!normalizedSearch) {
+          return true;
+        }
+        return `${title} ${conversation.searchText}`.toLowerCase().includes(normalizedSearch);
+      }),
+    [groupedConversations, normalizedSearch, titleOverrides],
+  );
+
+  function renameConversation(conversation: ConversationGroup) {
+    const currentTitle = titleOverrides[conversation.key] ?? conversation.first.title;
+    const nextTitle = window.prompt("Rename conversation", currentTitle)?.trim();
+
+    if (!nextTitle || nextTitle === currentTitle) {
+      return;
+    }
+
+    const nextOverrides = {
+      ...titleOverrides,
+      [conversation.key]: nextTitle,
+    };
+    setTitleOverrides(nextOverrides);
+    window.localStorage.setItem(TITLE_STORAGE_KEY, JSON.stringify(nextOverrides));
+  }
+
+  if (filtered.length === 0) {
+    return <div className="sidebar-empty">No conversations found.</div>;
+  }
+
+  return (
+    <div className="conversation-list">
+      {filtered.map((conversation) => {
+        const title = titleOverrides[conversation.key] ?? conversation.first.title;
+        return (
+          <article
+            key={conversation.key}
+            className={conversation.key === activeSessionKey ? "conversation-item active" : "conversation-item"}
+          >
+            <div className="conversation-item-title">
+              <Link to={`/chat/${conversation.latest.id}`}>
+                <span>{title}</span>
+              </Link>
+              <button
+                type="button"
+                className="conversation-rename"
+                onClick={() => renameConversation(conversation)}
+                aria-label={`Rename ${title}`}
+              >
+                Rename
+              </button>
+            </div>
+            <small>
+              {conversation.turns} turn{conversation.turns === 1 ? "" : "s"} / {formatDateTime(conversation.latest.updated_at)}
+            </small>
+          </article>
+        );
+      })}
+    </div>
+  );
+}
