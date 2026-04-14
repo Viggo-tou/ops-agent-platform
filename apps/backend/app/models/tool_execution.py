@@ -38,6 +38,7 @@ class ToolExecution(Base):
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     request_payload_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     response_payload_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    inverse_action_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     attempt_log_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)

@@ -5,8 +5,11 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.enums import EventSource, EventType, RoleName, TaskStatus, WorkflowStage
+from app.core.logging import get_logger
 from app.models.event import Event
 from app.models.task import Task
+
+_event_logger = get_logger(component="events")
 
 
 def record_event(
@@ -39,6 +42,16 @@ def record_event(
     )
     db.add(event)
     db.flush()
+    _event_logger.info(
+        "lifecycle_event",
+        task_id=task_id,
+        event_type=event_type.value if hasattr(event_type, "value") else str(event_type),
+        source=source.value if hasattr(source, "value") else str(source),
+        stage=stage.value if stage and hasattr(stage, "value") else str(stage),
+        role=role.value if role and hasattr(role, "value") else str(role),
+        tool_name=tool_name,
+        message=message,
+    )
     return event
 
 

@@ -337,3 +337,77 @@ export interface KnowledgeSyncResponse {
   updated_documents: number;
   removed_documents: number;
 }
+
+export interface KnowledgeUploadSkipped {
+  file_name: string;
+  reason: string;
+}
+
+export interface KnowledgeUploadResponse {
+  source_name: string;
+  source_path: string;
+  indexed_documents: KnowledgeDocumentSummary[];
+  skipped: KnowledgeUploadSkipped[];
+}
+
+export interface KnowledgeDeleteResponse {
+  source_name: string;
+  removed_documents: number;
+  removed_from_disk: boolean;
+}
+
+export interface MemoryItem {
+  id: string;
+  title: string;
+  body: string;
+  topic: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MemoryItemCreate {
+  title: string;
+  body: string;
+  topic?: string;
+}
+
+export interface MemoryItemUpdate {
+  title?: string;
+  body?: string;
+  topic?: string;
+}
+
+export interface MemorySettings {
+  enabled: boolean;
+  allow_list: string;
+  block_list: string;
+  updated_at: string;
+}
+
+export interface MemorySettingsUpdate {
+  enabled?: boolean;
+  allow_list?: string;
+  block_list?: string;
+}
+
+export interface ModelEntry {
+  id: string;
+  display_name: string;
+  sort_order: number;
+}
+
+export interface ModelProvider {
+  name: string;
+  note: string;
+  sort_order: number;
+  models: ModelEntry[];
+}
+
+export interface SelectedModel {
+  model_id: string | null;
+  updated_at: string;
+}
+
+export interface SelectedModelUpdate {
+  model_id: string | null;
+}

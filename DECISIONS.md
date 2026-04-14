@@ -85,3 +85,18 @@ Constraint:
 
 - Follow-up classification must use the marker-delimited user intent, not the whole context block.
 - The UI must hide the context block and show only the user's actual follow-up text.
+
+## D-008 Knowledge Delete is Hard Delete (T-026-B)
+
+`DELETE /api/knowledge/documents/{id}` and `DELETE /api/knowledge/sources/{name}` physically remove DB rows and, for upload-owned sources, files on disk. No soft-delete / disable column exists.
+
+Reason:
+
+- Knowledge documents are derived artifacts: files can be re-uploaded, repos can be re-synced. A soft-delete tombstone buys no recovery value the source of truth does not already offer.
+- Soft-delete adds query filters, index cost, and UI ambiguity ("is this hidden or gone?"). Not worth the complexity at the current product stage.
+- Governance-level undo is still available via the task rollback path for patches that introduced the knowledge change.
+
+Constraint:
+
+- Delete must remain gated by the `knowledge:delete` permission (admin only in current `PERMISSION_MAP`).
+- If compliance or legal later require retention/recall, switch to soft-delete by adding a `deleted_at` column and filtering in `KnowledgeService.list_documents` / `list_sources` — don't retrofit half the codebase.

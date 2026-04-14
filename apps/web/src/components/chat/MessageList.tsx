@@ -1,17 +1,64 @@
+import { EventTimeline } from "./EventTimeline";
+import { ThinkingIndicator } from "./ThinkingIndicator";
+import { TypingText } from "./TypingText";
+import { countDiffFiles, DiffViewer } from "./DiffViewer";
 import { readKnowledgeSearchResult } from "../tasks/KnowledgeResultPanel";
 import { readTaskPlanDocument } from "../tasks/PlanBreakdown";
 import { readTaskReviewDocument } from "../tasks/ReviewBreakdown";
-import type { TaskDetail } from "../../types";
+import type { EventRecord, TaskDetail } from "../../types";
 
 export const FOLLOW_UP_MARKER = "\n\nFollow-up request:\n";
 
 interface MessageListProps {
   task?: TaskDetail | null;
   tasks?: TaskDetail[];
+  eventsMap?: Record<string, EventRecord[]>;
 }
+
+const TERMINAL_STATUSES = new Set(["completed", "failed", "rolled_back"]);
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value : null;
+}
+
+function readRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function readStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && Boolean(item.trim())) : [];
+}
+
+function extractDiffFence(text: string): string | null {
+  const match = /```(?:diff|patch)\s*\n([\s\S]*?)```/i.exec(text);
+  if (!match?.[1]?.trim()) {
+    return null;
+  }
+
+  return match[1].trim();
+}
+
+function stripDiffFences(text: string): string {
+  return text.replace(/```(?:diff|patch)\s*\n[\s\S]*?```/gi, "").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function readDevelopDiff(task: TaskDetail, fallbackText: string): { diff: string; filesChanged: number } | null {
+  const result = readRecord(task.latest_result_json?.result);
+  const resultScenario = readString(result?.scenario);
+  const structuredDiff = readString(result?.diff);
+  if ((task.scenario === "jira_issue_develop" || resultScenario === "jira_issue_develop") && structuredDiff) {
+    const filesChanged = readStringArray(result?.files_changed).length || countDiffFiles(structuredDiff);
+    return { diff: structuredDiff, filesChanged };
+  }
+
+  const fencedDiff = extractDiffFence(fallbackText);
+  if (fencedDiff) {
+    return { diff: fencedDiff, filesChanged: countDiffFiles(fencedDiff) };
+  }
+
+  return null;
 }
 
 function buildNaturalFailureReply(message: string | null): string | null {
@@ -86,57 +133,59 @@ export function buildAgentReply(task: TaskDetail): string {
   return "I have received the request and am preparing the response.";
 }
 
-function renderMarkdownLite(text: string) {
-  return text.split(/\n\s*\n/).map((block, index) => {
-    const lines = block
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean);
-    if (lines.length > 0 && lines.every((line) => /^(-|\d+\.)\s+/.test(line))) {
-      return (
-        <ul className="message-list-block" key={`list-${index}`}>
-          {lines.map((line) => (
-            <li key={line}>{line.replace(/^(-|\d+\.)\s+/, "")}</li>
-          ))}
-        </ul>
-      );
-    }
-    return <p key={`paragraph-${index}`}>{lines.join(" ")}</p>;
-  });
-}
-
-export function MessageList({ task, tasks }: MessageListProps) {
+export function MessageList({ task, tasks, eventsMap }: MessageListProps) {
   const visibleTasks = tasks ?? (task ? [task] : []);
 
   if (visibleTasks.length === 0) {
     return (
       <div className="empty-chat">
         <h1>Knowledge Assistant</h1>
-        <p>
-          Ask a question, inspect repository evidence, or plan the next task.
-        </p>
+        <p>你的智能知识管理与学习助手</p>
       </div>
     );
   }
 
   return (
     <div className="message-list">
-      {visibleTasks.map((messageTask) => {
+      {visibleTasks.map((messageTask, index) => {
+        const events = eventsMap?.[messageTask.id] ?? [];
+        const latestEventType = events.length > 0 ? events[events.length - 1].event_type : null;
+        const isActive = !TERMINAL_STATUSES.has(messageTask.status);
+        const isLastTask = index === visibleTasks.length - 1;
+        const justCompleted =
+          messageTask.status === "completed" && Date.now() - new Date(messageTask.updated_at).getTime() < 30_000;
+        const shouldAnimate = isLastTask && justCompleted;
         const agentReply = buildAgentReply(messageTask);
+        const developDiff = readDevelopDiff(messageTask, agentReply);
+        const replyText = developDiff ? stripDiffFences(agentReply) : agentReply;
         return (
           <div className="message-turn" key={messageTask.id}>
             <article className="message-row user">
               <div className="message-bubble">
-                <div className="message-author">You</div>
                 <p>{readDisplayRequestText(messageTask.request_text)}</p>
               </div>
+              <div className="message-avatar user-avatar">U</div>
             </article>
 
+            {events.length ? <EventTimeline events={events} /> : null}
+
             <article className="message-row assistant">
-              <div className="message-bubble">
-                <div className="message-author">Assistant</div>
-                <div className="message-content">{renderMarkdownLite(agentReply)}</div>
-              </div>
+              <div className="message-avatar assistant-avatar">AI</div>
+              {isLastTask && isActive ? (
+                <ThinkingIndicator status={messageTask.status} events={events} latestEventType={latestEventType} />
+              ) : (
+                <div className="message-bubble">
+                  <div className="message-content">
+                    {replyText ? <TypingText text={replyText} enabled={shouldAnimate} /> : null}
+                    {developDiff ? (
+                      <details className="diff-details" open>
+                        <summary>Code Changes ({developDiff.filesChanged} files)</summary>
+                        <DiffViewer diff={developDiff.diff} />
+                      </details>
+                    ) : null}
+                  </div>
+                </div>
+              )}
             </article>
           </div>
         );

@@ -23,6 +23,7 @@ from app.models.tool_execution import ToolExecution
 from app.orchestrator.service import PrimaryOrchestrator, classify_request
 from app.schemas.task import TaskCreateRequest, TaskRollbackRequest
 from app.services.events import record_event, set_task_status
+from app.services.rollback import RollbackExecutor
 
 
 class TaskService:
@@ -218,9 +219,30 @@ class TaskService:
             }
 
         task.pending_approval = False
+        rollback_result = RollbackExecutor(self.db).execute_rollback(task_id=task.id)
+        rollback_steps = [
+            {
+                "execution_id": step.execution_id,
+                "tool_name": step.tool_name,
+                "inverse_type": step.inverse_type,
+                "success": step.success,
+                "message": step.message,
+            }
+            for step in rollback_result.steps
+        ]
         task.latest_result_json = {
             "status": TaskStatus.ROLLED_BACK.value,
-            "message": "Task state rolled back. No external side effects were executed in Phase 1.",
+            "message": (
+                "Rollback completed: "
+                f"{rollback_result.succeeded_count}/{rollback_result.total_steps} inverses executed."
+            ),
+            "rollback": {
+                "total_steps": rollback_result.total_steps,
+                "succeeded": rollback_result.succeeded_count,
+                "failed": rollback_result.failed_count,
+                "skipped": rollback_result.skipped_count,
+                "steps": rollback_steps,
+            },
             "reason": payload.reason,
         }
 
@@ -254,7 +276,13 @@ class TaskService:
             stage=WorkflowStage.DONE,
             role=RoleName.SYSTEM,
             message="Rollback completed.",
-            payload={"cancelled_approvals": len(pending_approvals)},
+            payload={
+                "cancelled_approvals": len(pending_approvals),
+                "total_steps": rollback_result.total_steps,
+                "succeeded": rollback_result.succeeded_count,
+                "failed": rollback_result.failed_count,
+                "skipped": rollback_result.skipped_count,
+            },
         )
 
         self.db.commit()
@@ -299,7 +327,7 @@ class TaskService:
             return RiskCategory.KNOWLEDGE_LOOKUP
         if scenario == "slack_message":
             return RiskCategory.EXTERNAL_BROADCAST
-        if scenario in {"jira_issue_create", "jira_issue_plan"}:
+        if scenario in {"jira_issue_create", "jira_issue_plan", "jira_issue_writeback"}:
             return RiskCategory.CHANGE_MANAGEMENT
         if scenario in {"internal_api_request", "action_with_approval"}:
             return RiskCategory.CONFIGURATION_CHANGE

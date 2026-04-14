@@ -7,11 +7,13 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.core.enums import ActorRole, ApprovalStatus
+from app.core.security import ActorContext, require_permission
 from app.schemas.approval import ApprovalDecisionRequest, ApprovalRead
 from app.services.approvals import ApprovalService
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
 DbSession = Annotated[Session, Depends(get_db)]
+ApprovalDecisionActorCtx = Annotated[ActorContext, Depends(require_permission("approval:decide"))]
 
 
 @router.get("", response_model=list[ApprovalRead])
@@ -26,22 +28,32 @@ def list_approvals(
 
 
 @router.post("/{approval_id}/grant", response_model=ApprovalRead)
-def grant_approval(approval_id: str, payload: ApprovalDecisionRequest, db: DbSession) -> ApprovalRead:
+def grant_approval(
+    approval_id: str,
+    payload: ApprovalDecisionRequest,
+    db: DbSession,
+    _actor: ApprovalDecisionActorCtx,
+) -> ApprovalRead:
     service = ApprovalService(db)
     try:
         return service.grant(approval_id=approval_id, payload=payload)
     except ValueError as exc:
         if str(exc) == "Approval not found":
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Approval not found.") from exc
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.post("/{approval_id}/reject", response_model=ApprovalRead)
-def reject_approval(approval_id: str, payload: ApprovalDecisionRequest, db: DbSession) -> ApprovalRead:
+def reject_approval(
+    approval_id: str,
+    payload: ApprovalDecisionRequest,
+    db: DbSession,
+    _actor: ApprovalDecisionActorCtx,
+) -> ApprovalRead:
     service = ApprovalService(db)
     try:
         return service.reject(approval_id=approval_id, payload=payload)
     except ValueError as exc:
         if str(exc) == "Approval not found":
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Approval not found.") from exc
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

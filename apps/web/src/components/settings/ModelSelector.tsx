@@ -1,74 +1,87 @@
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 
+import { api } from "../../lib/api";
 import { useAuth } from "../../lib/auth";
 
-interface ModelOption {
-  provider: string;
-  models: string[];
-  note: string;
-}
-
-const modelGroups: ModelOption[] = [
-  { provider: "OpenAI", models: ["GPT-5.4", "GPT-5.4 Mini", "GPT-4.1"], note: "General reasoning and tool use" },
-  { provider: "Anthropic", models: ["Claude Opus 4.6", "Claude Sonnet 4.6", "Claude Haiku 4.5"], note: "Long-context writing and coding" },
-  { provider: "Google", models: ["Gemini 2.5 Pro", "Gemini 2.5 Flash"], note: "Multimodal and fast assistant work" },
-  { provider: "DeepSeek", models: ["DeepSeek V3", "DeepSeek R1"], note: "Reasoning and code-oriented tasks" },
-  { provider: "Moonshot", models: ["Kimi K2", "Kimi Turbo"], note: "Long-context Chinese and mixed-language tasks" },
-  { provider: "Mistral", models: ["Mistral Large", "Codestral"], note: "Enterprise and coding workflows" },
-  { provider: "Cohere", models: ["Command R+", "Command A"], note: "RAG and enterprise retrieval" },
-  { provider: "Aliyun / Zhipu / Domestic", models: ["MiniMax-M2.7", "Qwen Max", "GLM-5"], note: "Domestic provider compatibility" },
-];
+const ALL_PROVIDERS = "全部";
 
 export function ModelSelector() {
   const { can } = useAuth();
+  const queryClient = useQueryClient();
+  const canEditModelConfig = can("settings:model_config");
   const [activeTab, setActiveTab] = useState<"models" | "api">("models");
-  const [providerFilter, setProviderFilter] = useState("All");
-  const [selectedModel, setSelectedModel] = useState(
-    () => window.localStorage.getItem("ops-agent-selected-model") ?? "GLM-5",
-  );
+  const [providerFilter, setProviderFilter] = useState(ALL_PROVIDERS);
   const [providerKeys, setProviderKeys] = useState<Record<string, string>>({});
 
-  const selectedProvider = modelGroups.find((group) => group.models.includes(selectedModel))?.provider ?? "Not selected";
+  const providersQuery = useQuery({
+    queryKey: ["model-providers"],
+    queryFn: () => api.getModelProviders(),
+  });
+
+  const selectedModelQuery = useQuery({
+    queryKey: ["selected-model"],
+    queryFn: () => api.getSelectedModel(),
+  });
+
+  const selectModelMutation = useMutation({
+    mutationFn: (modelId: string) => api.setSelectedModel({ model_id: modelId }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["selected-model"] });
+    },
+  });
+
+  const providers = providersQuery.data ?? [];
+  const selectedModelId = selectedModelQuery.data?.model_id ?? null;
+  const selectedGroup = providers.find((group) => group.models.some((model) => model.id === selectedModelId));
+  const selectedEntry = selectedGroup?.models.find((model) => model.id === selectedModelId);
+  const selectedProvider = selectedGroup?.name ?? "Not selected";
+  const selectedModel = selectedEntry?.display_name ?? "Not selected";
+  const providerChips = providersQuery.isLoading ? [] : [ALL_PROVIDERS, ...providers.map((provider) => provider.name)];
   const visibleGroups = useMemo(
-    () => (providerFilter === "All" ? modelGroups : modelGroups.filter((group) => group.provider === providerFilter)),
-    [providerFilter],
+    () => (providerFilter === ALL_PROVIDERS ? providers : providers.filter((group) => group.name === providerFilter)),
+    [providerFilter, providers],
   );
 
-  function selectModel(model: string) {
-    if (!can("settings:model_config")) {
+  function selectModel(modelId: string) {
+    if (!canEditModelConfig) {
       return;
     }
-    setSelectedModel(model);
-    window.localStorage.setItem("ops-agent-selected-model", model);
+    selectModelMutation.mutate(modelId);
   }
 
   return (
     <div className="settings-panel">
       <div className="settings-tab-row" role="tablist" aria-label="Settings sections">
         <button className={activeTab === "models" ? "tab-button active" : "tab-button"} type="button" onClick={() => setActiveTab("models")}>
-          Model selection
+          模型选择
         </button>
         <button className={activeTab === "api" ? "tab-button active" : "tab-button"} type="button" onClick={() => setActiveTab("api")}>
-          API configuration
+          API 配置
         </button>
       </div>
 
       {activeTab === "models" ? (
         <section className="settings-section">
           <div className="settings-section-head">
-            <div className="settings-icon">M</div>
+            <div className="settings-icon">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M7 8V7a5 5 0 0 1 10 0v1" />
+                <path d="M5 8h14l-1 12H6L5 8Z" />
+              </svg>
+            </div>
             <div>
-              <h2>Select model</h2>
-              <p>Choose the assistant model used for this workspace.</p>
+              <h2>选择模型</h2>
+              <p>选择适合您需求的 AI 模型</p>
             </div>
           </div>
 
-          {!can("settings:model_config") ? (
+          {!canEditModelConfig ? (
             <div className="permission-note">Your role can view settings but cannot change model configuration.</div>
           ) : null}
 
           <div className="provider-chip-row" aria-label="Provider filter">
-            {["All", ...modelGroups.map((group) => group.provider)].map((provider) => (
+            {providerChips.map((provider) => (
               <button
                 key={provider}
                 type="button"
@@ -84,18 +97,18 @@ export function ModelSelector() {
             {visibleGroups.flatMap((group) =>
               group.models.map((model) => (
                 <button
-                  key={`${group.provider}-${model}`}
+                  key={`${group.name}-${model.id}`}
                   type="button"
-                  className={model === selectedModel ? "model-row-card selected" : "model-row-card"}
-                  onClick={() => selectModel(model)}
-                  disabled={!can("settings:model_config")}
+                  className={model.id === selectedModelId ? "model-row-card selected" : "model-row-card"}
+                  onClick={() => selectModel(model.id)}
+                  disabled={!canEditModelConfig || selectModelMutation.isPending}
                 >
                   <span>
-                    <strong>{model}</strong>
-                    <small>{group.provider}</small>
+                    <strong>{model.display_name}</strong>
+                    <small>{group.name}</small>
                   </span>
                   <span>{group.note}</span>
-                  <i>{model === selectedModel ? "Selected" : "Select"}</i>
+                  <i>{model.id === selectedModelId ? "✓" : ""}</i>
                 </button>
               )),
             )}
@@ -117,17 +130,17 @@ export function ModelSelector() {
           </div>
 
           <div className="provider-key-list">
-            {modelGroups.map((group) => (
-              <label className="field" key={group.provider}>
-                <span>{group.provider}</span>
+            {providers.map((group) => (
+              <label className="field" key={group.name}>
+                <span>{group.name}</span>
                 <input
                   type="password"
-                  value={providerKeys[group.provider] ?? ""}
+                  value={providerKeys[group.name] ?? ""}
                   onChange={(event) =>
-                    setProviderKeys((current) => ({ ...current, [group.provider]: event.target.value }))
+                    setProviderKeys((current) => ({ ...current, [group.name]: event.target.value }))
                   }
                   placeholder="Managed by backend"
-                  disabled={!can("settings:model_config")}
+                  disabled={!canEditModelConfig}
                 />
               </label>
             ))}

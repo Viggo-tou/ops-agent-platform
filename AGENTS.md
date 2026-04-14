@@ -21,6 +21,37 @@ Then output:
 
 Do not make broad edits outside the active handoff scope until the current blocker and queue are understood.
 
+## Session Boundary Discipline (MANDATORY)
+
+The repo has an accumulated-uncommitted-work problem (see T-037 in `TASK_QUEUE.md`). To stop this recurring, every session MUST follow this ritual:
+
+### At session start
+
+1. Run `git status --short` and `git log --oneline -5`. If HEAD is not a clean checkpoint of prior session work, flag this to the user before editing anything.
+2. Create a session-start baseline tag: `git tag session-start/YYYY-MM-DD-HHMM` on current HEAD. This gives an unambiguous diff baseline for the session.
+3. Note in the first turn which tag was created.
+
+### During the session
+
+- Keep a running list of files touched, in memory or in a scratch note. At the end you must be able to answer "which files did this session modify" without guessing.
+
+### At session end
+
+Exactly one of the following must happen before the session closes:
+
+- **Option A (preferred):** Commit session work. Even a rough `wip:` commit is better than leaving the working tree dirty. The user can rebase/reword later.
+- **Option B (docs-only sessions):** Update `SESSION_HANDOFF.md` with a manifest section listing:
+  - Session-start tag name
+  - Exact file paths touched
+  - `git diff --stat <session-start-tag>..HEAD -- <file>` output for each file (or a note that the file is still in working tree)
+  - Whether the session's code changes are committed or still dirty
+
+If neither A nor B happens, the session has failed its contract.
+
+### Rationale
+
+Without a baseline tag, no git operation can separate "this session's work" from "all prior uncommitted work". Once multiple sessions stack dirty changes on top of each other, the only way out is a big rebaseline commit that attributes everything to a single author — losing real history. The ritual above costs ~10 seconds per session and prevents that failure mode.
+
 ## Project Goal
 
 Build an enterprise AI assistant platform with:
@@ -95,6 +126,42 @@ Open:
 - Sensitive frontend operations must be checked before the UI mutation and before backend mutation.
 - For chat, natural-language answers are primary; raw JSON, task status, review verdict, and plan metadata are diagnostic only.
 - Keep UI styling unified in the existing frontend styling approach unless there is a clear reason to change.
+
+## Execution Workflow (Claude / codex / MiniMax)
+
+This project uses a three-way split between AI coding agents. Roles are not interchangeable.
+
+- **Claude** — director, planner, reviewer. Reads code, writes specs, reviews diffs, runs verification (`python -m compileall app`, `tsc --noEmit`, `npm run build`, targeted smoke). Does **not** use Edit/Write on product source files.
+- **codex CLI** — primary executor for non-trivial code work across `apps/backend/**` and `apps/web/**`. Invoked via `codex exec` (see `Bash(codex *)` in `.claude/settings.json`).
+- **MiniMax** — cheaper executor for low-difficulty, well-scoped edits (simple renames, string/text tweaks, mechanical refactors, docstring/comment changes). Config via `OPS_AGENT_MINIMAX_*` env vars in `apps/backend/.env`. MiniMax also runs at runtime as the backend semantic translator; the "easy-lane executor" role is a dev-time convention.
+
+### What Claude may edit directly
+
+Meta, recovery, and config files only:
+
+- `.claude/settings.json`, `.claude/**`
+- Recovery/handoff docs: `AGENTS.md`, `PROJECT_CONTEXT.md`, `CURRENT_STATE.md`, `TASK_QUEUE.md`, `DECISIONS.md`, `SESSION_HANDOFF.md`, `CLAUDE.md`, `README.md`, `docs/task-cards.md`
+- Task specs in `docs/ai/tasks/*.md`, `docs/ai/runs/*.log`
+- `.gitignore`, `requirements.txt` (borderline config, Claude-authored is fine)
+- Personal Claude memory under `~/.claude/projects/.../memory/**`
+
+Everything else — backend services, API handlers, schemas, React components, styles — goes through codex or MiniMax.
+
+### Spec and run convention
+
+- Task spec: `docs/ai/tasks/<task-id>.md`. Canonical example: `docs/ai/tasks/T-UI-01-reference-alignment.md`.
+- Each spec must end with: **files to edit**, **acceptance criteria**, and a **Workflow (for the executor)** line naming the executor (codex or MiniMax).
+- Run log: `docs/ai/runs/<task-id>.log` (plus `-rerun.log`, `-stdin.log` variants).
+
+### Codex dispatch pattern
+
+```
+codex exec --full-auto -C "d:/项目/Ops_agent_platform" - < docs/ai/tasks/<spec>.md
+```
+
+After any codex or MiniMax run, Claude **must** re-read the changed files and run verification before reporting success. Never trust "done" without reviewing the diff.
+
+If unsure whether a task is simple enough for MiniMax, ask the user.
 
 ## UI Reference Direction
 

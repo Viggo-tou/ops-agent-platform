@@ -5,16 +5,15 @@ export function MemoryPage() {
     <div className="content-page reference-page memory-page-shell">
       <header className="content-header split-header">
         <div>
-          <span>Memory</span>
-          <h1>Memory management</h1>
-          <p>Control automatic memory and decide which topics can be remembered.</p>
+          <h1>记忆管理</h1>
+          <p>管理自动提取的记忆，控制哪些内容会被记住</p>
         </div>
         <div className="page-actions">
           <button type="button" className="subtle-button" onClick={() => document.getElementById("memory-controls")?.scrollIntoView({ behavior: "smooth" })}>
-            Memory settings
+            ⚙️ 提取设置
           </button>
           <button type="button" className="primary-action" onClick={() => document.getElementById("memory-editor")?.scrollIntoView({ behavior: "smooth" })}>
-            Add memory
+            + 添加记忆
           </button>
         </div>
       </header>

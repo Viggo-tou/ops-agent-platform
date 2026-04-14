@@ -52,6 +52,7 @@ class Task(Base):
     )
     pending_approval: Mapped[bool] = mapped_column(Boolean, default=False)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     governance_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     translation_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     plan_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)

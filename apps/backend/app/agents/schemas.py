@@ -145,3 +145,16 @@ class ReviewGenerationResult(BaseModel):
     review: GeneratedReview
     provider_name: str
     model_name: str | None = None
+
+
+class CodegenResult(BaseModel):
+    diff: str = Field(min_length=1)
+    summary: str = Field(min_length=1, max_length=500)
+    files_changed: list[str] = Field(default_factory=list)
+    file_summaries: list[dict[str, str]] = Field(default_factory=list)
+    provider_name: str = ""
+    model_name: str | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    used_fallback: bool = False
+    fallback_reason: str | None = None

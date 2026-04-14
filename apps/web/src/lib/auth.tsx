@@ -1,4 +1,7 @@
-import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
+// Keep rolePermissions in sync with apps/backend/app/core/security.py::PERMISSION_MAP.
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+
+import { setApiActor } from "./api";
 
 export type AppRole = "admin" | "operator" | "member" | "viewer";
 
@@ -90,6 +93,14 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AppUser | null>(() => readStoredUser());
+
+  useEffect(() => {
+    if (!user) {
+      setApiActor(null, null);
+      return;
+    }
+    setApiActor(toBackendActorRole(user.role), user.role);
+  }, [user]);
 
   const value = useMemo<AuthContextValue>(() => {
     const backendActorRole = toBackendActorRole(user?.role ?? "viewer");

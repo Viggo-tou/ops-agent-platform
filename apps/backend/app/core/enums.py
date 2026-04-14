@@ -89,6 +89,7 @@ class EventType(str, Enum):
     TOOL_TIMED_OUT = "tool_timed_out"
     TOOL_SUCCEEDED = "tool_succeeded"
     TOOL_FAILED = "tool_failed"
+    TOOL_SKIPPED = "tool_skipped"
     POLICY_EVALUATION_STARTED = "policy_evaluation_started"
     POLICY_EVALUATION_COMPLETED = "policy_evaluation_completed"
     POLICY_DENIED = "policy_denied"
@@ -128,6 +129,7 @@ class ToolPermissionCategory(str, Enum):
 
 
 class ToolExecutionStatus(str, Enum):
+    PENDING_APPROVAL = "pending_approval"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"

@@ -41,17 +41,30 @@ export function ChatInput({ disabled, isSubmitting, onSubmit, permissionDenied }
           disabled={disabled || isSubmitting}
           aria-label="Attach files"
         >
-          +
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M8 12.5 14.8 5.7a3.2 3.2 0 0 1 4.5 4.5l-8 8a5 5 0 0 1-7.1-7.1l8.4-8.4" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          className="icon-button"
+          disabled={disabled || isSubmitting}
+          aria-label="Voice input"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 4a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V7a3 3 0 0 0-3-3Z" />
+            <path d="M6 11a6 6 0 0 0 12 0M12 17v3m-4 0h8" />
+          </svg>
         </button>
         <textarea
           value={message}
           onChange={(event) => setMessage(event.target.value)}
-          placeholder="Message Assistant..."
+          placeholder="给 Assistant 发送消息..."
           rows={1}
           disabled={disabled || isSubmitting}
         />
         <button className="send-button" type="submit" disabled={disabled || isSubmitting || !message.trim()}>
-          {isSubmitting ? "..." : "Send"}
+          {isSubmitting ? "..." : "↑"}
         </button>
       </div>
       <input

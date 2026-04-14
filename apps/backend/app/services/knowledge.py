@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import shutil
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,10 +15,17 @@ from app.models.knowledge_document import KnowledgeDocument
 from app.schemas.knowledge import (
     KnowledgeAnswerTrace,
     KnowledgeCitation,
+    KnowledgeDeleteResponse,
+    KnowledgeDocumentSummary,
     KnowledgeSearchResult,
     KnowledgeSourceDescriptor,
     KnowledgeSyncResponse,
+    KnowledgeUploadResponse,
+    KnowledgeUploadSkipped,
 )
+
+UPLOAD_ACCEPTED_EXTENSIONS = {".md", ".txt", ".json", ".yml", ".yaml", ".properties"}
+SOURCE_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 TEXT_EXTENSIONS = {
     ".kt",
@@ -154,6 +162,7 @@ class KnowledgeService:
         query: str,
         top_k: int | None = None,
         source_name: str | None = None,
+        language: str | None = None,
     ) -> KnowledgeSearchResult:
         self.ensure_repositories_ready()
         source_specs = self._resolve_source_specs()
@@ -218,6 +227,7 @@ class KnowledgeService:
             citations=citations,
             hallucination_risk=hallucination_risk,
             route_kind=route.kind,
+            language=language,
         )
         packaged_context = "\n\n".join(
             [
@@ -344,6 +354,7 @@ class KnowledgeService:
 
     def _resolve_source_specs(self) -> list[SourceSpec]:
         specs: list[SourceSpec] = []
+        seen_names: set[str] = set()
         if self.settings.knowledge_source_specs:
             for raw_item in self.settings.knowledge_source_specs.split(";"):
                 item = raw_item.strip()
@@ -352,16 +363,217 @@ class KnowledgeService:
                 name, raw_path = item.split("=", 1)
                 path = Path(raw_path.strip())
                 if path.exists():
-                    specs.append(SourceSpec(name=name.strip().lower(), path=path))
+                    normalized = name.strip().lower()
+                    specs.append(SourceSpec(name=normalized, path=path))
+                    seen_names.add(normalized)
 
         if not specs:
-            if not self.settings.knowledge_source_path:
-                raise ValueError("No knowledge source path is configured")
-            path = Path(self.settings.knowledge_source_path)
-            if not path.exists():
-                raise ValueError(f"Knowledge source path does not exist: {path}")
-            specs.append(SourceSpec(name=self.settings.knowledge_source_name.strip().lower(), path=path))
+            if self.settings.knowledge_source_path:
+                path = Path(self.settings.knowledge_source_path)
+                if path.exists():
+                    normalized = self.settings.knowledge_source_name.strip().lower()
+                    specs.append(SourceSpec(name=normalized, path=path))
+                    seen_names.add(normalized)
 
+        upload_root = Path(self.settings.knowledge_upload_root)
+        if upload_root.exists():
+            for child in sorted(upload_root.iterdir()):
+                if not child.is_dir():
+                    continue
+                name = child.name.lower()
+                if name in seen_names:
+                    continue
+                if not SOURCE_NAME_PATTERN.match(name):
+                    continue
+                specs.append(SourceSpec(name=name, path=child))
+                seen_names.add(name)
+
+        if not specs:
+            raise ValueError("No knowledge source path is configured")
+
+        return specs
+
+    def _is_upload_source(self, source_name: str) -> bool:
+        upload_root = Path(self.settings.knowledge_upload_root)
+        candidate = upload_root / source_name
+        return candidate.exists() and candidate.is_dir()
+
+    def upload_documents(
+        self,
+        *,
+        files: list[tuple[str, bytes]],
+        source_name: str | None = None,
+    ) -> KnowledgeUploadResponse:
+        normalized_source = (source_name or self.settings.knowledge_upload_default_source).strip().lower()
+        if not SOURCE_NAME_PATTERN.match(normalized_source):
+            raise ValueError(
+                "Invalid source name. Use 1-64 lowercase letters, digits, underscores, or hyphens."
+            )
+
+        configured_names = {
+            spec.name
+            for spec in self._collect_configured_specs()
+        }
+        if normalized_source in configured_names:
+            raise ValueError(
+                f"Source '{normalized_source}' is a configured repository source and cannot receive uploads."
+            )
+
+        upload_root = Path(self.settings.knowledge_upload_root)
+        source_dir = upload_root / normalized_source
+        source_dir.mkdir(parents=True, exist_ok=True)
+
+        max_bytes = int(self.settings.knowledge_upload_max_bytes)
+        indexed: list[KnowledgeDocument] = []
+        skipped: list[KnowledgeUploadSkipped] = []
+
+        for raw_name, data in files:
+            safe_name = Path(raw_name).name
+            if not safe_name:
+                skipped.append(KnowledgeUploadSkipped(file_name=raw_name, reason="empty file name"))
+                continue
+            extension = Path(safe_name).suffix.lower()
+            if extension not in UPLOAD_ACCEPTED_EXTENSIONS:
+                skipped.append(
+                    KnowledgeUploadSkipped(
+                        file_name=safe_name,
+                        reason=f"unsupported extension {extension or '(none)'}",
+                    )
+                )
+                continue
+            if len(data) == 0:
+                skipped.append(KnowledgeUploadSkipped(file_name=safe_name, reason="empty content"))
+                continue
+            if len(data) > max_bytes:
+                skipped.append(
+                    KnowledgeUploadSkipped(
+                        file_name=safe_name,
+                        reason=f"exceeds upload limit ({max_bytes} bytes)",
+                    )
+                )
+                continue
+
+            destination = source_dir / safe_name
+            destination.write_bytes(data)
+
+            content = data.decode("utf-8", errors="ignore")
+            content_hash = hashlib.sha256(data).hexdigest()
+            line_count = len(content.splitlines()) if content else 0
+            metadata = {
+                "language": _language_from_extension(extension),
+                "source_path": str(source_dir),
+                "file_name": safe_name,
+                "uploaded": True,
+            }
+
+            existing_stmt = select(KnowledgeDocument).where(
+                KnowledgeDocument.source_name == normalized_source,
+                KnowledgeDocument.relative_path == safe_name,
+            )
+            existing = self.db.scalars(existing_stmt).first()
+            if existing is None:
+                document = KnowledgeDocument(
+                    source_name=normalized_source,
+                    relative_path=safe_name,
+                    title=safe_name,
+                    extension=extension,
+                    language=metadata["language"],
+                    size_bytes=len(data),
+                    line_count=line_count,
+                    content_hash=content_hash,
+                    metadata_json=metadata,
+                    content=content,
+                )
+                self.db.add(document)
+            else:
+                existing.title = safe_name
+                existing.extension = extension
+                existing.language = metadata["language"]
+                existing.size_bytes = len(data)
+                existing.line_count = line_count
+                existing.content_hash = content_hash
+                existing.metadata_json = metadata
+                existing.content = content
+                document = existing
+            indexed.append(document)
+
+        self.db.flush()
+        self.db.commit()
+
+        summaries = [KnowledgeDocumentSummary.model_validate(document) for document in indexed]
+        return KnowledgeUploadResponse(
+            source_name=normalized_source,
+            source_path=str(source_dir),
+            indexed_documents=summaries,
+            skipped=skipped,
+        )
+
+    def delete_document(self, *, document_id: str) -> KnowledgeDeleteResponse:
+        document = self.db.get(KnowledgeDocument, document_id)
+        if document is None:
+            raise LookupError(f"Knowledge document not found: {document_id}")
+
+        source_name = document.source_name
+        removed_from_disk = False
+        if self._is_upload_source(source_name):
+            disk_path = Path(self.settings.knowledge_upload_root) / source_name / document.relative_path
+            if disk_path.exists() and disk_path.is_file():
+                disk_path.unlink()
+                removed_from_disk = True
+
+        self.db.delete(document)
+        self.db.commit()
+        return KnowledgeDeleteResponse(
+            source_name=source_name,
+            removed_documents=1,
+            removed_from_disk=removed_from_disk,
+        )
+
+    def delete_source(self, *, source_name: str) -> KnowledgeDeleteResponse:
+        normalized = source_name.strip().lower()
+        if not SOURCE_NAME_PATTERN.match(normalized):
+            raise ValueError("Invalid source name")
+
+        count_stmt = (
+            select(func.count(KnowledgeDocument.id))
+            .where(KnowledgeDocument.source_name == normalized)
+        )
+        removed_count = int(self.db.execute(count_stmt).scalar_one() or 0)
+
+        self.db.execute(
+            delete(KnowledgeDocument).where(KnowledgeDocument.source_name == normalized)
+        )
+
+        removed_from_disk = False
+        if self._is_upload_source(normalized):
+            disk_dir = Path(self.settings.knowledge_upload_root) / normalized
+            shutil.rmtree(disk_dir, ignore_errors=True)
+            removed_from_disk = True
+
+        self.db.commit()
+        return KnowledgeDeleteResponse(
+            source_name=normalized,
+            removed_documents=removed_count,
+            removed_from_disk=removed_from_disk,
+        )
+
+    def _collect_configured_specs(self) -> list[SourceSpec]:
+        specs: list[SourceSpec] = []
+        if self.settings.knowledge_source_specs:
+            for raw_item in self.settings.knowledge_source_specs.split(";"):
+                item = raw_item.strip()
+                if not item or "=" not in item:
+                    continue
+                name, raw_path = item.split("=", 1)
+                path = Path(raw_path.strip())
+                specs.append(SourceSpec(name=name.strip().lower(), path=path))
+        if not specs and self.settings.knowledge_source_path:
+            specs.append(
+                SourceSpec(
+                    name=self.settings.knowledge_source_name.strip().lower(),
+                    path=Path(self.settings.knowledge_source_path),
+                )
+            )
         return specs
 
     @staticmethod
@@ -593,8 +805,9 @@ class KnowledgeService:
         citations: list[KnowledgeCitation],
         hallucination_risk: str,
         route_kind: str,
+        language: str | None = None,
     ) -> str:
-        use_chinese = cls._contains_cjk(query)
+        use_chinese = (language == "zh") if language else cls._contains_cjk(query)
         if not citations:
             if use_chinese:
                 return (

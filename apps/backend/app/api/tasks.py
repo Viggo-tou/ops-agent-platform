@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.core.enums import ActorRole, RiskCategory, TaskStatus
+from app.core.security import ActorContext, require_permission
 from app.schemas.event import EventRead
 from app.schemas.task import TaskCreateRequest, TaskDetail, TaskRollbackRequest, TaskSummary
 from app.schemas.tool import ToolExecutionRead
@@ -14,10 +15,13 @@ from app.services.tasks import TaskService
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 DbSession = Annotated[Session, Depends(get_db)]
+TaskCreateActorCtx = Annotated[ActorContext, Depends(require_permission("task:create"))]
+ApprovalDecisionActorCtx = Annotated[ActorContext, Depends(require_permission("approval:decide"))]
 
 
 @router.post("", response_model=TaskDetail, status_code=status.HTTP_201_CREATED)
-def create_task(payload: TaskCreateRequest, db: DbSession) -> TaskDetail:
+def create_task(payload: TaskCreateRequest, db: DbSession, _actor: TaskCreateActorCtx) -> TaskDetail:
+    # TODO: task:create_high_risk gate based on risk_level
     service = TaskService(db)
     task = service.create_task(payload)
     return task
@@ -49,7 +53,7 @@ def get_task(task_id: str, db: DbSession) -> TaskDetail:
     service = TaskService(db)
     task = service.get_task(task_id)
     if task is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
     return task
 
 
@@ -57,7 +61,7 @@ def get_task(task_id: str, db: DbSession) -> TaskDetail:
 def list_task_events(task_id: str, db: DbSession) -> list[EventRead]:
     service = TaskService(db)
     if not service.task_exists(task_id):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
     return service.list_events(task_id)
 
 
@@ -65,12 +69,17 @@ def list_task_events(task_id: str, db: DbSession) -> list[EventRead]:
 def list_task_tool_executions(task_id: str, db: DbSession) -> list[ToolExecutionRead]:
     service = TaskService(db)
     if not service.task_exists(task_id):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
     return service.list_tool_executions(task_id)
 
 
 @router.post("/{task_id}/rollback", response_model=TaskDetail)
-def rollback_task(task_id: str, payload: TaskRollbackRequest, db: DbSession) -> TaskDetail:
+def rollback_task(
+    task_id: str,
+    payload: TaskRollbackRequest,
+    db: DbSession,
+    _actor: ApprovalDecisionActorCtx,
+) -> TaskDetail:
     service = TaskService(db)
     try:
         return service.rollback_task(task_id=task_id, payload=payload)

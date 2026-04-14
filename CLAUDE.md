@@ -11,6 +11,14 @@ Before changing code in a new session, read:
 5. `TASK_QUEUE.md`
 6. `SESSION_HANDOFF.md`
 
+## Session Boundary Discipline (MANDATORY — read before any edit)
+
+See `AGENTS.md` → "Session Boundary Discipline" for the full rules. Summary:
+
+1. **At session start:** run `git status --short` + `git log --oneline -5`, then create `git tag session-start/YYYY-MM-DD-HHMM` on current HEAD. Announce the tag in your first response.
+2. **At session end:** either commit (preferred) OR append a manifest to `SESSION_HANDOFF.md` listing files touched + `git diff --stat <tag>..HEAD -- <file>` per file. No exceptions.
+3. **Why:** repo currently has only one commit (`940b232`). Multiple prior sessions left work uncommitted, so no git operation can separate "this session's work" from "everything prior". The tag + manifest ritual makes future sessions recoverable even without committing.
+
 ## Current Project State
 
 The project has moved beyond the original Phase 0 / Phase 1 MVP notes.

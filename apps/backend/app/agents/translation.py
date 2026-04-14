@@ -98,6 +98,8 @@ def _infer_work_type(request_text: str, *, scenario: str) -> str:
     lowered = request_text.lower()
     if scenario == "jira_issue_plan":
         return "feature" if any(word in lowered for word in ("feature", "story", "rollout")) else "investigation"
+    if scenario == "jira_issue_writeback":
+        return "operations"
     if any(word in lowered for word in ("bug", "fix", "debug", "error", "exception", "traceback", "crash", "fail")):
         return "bugfix"
     if any(word in lowered for word in ("plan", "investigate", "analyze", "root cause", "scope")):
@@ -115,6 +117,7 @@ def _infer_intent(request_text: str, *, scenario: str) -> str:
     intent_map = {
         "jira_issue_plan": "plan_existing_jira_issue",
         "jira_issue_create": "create_jira_issue",
+        "jira_issue_writeback": "writeback_jira_issue",
         "slack_message": "send_slack_message",
         "internal_api_request": "call_internal_api",
         "internal_db_query": "query_internal_database",
@@ -245,6 +248,7 @@ def build_fallback_semantic_translation_payload(
         "jira_issue_plan": ["implementation_plan", "execution_steps", "risk_review"],
         "process_question": ["grounded_answer", "citations", "debug_focus_areas"],
         "jira_issue_create": ["structured_issue_payload"],
+        "jira_issue_writeback": ["jira_writeback_payload"],
         "slack_message": ["channel_message_payload"],
         "internal_api_request": ["api_request_payload"],
         "internal_db_query": ["read_only_query_payload"],

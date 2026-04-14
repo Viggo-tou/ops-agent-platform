@@ -5,9 +5,7 @@ export function SettingsPage() {
   return (
     <div className="content-page reference-page settings-page-shell">
       <header className="content-header">
-        <span>Settings</span>
-        <h1>Settings</h1>
-        <p>Choose model and connection settings for the assistant.</p>
+        <h1>设置</h1>
       </header>
 
       <PermissionGuard

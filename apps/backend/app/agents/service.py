@@ -150,6 +150,102 @@ def build_fallback_plan_payload(
     )
     affected_code_locations = _extract_plan_locations_from_knowledge(planning_knowledge)
 
+    # For develop scenarios, citations are grounding context, not edit targets.
+    # Using them as affected_code_locations silently misleads downstream codegen
+    # (it tries to modify grounding files) and the completeness checker (it greps
+    # the wrong files). Leave it empty; the pipeline has multi-path new-file
+    # detection (plan/disk/request-text) to recover the correct targets.
+    if scenario == "jira_issue_develop":
+        develop_affected_code_locations: list[PlanCodeLocation] = []
+    else:
+        develop_affected_code_locations = affected_code_locations
+
+    if scenario == "jira_issue_develop":
+        codegen_tool = "codegen.generate_patch"
+        codegen_permission = registry.get_permission_category(codegen_tool)
+        issue_summary = str(issue_context.get("summary") or "").strip() if issue_context else ""
+        issue_description = str(issue_context.get("description") or "").strip() if issue_context else ""
+        develop_change_summary = issue_summary or change_summary
+        explanation_lines = [
+            change_explanation,
+            issue_description,
+        ]
+        if affected_code_locations:
+            explanation_lines.append(
+                "Likely source files were inferred from repository retrieval before planning."
+            )
+        return GeneratedPlanPayload(
+            objective="Implement the Jira issue by generating code changes, applying patches, running tests, and reviewing results.",
+            request_summary=request_summary,
+            scenario=scenario,
+            change_summary=develop_change_summary[:320],
+            change_explanation=" ".join(line for line in explanation_lines if line).strip()[:1200],
+            assumptions=[
+                "The referenced Jira issue exists and contains enough context to generate code.",
+                "Affected source files can be read from the knowledge index or sandbox.",
+            ],
+            missing_information=[],
+            risk_level=RiskLevel.MEDIUM,
+            requires_approval=codegen_permission == ToolPermissionCategory.APPROVAL_REQUIRED,
+            approval_reasons=["Code generation modifies source files and requires human approval."]
+            if codegen_permission == ToolPermissionCategory.APPROVAL_REQUIRED
+            else [],
+            affected_code_locations=develop_affected_code_locations,
+            tools=[
+                PlanTool(
+                    tool_name=codegen_tool,
+                    permission_category=codegen_permission,
+                    purpose="Generate code changes that implement the Jira issue requirements.",
+                )
+            ],
+            steps=[
+                PlanStep(
+                    step_id="step_1",
+                    title="Analyze Jira issue requirements and affected files",
+                    kind="analysis",
+                    owner_role=RoleName.PLANNER,
+                    depends_on=[],
+                    tool_name=None,
+                    expected_output="Issue requirements mapped to affected source files.",
+                    success_criteria="The issue context and file locations are identified.",
+                ),
+                PlanStep(
+                    step_id="step_2",
+                    title="Generate code patch from plan and file context",
+                    kind="action",
+                    owner_role=RoleName.ACTION,
+                    depends_on=["step_1"],
+                    tool_name=codegen_tool,
+                    expected_output="Unified diff implementing the required changes.",
+                    success_criteria="A valid patch is generated covering the affected files.",
+                ),
+                PlanStep(
+                    step_id="step_3",
+                    title="Apply patch and run tests in sandbox",
+                    kind="action",
+                    owner_role=RoleName.ACTION,
+                    depends_on=["step_2"],
+                    tool_name=None,
+                    expected_output="Patch applied, test results collected.",
+                    success_criteria="Patch applies cleanly and tests pass or are skipped.",
+                ),
+                PlanStep(
+                    step_id="step_4",
+                    title="Review generated changes",
+                    kind="review",
+                    owner_role=RoleName.REVIEWER,
+                    depends_on=["step_3"],
+                    tool_name=None,
+                    expected_output="Reviewed code changes ready for merge.",
+                    success_criteria="Changes are correct, safe, and match the Jira issue requirements.",
+                ),
+            ],
+            final_output_contract=FinalOutputContract(
+                type="jira_issue_develop",
+                required_fields=["issue_key", "files_changed", "diff", "summary"],
+            ),
+        )
+
     if scenario == "jira_issue_plan":
         tool_name = "jira.get_issue"
         permission_category = registry.get_permission_category(tool_name)
@@ -347,6 +443,100 @@ def build_fallback_plan_payload(
             ),
         )
 
+    if scenario == "jira_issue_writeback":
+        comment_tool = "jira.add_comment"
+        transition_tool = "jira.transition_issue"
+        comment_category = registry.get_permission_category(comment_tool)
+        transition_category = registry.get_permission_category(transition_tool)
+        issue_summary = str(issue_context.get("summary") or "").strip() if issue_context else ""
+        current_status = str(issue_context.get("issue_status") or "").strip() if issue_context else ""
+        explanation_lines = [
+            change_explanation,
+            f"Current Jira status: {current_status}." if current_status else "",
+        ]
+        return GeneratedPlanPayload(
+            objective="Write status and comments back to the Jira issue.",
+            request_summary=request_summary,
+            scenario=scenario,
+            change_summary=(issue_summary or change_summary)[:320],
+            change_explanation=" ".join(line for line in explanation_lines if line).strip()[:1200],
+            assumptions=[
+                "The referenced Jira issue exists.",
+                "The requested transition is available in the issue's current workflow state.",
+            ],
+            missing_information=[],
+            risk_level=RiskLevel.MEDIUM,
+            requires_approval=(
+                comment_category == ToolPermissionCategory.APPROVAL_REQUIRED
+                or transition_category == ToolPermissionCategory.APPROVAL_REQUIRED
+            ),
+            approval_reasons=(
+                ["Jira writeback tools are mapped to approval_required in the current tool policy."]
+                if comment_category == ToolPermissionCategory.APPROVAL_REQUIRED
+                or transition_category == ToolPermissionCategory.APPROVAL_REQUIRED
+                else []
+            ),
+            affected_code_locations=[],
+            tools=[
+                PlanTool(
+                    tool_name=comment_tool,
+                    permission_category=comment_category,
+                    purpose="Post a progress comment to the Jira issue.",
+                ),
+                PlanTool(
+                    tool_name=transition_tool,
+                    permission_category=transition_category,
+                    purpose="Transition the Jira issue to the requested workflow status.",
+                ),
+            ],
+            steps=[
+                PlanStep(
+                    step_id="step_1",
+                    title="Validate the writeback request",
+                    kind="analysis",
+                    owner_role=RoleName.PLANNER,
+                    depends_on=[],
+                    tool_name=None,
+                    expected_output="Validated issue key, transition name, and comment text.",
+                    success_criteria="The request contains a valid issue key and at least one writeback action.",
+                ),
+                PlanStep(
+                    step_id="step_2",
+                    title="Post progress comment to Jira",
+                    kind="action",
+                    owner_role=RoleName.ACTION,
+                    depends_on=["step_1"],
+                    tool_name=comment_tool,
+                    expected_output="Comment ID and creation timestamp.",
+                    success_criteria="The comment is visible on the Jira issue.",
+                ),
+                PlanStep(
+                    step_id="step_3",
+                    title="Transition the Jira issue status",
+                    kind="action",
+                    owner_role=RoleName.ACTION,
+                    depends_on=["step_2"],
+                    tool_name=transition_tool,
+                    expected_output="From-status and to-status confirmation.",
+                    success_criteria="The issue status matches the requested target.",
+                ),
+                PlanStep(
+                    step_id="step_4",
+                    title="Review the writeback results",
+                    kind="review",
+                    owner_role=RoleName.REVIEWER,
+                    depends_on=["step_3"],
+                    tool_name=None,
+                    expected_output="Confirmed writeback result for dashboard display.",
+                    success_criteria="Both comment and transition completed successfully.",
+                ),
+            ],
+            final_output_contract=FinalOutputContract(
+                type="jira_writeback_result",
+                required_fields=["status", "issue_key", "comment", "transition"],
+            ),
+        )
+
     if scenario in {"internal_api_request", "action_with_approval"}:
         tool_name = "internal_api.request"
         permission_category = registry.get_permission_category(tool_name)
@@ -539,6 +729,8 @@ class PrimaryAgentPlanner:
         self.settings = settings or get_settings()
 
     def _resolve_model_name(self, provider_name: str) -> str:
+        if provider_name == "anthropic":
+            return getattr(self.settings, "anthropic_model", "claude-sonnet-4-20250514")
         configured_model = self.settings.primary_agent_model.strip()
         if provider_name == "minimax" and configured_model.lower().startswith("gpt"):
             return self.settings.semantic_translator_model
@@ -555,133 +747,122 @@ class PrimaryAgentPlanner:
         planning_knowledge: dict[str, Any] | None = None,
         issue_context: dict[str, Any] | None = None,
     ) -> PlanGenerationResult:
+        """Generate a plan using the provider chain. On failure, cascade to the next provider."""
         provider_mode = self.settings.primary_agent_provider
-        should_try_openai = provider_mode == "openai" or (
-            provider_mode == "auto" and bool(self.settings.openai_api_key)
-        )
-        should_try_minimax = provider_mode == "minimax" or (
-            provider_mode == "auto"
-            and not self.settings.openai_api_key
-            and bool(self.settings.minimax_api_key)
+        anthropic_api_key = getattr(self.settings, "anthropic_api_key", None)
+        openai_api_key = getattr(self.settings, "openai_api_key", None)
+        minimax_api_key = getattr(self.settings, "minimax_api_key", None)
+
+        # Build ordered provider chain
+        providers: list[str] = []
+        if provider_mode == "auto":
+            if anthropic_api_key:
+                providers.append("anthropic")
+            if openai_api_key:
+                providers.append("openai")
+            if minimax_api_key:
+                providers.append("minimax")
+        elif provider_mode != "mock":
+            providers.append(provider_mode)
+
+        default_payload = build_fallback_plan_payload(
+            request_text,
+            scenario=scenario,
+            semantic_translation=semantic_translation,
+            planning_knowledge=planning_knowledge,
+            issue_context=issue_context,
         )
 
-        if should_try_openai:
-            default_payload = build_fallback_plan_payload(
-                request_text,
-                scenario=scenario,
-                semantic_translation=semantic_translation,
-                planning_knowledge=planning_knowledge,
-                issue_context=issue_context,
-            )
+        last_error: str | None = None
+        for provider_name in providers:
             try:
-                model_name = self._resolve_model_name("openai")
-                plan_payload = self._generate_plan_with_openai(
+                return self._try_plan_provider(
+                    provider_name=provider_name,
+                    task_id=task_id,
                     request_text=request_text,
                     scenario=scenario,
                     actor_name=actor_name,
-                    model_name=model_name,
                     default_payload=default_payload,
                 )
-                plan = _materialize_plan(
-                    payload=plan_payload,
-                    task_id=task_id,
-                    provider={
-                        "name": "openai",
-                        "mode": "responses_api",
-                        "model": model_name,
-                    },
-                )
-                return PlanGenerationResult(
-                    plan=plan,
-                    provider_name="openai",
-                    model_name=model_name,
-                )
             except Exception as exc:
-                fallback_plan = _materialize_plan(
-                    payload=default_payload,
-                    task_id=task_id,
-                    provider={
-                        "name": "mock",
-                        "mode": "fallback_after_openai_error",
-                        "requested_provider": "openai",
-                        "requested_model": self.settings.primary_agent_model,
-                        "error": str(exc),
-                    },
-                )
-                return PlanGenerationResult(
-                    plan=fallback_plan,
-                    provider_name="mock",
-                    model_name=self._resolve_model_name("openai"),
-                    used_fallback=True,
-                    fallback_reason=str(exc),
-                )
+                last_error = str(exc)
+                continue  # cascade to next provider
 
-        if should_try_minimax:
-            model_name = self._resolve_model_name("minimax")
-            default_payload = build_fallback_plan_payload(
-                request_text,
-                scenario=scenario,
-                semantic_translation=semantic_translation,
-                planning_knowledge=planning_knowledge,
-                issue_context=issue_context,
-            )
-            try:
-                plan_payload = self._generate_plan_with_minimax(
-                    request_text=request_text,
-                    scenario=scenario,
-                    actor_name=actor_name,
-                    model_name=model_name,
-                    default_payload=default_payload,
-                )
-                plan = _materialize_plan(
-                    payload=plan_payload,
-                    task_id=task_id,
-                    provider={
-                        "name": "minimax",
-                        "mode": "chatcompletion_v2",
-                        "model": model_name,
-                    },
-                )
-                return PlanGenerationResult(
-                    plan=plan,
-                    provider_name="minimax",
-                    model_name=model_name,
-                )
-            except Exception as exc:
-                fallback_plan = _materialize_plan(
-                    payload=default_payload,
-                    task_id=task_id,
-                    provider={
-                        "name": "mock",
-                        "mode": "fallback_after_minimax_error",
-                        "requested_provider": "minimax",
-                        "requested_model": model_name,
-                        "error": str(exc),
-                    },
-                )
-                return PlanGenerationResult(
-                    plan=fallback_plan,
-                    provider_name="mock",
-                    model_name=model_name,
-                    used_fallback=True,
-                    fallback_reason=str(exc),
-                )
-
+        # All providers failed or none configured — use mock fallback
         fallback_plan = _materialize_plan(
-            payload=build_fallback_plan_payload(
-                request_text,
-                scenario=scenario,
-                semantic_translation=semantic_translation,
-                planning_knowledge=planning_knowledge,
-                issue_context=issue_context,
-            ),
+            payload=default_payload,
             task_id=task_id,
-            provider={"name": "mock", "mode": "deterministic_planner"},
+            provider={
+                "name": "mock",
+                "mode": f"fallback_after_all_providers_failed" if providers else "no_provider_configured",
+                "attempted_providers": providers,
+                "error": last_error,
+            },
         )
         return PlanGenerationResult(
             plan=fallback_plan,
             provider_name="mock",
-            used_fallback=False,
+            model_name=None,
+            used_fallback=True,
+            fallback_reason=last_error,
+        )
+
+    def _try_plan_provider(
+        self,
+        *,
+        provider_name: str,
+        task_id: str,
+        request_text: str,
+        scenario: str,
+        actor_name: str,
+        default_payload: dict[str, Any],
+    ) -> PlanGenerationResult:
+        """Attempt plan generation with a single provider. Raises on failure."""
+        model_name = self._resolve_model_name(provider_name)
+
+        if provider_name == "anthropic":
+            plan_payload = self._generate_plan_with_anthropic(
+                request_text=request_text,
+                scenario=scenario,
+                actor_name=actor_name,
+                model_name=model_name,
+                default_payload=default_payload,
+            )
+            mode = "messages_api"
+        elif provider_name == "openai":
+            plan_payload = self._generate_plan_with_openai(
+                request_text=request_text,
+                scenario=scenario,
+                actor_name=actor_name,
+                model_name=model_name,
+                default_payload=default_payload,
+            )
+            mode = "responses_api"
+        elif provider_name == "minimax":
+            plan_payload = self._generate_plan_with_minimax(
+                request_text=request_text,
+                scenario=scenario,
+                actor_name=actor_name,
+                model_name=model_name,
+                default_payload=default_payload,
+            )
+            mode = "chatcompletion_v2"
+        else:
+            raise ValueError(f"Unknown plan provider: {provider_name}")
+
+        plan = _materialize_plan(
+            payload=plan_payload,
+            task_id=task_id,
+            provider={
+                "name": provider_name,
+                "mode": mode,
+                "model": model_name,
+            },
+        )
+        return PlanGenerationResult(
+            plan=plan,
+            provider_name=provider_name,
+            model_name=model_name,
         )
 
     def _generate_plan_with_openai(
@@ -743,7 +924,64 @@ class PrimaryAgentPlanner:
         raw_plan = json.loads(content)
         if default_payload is not None:
             raw_plan = self._merge_plan_payload_with_defaults(raw_plan, default_payload)
-        return GeneratedPlanPayload.model_validate(self._sanitize_plan_payload(raw_plan))
+        sanitized = self._sanitize_plan_payload(raw_plan)
+        if default_payload is not None:
+            sanitized = self._fill_empty_fields_from_default(sanitized, default_payload)
+        return GeneratedPlanPayload.model_validate(sanitized)
+
+    def _generate_plan_with_anthropic(
+        self,
+        *,
+        request_text: str,
+        scenario: str,
+        actor_name: str,
+        model_name: str,
+        default_payload: GeneratedPlanPayload | None = None,
+    ) -> GeneratedPlanPayload:
+        if not self.settings.anthropic_api_key:
+            raise RuntimeError("OPS_AGENT_ANTHROPIC_API_KEY is not configured")
+
+        payload = {
+            "model": model_name,
+            "max_tokens": 8192,
+            "system": self._build_planning_instructions(),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        f"Actor: {actor_name}\n"
+                        f"Scenario: {scenario}\n"
+                        f"Request:\n{request_text}\n\n"
+                        "Return only valid JSON that matches the requested plan schema."
+                    ),
+                }
+            ],
+            "temperature": 0.2,
+        }
+
+        headers = {
+            "x-api-key": self.settings.anthropic_api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+
+        response = httpx.post(
+            f"{self.settings.anthropic_base_url.rstrip('/')}/v1/messages",
+            headers=headers,
+            json=payload,
+            timeout=max(self.settings.primary_agent_timeout_seconds, 120),
+        )
+        response.raise_for_status()
+        response_payload = response.json()
+
+        content = self._extract_anthropic_content(response_payload)
+        raw_plan = self._parse_json_content(content)
+        if default_payload is not None:
+            raw_plan = self._merge_plan_payload_with_defaults(raw_plan, default_payload)
+        sanitized = self._sanitize_plan_payload(raw_plan)
+        if default_payload is not None:
+            sanitized = self._fill_empty_fields_from_default(sanitized, default_payload)
+        return GeneratedPlanPayload.model_validate(sanitized)
 
     def _generate_plan_with_minimax(
         self,
@@ -800,7 +1038,28 @@ class PrimaryAgentPlanner:
         raw_plan = self._parse_json_content(content)
         if default_payload is not None:
             raw_plan = self._merge_plan_payload_with_defaults(raw_plan, default_payload)
-        return GeneratedPlanPayload.model_validate(self._sanitize_plan_payload(raw_plan))
+        sanitized = self._sanitize_plan_payload(raw_plan)
+        if default_payload is not None:
+            sanitized = self._fill_empty_fields_from_default(sanitized, default_payload)
+        return GeneratedPlanPayload.model_validate(sanitized)
+
+    @staticmethod
+    def _extract_anthropic_content(response_payload: dict[str, Any]) -> str:
+        content_blocks = response_payload.get("content")
+        if not isinstance(content_blocks, list):
+            raise RuntimeError("Anthropic response did not include content blocks")
+
+        text_parts: list[str] = []
+        for block in content_blocks:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                text_parts.append(block["text"])
+
+        content = "".join(text_parts).strip()
+        if content:
+            return content
+        raise RuntimeError("Anthropic response did not include text content")
 
     @staticmethod
     def _extract_response_text(response_payload: dict[str, Any]) -> str:
@@ -863,8 +1122,10 @@ class PrimaryAgentPlanner:
             if isinstance(value, str) and value.strip():
                 merged[field_name] = value
 
-        if "requires_approval" in raw:
-            merged["requires_approval"] = bool(raw.get("requires_approval"))
+        # NOTE: requires_approval is NOT merged from LLM output — it is always
+        # determined by the tool permission policy in the base plan.  Allowing
+        # the LLM to set requires_approval=true would re-introduce approval
+        # gates that the admin has intentionally disabled.
 
         for field_name in ("assumptions", "missing_information", "approval_reasons"):
             value = raw.get(field_name)
@@ -881,6 +1142,25 @@ class PrimaryAgentPlanner:
             merged["final_output_contract"] = final_output_contract
 
         return merged
+
+    @staticmethod
+    def _fill_empty_fields_from_default(
+        sanitized: dict[str, Any],
+        default_payload: GeneratedPlanPayload,
+    ) -> dict[str, Any]:
+        """After sanitize, if required list fields are empty, pull them from default.
+
+        Sanitize filters out malformed steps/tools from LLM output; if that leaves
+        the lists empty, Pydantic validation would fail (steps requires min 1).
+        Fall back to the scenario's default plan so the pipeline always has a
+        working skeleton even when the LLM produces only partial content.
+        """
+        defaults = default_payload.model_dump(mode="python")
+        for field_name in ("steps", "tools"):
+            current = sanitized.get(field_name)
+            if not isinstance(current, list) or not current:
+                sanitized[field_name] = defaults.get(field_name, [])
+        return sanitized
 
     @staticmethod
     def _sanitize_plan_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1044,18 +1324,32 @@ class PrimaryAgentPlanner:
             "You must generate a structured execution plan for a single-runtime workflow with planner, reviewer, and action stages. "
             "The request may include a Semantic Translation JSON block, optional Jira Issue Context, and optional Planning Repository Context. "
             "Use those as grounded context instead of reinterpreting the request loosely. "
-            "Only these tool actions exist: knowledge.search, slack.post_message, jira.get_issue, jira.create_issue, internal_api.request, internal_db.query. "
+            "Only these tool actions exist: knowledge.search, slack.post_message, jira.get_issue, jira.create_issue, jira.add_comment, jira.transition_issue, internal_api.request, internal_db.query, codegen.generate_patch. "
             "Permission categories are read_only, write, and approval_required. "
             "If the scenario is slack_message, the only tool is slack.post_message. "
             "If the scenario is jira_issue_plan, the only tool is jira.get_issue. "
             "If the scenario is jira_issue_create, the only tool is jira.create_issue. "
+            "If the scenario is jira_issue_writeback, the allowed tools are jira.add_comment and jira.transition_issue. "
+            "If the scenario is jira_issue_develop, the only tool is codegen.generate_patch. "
+            "For jira_issue_develop, produce exactly these four steps in order: "
+            "(1) analyze the Jira issue and identify affected files, owner_role=planner, kind=analysis, tool_name=null; "
+            "(2) generate the code patch, owner_role=action, kind=action, tool_name=codegen.generate_patch; "
+            "(3) apply the patch and run tests in sandbox, owner_role=action, kind=action, tool_name=null; "
+            "(4) review the generated changes, owner_role=reviewer, kind=review, tool_name=null. "
             "If the scenario is internal_api_request or action_with_approval, the only tool is internal_api.request. "
             "If the scenario is internal_db_query, the only tool is internal_db.query. "
             "If the scenario is process_question, the only tool is knowledge.search and "
             "requires_approval must be false. "
             "Always fill change_summary and change_explanation in natural language. "
-            "If Planning Repository Context includes citations, map the most relevant ones into affected_code_locations using real repository paths. "
-            "Return 3 to 5 short steps. Each step owner_role should be one of primary, planner, knowledge, action, reviewer. "
+            "Planning Repository Context contains GROUNDING citations from semantic search \u2014 these are files that ranked high by relevance, "
+            "NOT necessarily files you should change. Treat citations as read-only background context. "
+            "For affected_code_locations, output ONLY files that will actually be created or modified by this task: "
+            "- If the user request asks to CREATE new files, list the NEW file paths (infer from the request text, e.g. filenames mentioned like 'database.rules.json'). "
+            "- If the user request asks to MODIFY existing files, list the target paths (which may or may not overlap with citations). "
+            "- If unsure, leave affected_code_locations empty rather than copying citations. "
+            "Return 3 to 5 short steps (exactly 4 for jira_issue_develop). Each step owner_role should be one of primary, planner, knowledge, action, reviewer. "
+            "EVERY step MUST include all of these non-empty string fields: step_id, title, kind, owner_role, expected_output, success_criteria. "
+            "Steps missing any of these fields will be discarded. "
             "Do not invent extra systems, tools, or business modules."
         )
 
@@ -1145,6 +1439,66 @@ class ActionAgent:
                 "task_id": task_id,
             }
 
+        if scenario == "jira_issue_writeback":
+            issue_reference = extract_jira_issue_reference(request_text)
+            issue_key = (
+                semantic_translation.issue_key
+                if semantic_translation and semantic_translation.issue_key
+                else issue_reference.issue_key if issue_reference else ""
+            )
+
+            transition_name = ""
+            transition_keywords = {
+                "in progress": "In Progress",
+                "to do": "To Do",
+                "done": "Done",
+                "in review": "In Review",
+                "complete": "Done",
+                "close": "Done",
+                "reopen": "To Do",
+            }
+            lowered = request_text.lower()
+            for keyword, mapped_name in transition_keywords.items():
+                if keyword in lowered:
+                    transition_name = mapped_name
+                    break
+
+            if semantic_translation and semantic_translation.objective:
+                obj_lower = semantic_translation.objective.lower()
+                for keyword, mapped_name in transition_keywords.items():
+                    if keyword in obj_lower:
+                        transition_name = mapped_name
+                        break
+
+            comment_text = ""
+            comment_markers = [
+                "comment:",
+                "评论:",
+                "评论：",
+                "备注:",
+                "备注：",
+                "note:",
+                "comment ",
+                "评论 ",
+                "备注 ",
+                "note ",
+            ]
+            for marker in comment_markers:
+                idx = lowered.find(marker)
+                if idx >= 0:
+                    comment_text = request_text[idx + len(marker) :].strip()
+                    break
+
+            if not comment_text and semantic_translation and semantic_translation.normalized_request:
+                comment_text = semantic_translation.normalized_request
+
+            return {
+                "issue_key": issue_key,
+                "transition_name": transition_name,
+                "text": comment_text,
+                "task_id": task_id,
+            }
+
         if scenario in {"internal_api_request", "action_with_approval"}:
             path_match = self.PATH_PATTERN.search(request_text)
             method = "POST" if any(word in request_text.lower() for word in ("create", "post", "send", "trigger")) else "GET"
@@ -1168,10 +1522,14 @@ class ActionAgent:
             }
 
         translated_queries = semantic_translation.search_queries if semantic_translation else []
+        # Detect language from original request_text, not translated query
+        from app.orchestrator.service import detect_user_language
+        user_lang = detect_user_language(request_text)
         return {
             "query": translated_queries[0] if translated_queries else request_text,
             "top_k": 4,
             "semantic_translation": semantic_translation.model_dump(mode="json") if semantic_translation else None,
+            "language": user_lang,
         }
 
 

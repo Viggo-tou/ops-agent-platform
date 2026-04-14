@@ -1,5 +1,4 @@
 import type { KnowledgeDocumentSummary, KnowledgeSourceDescriptor } from "../../types";
-import { formatDateTime } from "../../lib/format";
 import { PermissionGuard } from "../auth/PermissionGuard";
 
 interface KnowledgeSourceListProps {
@@ -7,94 +6,132 @@ interface KnowledgeSourceListProps {
   documents: KnowledgeDocumentSummary[];
   selectedSource: string | null;
   onViewSource: (sourceName: string) => void;
+  onDeleteDocument: (documentId: string) => void;
   onDeleteSource: (sourceName: string) => void;
   onSync: (sourceName?: string) => void;
-  isSyncing?: boolean;
+  isBusy?: boolean;
 }
+
+type FileRow =
+  | {
+      kind: "document";
+      id: string;
+      name: string;
+      path: string;
+      date: Date;
+      sourceName: string;
+    }
+  | {
+      kind: "source";
+      id: string;
+      name: string;
+      path: string;
+      date: Date;
+      sourceName: string;
+    };
 
 export function KnowledgeSourceList({
   sources,
   documents,
   selectedSource,
   onViewSource,
+  onDeleteDocument,
   onDeleteSource,
   onSync,
-  isSyncing,
+  isBusy,
 }: KnowledgeSourceListProps) {
+  const fileRows: FileRow[] =
+    documents.length > 0
+      ? documents.map((document) => ({
+          kind: "document" as const,
+          id: document.id,
+          name: document.title || document.relative_path,
+          path: `${document.source_name}:${document.relative_path}`,
+          date: new Date(document.updated_at),
+          sourceName: document.source_name,
+        }))
+      : sources.map((source) => ({
+          kind: "source" as const,
+          id: source.source_name,
+          name: source.source_name,
+          path: source.source_path,
+          date: new Date(),
+          sourceName: source.source_name,
+        }));
+
+  function formatShortDate(date: Date) {
+    return `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()}`;
+  }
+
+  function handleDelete(row: FileRow) {
+    if (row.kind === "document") {
+      onDeleteDocument(row.id);
+    } else {
+      onDeleteSource(row.sourceName);
+    }
+  }
+
   return (
-    <div className="knowledge-grid">
-      <section className="simple-card">
-        <div className="section-heading">
-          <div>
-            <span>Sources</span>
-            <h2>Uploaded sources</h2>
-          </div>
-          <PermissionGuard permission="knowledge:upload">
-            <button type="button" className="subtle-button" onClick={() => onSync()} disabled={isSyncing}>
-              {isSyncing ? "Indexing" : "Re-index"}
-            </button>
-          </PermissionGuard>
+    <section className="simple-card knowledge-file-list-card">
+      <div className="section-heading">
+        <div>
+          <h2>知识文件</h2>
         </div>
+        <PermissionGuard permission="knowledge:upload">
+          <button type="button" className="subtle-button" onClick={() => onSync()} disabled={isBusy}>
+            {isBusy ? "处理中" : "重新索引"}
+          </button>
+        </PermissionGuard>
+      </div>
 
-        {sources.length > 0 ? (
-          <div className="source-list">
-            {sources.map((source) => (
-              <article key={source.source_name} className="source-card">
-                <strong>{source.source_name}</strong>
-                <span>{source.indexed_document_count} documents</span>
-                <small>{source.source_path}</small>
-                <span className="source-status">Ready</span>
-                <div className="source-actions">
-                  <button type="button" onClick={() => onViewSource(source.source_name)}>
-                    {selectedSource === source.source_name ? "Show all" : "View"}
-                  </button>
-                  <PermissionGuard permission="knowledge:upload">
-                    <button type="button" onClick={() => onSync(source.source_name)} disabled={isSyncing}>
-                      Re-index
-                    </button>
-                  </PermissionGuard>
-                  <PermissionGuard
-                    permission="knowledge:delete"
-                    fallback={<span className="muted-inline">Delete requires admin access.</span>}
-                  >
-                    <button type="button" onClick={() => onDeleteSource(source.source_name)}>
-                      Delete
-                    </button>
-                  </PermissionGuard>
-                </div>
-              </article>
-            ))}
-          </div>
-        ) : (
-          <p className="muted-copy">No knowledge sources are registered yet.</p>
-        )}
-      </section>
-
-      <section className="simple-card">
-        <div className="section-heading">
-          <div>
-            <span>Documents</span>
-            <h2>{selectedSource ? `Files in ${selectedSource}` : "Indexed files"}</h2>
-          </div>
-        </div>
-
-        <div className="document-list">
-          {documents.map((document) => (
-            <article key={document.id} className="document-row">
+      {fileRows.length > 0 ? (
+        <div className="knowledge-file-list">
+          {fileRows.map((row) => (
+            <article key={`${row.kind}-${row.id}`} className="knowledge-file-row">
+              <div className="file-icon">📄</div>
               <div>
-                <strong>{document.title}</strong>
-                <span>{document.source_name}:{document.relative_path}</span>
+                <strong>{row.name}</strong>
+                <span>
+                  {formatShortDate(row.date)} · ✓ 已就绪
+                  {row.kind === "source" ? " · 来源" : ""}
+                </span>
+                <small>{row.path}</small>
               </div>
-              <div>
-                <small>{document.extension || "file"}</small>
-                <small>{document.line_count} lines</small>
-                <small>{formatDateTime(document.updated_at)}</small>
+              <div className="file-actions">
+                <PermissionGuard permission="knowledge:upload">
+                  <button
+                    type="button"
+                    onClick={() => onSync(row.sourceName)}
+                    disabled={isBusy}
+                    aria-label={`重新索引 ${row.name}`}
+                  >
+                    ⬇️
+                  </button>
+                </PermissionGuard>
+                <button
+                  type="button"
+                  onClick={() => onViewSource(row.sourceName)}
+                  aria-label={`${selectedSource === row.sourceName ? "显示全部" : "查看"} ${row.name}`}
+                >
+                  👁️
+                </button>
+                <PermissionGuard permission="knowledge:delete">
+                  <button
+                    type="button"
+                    onClick={() => handleDelete(row)}
+                    disabled={isBusy}
+                    aria-label={`删除 ${row.name}`}
+                  >
+                    🗑️
+                  </button>
+                </PermissionGuard>
               </div>
             </article>
           ))}
-          {documents.length === 0 ? <p className="muted-copy">No indexed documents to show.</p> : null}
         </div>
-      </section>
-    </div>
+      ) : (
+        <p className="muted-copy">暂无知识文件</p>
+      )}
+    </section>
   );
 }

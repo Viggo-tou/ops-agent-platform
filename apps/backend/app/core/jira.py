@@ -5,7 +5,10 @@ from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
 
 
-JIRA_ISSUE_KEY_PATTERN = re.compile(r"\b([A-Z][A-Z0-9]{1,9}-\d+)\b", re.IGNORECASE)
+JIRA_ISSUE_KEY_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])([A-Z][A-Z0-9]{1,9}-\d+)(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
 JIRA_URL_PATTERN = re.compile(r"https?://[^\s)>\]]+", re.IGNORECASE)
 
 

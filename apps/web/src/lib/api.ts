@@ -1,9 +1,20 @@
 import type {
   Approval,
+  ActorRole,
   EventRecord,
+  KnowledgeDeleteResponse,
   KnowledgeDocumentSummary,
   KnowledgeSourceDescriptor,
   KnowledgeSyncResponse,
+  KnowledgeUploadResponse,
+  MemoryItem,
+  MemoryItemCreate,
+  MemoryItemUpdate,
+  MemorySettings,
+  MemorySettingsUpdate,
+  ModelProvider,
+  SelectedModel,
+  SelectedModelUpdate,
   TaskCreateInput,
   TaskDetail,
   TaskListFilters,
@@ -14,13 +25,38 @@ import type {
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000/api";
 
+type ApprovalDecisionPayload = {
+  actor_name: string;
+  actor_role: ActorRole | string;
+  notes?: string;
+};
+
+let currentActorRole: string | null = null;
+let currentAppRole: string | null = null;
+
+export function setApiActor(actorRole: string | null, appRole: string | null) {
+  currentActorRole = actorRole;
+  currentAppRole = appRole;
+}
+
+function buildHeaders(headers?: HeadersInit, includeJson = false): Headers {
+  const nextHeaders = new Headers(headers);
+  if (includeJson && !nextHeaders.has("Content-Type")) {
+    nextHeaders.set("Content-Type", "application/json");
+  }
+  if (currentActorRole) {
+    nextHeaders.set("X-Actor-Role", currentActorRole);
+    if (currentAppRole !== null) {
+      nextHeaders.set("X-Actor-App-Role", currentAppRole);
+    }
+  }
+  return nextHeaders;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {}),
-    },
     ...init,
+    headers: buildHeaders(init?.headers, true),
   });
 
   if (!response.ok) {
@@ -32,6 +68,34 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   return (await response.json()) as T;
+}
+
+async function requestMultipart<T>(path: string, body: FormData): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method: "POST",
+    headers: buildHeaders(),
+    body,
+  });
+
+  if (!response.ok) {
+    const detail = await response
+      .json()
+      .then((payload) => payload.detail ?? response.statusText)
+      .catch(() => response.statusText);
+    throw new Error(String(detail));
+  }
+
+  return (await response.json()) as T;
+}
+
+function buildApprovalDecisionPayload(
+  decision: ApprovalDecisionPayload | string,
+  notes?: string,
+): ApprovalDecisionPayload {
+  if (typeof decision === "string") {
+    return { actor_name: decision, actor_role: "team_lead", notes };
+  }
+  return decision;
 }
 
 export const api = {
@@ -83,20 +147,74 @@ export const api = {
       method: "POST",
     });
   },
+  uploadKnowledgeFiles: (files: File[], sourceName?: string) => {
+    const body = new FormData();
+    for (const file of files) {
+      body.append("files", file, file.name);
+    }
+    if (sourceName) {
+      body.append("source_name", sourceName);
+    }
+    return requestMultipart<KnowledgeUploadResponse>("/knowledge/upload", body);
+  },
+  deleteKnowledgeDocument: (documentId: string) =>
+    request<KnowledgeDeleteResponse>(`/knowledge/documents/${documentId}`, {
+      method: "DELETE",
+    }),
+  deleteKnowledgeSource: (sourceName: string) =>
+    request<KnowledgeDeleteResponse>(`/knowledge/sources/${encodeURIComponent(sourceName)}`, {
+      method: "DELETE",
+    }),
+  listMemoryItems: (search?: string) => {
+    const params = new URLSearchParams();
+    const normalized = search?.trim();
+    if (normalized) {
+      params.set("search", normalized);
+    }
+    const query = params.toString();
+    return request<MemoryItem[]>(query ? `/memory/items?${query}` : "/memory/items");
+  },
+  createMemoryItem: (payload: MemoryItemCreate) =>
+    request<MemoryItem>("/memory/items", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  updateMemoryItem: (itemId: string, payload: MemoryItemUpdate) =>
+    request<MemoryItem>(`/memory/items/${encodeURIComponent(itemId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  deleteMemoryItem: (itemId: string) =>
+    request<{ ok: boolean }>(`/memory/items/${encodeURIComponent(itemId)}`, {
+      method: "DELETE",
+    }),
+  getMemorySettings: () => request<MemorySettings>("/memory/settings"),
+  updateMemorySettings: (payload: MemorySettingsUpdate) =>
+    request<MemorySettings>("/memory/settings", {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  getModelProviders: () => request<ModelProvider[]>("/model-config/providers"),
+  getSelectedModel: () => request<SelectedModel>("/model-config/selected"),
+  setSelectedModel: (payload: SelectedModelUpdate) =>
+    request<SelectedModel>("/model-config/selected", {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
   createTask: (input: TaskCreateInput) =>
     request<TaskDetail>("/tasks", {
       method: "POST",
       body: JSON.stringify(input),
     }),
-  grantApproval: (approvalId: string, actorName: string, notes?: string) =>
+  grantApproval: (approvalId: string, decision: ApprovalDecisionPayload | string, notes?: string) =>
     request<Approval>(`/approvals/${approvalId}/grant`, {
       method: "POST",
-      body: JSON.stringify({ actor_name: actorName, notes }),
+      body: JSON.stringify(buildApprovalDecisionPayload(decision, notes)),
     }),
-  rejectApproval: (approvalId: string, actorName: string, notes?: string) =>
+  rejectApproval: (approvalId: string, decision: ApprovalDecisionPayload | string, notes?: string) =>
     request<Approval>(`/approvals/${approvalId}/reject`, {
       method: "POST",
-      body: JSON.stringify({ actor_name: actorName, notes }),
+      body: JSON.stringify(buildApprovalDecisionPayload(decision, notes)),
     }),
   rollbackTask: (taskId: string, actorName: string, reason: string) =>
     request<TaskDetail>(`/tasks/${taskId}/rollback`, {

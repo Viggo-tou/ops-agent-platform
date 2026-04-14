@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event as sa_event, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
@@ -15,8 +15,16 @@ engine = create_engine(
     settings.database_url,
     echo=False,
     future=True,
-    connect_args={"check_same_thread": False} if is_sqlite else {},
+    connect_args={"check_same_thread": False, "timeout": 30} if is_sqlite else {},
 )
+
+if is_sqlite:
+    @sa_event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_conn, _connection_record):  # noqa: ANN001
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
 
 SessionLocal = sessionmaker(
     bind=engine,
@@ -43,6 +51,10 @@ def ensure_local_schema() -> None:
     existing_tables = set(inspector.get_table_names())
 
     with engine.begin() as connection:
+        llm_usage_table = Base.metadata.tables.get("llm_usage")
+        if "llm_usage" not in existing_tables and llm_usage_table is not None:
+            llm_usage_table.create(bind=connection, checkfirst=True)
+
         if "task" in existing_tables:
             task_columns = {column["name"] for column in inspector.get_columns("task")}
             if "session_id" not in task_columns:
@@ -59,6 +71,9 @@ def ensure_local_schema() -> None:
                 connection.execute(text("ALTER TABLE task ADD COLUMN risk_category VARCHAR(64) DEFAULT 'GENERAL'"))
             if "governance_json" not in task_columns:
                 connection.execute(text("ALTER TABLE task ADD COLUMN governance_json JSON"))
+            if "trace_id" not in task_columns:
+                connection.execute(text("ALTER TABLE task ADD COLUMN trace_id VARCHAR(64)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_task_trace_id ON task (trace_id)"))
             connection.execute(text("UPDATE task SET actor_name = 'employee' WHERE actor_name IS NULL"))
             connection.execute(text("UPDATE task SET actor_role = 'EMPLOYEE' WHERE actor_role IS NULL"))
             connection.execute(text("UPDATE task SET risk_category = 'GENERAL' WHERE risk_category IS NULL"))
@@ -115,3 +130,8 @@ def ensure_local_schema() -> None:
             connection.execute(text("UPDATE approval SET risk_category = 'GENERAL' WHERE risk_category IS NULL"))
             connection.execute(text("UPDATE approval SET risk_level = UPPER(risk_level) WHERE risk_level IS NOT NULL"))
             connection.execute(text("UPDATE approval SET risk_category = UPPER(risk_category) WHERE risk_category IS NOT NULL"))
+
+        if "tool_execution" in existing_tables:
+            tool_execution_columns = {column["name"] for column in inspector.get_columns("tool_execution")}
+            if "inverse_action_json" not in tool_execution_columns:
+                connection.execute(text("ALTER TABLE tool_execution ADD COLUMN inverse_action_json JSON"))

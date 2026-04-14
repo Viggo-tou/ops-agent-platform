@@ -1,7 +1,6 @@
 import { Link, useParams } from "react-router-dom";
 import { useMemo, useState } from "react";
 
-import { formatDateTime } from "../../lib/format";
 import type { TaskSummary } from "../../types";
 
 interface ConversationListProps {
@@ -94,7 +93,12 @@ export function ConversationList({ conversations, search }: ConversationListProp
   }
 
   if (filtered.length === 0) {
-    return <div className="sidebar-empty">No conversations found.</div>;
+    return <div className="sidebar-empty">未找到对话。</div>;
+  }
+
+  function formatConversationDate(value: string) {
+    const date = new Date(value);
+    return `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()}`;
   }
 
   return (
@@ -119,9 +123,7 @@ export function ConversationList({ conversations, search }: ConversationListProp
                 Rename
               </button>
             </div>
-            <small>
-              {conversation.turns} turn{conversation.turns === 1 ? "" : "s"} / {formatDateTime(conversation.latest.updated_at)}
-            </small>
+            <small>{formatConversationDate(conversation.latest.updated_at)} · {conversation.turns} 条消息</small>
           </article>
         );
       })}

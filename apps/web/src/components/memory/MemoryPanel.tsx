@@ -1,113 +1,113 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { type CSSProperties, useEffect, useState } from "react";
 
+import { api } from "../../lib/api";
 import { useAuth } from "../../lib/auth";
-
-interface MemoryItem {
-  id: string;
-  title: string;
-  body: string;
-  topic: string;
-  updatedAt: string;
-}
-
-const STORAGE_KEY = "ops-agent-memory-items";
-const SETTINGS_STORAGE_KEY = "ops-agent-memory-settings";
-
-function readMemoryItems(): MemoryItem[] {
-  const raw = window.localStorage.getItem(STORAGE_KEY);
-  if (!raw) {
-    return [
-      {
-        id: "default-1",
-        title: "Preferred planning style",
-        body: "Use concise implementation plans with code locations, risk notes, and validation steps.",
-        topic: "planning",
-        updatedAt: new Date().toISOString(),
-      },
-    ];
-  }
-  try {
-    return JSON.parse(raw) as MemoryItem[];
-  } catch {
-    return [];
-  }
-}
-
-function storeMemoryItems(items: MemoryItem[]) {
-  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
-}
-
-function readMemorySettings() {
-  try {
-    const raw = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
-    if (!raw) {
-      throw new Error("No stored settings");
-    }
-    const parsed = JSON.parse(raw) as { enabled?: boolean; allowList?: string; blockList?: string };
-    return {
-      enabled: parsed.enabled ?? true,
-      allowList: parsed.allowList ?? "planning, coding, debugging",
-      blockList: parsed.blockList ?? "passwords, tokens, personal secrets",
-    };
-  } catch {
-    return {
-      enabled: true,
-      allowList: "planning, coding, debugging",
-      blockList: "passwords, tokens, personal secrets",
-    };
-  }
-}
+import type { MemoryItem, MemoryItemUpdate } from "../../types";
 
 export function MemoryPanel() {
   const { can } = useAuth();
-  const initialSettings = useMemo(() => readMemorySettings(), []);
-  const [enabled, setEnabled] = useState(initialSettings.enabled);
-  const [items, setItems] = useState<MemoryItem[]>(() => readMemoryItems());
+  const queryClient = useQueryClient();
+  const canEditMemory = can("memory:edit");
+  const [enabled, setEnabled] = useState(false);
   const [search, setSearch] = useState("");
   const [draft, setDraft] = useState({ title: "", body: "", topic: "" });
   const [editId, setEditId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState({ title: "", body: "", topic: "" });
-  const [allowList, setAllowList] = useState(initialSettings.allowList);
-  const [blockList, setBlockList] = useState(initialSettings.blockList);
+  const [allowList, setAllowList] = useState("");
+  const [blockList, setBlockList] = useState("");
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+
+  const itemsQuery = useQuery({
+    queryKey: ["memory-items", search],
+    queryFn: () => api.listMemoryItems(search || undefined),
+    placeholderData: (previousItems) => previousItems,
+  });
+
+  const settingsQuery = useQuery({
+    queryKey: ["memory-settings"],
+    queryFn: () => api.getMemorySettings(),
+  });
+
+  async function invalidateMemoryItems() {
+    await queryClient.invalidateQueries({ queryKey: ["memory-items"] });
+  }
+
+  const createItemMutation = useMutation({
+    mutationFn: api.createMemoryItem,
+    onSuccess: () => {
+      setDraft({ title: "", body: "", topic: "" });
+      void invalidateMemoryItems();
+    },
+  });
+
+  const updateItemMutation = useMutation({
+    mutationFn: ({ itemId, payload }: { itemId: string; payload: MemoryItemUpdate }) =>
+      api.updateMemoryItem(itemId, payload),
+    onSuccess: () => {
+      setEditId(null);
+      setEditDraft({ title: "", body: "", topic: "" });
+      void invalidateMemoryItems();
+    },
+  });
+
+  const deleteItemMutation = useMutation({
+    mutationFn: (itemId: string) => api.deleteMemoryItem(itemId),
+    onSuccess: () => {
+      void invalidateMemoryItems();
+    },
+  });
+
+  const updateSettingsMutation = useMutation({
+    mutationFn: api.updateMemorySettings,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["memory-settings"] });
+    },
+  });
 
   useEffect(() => {
-    window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ enabled, allowList, blockList }));
-  }, [enabled, allowList, blockList]);
-
-  const filtered = useMemo(() => {
-    const normalized = search.trim().toLowerCase();
-    if (!normalized) {
-      return items;
+    if (!settingsQuery.data || settingsLoaded) {
+      return;
     }
-    return items.filter((item) => [item.title, item.body, item.topic].join(" ").toLowerCase().includes(normalized));
-  }, [items, search]);
+    setEnabled(settingsQuery.data.enabled);
+    setAllowList(settingsQuery.data.allow_list);
+    setBlockList(settingsQuery.data.block_list);
+    setSettingsLoaded(true);
+  }, [settingsLoaded, settingsQuery.data]);
+
+  const filtered = itemsQuery.data ?? [];
   const allowCount = allowList.split(",").map((item) => item.trim()).filter(Boolean).length;
   const blockCount = blockList.split(",").map((item) => item.trim()).filter(Boolean).length;
 
-  function saveItems(nextItems: MemoryItem[]) {
-    setItems(nextItems);
-    storeMemoryItems(nextItems);
+  function persistSettings(nextSettings = { enabled, allowList, blockList }) {
+    if (!canEditMemory) {
+      return;
+    }
+    updateSettingsMutation.mutate({
+      enabled: nextSettings.enabled,
+      allow_list: nextSettings.allowList,
+      block_list: nextSettings.blockList,
+    });
+  }
+
+  function handleEnabledChange(checked: boolean) {
+    setEnabled(checked);
+    persistSettings({ enabled: checked, allowList, blockList });
   }
 
   function addMemory() {
-    if (!can("memory:edit") || !draft.title.trim() || !draft.body.trim()) {
+    if (!canEditMemory || !draft.title.trim() || !draft.body.trim()) {
       return;
     }
-    saveItems([
-      {
-        id: crypto.randomUUID(),
-        title: draft.title.trim(),
-        body: draft.body.trim(),
-        topic: draft.topic.trim() || "general",
-        updatedAt: new Date().toISOString(),
-      },
-      ...items,
-    ]);
-    setDraft({ title: "", body: "", topic: "" });
+    createItemMutation.mutate({
+      title: draft.title.trim(),
+      body: draft.body.trim(),
+      topic: draft.topic.trim() || "general",
+    });
   }
 
   function startEditing(item: MemoryItem) {
-    if (!can("memory:edit")) {
+    if (!canEditMemory) {
       return;
     }
     setEditId(item.id);
@@ -115,39 +115,56 @@ export function MemoryPanel() {
   }
 
   function saveEdit() {
-    if (!can("memory:edit") || !editId || !editDraft.title.trim() || !editDraft.body.trim()) {
+    if (!canEditMemory || !editId || !editDraft.title.trim() || !editDraft.body.trim()) {
       return;
     }
-    saveItems(
-      items.map((item) =>
-        item.id === editId
-          ? {
-              ...item,
-              title: editDraft.title.trim(),
-              body: editDraft.body.trim(),
-              topic: editDraft.topic.trim() || "general",
-              updatedAt: new Date().toISOString(),
-            }
-          : item,
-      ),
-    );
-    setEditId(null);
-    setEditDraft({ title: "", body: "", topic: "" });
+    updateItemMutation.mutate({
+      itemId: editId,
+      payload: {
+        title: editDraft.title.trim(),
+        body: editDraft.body.trim(),
+        topic: editDraft.topic.trim() || "general",
+      },
+    });
+  }
+
+  function deleteMemory(itemId: string) {
+    if (!canEditMemory) {
+      return;
+    }
+    deleteItemMutation.mutate(itemId);
   }
 
   return (
     <div className="memory-panel">
       <section className="memory-stats">
-        <article className="memory-stat-card">
-          <span>Automatic capture</span>
-          <strong>{enabled ? "On" : "Off"}</strong>
+        <article className="memory-stat-card" style={{ "--icon-bg": "#f3e8ff" } as CSSProperties}>
+          <div className="memory-stat-icon purple">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-2 5.2A3.5 3.5 0 0 0 8 18h1V4Z" />
+              <path d="M15 4a3 3 0 0 1 3 3 3 3 0 0 1 2 5.2A3.5 3.5 0 0 1 16 18h-1V4Z" />
+            </svg>
+          </div>
+          <span>自动提取</span>
+          <strong>{enabled ? "开启" : "关闭"}</strong>
         </article>
-        <article className="memory-stat-card">
-          <span>Allowed topics</span>
+        <article className="memory-stat-card" style={{ "--icon-bg": "#dcfce7" } as CSSProperties}>
+          <div className="memory-stat-icon green">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z" />
+              <path d="m8.5 12 2.2 2.2 4.8-5" />
+            </svg>
+          </div>
+          <span>白名单主题</span>
           <strong>{allowCount}</strong>
         </article>
-        <article className="memory-stat-card">
-          <span>Blocked topics</span>
+        <article className="memory-stat-card" style={{ "--icon-bg": "#fee2e2" } as CSSProperties}>
+          <div className="memory-stat-icon red">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 5h16l-6 7v5l-4 2v-7L4 5Z" />
+            </svg>
+          </div>
+          <span>黑名单主题</span>
           <strong>{blockCount}</strong>
         </article>
       </section>
@@ -162,16 +179,16 @@ export function MemoryPanel() {
             <input
               type="checkbox"
               checked={enabled}
-              onChange={(event) => setEnabled(event.target.checked)}
-              disabled={!can("memory:edit")}
+              onChange={(event) => handleEnabledChange(event.target.checked)}
+              disabled={!canEditMemory || updateSettingsMutation.isPending}
             />
-            <span>{enabled ? "On" : "Off"}</span>
+            <span>{enabled ? "开启" : "关闭"}</span>
           </label>
         </div>
         <p className="muted-copy">
           Keep lightweight preferences and working context. Sensitive topics should stay blocked.
         </p>
-        {!can("memory:edit") ? <div className="permission-note">Your role can view memory but cannot edit it.</div> : null}
+        {!canEditMemory ? <div className="permission-note">Your role can view memory but cannot edit it.</div> : null}
       </section>
 
       <section className="simple-card">
@@ -183,28 +200,37 @@ export function MemoryPanel() {
         </div>
         <div className="two-column-fields">
           <label className="field">
-            <span>Whitelist topics</span>
-            <input value={allowList} onChange={(event) => setAllowList(event.target.value)} disabled={!can("memory:edit")} />
+            <span>白名单主题</span>
+            <input
+              value={allowList}
+              onChange={(event) => setAllowList(event.target.value)}
+              onBlur={() => persistSettings()}
+              disabled={!canEditMemory || updateSettingsMutation.isPending}
+            />
           </label>
           <label className="field">
-            <span>Blacklist topics</span>
-            <input value={blockList} onChange={(event) => setBlockList(event.target.value)} disabled={!can("memory:edit")} />
+            <span>黑名单主题</span>
+            <input
+              value={blockList}
+              onChange={(event) => setBlockList(event.target.value)}
+              onBlur={() => persistSettings()}
+              disabled={!canEditMemory || updateSettingsMutation.isPending}
+            />
           </label>
         </div>
       </section>
 
       <section className="simple-card">
-        <div className="section-heading">
-          <div>
-            <span>Entries</span>
-            <h2>Saved memory</h2>
-          </div>
-          <input
-            className="compact-input"
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder="Search memory"
-          />
+        <div className="memory-search-row">
+          <label className="memory-search-field">
+            <span>🔍</span>
+            <input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="搜索记忆..."
+            />
+          </label>
+          <button type="button" onClick={() => void itemsQuery.refetch()}>搜索</button>
         </div>
 
         <div className="memory-editor" id="memory-editor">
@@ -212,22 +238,22 @@ export function MemoryPanel() {
             value={draft.title}
             onChange={(event) => setDraft((current) => ({ ...current, title: event.target.value }))}
             placeholder="Short memory title"
-            disabled={!can("memory:edit")}
+            disabled={!canEditMemory || createItemMutation.isPending}
           />
           <input
             value={draft.topic}
             onChange={(event) => setDraft((current) => ({ ...current, topic: event.target.value }))}
             placeholder="Topic"
-            disabled={!can("memory:edit")}
+            disabled={!canEditMemory || createItemMutation.isPending}
           />
           <textarea
             value={draft.body}
             onChange={(event) => setDraft((current) => ({ ...current, body: event.target.value }))}
             placeholder="What should the assistant remember?"
-            disabled={!can("memory:edit")}
+            disabled={!canEditMemory || createItemMutation.isPending}
           />
-          <button type="button" onClick={addMemory} disabled={!can("memory:edit")}>
-            Add memory
+          <button type="button" onClick={addMemory} disabled={!canEditMemory || createItemMutation.isPending}>
+            + 添加记忆
           </button>
         </div>
 
@@ -239,20 +265,20 @@ export function MemoryPanel() {
                   <input
                     value={editDraft.title}
                     onChange={(event) => setEditDraft((current) => ({ ...current, title: event.target.value }))}
-                    disabled={!can("memory:edit")}
+                    disabled={!canEditMemory || updateItemMutation.isPending}
                   />
                   <input
                     value={editDraft.topic}
                     onChange={(event) => setEditDraft((current) => ({ ...current, topic: event.target.value }))}
-                    disabled={!can("memory:edit")}
+                    disabled={!canEditMemory || updateItemMutation.isPending}
                   />
                   <textarea
                     value={editDraft.body}
                     onChange={(event) => setEditDraft((current) => ({ ...current, body: event.target.value }))}
-                    disabled={!can("memory:edit")}
+                    disabled={!canEditMemory || updateItemMutation.isPending}
                   />
                   <div className="memory-actions">
-                    <button type="button" onClick={saveEdit} disabled={!can("memory:edit")}>
+                    <button type="button" onClick={saveEdit} disabled={!canEditMemory || updateItemMutation.isPending}>
                       Save
                     </button>
                     <button type="button" onClick={() => setEditId(null)}>
@@ -268,13 +294,13 @@ export function MemoryPanel() {
                   </div>
                   <p>{item.body}</p>
                   <div className="memory-actions">
-                    <button type="button" onClick={() => startEditing(item)} disabled={!can("memory:edit")}>
+                    <button type="button" onClick={() => startEditing(item)} disabled={!canEditMemory}>
                       Edit
                     </button>
                     <button
                       type="button"
-                      onClick={() => saveItems(items.filter((candidate) => candidate.id !== item.id))}
-                      disabled={!can("memory:edit")}
+                      onClick={() => deleteMemory(item.id)}
+                      disabled={!canEditMemory || deleteItemMutation.isPending}
                     >
                       Delete
                     </button>
@@ -283,6 +309,16 @@ export function MemoryPanel() {
               )}
             </article>
           ))}
+          {filtered.length === 0 ? (
+            <div className="memory-empty-state">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-2 5.2A3.5 3.5 0 0 0 8 18h1V4Z" />
+                <path d="M15 4a3 3 0 0 1 3 3 3 3 0 0 1 2 5.2A3.5 3.5 0 0 1 16 18h-1V4Z" />
+              </svg>
+              <h2>暂无记忆</h2>
+              <p>开启记忆功能后，AI 会自动从对话中提取重要信息</p>
+            </div>
+          ) : null}
         </div>
       </section>
     </div>

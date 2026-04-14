@@ -1,6 +1,15 @@
 # Current State
 
-Last updated: 2026-04-11
+Last updated: 2026-04-14
+
+## 2026-04-14 Addendum: Pipeline Stability (T-034, docs-only commit)
+
+- Six fixes landed in working tree for the `jira_issue_develop` flow (Fixes #1, #3, #4, #5, #6 + test sync). See `TASK_QUEUE.md` → T-034 and `SESSION_HANDOFF.md` → "Session 2026-04-14" for full manifest.
+- End-to-end verified on real Jira project `TEST` (issue TEST-1, To Do → Done).
+- Develop pipeline tests: 12/12 green.
+- Residual debt: T-035 (7 pre-existing test failures in codegen provider resolver + tool approval gate), T-036 (Fix #2 safety net, demoted), T-037 (commit hygiene — only 1 commit in repo history).
+- `AGENTS.md` and `CLAUDE.md` now enforce a mandatory session-start tag + session-end commit/manifest ritual to prevent session-boundary ambiguity from recurring.
+- Baseline tag created: `session-start/2026-04-14-pipeline-fixes` → `940b232`.
 
 ## Baseline
 

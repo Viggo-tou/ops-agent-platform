@@ -46,6 +46,8 @@ desktop.ini
 *.sqlite
 *.sqlite3
 *.db-journal
+*.db-shm
+*.db-wal
 
 # Logs
 *.log
@@ -54,3 +56,19 @@ logs/
 
 # Codex session artifacts
 .codex/
+
+# Backend uploaded knowledge files
+apps/backend/data/uploads/
+
+# Per-task orchestrator sandboxes (runtime state)
+apps/backend/data/sandboxes/
+
+# Stray test-artifact directories
+apps/backend/manual-mode-777/
+apps/backend/manual-pathlib-default/
+
+# Claude Code per-machine session state
+.claude/
+
+# One-off MiniMax generated output
+scripts/minimax_r4_output.py

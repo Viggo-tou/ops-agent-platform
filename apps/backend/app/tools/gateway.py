@@ -1,28 +1,48 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import asdict
 from time import perf_counter
 from urllib.parse import urlparse
 
 import httpx
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
 from app.core.enums import (
+    ActorRole,
+    ApprovalStatus,
     EventSource,
     EventType,
+    RiskCategory,
+    RiskLevel,
     RoleName,
     ToolExecutionStatus,
     ToolPermissionCategory,
     WorkflowStage,
 )
+from app.core.telemetry import get_tracer
+from app.models.approval import Approval
 from app.models.tool_execution import ToolExecution
 from app.models.base import utcnow
 from app.schemas.tool import ToolRegistryEntryRead
+from app.services.codegen import CodeGenerator, CodegenError
+from app.services.cost_tracking import CostTracker
 from app.services.events import record_event
 from app.services.knowledge import KnowledgeService
+from app.services.reviewer import DiffReviewer, ReviewContext
+from app.services.sandbox import ExecutionSandbox, SandboxError
+from app.services.test_pipeline import TestPipeline, TestPipelineError
 from app.tools.registry import ToolDefinition, ToolRegistry
+
+
+def _set_span_attribute(span: object, key: str, value: object | None) -> None:
+    if value is None:
+        return
+    if hasattr(value, "value"):
+        value = getattr(value, "value")
+    span.set_attribute(key, value)
 
 
 class ToolInvocationError(RuntimeError):
@@ -36,6 +56,16 @@ class ToolInvocationError(RuntimeError):
         super().__init__(message)
         self.retryable = retryable
         self.timed_out = timed_out
+
+
+class ToolApprovalRequired(Exception):
+    """Raised when a tool requires approval before execution."""
+
+    def __init__(self, tool_name: str, execution_id: str, approval_id: str):
+        super().__init__(f"Tool '{tool_name}' requires approval (approval_id={approval_id})")
+        self.tool_name = tool_name
+        self.execution_id = execution_id
+        self.approval_id = approval_id
 
 
 class ToolGateway:
@@ -79,24 +109,85 @@ class ToolGateway:
         role: RoleName | None = None,
         approval_id: str | None = None,
     ) -> dict[str, object]:
+        with get_tracer().start_as_current_span("tool.execute") as span:
+            _set_span_attribute(span, "task.id", task_id)
+            _set_span_attribute(span, "tool.name", tool_name)
+            _set_span_attribute(span, "workflow.stage", stage)
+            _set_span_attribute(span, "actor.role", role)
+            _set_span_attribute(span, "approval.id", approval_id)
+            return self._execute_with_span(
+                task_id=task_id,
+                tool_name=tool_name,
+                payload=payload,
+                actor_context=actor_context,
+                session_id=session_id,
+                stage=stage,
+                role=role,
+                approval_id=approval_id,
+            )
+
+    def _execute_with_span(
+        self,
+        *,
+        task_id: str,
+        tool_name: str,
+        payload: dict[str, object],
+        actor_context: dict[str, object],
+        session_id: str | None = None,
+        stage: WorkflowStage | None = None,
+        role: RoleName | None = None,
+        approval_id: str | None = None,
+    ) -> dict[str, object]:
         definition = self.registry.get_definition(tool_name)
-        execution = ToolExecution(
-            task_id=task_id,
-            session_id=session_id,
-            approval_id=approval_id,
-            tool_name=tool_name,
-            provider_name=definition.provider_name,
-            permission_category=definition.permission_category,
-            status=ToolExecutionStatus.RUNNING,
-            actor_name=str(actor_context.get("actor_name")) if actor_context.get("actor_name") else None,
-            attempt_count=0,
-            max_retries=definition.retry_count,
-            timeout_seconds=definition.timeout_seconds,
-            request_payload_json=payload,
-            attempt_log_json=[],
+        execution = (
+            self._resume_pending_execution(approval_id=approval_id, tool_name=tool_name)
+            if approval_id is not None
+            else None
         )
-        self.db.add(execution)
-        self.db.flush()
+        if execution is None:
+            execution = ToolExecution(
+                task_id=task_id,
+                session_id=session_id,
+                approval_id=approval_id,
+                tool_name=tool_name,
+                provider_name=definition.provider_name,
+                permission_category=definition.permission_category,
+                status=ToolExecutionStatus.RUNNING,
+                actor_name=str(actor_context.get("actor_name")) if actor_context.get("actor_name") else None,
+                attempt_count=0,
+                max_retries=definition.retry_count,
+                timeout_seconds=definition.timeout_seconds,
+                request_payload_json=payload,
+                attempt_log_json=[],
+            )
+            self.db.add(execution)
+            self.db.flush()
+
+        if definition.permission_category == ToolPermissionCategory.APPROVAL_REQUIRED and approval_id is None:
+            approval = Approval(
+                task_id=task_id,
+                action_name=tool_name,
+                status=ApprovalStatus.PENDING,
+                requested_by_role=role if role else RoleName.ACTION,
+                approver_role=ActorRole.TEAM_LEAD.value,
+                requested_by_actor_name=str(actor_context.get("actor_name") or ""),
+                risk_level=RiskLevel.HIGH,
+                risk_category=RiskCategory.CHANGE_MANAGEMENT,
+                reason=f"Tool '{tool_name}' requires approval before execution.",
+                request_payload_json=payload,
+            )
+            self.db.add(approval)
+            self.db.flush()
+
+            execution.status = ToolExecutionStatus.PENDING_APPROVAL
+            execution.approval_id = approval.id
+            self.db.flush()
+
+            raise ToolApprovalRequired(
+                tool_name=tool_name,
+                execution_id=execution.id,
+                approval_id=approval.id,
+            )
 
         total_attempts = definition.retry_count + 1
         started = perf_counter()
@@ -105,6 +196,7 @@ class ToolGateway:
             attempt_started = perf_counter()
             try:
                 result = self._execute_once(
+                    task_id=task_id,
                     definition=definition,
                     payload=payload,
                     actor_context=actor_context,
@@ -124,6 +216,7 @@ class ToolGateway:
                 execution.status = ToolExecutionStatus.SUCCEEDED
                 execution.duration_ms = duration_ms
                 execution.response_payload_json = result
+                execution.inverse_action_json = self._build_inverse_action(definition.name, payload, result)
                 execution.finished_at = utcnow()
                 self.db.flush()
                 return result
@@ -172,9 +265,51 @@ class ToolGateway:
 
         raise RuntimeError("Tool execution terminated unexpectedly without a result")
 
+    def _resume_pending_execution(self, *, approval_id: str, tool_name: str) -> ToolExecution | None:
+        stmt = (
+            select(ToolExecution)
+            .where(
+                ToolExecution.approval_id == approval_id,
+                ToolExecution.tool_name == tool_name,
+                ToolExecution.status == ToolExecutionStatus.PENDING_APPROVAL,
+            )
+            .order_by(ToolExecution.started_at.desc())
+            .limit(1)
+        )
+        execution = self.db.scalars(stmt).first()
+        if not isinstance(execution, ToolExecution):
+            return None
+
+        execution.approval_id = approval_id
+        execution.status = ToolExecutionStatus.RUNNING
+        execution.finished_at = None
+        execution.error_message = None
+        self.db.flush()
+        return execution
+
     def _execute_once(
         self,
         *,
+        task_id: str,
+        definition: ToolDefinition,
+        payload: Mapping[str, object],
+        actor_context: Mapping[str, object],
+    ) -> dict[str, object]:
+        with get_tracer().start_as_current_span("tool.execute_once") as span:
+            _set_span_attribute(span, "tool.name", definition.name)
+            _set_span_attribute(span, "tool.provider", definition.provider_name)
+            _set_span_attribute(span, "tool.permission_category", definition.permission_category)
+            return self._execute_once_impl(
+                task_id=task_id,
+                definition=definition,
+                payload=payload,
+                actor_context=actor_context,
+            )
+
+    def _execute_once_impl(
+        self,
+        *,
+        task_id: str,
         definition: ToolDefinition,
         payload: Mapping[str, object],
         actor_context: Mapping[str, object],
@@ -186,12 +321,30 @@ class ToolGateway:
 
         if definition.name == "knowledge.search":
             return self._execute_knowledge_search(payload)
+        if definition.name == "sandbox.run_command":
+            return self._execute_sandbox_run_command(definition=definition, payload=payload)
+        if definition.name == "sandbox.apply_patch":
+            return self._execute_sandbox_apply_patch(definition=definition, payload=payload)
+        if definition.name == "test_pipeline.run":
+            return self._execute_test_pipeline_run(definition=definition, payload=payload)
+        if definition.name == "diff_reviewer.review":
+            return self._execute_diff_reviewer_review(payload)
+        if definition.name == "codegen.generate_patch":
+            return self._execute_codegen_generate_patch(
+                task_id=task_id,
+                payload=payload,
+                actor_context=actor_context,
+            )
         if definition.name == "jira.get_issue":
             return self._execute_jira_get_issue(definition=definition, payload=payload)
         if definition.name == "slack.post_message":
             return self._execute_slack_post_message(definition=definition, payload=payload)
         if definition.name == "jira.create_issue":
             return self._execute_jira_create_issue(definition=definition, payload=payload)
+        if definition.name == "jira.transition_issue":
+            return self._execute_jira_transition_issue(definition=definition, payload=payload)
+        if definition.name == "jira.add_comment":
+            return self._execute_jira_add_comment(definition=definition, payload=payload)
         if definition.name == "internal_api.request":
             return self._execute_internal_api_request(definition=definition, payload=payload)
         if definition.name == "internal_db.query":
@@ -199,15 +352,313 @@ class ToolGateway:
 
         raise ToolInvocationError(f"Unsupported tool: {definition.name}")
 
+    @staticmethod
+    def _build_inverse_action(
+        tool_name: str,
+        payload: Mapping[str, object],
+        result: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        if tool_name == "sandbox.apply_patch":
+            before_sha = str(result.get("before_sha") or "").strip()
+            sandbox_dir = str(result.get("sandbox_dir") or "").strip()
+            if not before_sha or not sandbox_dir:
+                return None
+            return {
+                "type": "git_revert",
+                "sandbox_dir": sandbox_dir,
+                "before_sha": before_sha,
+            }
+
+        if tool_name == "jira.transition_issue":
+            issue_key = str(result.get("issue_key") or payload.get("issue_key") or "").strip().upper()
+            previous_status = str(result.get("from_status") or "").strip()
+            current_status = str(result.get("to_status") or "").strip()
+            if not issue_key or not previous_status or not current_status:
+                return None
+            return {
+                "type": "jira_transition",
+                "issue_key": issue_key,
+                "from_status": current_status,
+                "to_status": previous_status,
+            }
+
+        if tool_name == "jira.add_comment":
+            issue_key = str(result.get("issue_key") or payload.get("issue_key") or "").strip().upper()
+            comment_id = str(result.get("comment_id") or "").strip()
+            if not issue_key or not comment_id:
+                return None
+            return {
+                "type": "jira_delete_comment",
+                "issue_key": issue_key,
+                "comment_id": comment_id,
+            }
+
+        return None
+
     def _execute_knowledge_search(self, payload: Mapping[str, object]) -> dict[str, object]:
         query = str(payload.get("query", "")).strip()
         top_k = payload.get("top_k")
         source_name = payload.get("source_name")
+        language = payload.get("language")
         result = self.knowledge_service.search_repositories(
             query=query,
             top_k=int(top_k) if isinstance(top_k, int) else None,
             source_name=str(source_name) if isinstance(source_name, str) and source_name else None,
+            language=str(language) if isinstance(language, str) and language else None,
         )
+        return result.model_dump(mode="json")
+
+    def _execute_sandbox_run_command(
+        self,
+        *,
+        definition: ToolDefinition,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        task_id = str(payload.get("task_id") or "").strip()
+        command = str(payload.get("command") or "").strip()
+        cwd_value = payload.get("cwd")
+        cwd = str(cwd_value).strip() if isinstance(cwd_value, str) and cwd_value.strip() else None
+
+        if not task_id or not command:
+            raise ToolInvocationError(
+                "sandbox.run_command requires 'task_id' and 'command' in payload.",
+                retryable=False,
+            )
+
+        try:
+            sandbox = ExecutionSandbox(
+                task_id=task_id,
+                base_dir=str(getattr(self.settings, "sandbox_base_dir", "data/sandboxes")),
+            )
+            if not sandbox.exists():
+                raise ToolInvocationError(
+                    f"No sandbox found for task {task_id}. Clone a repo first.",
+                    retryable=False,
+                )
+
+            result = sandbox.run(
+                command,
+                cwd=cwd,
+                timeout_seconds=float(
+                    getattr(
+                        self.settings,
+                        "sandbox_command_timeout_seconds",
+                        definition.timeout_seconds,
+                    )
+                ),
+                max_output_bytes=int(getattr(self.settings, "sandbox_max_output_bytes", 65536)),
+            )
+        except SandboxError as exc:
+            raise ToolInvocationError(str(exc), retryable=False) from exc
+
+        return {
+            "status": "executed",
+            "tool_name": definition.name,
+            "provider": definition.provider_name,
+            **result,
+        }
+
+    def _execute_sandbox_apply_patch(
+        self,
+        *,
+        definition: ToolDefinition,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        task_id = str(payload.get("task_id") or "").strip()
+        patch_value = payload.get("patch")
+        patch = patch_value if isinstance(patch_value, str) else ""
+        if not task_id or not patch.strip():
+            raise ToolInvocationError(
+                "sandbox.apply_patch requires 'task_id' and 'patch' in payload.",
+                retryable=False,
+            )
+
+        commit_value = payload.get("commit", True)
+        commit = commit_value if isinstance(commit_value, bool) else True
+        commit_message_value = payload.get("commit_message")
+        commit_message = (
+            commit_message_value.strip()
+            if isinstance(commit_message_value, str) and commit_message_value.strip()
+            else "Applied patch via sandbox"
+        )
+        context_files_value = payload.get("context_files")
+        context_files = (
+            {str(path): str(content) for path, content in context_files_value.items()}
+            if isinstance(context_files_value, dict)
+            and all(isinstance(path, str) and isinstance(content, str) for path, content in context_files_value.items())
+            else None
+        )
+
+        try:
+            sandbox = ExecutionSandbox(
+                task_id=task_id,
+                base_dir=str(getattr(self.settings, "sandbox_base_dir", "data/sandboxes")),
+            )
+            result = sandbox.apply_patch(
+                patch,
+                context_files=context_files,
+                commit=commit,
+                commit_message=commit_message,
+                timeout_seconds=definition.timeout_seconds,
+            )
+        except SandboxError as exc:
+            raise ToolInvocationError(str(exc), retryable=False) from exc
+
+        return {
+            "status": "patched",
+            "tool_name": definition.name,
+            "provider": definition.provider_name,
+            **result,
+        }
+
+    def _execute_test_pipeline_run(
+        self,
+        *,
+        definition: ToolDefinition,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        task_id = str(payload.get("task_id") or "").strip()
+        config_path_value = payload.get("config_path")
+        config_path = (
+            config_path_value.strip()
+            if isinstance(config_path_value, str) and config_path_value.strip()
+            else "tests.yaml"
+        )
+        if not task_id:
+            raise ToolInvocationError(
+                "test_pipeline.run requires 'task_id' in payload.",
+                retryable=False,
+            )
+
+        try:
+            sandbox = ExecutionSandbox(
+                task_id=task_id,
+                base_dir=str(getattr(self.settings, "sandbox_base_dir", "data/sandboxes")),
+            )
+            result = TestPipeline(sandbox).run(
+                config_path=config_path,
+                max_output_bytes=int(getattr(self.settings, "sandbox_max_output_bytes", 65536)),
+            )
+        except (SandboxError, TestPipelineError) as exc:
+            raise ToolInvocationError(str(exc), retryable=False) from exc
+
+        return {
+            "status": "passed" if result.overall_passed else "failed",
+            "tool_name": definition.name,
+            "provider": definition.provider_name,
+            **asdict(result),
+        }
+
+    def _execute_diff_reviewer_review(self, payload: Mapping[str, object]) -> dict[str, object]:
+        diff_value = payload.get("diff")
+        if not isinstance(diff_value, str):
+            raise ToolInvocationError(
+                "diff_reviewer.review requires 'diff' as a string in payload.",
+                retryable=False,
+            )
+
+        test_result_value = payload.get("test_result")
+        if test_result_value is None:
+            test_result = None
+        elif isinstance(test_result_value, dict):
+            test_result = test_result_value
+        else:
+            raise ToolInvocationError(
+                "diff_reviewer.review optional 'test_result' must be a dict.",
+                retryable=False,
+            )
+
+        protected_paths_value = payload.get("protected_paths")
+        if protected_paths_value is None:
+            protected_paths = None
+        elif isinstance(protected_paths_value, list) and all(
+            isinstance(item, str) for item in protected_paths_value
+        ):
+            protected_paths = protected_paths_value
+        else:
+            raise ToolInvocationError(
+                "diff_reviewer.review optional 'protected_paths' must be a list of strings.",
+                retryable=False,
+            )
+
+        max_diff_size_value = payload.get("max_diff_size", 50_000)
+        if isinstance(max_diff_size_value, bool) or not isinstance(max_diff_size_value, int):
+            raise ToolInvocationError(
+                "diff_reviewer.review optional 'max_diff_size' must be an integer.",
+                retryable=False,
+            )
+        if max_diff_size_value <= 0:
+            raise ToolInvocationError(
+                "diff_reviewer.review optional 'max_diff_size' must be greater than zero.",
+                retryable=False,
+            )
+
+        task_description_value = payload.get("task_description")
+        task_description = task_description_value if isinstance(task_description_value, str) else ""
+
+        result = DiffReviewer(
+            protected_paths=protected_paths,
+            max_diff_size=max_diff_size_value,
+        ).review(
+            ReviewContext(
+                diff=diff_value,
+                test_result=test_result,
+                task_description=task_description,
+            )
+        )
+        return asdict(result)
+
+    def _execute_codegen_generate_patch(
+        self,
+        *,
+        task_id: str,
+        payload: Mapping[str, object],
+        actor_context: Mapping[str, object],
+    ) -> dict[str, object]:
+        plan_json_value = payload.get("plan_json")
+        if not isinstance(plan_json_value, dict):
+            raise ToolInvocationError(
+                "codegen.generate_patch requires 'plan_json' as a dict in payload.",
+                retryable=False,
+            )
+
+        context_files_value = payload.get("context_files")
+        if not isinstance(context_files_value, dict) or not all(
+            isinstance(path, str) and isinstance(content, str)
+            for path, content in context_files_value.items()
+        ):
+            raise ToolInvocationError(
+                "codegen.generate_patch requires 'context_files' as a dict[str, str] in payload.",
+                retryable=False,
+            )
+
+        task_description_value = payload.get("task_description")
+        task_description = task_description_value if isinstance(task_description_value, str) else ""
+
+        try:
+            result = CodeGenerator(self.settings).generate_patch(
+                task_id=task_id,
+                plan_json=dict(plan_json_value),
+                context_files={str(path): str(content) for path, content in context_files_value.items()},
+                task_description=task_description,
+            )
+        except CodegenError as exc:
+            raise ToolInvocationError(str(exc), retryable=False) from exc
+
+        actor_name_value = actor_context.get("actor_name")
+        try:
+            CostTracker(self.db).record_usage(
+                task_id=task_id,
+                actor_name=str(actor_name_value) if actor_name_value else None,
+                provider_name=result.provider_name,
+                model_name=result.model_name or "",
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                purpose="codegen",
+            )
+        except Exception:
+            pass
+
         return result.model_dump(mode="json")
 
     def _execute_slack_post_message(
@@ -378,6 +829,179 @@ class ToolGateway:
             "issue_url": browse_url,
         }
 
+    def _execute_jira_transition_issue(
+        self,
+        *,
+        definition: ToolDefinition,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        base_url = self._resolve_jira_site_root()
+        if not base_url:
+            raise ToolInvocationError("Jira base URL is not configured.")
+
+        issue_key = str(payload.get("issue_key") or "").strip().upper()
+        transition_name = str(payload.get("transition_name") or "").strip()
+        if not issue_key:
+            raise ToolInvocationError("Jira payload did not include an issue key.")
+        if not transition_name:
+            raise ToolInvocationError("Jira payload did not include a transition name.")
+
+        headers: dict[str, str] = {"Accept": "application/json"}
+        auth: tuple[str, str] | None = None
+        if self.settings.jira_bearer_token:
+            headers["Authorization"] = f"Bearer {self.settings.jira_bearer_token}"
+        elif self.settings.jira_email and self.settings.jira_api_token:
+            auth = (self.settings.jira_email, self.settings.jira_api_token)
+        else:
+            raise ToolInvocationError("Jira credentials are not configured.")
+
+        issue_url = f"{base_url.rstrip('/')}/rest/api/3/issue/{issue_key}"
+        try:
+            from_response = self._request_json(
+                method="GET",
+                url=issue_url,
+                headers=headers,
+                auth=auth,
+                params={"fields": "status"},
+                timeout_seconds=definition.timeout_seconds,
+            )
+        except ToolInvocationError as exc:
+            raise ToolInvocationError(
+                f"Jira issue status lookup failed for {issue_key}: {exc}",
+                retryable=True,
+                timed_out=exc.timed_out,
+            ) from exc
+
+        from_status = self._extract_jira_status_name(self._jira_response_data(from_response))
+
+        transitions_response = self._request_json(
+            method="GET",
+            url=f"{issue_url}/transitions",
+            headers=headers,
+            auth=auth,
+            timeout_seconds=definition.timeout_seconds,
+        )
+        transitions_data = self._jira_response_data(transitions_response)
+        transitions = transitions_data.get("transitions") if isinstance(transitions_data.get("transitions"), list) else []
+        available_names: list[str] = []
+        matched_transition: Mapping[str, object] | None = None
+
+        for transition in transitions:
+            if not isinstance(transition, Mapping):
+                continue
+            name = str(transition.get("name") or "").strip()
+            if not name:
+                continue
+            available_names.append(name)
+            if name.casefold() == transition_name.casefold():
+                matched_transition = transition
+
+        if matched_transition is None:
+            available_text = ", ".join(available_names) if available_names else "none"
+            raise ToolInvocationError(
+                f"Jira transition '{transition_name}' is not available for {issue_key}. "
+                f"Available transitions: {available_text}.",
+                retryable=False,
+            )
+
+        transition_id = str(matched_transition.get("id") or "").strip()
+        matched_name = str(matched_transition.get("name") or transition_name).strip()
+        if not transition_id:
+            raise ToolInvocationError(
+                f"Jira returned transition '{matched_name}' without an id.",
+                retryable=False,
+            )
+
+        self._request_json(
+            method="POST",
+            url=f"{issue_url}/transitions",
+            headers=headers,
+            auth=auth,
+            json_body={"transition": {"id": transition_id}},
+            timeout_seconds=definition.timeout_seconds,
+        )
+
+        to_response = self._request_json(
+            method="GET",
+            url=issue_url,
+            headers=headers,
+            auth=auth,
+            params={"fields": "status"},
+            timeout_seconds=definition.timeout_seconds,
+        )
+        to_status = self._extract_jira_status_name(self._jira_response_data(to_response))
+
+        return {
+            "status": "transitioned",
+            "tool_name": definition.name,
+            "provider": definition.provider_name,
+            "issue_key": issue_key,
+            "transition_id": transition_id,
+            "transition_name": matched_name,
+            "from_status": from_status,
+            "to_status": to_status,
+            "issue_url": f"{base_url.rstrip('/')}/browse/{issue_key}",
+        }
+
+    def _execute_jira_add_comment(
+        self,
+        *,
+        definition: ToolDefinition,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        base_url = self._resolve_jira_site_root()
+        if not base_url:
+            raise ToolInvocationError("Jira base URL is not configured.")
+
+        issue_key = str(payload.get("issue_key") or "").strip().upper()
+        text_value = str(payload.get("text") or "").strip()
+        if not issue_key:
+            raise ToolInvocationError("Jira payload did not include an issue key.")
+        if not text_value:
+            raise ToolInvocationError("Jira payload did not include comment text.")
+
+        headers: dict[str, str] = {"Accept": "application/json"}
+        auth: tuple[str, str] | None = None
+        if self.settings.jira_bearer_token:
+            headers["Authorization"] = f"Bearer {self.settings.jira_bearer_token}"
+        elif self.settings.jira_email and self.settings.jira_api_token:
+            auth = (self.settings.jira_email, self.settings.jira_api_token)
+        else:
+            raise ToolInvocationError("Jira credentials are not configured.")
+
+        comment_body: dict[str, object] = {
+            "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": text_value}],
+                    }
+                ],
+            }
+        }
+        response = self._request_json(
+            method="POST",
+            url=f"{base_url.rstrip('/')}/rest/api/3/issue/{issue_key}/comment",
+            headers=headers,
+            auth=auth,
+            json_body=comment_body,
+            timeout_seconds=definition.timeout_seconds,
+        )
+        response_data = self._jira_response_data(response)
+
+        return {
+            "status": "commented",
+            "tool_name": definition.name,
+            "provider": definition.provider_name,
+            "issue_key": issue_key,
+            "comment_id": str(response_data.get("id") or "").strip(),
+            "created": str(response_data.get("created") or "").strip(),
+            "excerpt": text_value[:200],
+            "issue_url": f"{base_url.rstrip('/')}/browse/{issue_key}",
+        }
+
     def _resolve_jira_site_root(self) -> str | None:
         raw_value = (self.settings.jira_base_url or "").strip()
         if not raw_value:
@@ -512,6 +1136,21 @@ class ToolGateway:
         if isinstance(parsed, dict):
             return {"_status_code": response.status_code, "data": parsed}
         return {"_status_code": response.status_code, "data": parsed}
+
+    @staticmethod
+    def _jira_response_data(response: Mapping[str, object]) -> dict[str, object]:
+        data = response.get("data")
+        if isinstance(data, dict):
+            return data
+        if "data" not in response:
+            return dict(response)
+        return {}
+
+    @staticmethod
+    def _extract_jira_status_name(response_data: Mapping[str, object]) -> str:
+        fields = response_data.get("fields") if isinstance(response_data.get("fields"), dict) else {}
+        status = fields.get("status") if isinstance(fields.get("status"), dict) else {}
+        return str(status.get("name") or "").strip()
 
     @staticmethod
     def _extract_jira_description(value: object) -> str:
