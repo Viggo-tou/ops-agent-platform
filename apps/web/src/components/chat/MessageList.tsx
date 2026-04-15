@@ -73,6 +73,21 @@ function buildNaturalFailureReply(message: string | null): string | null {
   return message;
 }
 
+const JIRA_REJECT_HEADING = "## Jira transition rejected";
+
+function extractJiraRejectionNotice(message: string | null): string | null {
+  if (!message) return null;
+  const idx = message.indexOf(JIRA_REJECT_HEADING);
+  if (idx === -1) return null;
+  const tail = message.slice(idx);
+  const nextHeadingOffset = tail.slice(JIRA_REJECT_HEADING.length).search(/\n## /);
+  const section =
+    nextHeadingOffset === -1
+      ? tail
+      : tail.slice(0, JIRA_REJECT_HEADING.length + nextHeadingOffset);
+  return section.trim();
+}
+
 export function readDisplayRequestText(requestText: string): string {
   const markerIndex = requestText.lastIndexOf(FOLLOW_UP_MARKER);
   if (markerIndex === -1) {
@@ -90,6 +105,7 @@ export function buildAgentReply(task: TaskDetail): string {
 
   const resultMessage = readString(task.latest_result_json?.message);
   const reviewSummary = readString(task.review_summary);
+  const jiraRejection = extractJiraRejectionNotice(resultMessage);
 
   if (task.scenario === "process_question") {
     return (
@@ -102,35 +118,44 @@ export function buildAgentReply(task: TaskDetail): string {
     return resultMessage ?? reviewSummary ?? "I could not complete this request yet.";
   }
 
-  const plan = readTaskPlanDocument(task.plan_json);
-  if (plan) {
-    const locations =
-      plan.affected_code_locations.length > 0
-        ? `\n\nWhere I would look first:\n${plan.affected_code_locations
-            .slice(0, 4)
-            .map((location) => `- ${location.source_name}:${location.relative_path}`)
-            .join("\n")}`
-        : "";
-    const steps =
-      plan.steps.length > 0
-        ? `\n\nSuggested next steps:\n${plan.steps
-            .slice(0, 5)
-            .map((step, index) => `${index + 1}. ${step.title}`)
-            .join("\n")}`
-        : "";
-    return `${plan.change_explanation}${locations}${steps}`;
+  const buildDevelopDetail = (): string | null => {
+    const plan = readTaskPlanDocument(task.plan_json);
+    if (plan) {
+      const locations =
+        plan.affected_code_locations.length > 0
+          ? `\n\nWhere I would look first:\n${plan.affected_code_locations
+              .slice(0, 4)
+              .map((location) => `- ${location.source_name}:${location.relative_path}`)
+              .join("\n")}`
+          : "";
+      const steps =
+        plan.steps.length > 0
+          ? `\n\nSuggested next steps:\n${plan.steps
+              .slice(0, 5)
+              .map((step, index) => `${index + 1}. ${step.title}`)
+              .join("\n")}`
+          : "";
+      return `${plan.change_explanation}${locations}${steps}`;
+    }
+
+    const review = readTaskReviewDocument(task.review_json);
+    if (review?.summary) {
+      return review.summary;
+    }
+
+    if (resultMessage) {
+      return resultMessage;
+    }
+
+    return null;
+  };
+
+  if (jiraRejection) {
+    const detail = buildDevelopDetail();
+    return detail ? `${jiraRejection}\n\n${detail}` : jiraRejection;
   }
 
-  const review = readTaskReviewDocument(task.review_json);
-  if (review?.summary) {
-    return review.summary;
-  }
-
-  if (resultMessage) {
-    return resultMessage;
-  }
-
-  return "I have received the request and am preparing the response.";
+  return buildDevelopDetail() ?? "I have received the request and am preparing the response.";
 }
 
 export function MessageList({ task, tasks, eventsMap }: MessageListProps) {
