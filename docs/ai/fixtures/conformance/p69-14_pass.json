@@ -1,0 +1,13 @@
+{
+  "id": "p69-14",
+  "description": "Remove deprecated 'legacy_flag' from config. Destructive verb, anchor exists, patch modifies the file containing it. Should pass.",
+  "request_text": "Remove the 'legacy_flag' setting from the runtime config; it is no longer read by any caller.",
+  "normalized_request": "Delete 'legacy_flag' entry in config/runtime.yaml.",
+  "diff": "diff --git a/config/runtime.yaml b/config/runtime.yaml\nindex aaaaaaa..bbbbbbb 100644\n--- a/config/runtime.yaml\n+++ b/config/runtime.yaml\n@@ -1,5 +1,4 @@\n timeout: 30\n retries: 3\n-legacy_flag: true\n feature_x: enabled\n log_level: info\n",
+  "must_touch_files": ["config/runtime.yaml"],
+  "source_tree_files": {
+    "config/runtime.yaml": "timeout: 30\nretries: 3\nlegacy_flag: true\nfeature_x: enabled\nlog_level: info\n"
+  },
+  "expected_verdict": "pass",
+  "expected_rules": []
+}

@@ -1,0 +1,53 @@
+{
+  "verdict": "pass",
+  "findings": [
+    {
+      "rule": "hit_delta",
+      "severity": "warn",
+      "message": "Request references 'mockUsers' but post-patch occurrence count did not decrease (before=3, after=3).",
+      "evidence": {
+        "anchor": "mockUsers",
+        "count_before": 3,
+        "count_after": 3,
+        "minus_in_diff": 0,
+        "plus_in_diff": 0
+      }
+    },
+    {
+      "rule": "hit_delta",
+      "severity": "warn",
+      "message": "Request references 'currentUser' but post-patch occurrence count did not decrease (before=52, after=52).",
+      "evidence": {
+        "anchor": "currentUser",
+        "count_before": 52,
+        "count_after": 52,
+        "minus_in_diff": 2,
+        "plus_in_diff": 2
+      }
+    },
+    {
+      "rule": "hit_delta",
+      "severity": "warn",
+      "message": "Request references 'localStorage' but post-patch occurrence count did not decrease (before=14, after=14).",
+      "evidence": {
+        "anchor": "localStorage",
+        "count_before": 14,
+        "count_after": 14,
+        "minus_in_diff": 1,
+        "plus_in_diff": 1
+      }
+    },
+    {
+      "rule": "hit_delta",
+      "severity": "warn",
+      "message": "Request references 'useEffect' but post-patch occurrence count did not decrease (before=27, after=28).",
+      "evidence": {
+        "anchor": "useEffect",
+        "count_before": 27,
+        "count_after": 28,
+        "minus_in_diff": 0,
+        "plus_in_diff": 1
+      }
+    }
+  ]
+}

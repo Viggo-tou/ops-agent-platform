@@ -72,3 +72,16 @@ apps/backend/manual-pathlib-default/
 
 # One-off MiniMax generated output
 scripts/minimax_r4_output.py
+
+# Cloned repos used for e2e testing
+HostedDashboard/
+
+# Playwright MCP logs
+.playwright-mcp/
+
+# Codex temp pytest artifacts
+apps/backend/.tmp-pytest/
+apps/backend/manual-pytest-temp/
+
+# MCP config (machine-local)
+.mcp.json

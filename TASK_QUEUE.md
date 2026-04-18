@@ -55,9 +55,105 @@ Status: todo (demoted)
 
 After Fix #4 the original symptom (grounding-file pollution in completeness check) is no longer the main failure mode. This safety-net path remains a hedge. Low priority.
 
+### T-038 Spec Conformance Gate (honesty harness, P0)
+
+Status: in progress (P0 partial done 2026-04-14; A/B deferred)
+
+Motivation: P69-10 surfaced the "shadow implementation" failure mode —
+diff_reviewer and Jira transition both passed while the patch created a
+parallel clean architecture and left the dirty existing code completely
+untouched. Root cause: no gate binds the diff shape to the request's
+semantic intent. The fix is general-purpose (applies to every modify
+task, not just P69-10): enforce three invariants between apply_patch and
+jira.transition_issue.
+
+Sub-tasks:
+
+| ID | Scope | Owner | Status |
+|---|---|---|---|
+| T-038-S1 | spec_conformance service: shadow_implementation, hit_delta, must_touch | Claude | done → `apps/backend/app/services/spec_conformance.py` + 13 tests |
+| T-038-S2 | Wire hard gate into orchestrator (after diff_reviewer, before jira.transition) | Claude | done → `apps/backend/app/orchestrator/service.py` |
+| T-038-A | Retry-with-feedback loop (max 1 retry, feed block messages into codegen prompt) | Claude | done → `MAX_CONFORMANCE_ATTEMPTS=2`, `_reset_for_conformance_retry`, recursive re-entry, `_build_codegen_task_description` injects directives |
+| T-038-B | Evidence bundle schema in planner output (must_touch_files + justification) | Claude | done → `GeneratedPlanPayload.must_touch_files` field + planner instruction text + rule-based fallback in develop scenario + `planner_must_touch` 4th gate rule |
+| T-038-C | Replay harness: record P69-8/P69-14/P69-10 as fixtures for regression scoring | Claude | done → `scripts/replay_conformance.py` + `docs/ai/fixtures/conformance/*.json` (3/3 fixtures match expected verdicts) |
+| T-038-D | Goal-evidence attestation: per-anchor proof that each destructive sub-goal landed | Claude | done → `build_goal_attestation` in `spec_conformance.py`, emitted as `spec_conformance.attest` event + included in task result JSON + 3 unit tests |
+
+Verification (2026-04-14):
+
+- `pytest tests/` → 167 passed, 0 failed (was 145 before; +13 conformance + +3 attestation + +1 retry-loop + +5 planner-fallback tests).
+- Retry path proven by `test_conformance_retry.py`: first codegen returns a shadow diff → gate blocks → sandbox reset → second codegen receives `RETRY FEEDBACK` directive → modifying diff → gate passes → Jira transitions; `conformance_attempts=1`, attestation shows `Minij` status=achieved with count 2→0.
+- Planner fallback proven by `test_plan_must_touch_fallback.py` (5 cases covering destructive+citations, non-destructive, empty knowledge, non-develop scenario, 6-entry cap).
+- On the exact P69-10 shape (all-new-files patch with request mentioning
+  `'Minij'`), the gate now blocks with `shadow_implementation`,
+  `hit_delta`, `must_touch`, and `planner_must_touch` findings (asserted
+  in both unit tests and the replay harness).
+- Replay harness: `python scripts/replay_conformance.py` → 3/3 fixtures
+  match expected verdicts (P69-8 pass, P69-14 pass, P69-10 block-with-4-rules).
+- Goal attestation: `build_goal_attestation` emits per-anchor before/after
+  counts and the files that were modified; event `spec_conformance.attest`
+  carries the attestation, and the final `task.result.goal_attestation`
+  records it for UI/audit consumption.
+
+Files touched this session:
+
+- `apps/backend/app/services/spec_conformance.py` (3 rules → 4 rules + `build_goal_attestation`)
+- `apps/backend/tests/services/test_spec_conformance.py` (+3 attestation tests, 16 total)
+- `apps/backend/tests/orchestrator/test_conformance_retry.py` **NEW** (retry loop end-to-end)
+- `apps/backend/tests/agents/test_plan_must_touch_fallback.py` **NEW** (5 cases)
+- `apps/backend/app/agents/schemas.py` (`must_touch_files` field on `GeneratedPlanPayload`)
+- `apps/backend/app/agents/service.py` (planner instructions + rule-based `must_touch_paths` fallback wired into develop payload)
+- `apps/backend/app/orchestrator/service.py` (retry loop, sandbox reset, codegen directives, attestation event + result embed)
+- `scripts/replay_conformance.py` **NEW**
+- `docs/ai/fixtures/conformance/{README.md,p69-8_pass.json,p69-14_pass.json,p69-10_block.json}` **NEW**
+- `TASK_QUEUE.md`
+
+### T-039 Jira Transition Approval Gate
+
+Status: done (2026-04-15)
+
+Scope: insert a human-approval gate between the spec-conformance `attest` pass and `jira.transition_issue`. Pre-T-039, develop tasks auto-transitioned Jira the moment the gate passed — forcing the user to keep flipping Jira back to "To Do" during test runs. Post-T-039, the task parks in `AWAITING_APPROVAL` with the diff + summary + goal attestation surfaced; only a grant proceeds to Jira, and reject keeps the code while leaving Jira untouched.
+
+Sub-tasks:
+
+| ID | Description | Owner | Notes |
+|---|---|---|---|
+| T-039-A | Gate in orchestrator before jira writeback (setting-gated) | Claude | done → `app/core/config.py:develop_require_jira_approval`, `app/orchestrator/service.py` gate block + `_request_jira_transition_approval` |
+| T-039-B | `resume_after_approval` branches on develop scenario | Claude | done → sets `pipeline_state.jira_approval_granted`, re-enters `_execute_develop_pipeline` (cached stages short-circuit) |
+| T-039-C | Reject special-cases `jira.transition_issue` → task COMPLETED (not FAILED) | Claude | done → `app/services/approvals.py::reject` preserves diff + annotates `jira_transition_rejected=true` |
+| T-039-D | Unit tests (gate, grant routing, reject-on-develop vs reject-other) | Claude | done → `tests/orchestrator/test_jira_approval_gate.py` (4 tests) |
+| T-039-E | Curl-driven E2E driver + recorded evidence | Claude | done → `scripts/e2e_develop_approval.py`; reject path passed end-to-end, evidence in `docs/ai/evidence/T-039/reject-path-2026-04-15.txt` |
+
+Persistence bug caught during this work: `ConformanceReport` dataclass was landing in `task.latest_result_json` via two paths (not one as first diagnosed), triggering SA `json_serializer` failures and the frontend "Failed to fetch" / PendingRollbackError. Fix: store `conformance_report.to_payload()` (dict) at the event-record site so `pipeline_state` never holds the dataclass. Lesson: any invariant "everything in pipeline_state must be JSON-safe" deserves an `assert_json_safe` guard; tests that mock `self.db` will not catch this.
+
+Verification:
+
+- `pytest tests/` → **171 passed, 0 failed** (167 pre-T-039 + 4 gate/grant/reject tests).
+- E2E reject path: task posted to /api/tasks → parked at AWAITING_APPROVAL → Approval row has `action_name=jira.transition_issue`, `approver_role=team_lead` → `/reject` → task COMPLETED, `jira_transitioned=false`, `jira_transition_rejected=true`, 5 files preserved in `files_changed`. No Jira API call made.
+- Grant path not exercised E2E (needs a real Jira project wired up); unit-covered by `test_resume_after_approval_flips_granted_and_reenters_pipeline`.
+
+Files touched this session:
+
+- `apps/backend/app/core/config.py` (new `develop_require_jira_approval` setting)
+- `apps/backend/app/orchestrator/service.py` (approval gate + `_request_jira_transition_approval` + develop-aware `resume_after_approval` + persistence fix)
+- `apps/backend/app/services/approvals.py` (reject special-case)
+- `apps/backend/tests/orchestrator/test_jira_approval_gate.py` **NEW**
+- `apps/backend/tests/orchestrator/test_conformance_retry.py` (opt out of gate for that test's scope)
+- `scripts/e2e_develop_approval.py` **NEW**
+- `docs/ai/evidence/T-039/reject-path-2026-04-15.txt` **NEW**
+- `docs/ai/mcp/playwright-setup.md` **NEW** (unblocks future browser-mode self-testing)
+- `SESSION_HANDOFF.md`, `TASK_QUEUE.md`
+
 ### T-037 Session Boundary Discipline and Commit Hygiene
 
-Status: todo
+Status: done (2026-04-14)
+
+Outcome:
+
+- Policy: `AGENTS.md` + `CLAUDE.md` now mandate session-start tag + commit-or-manifest-at-close.
+- Backlog cleared: 153-file catch-up commit `c6c3101` consolidates every prior session's working tree into a real baseline.
+- Baseline tag `session-baseline/2026-04-14-T037` points at `c6c3101` so future sessions have an unambiguous diff origin.
+- `.gitignore` expanded for runtime artifacts (`*.db-shm/wal`, `data/sandboxes/`, `manual-*/`, `.claude/`, one-off MiniMax output).
+- Next session can genuinely answer "what did I change?" via `git diff session-baseline/2026-04-14-T037..HEAD`.
 
 Root cause: only one commit (`940b232 chore: initial commit`) exists. Every session since T-024 has left its work in the working tree; there is no git-level way to tell which lines belong to which session. This forces every "commit only this session" request to fail.
 
@@ -145,7 +241,8 @@ Audit (2026-04-14) found that most scope was already implemented. Refined sub-ta
 | T-026-M2 | API schema docstrings | MiniMax | done → `Field(description=...)` added in memory.py, model_config.py, knowledge.py |
 | T-026-M3 | ADR 0001 zip import security policy | MiniMax | done → `docs/adr/0001-zip-import-security.md` (9 MUST controls) |
 | T-026-M4 | HTTPException detail text normalization | MiniMax | done → 17 sites normalized across `apps/backend/app/api/` |
-| T-026-A | Zip archive import endpoint | Codex (after 2026-04-17) | unblocked on ADR; still waiting codex availability |
+| T-026-A | Zip archive import endpoint | Claude (codex unavailable) | **done** → `apps/backend/app/services/knowledge_zip.py` + `/api/knowledge/upload-zip` route + 16 tests. All 9 ADR 0001 controls covered. 145 passed overall. |
+| T-026-M5 | Zip test fixture builder | MiniMax | spec ready → `docs/ai/tasks/T-026-M5-zip-test-fixtures.md`; unblocks T-026-A tests |
 | T-026-E | 4-role E2E RBAC smoke (`scripts/verify-rbac.ps1`) | Claude | done → 88/88 role×endpoint cells pass against live backend |
 
 Acceptance (original, unchanged):
@@ -155,6 +252,68 @@ Acceptance (original, unchanged):
 - Memory entries and memory settings persist through backend APIs.
 - Model/provider settings load from backend-controlled APIs.
 - Sensitive actions are checked by frontend and backend RBAC/governance paths.
+
+### T-040 Validator & Harness Hardening: no-found > fabrication
+
+Status: done (2026-04-16, codegen deferred to codex)
+
+Scope: harden the 5 defense lines against LLM fabrication. Three MiniMax codegen failures proved the validator correctly blocks hallucinated patches.
+
+Bug fixes:
+- Unified diff format parsing (Strategy 2 for standard `--- a/` / `+++ b/` without git headers)
+- hit_delta aggregate logic (at least one anchor decreased → rest are warn, not block)
+- Alphanum identifier extraction (`master1`-type: `_IDENT_ALPHANUM_RE`)
+- Unified diff regex for `/dev/null` paths (create/delete detection)
+
+New defense lines:
+- 防线2: `_anchor_precheck_fails()` in orchestrator — all anchors missing from knowledge source → fail fast before codegen
+- 防线5: `compile_gate.py` — `node --check` (JS/JSX) + `py_compile` (Python) syntax validation after apply_patch
+
+New codegen hardening:
+- System prompt rules 7-9 (file creation constraints, target file enforcement, `targets_not_in_context` error)
+- Constraint injection from translation → codegen (`_build_prompt`)
+
+Tests: 226/226 passed (including 31 adversarial defense-line tests covering all 5 gates + diff parser edge cases).
+
+Evidence: `docs/ai/evidence/T-040/` — 3 blocked hallucinated tasks + 1 correct-patch-conformance pass.
+
+Files:
+- `apps/backend/app/services/spec_conformance.py` (3 bug fixes + anchors_missing_from_tree rule)
+- `apps/backend/app/services/compile_gate.py` **NEW**
+- `apps/backend/app/services/codegen.py` (prompt hardening + constraint injection)
+- `apps/backend/app/orchestrator/service.py` (防线2 + 防线5 wiring + translation→codegen constraints)
+- `apps/backend/tests/services/test_spec_conformance.py` (18→30 tests)
+- `apps/backend/tests/services/test_compile_gate.py` **NEW** (10 tests)
+- `apps/backend/tests/services/test_defense_lines_adversarial.py` **NEW** (31 tests)
+
+### T-041 Anti-Hallucination Defense Matrix (12-mechanism)
+
+Status: in progress (2026-04-16)
+
+Motivation: T-040 proved the existing 5 defense lines work, but gap analysis against a comprehensive 12-point anti-hallucination framework revealed 5 fully missing and 3 partially missing mechanisms. T-041 implements all 8 gaps to complete the defense matrix.
+
+Pipeline evolution: `plan → evidence_build → target_validation → codegen → patch_guard → apply_patch → spec_conformance → runtime_test → review → approve → writeback`
+
+Sub-tasks:
+
+| ID | Mechanism | Priority | Status |
+|---|---|---|---|
+| T-041-01 | Evidence bundle — codegen 前定位证据包 (搜索命中 + 符号 + must-touch)，不通过不允许 codegen | P0 | todo |
+| T-041-02 | Intent-vs-diff shape checker — diff 规模/新增比例/文件数 vs 任务类型不匹配则 block | P0 | todo |
+| T-041-03 | Existing-file-first policy — 新增文件比例硬性门槛，超限 block 或强制 review | P0 | todo |
+| T-041-04 | Approval 强制校验证据 — approve 前检查 attestation/must-touch/hit-delta 全闭合 | P0 | todo |
+| T-041-05 | Symbol + reference gate — import/调用链分析，改定义必须改引用 | P1 | todo |
+| T-041-06 | Failing test first — 行为 bug 类任务要求先生成失败测试 | P1 | todo |
+| T-041-07 | Runtime path validation — browser smoke / integration test 验收行为 | P1 | todo |
+| T-041-08 | Goal-by-goal conformance + per-file justification — 子目标逐项验证 + 每文件改动理由 | P1 | todo |
+
+Acceptance:
+- All 12 anti-hallucination mechanisms have code + tests
+- Pipeline has evidence_build and target_validation stages before codegen
+- Approval gate requires evidence chain closure, not just green status
+- 行为 bug 类任务有 failing-test-first 门控
+- diff shape 与任务意图匹配检查
+- 全部 tests pass
 
 ## P2
 
@@ -170,9 +329,11 @@ Acceptance:
 
 ### T-031 Async Execution Design Spike
 
-Status: todo
+Status: done (2026-04-14) → `docs/adr/0002-async-execution-trigger.md`
+
+Outcome: ADR 0002 locks in four hard trigger conditions (latency p95 > 60 s over 7 d, governance stability, frontend async UX ready, multi-tenant demand) before we leave the single-runtime path. Migration target when triggers fire is Option B (in-process asyncio + persisted state machine + SSE stream), staged across 3 PRs behind `ASYNC_EXECUTION_ENABLED`. Option C (Celery/RQ) explicitly deferred to a future ADR.
 
 Acceptance:
 
-- Documents when and how to introduce queue-backed long-running workflows.
-- Keeps the current single-runtime path as the default until governance and product UI are stable.
+- Documents when and how to introduce queue-backed long-running workflows. ✅
+- Keeps the current single-runtime path as the default until governance and product UI are stable. ✅ (encoded as trigger conditions 2 + 3)

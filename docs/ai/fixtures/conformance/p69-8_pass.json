@@ -1,0 +1,13 @@
+{
+  "id": "p69-8",
+  "description": "Add retry config file. Pure new-file task, no destructive verbs. Should pass.",
+  "request_text": "Create config/retry.json with default retry policy (max_attempts=3, backoff=exponential).",
+  "normalized_request": "Create config/retry.json with default retry policy.",
+  "diff": "diff --git a/config/retry.json b/config/retry.json\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/config/retry.json\n@@ -0,0 +1,4 @@\n+{\n+  \"max_attempts\": 3,\n+  \"backoff\": \"exponential\"\n+}\n",
+  "must_touch_files": [],
+  "source_tree_files": {
+    "README.md": "# Project\n"
+  },
+  "expected_verdict": "pass",
+  "expected_rules": []
+}

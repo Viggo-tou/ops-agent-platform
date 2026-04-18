@@ -1,0 +1,23 @@
+[1/5] POST /api/tasks  request='implement TEST-1: remove "Minij" from src/a.py'
+       created task_id=7b6d341b-d13c-4431-884f-a7e9f489572f  initial_status=awaiting_approval
+[2/5] polling for AWAITING_APPROVAL ...
+  [poll] status=awaiting_approval
+       parked. approval_id=74996b8c-4ecc-4624-8c14-9e14b953fcf4
+       preview diff first 120 chars: 'diff --git a/app/src/main/res/layout/fragment_handyman_job_board.xml b/app/src/main/res/layout/fragment_handyman_job_boa'
+[3/5] GET /api/approvals ¡ú confirm jira.transition_issue row exists
+       action_name=jira.transition_issue approver_role=team_lead
+[4/5] POST /api/approvals/74996b8c-4ecc-4624-8c14-9e14b953fcf4/reject
+       decision=rejected  decided_by=e2e-driver
+[5/5] polling for terminal status ...
+  [poll] status=completed
+
+=== EVIDENCE ===
+task_id:                 7b6d341b-d13c-4431-884f-a7e9f489572f
+final status:            completed
+jira_transitioned:       False
+jira_transition_rejected:True
+files_changed:           ['app/src/main/res/layout/fragment_handyman_job_board.xml', 'app/src/main/res/layout/fragment_handyman_job_board_details.xml', 'app/src/main/res/layout/fragment_handyman_job_list_details.xml', 'app/src/main/res/layout/fragment_service_category.xml', 'src/a.py']
+approval decision:       rejected
+expected outcome:        completed+jira_transitioned=false
+
+[PASS] reject path preserved code + skipped Jira transition
