@@ -14,12 +14,15 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         start = time.monotonic()
         response = await call_next(request)
         duration_ms = int((time.monotonic() - start) * 1000)
-        _request_logger.info(
-            "http_request",
-            method=request.method,
-            path=request.url.path,
-            status_code=response.status_code,
-            duration_ms=duration_ms,
-            actor_role=request.headers.get("X-Actor-Role"),
-        )
+        try:
+            _request_logger.info(
+                "http_request",
+                method=request.method,
+                path=request.url.path,
+                status_code=response.status_code,
+                duration_ms=duration_ms,
+                actor_role=request.headers.get("X-Actor-Role"),
+            )
+        except OSError:
+            pass
         return response

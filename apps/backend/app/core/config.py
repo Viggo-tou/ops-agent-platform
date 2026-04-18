@@ -14,7 +14,9 @@ class Settings(BaseSettings):
     debug: bool = True
     api_prefix: str = "/api"
     database_url: str = f"sqlite:///{(BASE_DIR / 'ops_agent_platform.db').as_posix()}"
-    primary_agent_provider: Literal["auto", "mock", "openai", "minimax", "anthropic", "deepseek", "ollama"] = "auto"
+    primary_agent_provider: Literal["auto", "mock", "openai", "minimax", "anthropic", "deepseek", "ollama", "claude_code", "codex"] = "auto"
+    planner_provider: Literal["auto", "claude_code", "anthropic", "openai", "minimax", "mock"] | None = None
+    codegen_provider: Literal["auto", "claude_code", "codex", "anthropic", "openai", "minimax", "deepseek", "ollama", "mock"] | None = None
     primary_agent_model: str = "gpt-4o-mini"
     primary_agent_timeout_seconds: float = 30.0
     minimax_planner_timeout_seconds: float = 90.0
@@ -32,6 +34,15 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = None
     anthropic_base_url: str = "https://api.anthropic.com"
     anthropic_model: str = "claude-sonnet-4-20250514"
+    # Claude Code CLI (planner)
+    claude_code_command: str = "npx"
+    claude_code_args: str = "--yes @anthropic-ai/claude-code"
+    claude_code_timeout_seconds: float = 300.0
+    claude_code_git_bash_path: str | None = None
+    # Codex CLI (codegen)
+    codex_command: str = "codex"
+    codex_timeout_seconds: float = 300.0
+    codex_model: str = "gpt-5.4"
     semantic_translator_provider: Literal["auto", "mock", "minimax"] = "auto"
     semantic_translator_model: str = "MiniMax-M2.7"
     semantic_translator_timeout_seconds: float = 30.0
@@ -66,6 +77,12 @@ class Settings(BaseSettings):
     jira_issue_type: str = "Task"
     jira_timeout_seconds: float = 15.0
     jira_retry_count: int = 1
+    # T-039: require human approval between code-generation-pass and
+    # jira.transition_issue writeback. When True, the develop pipeline
+    # pauses in AWAITING_APPROVAL after spec_conformance.attest pass,
+    # exposing the diff + goal_attestation in the approval record, and
+    # only transitions Jira once the approval is granted.
+    develop_require_jira_approval: bool = True
     internal_api_base_url: str | None = None
     internal_api_token: str | None = None
     internal_api_auth_header: str = "Authorization"

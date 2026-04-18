@@ -50,6 +50,17 @@ class GeneratedPlanPayload(BaseModel):
     requires_approval: bool
     approval_reasons: list[str] = Field(default_factory=list, max_length=6)
     affected_code_locations: list[PlanCodeLocation] = Field(default_factory=list, max_length=8)
+    must_touch_files: list[str] = Field(
+        default_factory=list,
+        max_length=12,
+        description=(
+            "Files that the patch MUST modify (not merely create) for the "
+            "task to count as complete. Populated by the planner when the "
+            "request asks to remove, rename, fix, or refactor existing "
+            "behavior and retrieval has located the file(s) holding it. "
+            "Empty for pure new-file or scaffold tasks."
+        ),
+    )
     tools: list[PlanTool] = Field(min_length=1, max_length=6)
     steps: list[PlanStep] = Field(min_length=1, max_length=10)
     final_output_contract: FinalOutputContract

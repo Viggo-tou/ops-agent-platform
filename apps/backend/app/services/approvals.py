@@ -85,11 +85,16 @@ class ApprovalService:
             "decision": ApprovalStatus.REJECTED.value,
         }
         task.pending_approval = False
-        task.latest_result_json = {
-            "status": TaskStatus.FAILED.value,
-            "message": "Approval rejected. No action was executed.",
-            "approval_id": approval.id,
-        }
+
+        # T-039: jira-transition rejection is not a failure — the code
+        # changes were already verified (conformance + attestation passed);
+        # the reviewer just doesn't want Jira flipped. Keep the task as
+        # COMPLETED, preserve the diff/summary already in latest_result_json,
+        # and annotate jira_transitioned=false.
+        is_jira_transition_gate = (
+            approval.action_name == "jira.transition_issue"
+            and (task.scenario or "") == "jira_issue_develop"
+        )
 
         record_event(
             self.db,
@@ -98,23 +103,66 @@ class ApprovalService:
             source=EventSource.APPROVAL,
             stage=WorkflowStage.REVIEW,
             role=RoleName.REVIEWER,
-            message="Approval rejected for pending action.",
+            message=(
+                "Jira transition rejected; code changes kept."
+                if is_jira_transition_gate
+                else "Approval rejected for pending action."
+            ),
             payload={
                 "approval_id": approval.id,
                 "actor_name": payload.actor_name,
                 "actor_role": payload.actor_role.value,
+                "notes": payload.notes,
             },
         )
 
-        set_task_status(
-            self.db,
-            task=task,
-            new_status=TaskStatus.FAILED,
-            new_stage=WorkflowStage.DONE,
-            role=RoleName.PRIMARY,
-            source=EventSource.ORCHESTRATOR,
-            message="Task failed because approval was rejected.",
-        )
+        if is_jira_transition_gate:
+            existing = dict(task.latest_result_json) if isinstance(task.latest_result_json, dict) else {}
+            result_preview = existing.get("result") if isinstance(existing.get("result"), dict) else {}
+            result_preview = dict(result_preview)
+            result_preview["jira_transitioned"] = False
+            result_preview["jira_transition_rejected"] = True
+            result_preview["approval_id"] = approval.id
+            message = (
+                "## Jira transition rejected\n\n"
+                "Code changes passed review and are preserved. "
+                "Jira status was NOT updated because the transition approval was rejected."
+            )
+            if payload.notes:
+                message += f"\n\n**Reviewer notes:** {payload.notes}"
+            prior_message = existing.get("message") if isinstance(existing.get("message"), str) else ""
+            combined_message = prior_message + "\n\n---\n\n" + message if prior_message else message
+            task.latest_result_json = {
+                **existing,
+                "status": TaskStatus.COMPLETED.value,
+                "message": combined_message,
+                "approval_id": approval.id,
+                "result": result_preview,
+            }
+            set_task_status(
+                self.db,
+                task=task,
+                new_status=TaskStatus.COMPLETED,
+                new_stage=WorkflowStage.DONE,
+                role=RoleName.PRIMARY,
+                source=EventSource.ORCHESTRATOR,
+                message="Task completed; Jira transition skipped per rejected approval.",
+            )
+        else:
+            task.latest_result_json = {
+                "status": TaskStatus.FAILED.value,
+                "message": "Approval rejected. No action was executed.",
+                "approval_id": approval.id,
+            }
+            set_task_status(
+                self.db,
+                task=task,
+                new_status=TaskStatus.FAILED,
+                new_stage=WorkflowStage.DONE,
+                role=RoleName.PRIMARY,
+                source=EventSource.ORCHESTRATOR,
+                message="Task failed because approval was rejected.",
+            )
 
         record_event(
             self.db,

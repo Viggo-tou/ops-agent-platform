@@ -66,6 +66,19 @@
       }
     },
     {
+      "method": "POST",
+      "path": "/api/knowledge/upload-zip",
+      "requires": [
+        "knowledge:upload"
+      ],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 403,
+        "viewer": 403
+      }
+    },
+    {
       "method": "DELETE",
       "path": "/api/knowledge/documents/{id}",
       "requires": [

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import subprocess
 from typing import Any
 
 import httpx
@@ -160,6 +163,26 @@ def build_fallback_plan_payload(
     else:
         develop_affected_code_locations = affected_code_locations
 
+    # T-038-B: when the request mentions a destructive verb and retrieval
+    # surfaced citation files, mark those files as must_touch_files so the
+    # spec-conformance gate can enforce that the patch actually edits them.
+    _DESTRUCTIVE_VERBS_FOR_MUST_TOUCH = (
+        "remove", "delete", "clean", "rename", "refactor", "fix",
+        "replace", "simplify", "strip", "eliminate", "drop", "disable",
+    )
+    must_touch_paths: list[str] = []
+    if scenario == "jira_issue_develop" and affected_code_locations:
+        request_lower = (request_text or "").lower()
+        if any(verb in request_lower for verb in _DESTRUCTIVE_VERBS_FOR_MUST_TOUCH):
+            seen: set[str] = set()
+            for loc in affected_code_locations:
+                rel = (loc.relative_path or "").strip()
+                if rel and rel not in seen:
+                    seen.add(rel)
+                    must_touch_paths.append(rel)
+                if len(must_touch_paths) >= 6:
+                    break
+
     if scenario == "jira_issue_develop":
         codegen_tool = "codegen.generate_patch"
         codegen_permission = registry.get_permission_category(codegen_tool)
@@ -191,6 +214,7 @@ def build_fallback_plan_payload(
             if codegen_permission == ToolPermissionCategory.APPROVAL_REQUIRED
             else [],
             affected_code_locations=develop_affected_code_locations,
+            must_touch_files=must_touch_paths,
             tools=[
                 PlanTool(
                     tool_name=codegen_tool,
@@ -729,6 +753,8 @@ class PrimaryAgentPlanner:
         self.settings = settings or get_settings()
 
     def _resolve_model_name(self, provider_name: str) -> str:
+        if provider_name == "claude_code":
+            return "claude-code"
         if provider_name == "anthropic":
             return getattr(self.settings, "anthropic_model", "claude-sonnet-4-20250514")
         configured_model = self.settings.primary_agent_model.strip()
@@ -748,7 +774,13 @@ class PrimaryAgentPlanner:
         issue_context: dict[str, Any] | None = None,
     ) -> PlanGenerationResult:
         """Generate a plan using the provider chain. On failure, cascade to the next provider."""
-        provider_mode = self.settings.primary_agent_provider
+        # Explicit planner_provider override takes priority
+        planner_override = getattr(self.settings, "planner_provider", None)
+        if planner_override and planner_override != "auto":
+            provider_mode = planner_override
+        else:
+            provider_mode = self.settings.primary_agent_provider
+
         anthropic_api_key = getattr(self.settings, "anthropic_api_key", None)
         openai_api_key = getattr(self.settings, "openai_api_key", None)
         minimax_api_key = getattr(self.settings, "minimax_api_key", None)
@@ -756,12 +788,18 @@ class PrimaryAgentPlanner:
         # Build ordered provider chain
         providers: list[str] = []
         if provider_mode == "auto":
+            if shutil.which(self.settings.claude_code_command):
+                providers.append("claude_code")
             if anthropic_api_key:
                 providers.append("anthropic")
             if openai_api_key:
                 providers.append("openai")
             if minimax_api_key:
                 providers.append("minimax")
+        elif provider_mode == "codex":
+            # codex is a codegen provider, not a planner — fallback to anthropic
+            if anthropic_api_key:
+                providers.append("anthropic")
         elif provider_mode != "mock":
             providers.append(provider_mode)
 
@@ -820,7 +858,16 @@ class PrimaryAgentPlanner:
         """Attempt plan generation with a single provider. Raises on failure."""
         model_name = self._resolve_model_name(provider_name)
 
-        if provider_name == "anthropic":
+        if provider_name == "claude_code":
+            plan_payload = self._generate_plan_with_claude_code(
+                request_text=request_text,
+                scenario=scenario,
+                actor_name=actor_name,
+                default_payload=default_payload,
+            )
+            mode = "claude_code_cli"
+            model_name = "claude-code"
+        elif provider_name == "anthropic":
             plan_payload = self._generate_plan_with_anthropic(
                 request_text=request_text,
                 scenario=scenario,
@@ -975,6 +1022,125 @@ class PrimaryAgentPlanner:
         response_payload = response.json()
 
         content = self._extract_anthropic_content(response_payload)
+        raw_plan = self._parse_json_content(content)
+        if default_payload is not None:
+            raw_plan = self._merge_plan_payload_with_defaults(raw_plan, default_payload)
+        sanitized = self._sanitize_plan_payload(raw_plan)
+        if default_payload is not None:
+            sanitized = self._fill_empty_fields_from_default(sanitized, default_payload)
+        return GeneratedPlanPayload.model_validate(sanitized)
+
+    def _generate_plan_with_claude_code(
+        self,
+        *,
+        request_text: str,
+        scenario: str,
+        actor_name: str,
+        default_payload: GeneratedPlanPayload | None = None,
+    ) -> GeneratedPlanPayload:
+        """Invoke Claude Code CLI (``claude --print``) as the planner."""
+        claude_cmd = shutil.which(self.settings.claude_code_command)
+        claude_args = self.settings.claude_code_args.split()
+        if not claude_cmd:
+            raise RuntimeError(f"Claude Code CLI not found: {self.settings.claude_code_command}")
+
+        user_prompt = (
+            f"Actor: {actor_name}\n"
+            f"Scenario: {scenario}\n"
+            f"Request:\n{request_text}\n\n"
+            "Return ONLY valid JSON that matches the requested plan schema. "
+            "No markdown fences, no explanations, no commentary — pure JSON only."
+        )
+
+        system_prompt = self._build_planning_instructions()
+
+        # Write prompt to a temp file and pipe via stdin file descriptor.
+        # On Windows, large prompts fail when piped through npx.CMD using
+        # subprocess.run(input=...) due to pipe buffer issues.
+        full_prompt = (
+            f"SYSTEM INSTRUCTIONS:\n{system_prompt}\n\n"
+            f"USER REQUEST:\n{user_prompt}"
+        )
+
+        import tempfile
+        prompt_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8",
+        )
+        prompt_file.write(full_prompt)
+        prompt_file.close()
+
+        cmd = [
+            claude_cmd, *claude_args,
+            "--print",
+            "-",  # read prompt from stdin
+        ]
+
+        env = {**os.environ}
+        # Do NOT pass ANTHROPIC_API_KEY — Claude Code CLI should use its own
+        # OAuth session, not the possibly-exhausted API key.
+        env.pop("ANTHROPIC_API_KEY", None)
+        # Windows: Claude Code CLI needs git-bash path
+        if os.name == "nt" and "CLAUDE_CODE_GIT_BASH_PATH" not in env:
+            configured = getattr(self.settings, "claude_code_git_bash_path", None)
+            if configured:
+                env["CLAUDE_CODE_GIT_BASH_PATH"] = configured
+            else:
+                for candidate in [
+                    r"D:\Git\bin\bash.exe",
+                    r"C:\Program Files\Git\bin\bash.exe",
+                    r"C:\Program Files (x86)\Git\bin\bash.exe",
+                ]:
+                    if os.path.isfile(candidate):
+                        env["CLAUDE_CODE_GIT_BASH_PATH"] = candidate
+                        break
+
+        timeout_sec = int(self.settings.claude_code_timeout_seconds)
+        try:
+            with open(prompt_file.name, "r", encoding="utf-8") as stdin_f:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=stdin_f,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                try:
+                    stdout, stderr = proc.communicate(timeout=timeout_sec)
+                except subprocess.TimeoutExpired:
+                    if os.name == "nt":
+                        subprocess.run(
+                            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                            capture_output=True, timeout=10,
+                        )
+                    else:
+                        proc.kill()
+                    proc.wait(timeout=5)
+                    raise RuntimeError(
+                        f"Claude Code CLI timed out after {timeout_sec}s"
+                    )
+        finally:
+            try:
+                os.unlink(prompt_file.name)
+            except OSError:
+                pass
+
+        result = type("Result", (), {
+            "returncode": proc.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+        })()
+
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()[:500]
+            raise RuntimeError(f"Claude Code CLI failed (rc={result.returncode}): {stderr}")
+
+        content = (result.stdout or "").strip()
+        if not content:
+            raise RuntimeError("Claude Code CLI returned empty output")
+
         raw_plan = self._parse_json_content(content)
         if default_payload is not None:
             raw_plan = self._merge_plan_payload_with_defaults(raw_plan, default_payload)
@@ -1347,6 +1513,13 @@ class PrimaryAgentPlanner:
             "- If the user request asks to CREATE new files, list the NEW file paths (infer from the request text, e.g. filenames mentioned like 'database.rules.json'). "
             "- If the user request asks to MODIFY existing files, list the target paths (which may or may not overlap with citations). "
             "- If unsure, leave affected_code_locations empty rather than copying citations. "
+            "For must_touch_files, populate it ONLY when ALL of these hold: "
+            "(a) the request uses a destructive/modifying verb (remove, rename, delete, fix, refactor, replace, simplify, clean), "
+            "(b) repository retrieval has located one or more citation files that demonstrably contain the targeted symbol/string/behavior, "
+            "(c) the patch will be invalid if those files are not modified. "
+            "List the relative paths from retrieval citations that hold the existing dirty code that must be edited. "
+            "These files cannot be merely created or referenced \u2014 they must be edited. "
+            "Leave must_touch_files empty for pure scaffold/feature/question tasks. "
             "Return 3 to 5 short steps (exactly 4 for jira_issue_develop). Each step owner_role should be one of primary, planner, knowledge, action, reviewer. "
             "EVERY step MUST include all of these non-empty string fields: step_id, title, kind, owner_role, expected_output, success_criteria. "
             "Steps missing any of these fields will be discarded. "

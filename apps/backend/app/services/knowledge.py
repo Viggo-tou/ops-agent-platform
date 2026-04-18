@@ -38,8 +38,19 @@ TEXT_EXTENSIONS = {
     ".properties",
     ".yml",
     ".yaml",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+    ".css",
+    ".scss",
+    ".html",
+    ".py",
+    ".vue",
 }
-IGNORED_PARTS = {".git", ".gradle", "build", ".idea", "__pycache__"}
+IGNORED_PARTS = {".git", ".gradle", "build", ".idea", "__pycache__", "node_modules", "dist", ".next", "coverage", ".venv"}
 TOKEN_PATTERN = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]+")
 CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 SEMANTIC_EXPANSIONS = {

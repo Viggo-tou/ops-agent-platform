@@ -16,6 +16,7 @@ from app.schemas.knowledge import (
     KnowledgeUploadResponse,
 )
 from app.services.knowledge import KnowledgeService
+from app.services.knowledge_zip import ZipImportError, extract_zip_safely
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
 DbSession = Annotated[Session, Depends(get_db)]
@@ -77,6 +78,35 @@ async def upload_knowledge_documents(
     for upload in files:
         data = await upload.read()
         payload.append((upload.filename or "", data))
+
+    service = KnowledgeService(db)
+    try:
+        return service.upload_documents(files=payload, source_name=source_name)
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error))
+
+
+@router.post("/upload-zip", response_model=KnowledgeUploadResponse)
+async def upload_knowledge_zip(
+    db: DbSession,
+    _actor: KnowledgeUploadActorCtx,
+    archive: UploadFile = File(...),
+    source_name: str | None = Form(default=None),
+) -> KnowledgeUploadResponse:
+    archive_bytes = await archive.read()
+    if not archive_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Archive is empty.",
+        )
+
+    try:
+        payload = extract_zip_safely(archive_bytes)
+    except ZipImportError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"reason": error.reason, "entry": error.entry},
+        )
 
     service = KnowledgeService(db)
     try:
