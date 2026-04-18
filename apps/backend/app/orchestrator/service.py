@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import time
 from pathlib import Path
 
 from sqlalchemy import select
@@ -14,10 +16,16 @@ from app.core.enums import ActorRole, ApprovalStatus, EventSource, EventType, Ro
 from app.core.jira import extract_jira_issue_reference, looks_like_jira_issue_url
 from app.core.telemetry import get_current_trace_id, get_tracer
 from app.models.approval import Approval
+from app.models.event import Event
 from app.models.task import Task
 from app.models.tool_execution import ToolExecution
 from app.services.events import record_event, set_task_status
 from app.services.sandbox import ExecutionSandbox, SandboxError
+from app.services.spec_conformance import (
+    ConformanceReport,
+    build_goal_attestation,
+    check_spec_conformance,
+)
 from app.tools.gateway import ToolApprovalRequired, ToolGateway, ToolInvocationError
 
 
@@ -141,16 +149,41 @@ class PrimaryOrchestrator:
                 actor_name=actor_name,
                 issue_key=semantic_translation.issue_key,
             )
-            if issue_context is None:
+            if issue_context is None and task.scenario == "jira_issue_develop":
+                # Graceful fallback: proceed with translation-only context
+                # when the Jira issue can't be loaded (e.g. deleted project).
+                # _prefetch_jira_issue_context already marked the task as FAILED,
+                # so reset it back to CREATED to allow the pipeline to continue.
+                issue_context = {
+                    "key": semantic_translation.issue_key or "UNKNOWN",
+                    "summary": semantic_translation.objective or task.request_text or "",
+                    "description": semantic_translation.normalized_request or task.request_text or "",
+                    "status": "Unknown",
+                    "_synthetic": True,
+                }
+                set_task_status(
+                    self.db,
+                    task=task,
+                    new_status=TaskStatus.CREATED,
+                    new_stage=WorkflowStage.INTAKE,
+                    role=RoleName.PRIMARY,
+                    source=EventSource.ORCHESTRATOR,
+                    message="Jira issue unavailable — proceeding with translation-only context.",
+                )
+            elif issue_context is None:
                 return
 
-            semantic_translation = self._translate_request(
-                task=task,
-                actor_name=actor_name,
-                issue_context=issue_context,
-            )
-            self._apply_jira_issue_key_fallback(task=task, semantic_translation=semantic_translation)
-            task.translation_json = semantic_translation.model_dump(mode="json")
+            # Skip 2nd translation pass when using synthetic issue context —
+            # the 1st pass already has concrete grounding terms; re-translating
+            # with the empty synthetic context produces generic/unusable terms.
+            if not issue_context.get("_synthetic"):
+                semantic_translation = self._translate_request(
+                    task=task,
+                    actor_name=actor_name,
+                    issue_context=issue_context,
+                )
+                self._apply_jira_issue_key_fallback(task=task, semantic_translation=semantic_translation)
+                task.translation_json = semantic_translation.model_dump(mode="json")
             planning_knowledge_context = self._prefetch_planning_repository_context(
                 task=task,
                 actor_name=actor_name,
@@ -193,6 +226,18 @@ class PrimaryOrchestrator:
                 issue_context=None,
                 planning_knowledge_context=None,
             )
+
+        # --- Defense line 2: anchor pre-check ---
+        # If translation extracted grounding_terms/anchors, verify at least one
+        # exists in the knowledge source tree. If ALL are missing, the task is
+        # likely targeting the wrong repository — fail fast before planning.
+        # Skip when using synthetic Jira context — the grounding terms are just
+        # the Jira issue key, which will never appear in the codebase.
+        _skip_anchor = (
+            issue_context is not None and issue_context.get("_synthetic")
+        )
+        if not _skip_anchor and self._anchor_precheck_fails(task):
+            return
 
         set_task_status(
             self.db,
@@ -409,6 +454,23 @@ class PrimaryOrchestrator:
 
     def resume_after_approval(self, *, task: Task, actor_name: str, approval_id: str) -> None:
         plan_document = GeneratedPlan.model_validate(task.plan_json or {})
+        # T-039: for develop tasks paused at the post-conformance Jira
+        # transition gate, set the granted flag on pipeline_state and
+        # re-enter the develop pipeline. Cached pipeline_state entries
+        # (codegen, sandbox, review, conformance, attestation) short-
+        # circuit their stages, so the recursion only runs the Jira
+        # writeback + completion tail.
+        if (task.scenario or "") == "jira_issue_develop":
+            pipeline_state = self._load_develop_pipeline_state(task)
+            pending_id = pipeline_state.get("pending_jira_approval_id")
+            if pending_id == approval_id or pending_id is None:
+                pipeline_state["jira_approval_granted"] = True
+                pipeline_state.pop("pending_jira_approval_id", None)
+                self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+                self._execute_develop_pipeline(
+                    task=task, actor_name=actor_name, plan=plan_document, approval_id=approval_id
+                )
+                return
         self._execute_plan(task=task, actor_name=actor_name, plan=plan_document, approval_id=approval_id)
 
     def _translate_request(
@@ -1267,6 +1329,66 @@ class PrimaryOrchestrator:
         pipeline_state["context_file_paths"] = list(context_files)
         pipeline_state["context_files"] = context_files
 
+        # --- Evidence bundle gate (T-041-01) ---
+        if not pipeline_state.get("evidence_bundle_done"):
+            from app.services.evidence_bundle import build_evidence_bundle
+            from app.services.spec_conformance import _has_destructive_verb
+
+            translation = task.translation_json if isinstance(task.translation_json, dict) else {}
+            try:
+                evidence = build_evidence_bundle(
+                    request_text=task.request_text,
+                    normalized_request=translation.get("normalized_request"),
+                    source_tree=self._resolve_knowledge_source_path(),
+                    grounding_terms=translation.get("grounding_terms"),
+                    planner_must_touch=getattr(plan, "must_touch_files", None) or [],
+                    has_destructive_verb=_has_destructive_verb(task.request_text or ""),
+                )
+            except Exception as exc:
+                evidence = None
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_FAILED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.KNOWLEDGE,
+                    role=RoleName.KNOWLEDGE,
+                    tool_name="evidence_bundle.build",
+                    message=f"Evidence bundle errored: {exc}",
+                    payload={"error": str(exc)},
+                )
+            if evidence is not None:
+                pipeline_state["evidence_bundle"] = evidence.to_payload()
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=(
+                        EventType.TOOL_SUCCEEDED
+                        if evidence.verdict != "insufficient"
+                        else EventType.EXECUTION_FAILED
+                    ),
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.KNOWLEDGE,
+                    role=RoleName.KNOWLEDGE,
+                    tool_name="evidence_bundle.build",
+                    message=evidence.reason,
+                    payload=evidence.to_payload(),
+                )
+                if evidence.verdict == "insufficient":
+                    self._fail_develop_pipeline(
+                        task=task,
+                        message=f"Evidence bundle insufficient: {evidence.reason}",
+                        event_type=EventType.EXECUTION_FAILED,
+                        stage=WorkflowStage.KNOWLEDGE,
+                        role=RoleName.KNOWLEDGE,
+                        payload=evidence.to_payload(),
+                    )
+                    return
+                if evidence.must_touch_files and not getattr(plan, "must_touch_files", None):
+                    plan.must_touch_files = evidence.must_touch_files
+            pipeline_state["evidence_bundle_done"] = True
+            self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+
         codegen_result = pipeline_state.get("codegen_result")
         if not isinstance(codegen_result, dict):
             # --- Fast path: deterministic rename if applicable ---
@@ -1327,7 +1449,19 @@ class PrimaryOrchestrator:
             # Separate new-file stubs (empty content) from existing files.
             # New-file stubs go into a single dedicated batch so they are
             # only generated once instead of duplicated across every batch.
-            batch_size = 3
+            batch_size = 5
+            # Filter out non-modifiable / excessively large files that waste
+            # tokens and confuse the model (e.g. package-lock.json).
+            _CODEGEN_EXCLUDE_PATTERNS = frozenset({
+                "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+                "composer.lock", "Gemfile.lock", "poetry.lock",
+            })
+            _CODEGEN_MAX_FILE_CHARS = 50_000  # ~50KB — skip enormous files
+            context_files = {
+                p: c for p, c in context_files.items()
+                if p.split("/")[-1] not in _CODEGEN_EXCLUDE_PATTERNS
+                and len(c) <= _CODEGEN_MAX_FILE_CHARS
+            }
             existing_files = [(p, c) for p, c in context_files.items() if c.strip()]
             new_file_stubs = [(p, c) for p, c in context_files.items() if not c.strip()]
 
@@ -1380,7 +1514,16 @@ class PrimaryOrchestrator:
             seen_files: set[str] = set()
             codegen_provider = "unknown"
 
+            # Pipe translation constraints into plan_json so codegen sees them
+            _plan_json_for_codegen = dict(task.plan_json or plan.model_dump(mode="json"))
+            _translation = task.translation_json or {}
+            if _translation.get("constraints"):
+                _plan_json_for_codegen["constraints"] = _translation["constraints"]
+
             for batch_idx, batch_files in enumerate(batches):
+                # Delay between CLI-based codegen batches to avoid rate limiting
+                if batch_idx > 0:
+                    time.sleep(15)
                 batch_label = f"batch {batch_idx + 1}/{len(batches)}"
                 try:
                     batch_result = self._execute_develop_tool(
@@ -1388,9 +1531,14 @@ class PrimaryOrchestrator:
                         actor_name=actor_name,
                         tool_name="codegen.generate_patch",
                         payload={
-                            "plan_json": task.plan_json or plan.model_dump(mode="json"),
+                            "plan_json": _plan_json_for_codegen,
                             "context_files": batch_files,
-                            "task_description": task.request_text,
+                            "task_description": self._build_codegen_task_description(
+                                task=task,
+                                plan=plan,
+                                pipeline_state=pipeline_state,
+                                batch_files=batch_files,
+                            ),
                         },
                         stage=WorkflowStage.ACTION,
                         role=RoleName.ACTION,
@@ -1419,7 +1567,14 @@ class PrimaryOrchestrator:
                     # Deduplicate: skip files already produced by an earlier batch
                     novel_files = [f for f in batch_changed if f not in seen_files]
                     if novel_files and batch_diff:
-                        merged_diff_parts.append(batch_diff)
+                        # Strip diff hunks for already-seen files to prevent
+                        # overlapping patches that corrupt file content.
+                        if seen_files:
+                            batch_diff = self._strip_duplicate_diff_hunks(
+                                batch_diff, seen_files,
+                            )
+                        if batch_diff.strip():
+                            merged_diff_parts.append(batch_diff)
                     for f in novel_files:
                         seen_files.add(f)
                     merged_files_changed.extend(novel_files)
@@ -1683,7 +1838,7 @@ class PrimaryOrchestrator:
                         )
                 else:
                     # LLM-based retry: batch retry files (batch_size=3)
-                    retry_batch_size = 3
+                    retry_batch_size = 5
                     retry_items = list(retry_context.items())
                     retry_batches = [
                         dict(retry_items[i : i + retry_batch_size])
@@ -1691,6 +1846,8 @@ class PrimaryOrchestrator:
                     ]
 
                     for rb_idx, rb_files in enumerate(retry_batches):
+                        if rb_idx > 0:
+                            time.sleep(15)
                         rb_label = f"retry batch {rb_idx + 1}/{len(retry_batches)}"
                         try:
                             rb_result = self._execute_develop_tool(
@@ -1700,7 +1857,12 @@ class PrimaryOrchestrator:
                                 payload={
                                     "plan_json": task.plan_json or plan.model_dump(mode="json"),
                                     "context_files": rb_files,
-                                    "task_description": task.request_text,
+                                    "task_description": self._build_codegen_task_description(
+                                        task=task,
+                                        plan=plan,
+                                        pipeline_state=pipeline_state,
+                                        batch_files=rb_files,
+                                    ),
                                 },
                                 stage=WorkflowStage.ACTION,
                                 role=RoleName.ACTION,
@@ -1836,6 +1998,169 @@ class PrimaryOrchestrator:
             )
             return
 
+        # --- Diff shape check (T-041-02 + T-041-03) ---
+        if not pipeline_state.get("diff_shape_done"):
+            from app.services.diff_shape_checker import check_diff_shape
+            from app.services.spec_conformance import _classify_files_in_diff
+
+            file_shapes = _classify_files_in_diff(diff)
+            if diff.strip() and file_shapes:
+                try:
+                    shape_report = check_diff_shape(
+                        request_text=task.request_text or "",
+                        diff=diff,
+                        file_shapes=file_shapes,
+                    )
+                except Exception as exc:
+                    shape_report = None
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_FAILED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="diff_shape.check",
+                        message=f"Diff shape check errored: {exc}",
+                        payload={"error": str(exc)},
+                    )
+                if shape_report is not None:
+                    pipeline_state["diff_shape"] = shape_report.to_payload()
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_SUCCEEDED if not shape_report.blocked else EventType.REVIEW_FAILED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="diff_shape.check",
+                        message=(
+                            "Diff shape check passed."
+                            if not shape_report.blocked
+                            else f"Diff shape check blocked: {'; '.join(f.message for f in shape_report.findings if f.severity == 'block')}"
+                        ),
+                        payload=shape_report.to_payload(),
+                    )
+                    if shape_report.blocked:
+                        self._fail_develop_pipeline(
+                            task=task,
+                            event_type=EventType.REVIEW_FAILED,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            message=f"Diff shape: {'; '.join(f.message for f in shape_report.findings if f.severity == 'block')}",
+                            payload=shape_report.to_payload(),
+                        )
+                        return
+            pipeline_state["diff_shape_done"] = True
+            self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+
+        # --- Compile gate (T-040 defense line 5) with repair loop ---
+        if not pipeline_state.get("compile_gate_done"):
+            from app.services.compile_gate import run_compile_gate
+
+            sandbox_dir = self._develop_sandbox_dir(task)
+            changed = pipeline_state.get("files_changed") or []
+            max_compile_passes = 2  # initial check + 1 repair attempt
+
+            for compile_pass in range(max_compile_passes):
+                if not (sandbox_dir.exists() and changed):
+                    break
+
+                try:
+                    compile_result = run_compile_gate(
+                        sandbox_dir=sandbox_dir,
+                        changed_files=changed,
+                    )
+                except Exception as exc:
+                    compile_result = None
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_FAILED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="compile_gate.check",
+                        message=f"Compile gate errored: {exc}",
+                        payload={"error": str(exc)},
+                    )
+                    break  # Can't recover from an internal error
+
+                if compile_result is None:
+                    break
+
+                pipeline_state["compile_gate"] = {
+                    "passed": compile_result.passed,
+                    "errors": compile_result.errors,
+                }
+
+                if compile_result.passed:
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_SUCCEEDED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="compile_gate.check",
+                        message=compile_result.summary(),
+                        payload=pipeline_state["compile_gate"],
+                    )
+                    break  # Gate passed
+
+                # Gate failed — attempt repair on first pass only
+                if compile_pass == 0:
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.REVIEW_FAILED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="compile_gate.check",
+                        message=f"Compile gate failed (attempting repair): {compile_result.summary()}",
+                        payload=pipeline_state["compile_gate"],
+                    )
+                    repaired, repair_touched = self._attempt_compile_repair(
+                        task=task,
+                        actor_name=actor_name,
+                        compile_errors=compile_result.errors,
+                        sandbox_dir=sandbox_dir,
+                        pipeline_state=pipeline_state,
+                        approval_id=approval_id,
+                    )
+                    if repaired:
+                        # Merge repair-touched files into changed so
+                        # the next compile gate pass also checks them.
+                        changed = list(set(changed) | set(repair_touched))
+                        continue  # Re-run compile gate after repair
+                    # Repair failed or produced no changes — fall through to fail
+
+                # Final failure (repair exhausted or skipped)
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.REVIEW_FAILED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="compile_gate.check",
+                    message=compile_result.summary(),
+                    payload=pipeline_state["compile_gate"],
+                )
+                self._fail_develop_pipeline(
+                    task=task,
+                    event_type=EventType.REVIEW_FAILED,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    message=f"Compile gate: {compile_result.summary()}",
+                    payload=pipeline_state["compile_gate"],
+                )
+                return
+
+            pipeline_state["compile_gate_done"] = True
+            self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+
         review_result = pipeline_state.get("review_result")
         if not isinstance(review_result, dict):
             try:
@@ -1879,6 +2204,340 @@ class PrimaryOrchestrator:
                 role=RoleName.REVIEWER,
                 message=f"\u4ee3\u7801\u5ba1\u67e5\u672a\u901a\u8fc7\uff1a{violations}",
                 payload={"review_result": review_result, "plan_id": plan.plan_id},
+            )
+            return
+
+        # --- Spec conformance gate (T-038) ---
+        # Hard rules that catch "creative avoidance": shadow implementations,
+        # unchanged hit counts on anchors the request asked to remove, and
+        # patches that don't touch any file actually containing the anchors.
+        # Runs after diff_reviewer so the LLM-graded review has already had
+        # its say; conformance failures here mean the diff shape does not
+        # match the task intent regardless of code quality.
+        conformance_report = pipeline_state.get("conformance_report")
+        if not isinstance(conformance_report, ConformanceReport):
+            translation = task.translation_json if isinstance(task.translation_json, dict) else {}
+            normalized_request = translation.get("normalized_request") if translation else None
+            try:
+                conformance_report = check_spec_conformance(
+                    request_text=task.request_text,
+                    normalized_request=normalized_request if isinstance(normalized_request, str) else None,
+                    diff=diff,
+                    source_tree=self._resolve_knowledge_source_path(),
+                    must_touch_files=getattr(plan, "must_touch_files", []) or [],
+                )
+            except Exception as exc:
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_FAILED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="spec_conformance.check",
+                    message=f"Spec conformance check errored and was skipped: {exc}",
+                    payload={"error": str(exc)},
+                )
+                conformance_report = None
+            if isinstance(conformance_report, ConformanceReport):
+                # store only the JSON-safe payload in pipeline_state so
+                # persistence (both mid-pipeline flushes and the final
+                # latest_result_json write) never sees the dataclass. The
+                # ConformanceReport local is used for the block/retry
+                # logic below but is not persisted.
+                pipeline_state["conformance_report"] = conformance_report.to_payload()
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=(
+                        EventType.TOOL_SUCCEEDED
+                        if not conformance_report.blocked
+                        else EventType.REVIEW_FAILED
+                    ),
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="spec_conformance.check",
+                    message=(
+                        "Spec conformance passed."
+                        if not conformance_report.blocked
+                        else "Spec conformance blocked the diff."
+                    ),
+                    payload=conformance_report.to_payload(),
+                )
+                if not conformance_report.blocked:
+                    # T-038 goal-evidence attestation: positive proof that
+                    # each destructive sub-goal actually landed. Runs only
+                    # on the pass path so the final task result carries a
+                    # machine-checkable summary of what the patch changed.
+                    try:
+                        attestation = build_goal_attestation(
+                            request_text=task.request_text,
+                            normalized_request=(
+                                normalized_request
+                                if isinstance(normalized_request, str)
+                                else None
+                            ),
+                            diff=diff,
+                            source_tree=self._resolve_knowledge_source_path(),
+                        )
+                    except Exception as exc:
+                        attestation = {"error": str(exc)}
+                    pipeline_state["goal_attestation"] = attestation
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_SUCCEEDED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="spec_conformance.attest",
+                        message=(
+                            "Goal attestation: "
+                            + ("all goals met" if attestation.get("all_goals_met") else "partial")
+                        ),
+                        payload=attestation,
+                    )
+
+        if isinstance(conformance_report, ConformanceReport) and conformance_report.blocked:
+            blocks = "; ".join(conformance_report.block_messages()) or "unspecified"
+            attempts_used = int(pipeline_state.get("conformance_attempts", 0) or 0)
+            if attempts_used + 1 < self.MAX_CONFORMANCE_ATTEMPTS:
+                # T-038-A: clear downstream state, reset sandbox, push the
+                # block reasons into pipeline_state["conformance_feedback"]
+                # so the next codegen pass sees them, then recurse. The
+                # recursion adds one duplicate EXECUTION_STARTED event but
+                # otherwise re-runs only codegen→apply→review→conformance.
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_SKIPPED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="spec_conformance.retry",
+                    message=(
+                        f"Spec conformance failed (attempt {attempts_used + 1}/"
+                        f"{self.MAX_CONFORMANCE_ATTEMPTS}); resetting sandbox "
+                        "and re-running codegen with feedback."
+                    ),
+                    payload={
+                        "attempt": attempts_used + 1,
+                        "feedback": conformance_report.block_messages(),
+                    },
+                )
+                self._reset_for_conformance_retry(
+                    task=task,
+                    pipeline_state=pipeline_state,
+                    feedback=conformance_report.block_messages(),
+                )
+                # Cooldown before retry — avoids rate-limiting from
+                # back-to-back Claude Code CLI calls.
+                time.sleep(30)
+                return self._execute_develop_pipeline(
+                    task=task,
+                    actor_name=actor_name,
+                    plan=plan,
+                    approval_id=approval_id,
+                )
+
+            self._fail_develop_pipeline(
+                task=task,
+                event_type=EventType.REVIEW_FAILED,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                message=(
+                    "\u89c4\u8303\u4e00\u81f4\u6027\u68c0\u67e5\u672a\u901a\u8fc7\uff1a" + blocks
+                ),
+                payload={
+                    "conformance_report": conformance_report.to_payload(),
+                    "plan_id": plan.plan_id,
+                    "attempts_used": attempts_used + 1,
+                },
+            )
+            return
+
+        # --- T-041-06: Failing test first gate ---
+        if not pipeline_state.get("failing_test_gate_done"):
+            from app.services.failing_test_gate import check_failing_test_gate
+            from app.services.spec_conformance import _classify_files_in_diff as _clf_diff
+
+            ft_shapes = _clf_diff(diff) if diff.strip() else {}
+            try:
+                ft_report = check_failing_test_gate(
+                    request_text=task.request_text or "",
+                    file_shapes=ft_shapes,
+                    test_result=test_result if isinstance(test_result, dict) else None,
+                )
+            except Exception as exc:
+                ft_report = None
+                record_event(
+                    self.db, task_id=task.id,
+                    event_type=EventType.TOOL_FAILED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW, role=RoleName.REVIEWER,
+                    tool_name="failing_test_gate.check",
+                    message=f"Failing test gate errored: {exc}",
+                    payload={"error": str(exc)},
+                )
+            if ft_report is not None:
+                pipeline_state["failing_test_gate"] = ft_report.to_payload()
+                if ft_report.findings:
+                    record_event(
+                        self.db, task_id=task.id,
+                        event_type=EventType.TOOL_SUCCEEDED if ft_report.verdict != "block" else EventType.REVIEW_FAILED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW, role=RoleName.REVIEWER,
+                        tool_name="failing_test_gate.check",
+                        message=f"Failing test gate: {ft_report.verdict} ({len(ft_report.findings)} findings)",
+                        payload=ft_report.to_payload(),
+                    )
+                    if ft_report.verdict == "block":
+                        self._fail_develop_pipeline(
+                            task=task,
+                            event_type=EventType.REVIEW_FAILED,
+                            stage=WorkflowStage.REVIEW, role=RoleName.REVIEWER,
+                            message=f"Failing test gate: {ft_report.findings[0].message}",
+                            payload=ft_report.to_payload(),
+                        )
+                        return
+            pipeline_state["failing_test_gate_done"] = True
+            self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+
+        # --- T-041-08: Goal decomposition + per-file justification ---
+        if not pipeline_state.get("goal_decomp_done"):
+            from app.services.goal_decomposition import decompose_and_verify
+            from app.services.spec_conformance import _classify_files_in_diff as _clf_diff2
+
+            gd_shapes = _clf_diff2(diff) if diff.strip() else {}
+            try:
+                goal_report = decompose_and_verify(
+                    request_text=task.request_text or "",
+                    diff=diff,
+                    file_shapes=gd_shapes,
+                    source_tree=self._resolve_knowledge_source_path(),
+                    attestation=pipeline_state.get("goal_attestation"),
+                )
+            except Exception as exc:
+                goal_report = None
+                record_event(
+                    self.db, task_id=task.id,
+                    event_type=EventType.TOOL_FAILED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW, role=RoleName.REVIEWER,
+                    tool_name="goal_decomposition.check",
+                    message=f"Goal decomposition errored: {exc}",
+                    payload={"error": str(exc)},
+                )
+            if goal_report is not None:
+                pipeline_state["goal_decomposition"] = goal_report.to_payload()
+                record_event(
+                    self.db, task_id=task.id,
+                    event_type=EventType.TOOL_SUCCEEDED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW, role=RoleName.REVIEWER,
+                    tool_name="goal_decomposition.check",
+                    message=(
+                        f"Goals: {len(goal_report.sub_goals)}, "
+                        f"all met: {goal_report.all_goals_met}, "
+                        f"unjustified files: {goal_report.unjustified_files}"
+                    ),
+                    payload=goal_report.to_payload(),
+                )
+            pipeline_state["goal_decomp_done"] = True
+            self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+
+        # --- T-041-05: Symbol + reference gate ---
+        if not pipeline_state.get("symbol_ref_done"):
+            from app.services.symbol_reference_gate import check_symbol_references
+            try:
+                sym_report = check_symbol_references(
+                    diff=diff,
+                    source_tree=self._resolve_knowledge_source_path(),
+                )
+            except Exception as exc:
+                sym_report = None
+                record_event(
+                    self.db, task_id=task.id,
+                    event_type=EventType.TOOL_FAILED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW, role=RoleName.REVIEWER,
+                    tool_name="symbol_reference.check",
+                    message=f"Symbol reference check errored: {exc}",
+                    payload={"error": str(exc)},
+                )
+            if sym_report is not None and sym_report.findings:
+                pipeline_state["symbol_ref"] = sym_report.to_payload()
+                record_event(
+                    self.db, task_id=task.id,
+                    event_type=EventType.TOOL_SUCCEEDED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW, role=RoleName.REVIEWER,
+                    tool_name="symbol_reference.check",
+                    message=f"Symbol reference warnings: {len(sym_report.findings)}",
+                    payload=sym_report.to_payload(),
+                )
+            pipeline_state["symbol_ref_done"] = True
+            self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+
+        # --- T-041-04: evidence chain validation before approval ---
+        if not pipeline_state.get("evidence_chain_validated"):
+            chain_gaps: list[str] = []
+            attestation = pipeline_state.get("goal_attestation")
+            if isinstance(attestation, dict) and attestation.get("all_goals_met") is False:
+                unmet = [
+                    a["anchor"] for a in attestation.get("anchors", [])
+                    if a.get("status") == "not_achieved"
+                ]
+                if unmet:
+                    chain_gaps.append(f"Unmet goals: {unmet!r}")
+            conf = pipeline_state.get("conformance_report")
+            if isinstance(conf, dict) and conf.get("verdict") == "block":
+                chain_gaps.append("Conformance verdict is block")
+            shape = pipeline_state.get("diff_shape")
+            if isinstance(shape, dict) and shape.get("verdict") == "block":
+                chain_gaps.append("Diff shape verdict is block")
+            evidence = pipeline_state.get("evidence_bundle")
+            if isinstance(evidence, dict) and evidence.get("verdict") == "insufficient":
+                chain_gaps.append("Evidence bundle insufficient")
+            ft_gate = pipeline_state.get("failing_test_gate")
+            if isinstance(ft_gate, dict) and ft_gate.get("verdict") == "block":
+                chain_gaps.append("Failing test gate blocked")
+
+            pipeline_state["evidence_chain_validated"] = True
+            pipeline_state["evidence_chain_gaps"] = chain_gaps
+            if chain_gaps:
+                self._fail_develop_pipeline(
+                    task=task,
+                    event_type=EventType.REVIEW_FAILED,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    message=f"Evidence chain incomplete: {'; '.join(chain_gaps)}",
+                    payload={"gaps": chain_gaps},
+                )
+                return
+            self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+
+        # --- T-039: human approval gate before Jira transition ---
+        # After conformance+attestation pass, pause here so a human can
+        # review the diff/summary and either grant (→ Jira transitions)
+        # or reject (→ task completes, Jira untouched). Gated by the
+        # `develop_require_jira_approval` setting so tests/CI can disable it.
+        require_approval = bool(
+            getattr(self.tool_gateway.settings, "develop_require_jira_approval", True)
+        )
+        already_granted = bool(pipeline_state.get("jira_approval_granted"))
+        writeback_done = isinstance(pipeline_state.get("jira_writeback"), dict) and bool(
+            pipeline_state["jira_writeback"].get("transition")
+        )
+        if require_approval and not already_granted and not writeback_done:
+            self._request_jira_transition_approval(
+                task=task,
+                plan=plan,
+                pipeline_state=pipeline_state,
+                codegen_result=codegen_result,
+                review_result=review_result,
+                attestation=pipeline_state.get("goal_attestation"),
             )
             return
 
@@ -1934,6 +2593,7 @@ class PrimaryOrchestrator:
                 "review_verdict": review_result.get("verdict", ""),
                 "jira_transitioned": bool(jira_writeback.get("transition")),
                 "completeness_check": pipeline_state.get("completeness_check"),
+                "goal_attestation": pipeline_state.get("goal_attestation"),
             },
             "codegen": codegen_result,
             "sandbox": sandbox_result,
@@ -2186,7 +2846,86 @@ class PrimaryOrchestrator:
             if content is not None:
                 context_files[relative_path] = content
 
+        # --- Strategy 3: knowledge citations from the planning phase ---
+        # Fix for tasks where the request describes the change conceptually
+        # (e.g. "remove hardcoded username Minij across the codebase") and
+        # neither grep keywords nor the planner's affected_code_locations
+        # resolve to any file — but knowledge.search *did* return relevant
+        # citations during the planning prefetch. Those citations are still
+        # grounding, not edit targets, so we only fall back here when both
+        # earlier strategies produced no context. Without this fallback the
+        # pipeline hard-fails with "no context for affected files" even
+        # though the grounding data already exists in the task's events.
+        if not context_files:
+            for citation_path in self._citation_paths_from_planning_events(task):
+                relative_path = self._normalize_codegen_path(citation_path)
+                if not relative_path or relative_path in context_files:
+                    continue
+                content = self._read_context_file(
+                    source_path=source_path,
+                    sandbox_dir=sandbox_dir,
+                    relative_path=relative_path,
+                )
+                if content is not None:
+                    context_files[relative_path] = content
+
+        # --- Strategy 4: must_touch_files (guarantee full file context) ---
+        # The planner declares which files MUST be modified. Earlier strategies
+        # may miss these if grep keywords don't match or affected_code_locations
+        # is empty.  Reading them here ensures codegen always receives the
+        # complete file contents it needs — the same quality of context that a
+        # human-written spec would provide.
+        must_touch = getattr(plan, "must_touch_files", None) or []
+        for mt_path in must_touch:
+            relative_path = self._normalize_codegen_path(mt_path)
+            if not relative_path or relative_path in context_files:
+                continue
+            content = self._read_context_file(
+                source_path=source_path,
+                sandbox_dir=sandbox_dir,
+                relative_path=relative_path,
+            )
+            if content is not None:
+                context_files[relative_path] = content
+
         return context_files
+
+    def _citation_paths_from_planning_events(self, task: Task) -> list[str]:
+        """Pull relative_path values from the most recent KNOWLEDGE_RETRIEVED
+        event for this task. Used as Strategy 3 fallback in
+        _gather_codegen_context. Returns an empty list if no knowledge
+        retrieval ran or citations are missing.
+        """
+        stmt = (
+            select(Event.payload_json)
+            .where(Event.task_id == task.id)
+            .where(Event.event_type == EventType.KNOWLEDGE_RETRIEVED)
+            .order_by(Event.created_at.desc())
+            .limit(4)
+        )
+        paths: list[str] = []
+        seen: set[str] = set()
+        try:
+            payloads = list(self.db.scalars(stmt))
+        except Exception:
+            return paths
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+            citations = payload.get("citations")
+            if not isinstance(citations, list):
+                continue
+            for entry in citations:
+                if not isinstance(entry, dict):
+                    continue
+                raw = entry.get("relative_path") or entry.get("file_path") or entry.get("path")
+                if not isinstance(raw, str):
+                    continue
+                trimmed = raw.strip()
+                if trimmed and trimmed not in seen:
+                    seen.add(trimmed)
+                    paths.append(trimmed)
+        return paths
 
     @staticmethod
     def _extract_snippets(
@@ -2405,6 +3144,7 @@ class PrimaryOrchestrator:
         so the most relevant files come first.  At most 15 unique files.
         """
         code_extensions = {".kt", ".java", ".xml", ".json", ".py", ".ts", ".tsx", ".js", ".jsx"}
+        EXCLUDED_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "venv", "dist", "build", ".next"}
         max_files = 25
         # rel_path -> set of matched line numbers
         hits: dict[str, set[int]] = {}
@@ -2412,6 +3152,8 @@ class PrimaryOrchestrator:
         candidate_files: list[Path] = []
         try:
             for file_path in source_path.rglob("*"):
+                if EXCLUDED_DIRS.intersection(file_path.parts):
+                    continue
                 if file_path.suffix.lower() in code_extensions and file_path.is_file():
                     candidate_files.append(file_path)
                 if len(candidate_files) >= 2000:
@@ -2472,6 +3214,380 @@ class PrimaryOrchestrator:
         base_dir = Path(str(getattr(self.tool_gateway.settings, "sandbox_base_dir", "data/sandboxes")))
         return base_dir / task.id
 
+    # ----- Compile repair loop --------------------------------------------- #
+
+    def _attempt_compile_repair(
+        self,
+        *,
+        task: Task,
+        actor_name: str,
+        compile_errors: list[dict],
+        sandbox_dir: Path,
+        pipeline_state: dict,
+        approval_id: str | None,
+    ) -> tuple[bool, list[str]]:
+        """Attempt a narrow syntax-only repair after compile gate failure.
+
+        Processes each broken file individually (one codegen call per file)
+        to stay within the 300s timeout. Returns (any_applied, files_touched)
+        where files_touched is the list of file paths modified by repair diffs.
+        """
+        if not compile_errors:
+            return False, []
+
+        source_path = self._resolve_knowledge_source_path()
+        any_applied = False
+        all_repair_touched: list[str] = []
+
+        for err in compile_errors[:5]:  # Cap at 5 files
+            rel_path = err.get("file", "")
+            error_msg = err.get("error", "syntax error")
+            if not rel_path:
+                continue
+
+            full = sandbox_dir / rel_path.replace("/", "\\") if "\\" in str(sandbox_dir) else sandbox_dir / rel_path
+            if not full.exists():
+                continue
+
+            try:
+                broken_content = full.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            # Load original (pre-patch) version as reference
+            orig_section = ""
+            if source_path:
+                orig = self._read_knowledge_source_context_file(
+                    source_path=source_path,
+                    relative_path=rel_path,
+                )
+                if orig:
+                    orig_section = (
+                        f"\nORIGINAL FILE (before the broken patch was applied):\n"
+                        f"=== ORIGINAL {rel_path} ===\n{orig[:4000]}\n=== END ORIGINAL ===\n\n"
+                    )
+
+            repair_prompt = (
+                f"STRUCTURAL REPAIR TASK — fix ONE broken file: {rel_path}\n\n"
+                f"This file has a syntax error caused by a malformed patch. "
+                "Common problems include:\n"
+                "- Duplicated code blocks (same function/import appears twice)\n"
+                "- Code from inside a function appearing AFTER the module's "
+                "default export or closing brace\n"
+                "- Missing or extra brackets/parentheses from misaligned diff hunks\n"
+                "- Incomplete statements where lines were deleted incorrectly\n\n"
+                "RULES:\n"
+                "- Compare the BROKEN file with the ORIGINAL to find structural damage\n"
+                "- Remove any duplicated code blocks\n"
+                "- Fix bracket/parenthesis matching\n"
+                "- Restore proper function and component structure\n"
+                "- Keep the INTENDED changes (like role simplification, removing "
+                "hardcoded values) but fix the broken structure\n"
+                "- Do NOT add new features or change business logic beyond what "
+                "the original patch intended\n\n"
+                f"ERROR:\n  {rel_path}: {error_msg[:300]}\n\n"
+                + orig_section
+                + f"Output ONLY valid unified diff hunks that fix {rel_path}.\n"
+                f"Start with 'diff --git a/{rel_path} b/{rel_path}'.\n"
+                "If no fix is needed, output nothing.\n"
+            )
+
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_CALL_REQUESTED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="codegen.repair",
+                message=f"Attempting per-file syntax repair for {rel_path}",
+            )
+
+            # Cooldown before repair CLI call — avoids rate limiting from
+            # the preceding codegen + retry batches.
+            time.sleep(15)
+
+            repair_payload = {
+                "plan_json": {"objective": f"Fix syntax errors in {rel_path}", "steps": []},
+                "context_files": {rel_path: broken_content},
+                "task_description": repair_prompt,
+            }
+            repair_result = None
+            for _repair_attempt in range(2):  # 1 retry on failure
+                try:
+                    repair_result = self._execute_develop_tool(
+                        task=task,
+                        actor_name=actor_name,
+                        tool_name="codegen.generate_patch",
+                        payload=repair_payload,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        approval_id=approval_id,
+                        pipeline_state=pipeline_state,
+                    )
+                    break  # Success
+                except Exception as exc:
+                    if _repair_attempt == 0:
+                        time.sleep(20)  # Cool down before retry
+                        continue
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_FAILED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="codegen.repair",
+                        message=f"Syntax repair codegen failed for {rel_path}: {exc}",
+                    )
+            if repair_result is None:
+                continue
+
+            if not repair_result:
+                continue
+
+            repair_diff = str(repair_result.get("diff") or "").strip()
+            if not repair_diff:
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_FAILED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="codegen.repair",
+                    message=f"Syntax repair for {rel_path} produced no diff.",
+                )
+                continue
+
+            # Filter repair diff — only keep hunks targeting the broken file.
+            # The LLM sometimes emits stray hunks for unrelated files.
+            filtered_sections: list[str] = []
+            for section in re.split(r"(?=^diff --git )", repair_diff, flags=re.MULTILINE):
+                section = section.strip()
+                if not section:
+                    continue
+                m_hdr = re.match(r"diff --git a/(.+?) b/", section)
+                if m_hdr and m_hdr.group(1).strip() == rel_path:
+                    filtered_sections.append(section)
+                elif not m_hdr:
+                    # Leading preamble (before first diff header) — keep
+                    filtered_sections.append(section)
+            repair_diff = "\n".join(filtered_sections).strip()
+            if not repair_diff or "diff --git" not in repair_diff:
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_FAILED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="codegen.repair",
+                    message=f"Repair diff for {rel_path} contained only off-target hunks — skipped.",
+                )
+                continue
+
+            # Apply repair diff to sandbox
+            try:
+                sandbox = self._build_develop_sandbox(task)
+                sandbox.apply_patch(
+                    repair_diff,
+                    commit=False,
+                    commit_message=f"syntax repair: {rel_path}",
+                    timeout_seconds=15,
+                )
+                any_applied = True
+                # Extract file paths touched by this repair diff
+                for m in re.finditer(r"diff --git a/(.+?) b/", repair_diff):
+                    touched_path = m.group(1).strip()
+                    if touched_path and touched_path not in all_repair_touched:
+                        all_repair_touched.append(touched_path)
+                if rel_path not in all_repair_touched:
+                    all_repair_touched.append(rel_path)
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_SUCCEEDED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="codegen.repair",
+                    message=f"Syntax repair applied to {rel_path}.",
+                )
+            except Exception as exc:
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_FAILED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="codegen.repair",
+                    message=f"Repair diff apply failed for {rel_path}: {exc}",
+                )
+                continue
+
+        if any_applied:
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_SUCCEEDED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="codegen.repair",
+                message=f"Per-file repair complete. {len(all_repair_touched)} file(s) repaired. Re-running compile gate.",
+            )
+        return any_applied, all_repair_touched
+
+    # ----- T-038-A: retry plumbing ----------------------------------------- #
+
+    MAX_CONFORMANCE_ATTEMPTS: int = 2
+    DESTRUCTIVE_VERB_HINTS: tuple[str, ...] = (
+        "remove", "delete", "clean", "rename", "refactor", "fix",
+        "replace", "simplify", "strip", "eliminate", "drop", "disable",
+    )
+
+    def _build_codegen_task_description(
+        self,
+        *,
+        task: Task,
+        plan: GeneratedPlan,
+        pipeline_state: dict,
+        batch_files: dict[str, str] | None = None,
+    ) -> str:
+        """Augment the user's request with strict directives the codegen
+        tool must obey. Includes (a) shadow-implementation guard, (b) the
+        planner's must_touch_files commitment, and (c) feedback from a
+        previous failed conformance attempt when retrying.
+
+        When *batch_files* is provided, the must-touch directive is scoped
+        to only the files present in this batch's context. This prevents
+        the model from hallucinating diffs for files it has no content for.
+        """
+        original = (task.request_text or "").strip()
+        directives: list[str] = []
+
+        request_lower = original.lower()
+        if any(verb in request_lower for verb in self.DESTRUCTIVE_VERB_HINTS):
+            directives.append(
+                "DIRECTIVE: This task asks to modify or remove existing "
+                "behavior. Prefer modifying existing files over creating "
+                "new ones. Do not create a parallel implementation that "
+                "leaves the dirty existing code untouched."
+            )
+
+        must_touch = list(getattr(plan, "must_touch_files", []) or [])
+        if must_touch:
+            # Scope to current batch: only list files the model actually has
+            if batch_files is not None:
+                must_touch = [f for f in must_touch if f in batch_files]
+            if must_touch:
+                directives.append(
+                    "DIRECTIVE: The plan commits to modifying these files. "
+                    "Your patch MUST modify each one (not merely create new "
+                    "files alongside them): " + ", ".join(must_touch)
+                    + "\n\nIMPORTANT: Only modify files whose content is "
+                    "provided below. Do NOT generate diffs for files you "
+                    "cannot see."
+                )
+
+        feedback = pipeline_state.get("conformance_feedback")
+        if isinstance(feedback, list) and feedback:
+            joined = "; ".join(str(item) for item in feedback if item)
+            if joined:
+                directives.append(
+                    "RETRY FEEDBACK: A previous patch was rejected by the "
+                    "spec-conformance gate for these reasons — " + joined +
+                    ". Address each reason in this attempt."
+                )
+
+        if not directives:
+            return original
+        return original + "\n\n" + "\n\n".join(directives)
+
+    @staticmethod
+    def _strip_duplicate_diff_hunks(diff_text: str, seen_files: set[str]) -> str:
+        """Remove diff sections for files already produced by an earlier batch.
+
+        Splits on ``diff --git`` or ``--- a/`` boundaries and drops any
+        section whose target file path is in *seen_files*.
+        """
+        import re as _re
+        # Split on "diff --git a/X b/X" or bare "--- a/X" headers
+        sections = _re.split(r"(?m)^(?=diff --git |--- a/)", diff_text)
+        kept: list[str] = []
+        for section in sections:
+            if not section.strip():
+                continue
+            # Extract file path from "diff --git a/X b/X" or "--- a/X"
+            m = _re.match(r"diff --git a/(.+?) b/", section)
+            if not m:
+                m = _re.match(r"--- a/(.+)", section)
+            if m:
+                fpath = m.group(1).strip()
+                if fpath in seen_files:
+                    continue  # Skip duplicate
+            kept.append(section)
+        return "\n".join(kept)
+
+    def _reset_for_conformance_retry(
+        self,
+        *,
+        task: Task,
+        pipeline_state: dict,
+        feedback: list[str],
+    ) -> None:
+        """Clear pipeline_state of all stages downstream of context_files
+        so the next pipeline pass re-runs codegen→apply→review→conformance.
+        Also wipes the on-disk sandbox so apply_patch starts from a clean
+        clone instead of stacking diffs.
+        """
+        for key in (
+            "codegen_result",
+            "diff",
+            "files_changed",
+            "codegen_provider",
+            "file_summaries",
+            "sandbox_result",
+            "patch_method",
+            "completeness_check",
+            "test_result",
+            "review_result",
+            "review_verdict",
+            "conformance_report",
+            "diff_shape_done",
+            "diff_shape",
+            "compile_gate_done",
+            "compile_gate",
+            "failing_test_gate_done",
+            "failing_test_gate",
+            "goal_decomp_done",
+            "goal_decomposition",
+            "symbol_ref_done",
+            "symbol_ref",
+            "evidence_chain_validated",
+            "evidence_chain_gaps",
+            "goal_attestation",
+            "retry_done",
+        ):
+            pipeline_state.pop(key, None)
+        pipeline_state["conformance_feedback"] = list(feedback)
+        pipeline_state["conformance_attempts"] = (
+            int(pipeline_state.get("conformance_attempts", 0) or 0) + 1
+        )
+
+        sandbox_dir = self._develop_sandbox_dir(task)
+        if sandbox_dir.exists():
+            try:
+                shutil.rmtree(sandbox_dir, ignore_errors=False)
+            except OSError:
+                # best-effort; if the dir can't be removed (file lock on
+                # Windows, etc.), apply_patch will surface the failure.
+                pass
+
+        self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+
     @staticmethod
     def _normalize_codegen_path(relative_path: str) -> str | None:
         normalized = str(relative_path or "").strip().replace("\\", "/")
@@ -2509,6 +3625,66 @@ class PrimaryOrchestrator:
                 seen.add(norm)
                 out.append(norm)
         return out
+
+    def _anchor_precheck_fails(self, task: Task) -> bool:
+        """Defense line 2: reject tasks whose anchors are absent from the knowledge source.
+
+        Returns True (and fails the task) when ALL anchors from the
+        translation are missing from the source tree. Checks grounding_terms,
+        search_queries, AND quoted identifiers from the normalized request.
+        Partial hits proceed normally — the anchor might be a new concept
+        being added.
+        """
+        translation = task.translation_json or {}
+        anchors = list(translation.get("grounding_terms") or [])
+
+        # Also pull search_queries from translation (often more specific)
+        search_queries = translation.get("search_queries") or []
+        for sq in search_queries:
+            if sq and sq not in anchors:
+                anchors.append(sq)
+
+        # Also extract quoted identifiers from the normalized request
+        normalized = translation.get("normalized_request") or ""
+        if normalized:
+            from app.services.spec_conformance import _extract_quoted_anchors
+            for qa in _extract_quoted_anchors(normalized):
+                if qa and qa not in anchors:
+                    anchors.append(qa)
+
+        if not anchors:
+            return False
+
+        source_path = self._resolve_knowledge_source_path()
+        if source_path is None:
+            return False
+
+        from app.services.spec_conformance import _find_files_containing_anchor
+
+        missing = [a for a in anchors if not _find_files_containing_anchor(source_path, a)]
+        if missing and len(missing) == len(anchors):
+            msg = (
+                "## Task rejected: anchors not found\n\n"
+                f"The request references {missing!r} but none of these "
+                f"appear in the configured knowledge source "
+                f"({source_path.name}). This likely means the task is "
+                f"targeting a different repository. Please verify the "
+                f"knowledge source configuration."
+            )
+            self._fail_develop_pipeline(
+                task=task,
+                message=msg,
+                event_type=EventType.EXECUTION_FAILED,
+                stage=WorkflowStage.KNOWLEDGE,
+                role=RoleName.KNOWLEDGE,
+                payload={
+                    "scenario": "anchor_not_found",
+                    "missing_anchors": missing,
+                    "source_name": source_path.name,
+                },
+            )
+            return True
+        return False
 
     def _resolve_knowledge_source_path(self) -> Path | None:
         path_str = str(getattr(self.tool_gateway.settings, "knowledge_source_path", "") or "").strip()
@@ -2669,10 +3845,15 @@ class PrimaryOrchestrator:
 
     def _preserve_develop_pipeline_state(self, *, task: Task, pipeline_state: dict[str, object]) -> None:
         # Strip large data (context_files, diff) before persisting to avoid bloating the DB
-        persistable = {
-            k: v for k, v in pipeline_state.items()
-            if k != "context_files"
-        }
+        persistable: dict[str, object] = {}
+        for k, v in pipeline_state.items():
+            if k == "context_files":
+                continue
+            if isinstance(v, ConformanceReport):
+                # in-memory object is not JSON serializable; persist its payload
+                persistable[k] = v.to_payload()
+            else:
+                persistable[k] = v
         latest_result = dict(task.latest_result_json) if isinstance(task.latest_result_json, dict) else {}
         latest_result["pipeline_state"] = persistable
         task.latest_result_json = latest_result
@@ -2685,6 +3866,119 @@ class PrimaryOrchestrator:
     def _is_missing_test_pipeline_config_error(error_message: str) -> bool:
         normalized = error_message.casefold()
         return "config not found" in normalized or ("not found" in normalized and "config" in normalized)
+
+    def _request_jira_transition_approval(
+        self,
+        *,
+        task: Task,
+        plan: GeneratedPlan,
+        pipeline_state: dict[str, object],
+        codegen_result: dict[str, object],
+        review_result: dict[str, object],
+        attestation: object,
+    ) -> None:
+        """Create a pending Approval for the final Jira transition step and
+        park the task in AWAITING_APPROVAL. The diff, change summary,
+        files_changed, conformance/review verdicts, and goal attestation
+        are all put into both ``task.latest_result_json`` (so the task
+        detail page can render them) and ``approval.request_payload_json``
+        (so the approval queue page can).
+        """
+        issue_key = self._resolve_develop_issue_key(task) or "unknown"
+        diff = str(pipeline_state.get("diff") or codegen_result.get("diff") or "")
+        files_changed = codegen_result.get("files_changed") or pipeline_state.get("files_changed") or []
+        summary_md = self._build_develop_summary(pipeline_state)
+        preview_result = {
+            "scenario": "jira_issue_develop",
+            "issue_key": issue_key,
+            "summary": plan.change_summary,
+            "files_changed": list(files_changed),
+            "diff": diff,
+            "patch_method": pipeline_state.get("patch_method", ""),
+            "test_skipped": pipeline_state.get("test_skipped", False),
+            "review_verdict": review_result.get("verdict", ""),
+            "jira_transitioned": False,
+            "conformance_report": pipeline_state.get("conformance_report"),
+            "goal_attestation": attestation,
+        }
+
+        approval = Approval(
+            task_id=task.id,
+            action_name="jira.transition_issue",
+            status=ApprovalStatus.PENDING,
+            requested_by_role=RoleName.REVIEWER,
+            approver_role=ActorRole.TEAM_LEAD.value,
+            requested_by_actor_name=task.actor_name,
+            risk_level=task.risk_level,
+            risk_category=task.risk_category,
+            reason=(
+                "Code changes passed spec conformance and goal attestation. "
+                "Manual approval required before transitioning the Jira issue."
+            ),
+            request_payload_json={
+                "stage": "post_codegen_pre_jira_transition",
+                "scenario": "jira_issue_develop",
+                "issue_key": issue_key,
+                "summary_markdown": summary_md,
+                "files_changed": list(files_changed),
+                "diff": diff,
+                "review_verdict": review_result.get("verdict"),
+                "conformance_report": pipeline_state.get("conformance_report"),
+                "goal_attestation": attestation,
+            },
+            policy_snapshot_json={
+                "decision": "require_approval",
+                "source": "develop_post_conformance_gate",
+                "tool_name": "jira.transition_issue",
+                "actor_name": task.actor_name,
+                "actor_role": task.actor_role.value,
+                "risk_level": task.risk_level.value,
+                "risk_category": task.risk_category.value,
+                "required_approver_role": ActorRole.TEAM_LEAD.value,
+            },
+        )
+        self.db.add(approval)
+        self.db.flush()
+
+        # Mark pipeline_state so resume_after_approval knows to skip straight
+        # to jira_writeback without re-running earlier stages.
+        pipeline_state["pending_jira_approval_id"] = approval.id
+        self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+
+        task.pending_approval = True
+        task.latest_result_json = {
+            "status": TaskStatus.AWAITING_APPROVAL.value,
+            "message": summary_md,
+            "approval_id": approval.id,
+            "result": preview_result,
+            "pipeline_state": pipeline_state,
+        }
+
+        set_task_status(
+            self.db,
+            task=task,
+            new_status=TaskStatus.AWAITING_APPROVAL,
+            new_stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            source=EventSource.ORCHESTRATOR,
+            message="Awaiting human approval before Jira transition.",
+        )
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.APPROVAL_REQUESTED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            message="Approval requested for Jira transition.",
+            payload={
+                "approval_id": approval.id,
+                "action_name": approval.action_name,
+                "approver_role": approval.approver_role,
+                "issue_key": issue_key,
+                "files_changed": list(files_changed),
+            },
+        )
 
     def _fail_develop_pipeline(
         self,

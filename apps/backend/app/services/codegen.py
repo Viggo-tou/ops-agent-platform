@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import difflib
 import json
+import os
 import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -58,7 +63,9 @@ CRITICAL RULES:
 4. Only include files that you actually modified or newly created. Do not include unchanged files.
 5. Make minimal, focused changes. Do not refactor unrelated code.
 6. Preserve existing code style (indentation, naming conventions).
-7. You CAN create entirely new files. If the task requires a new file that does not exist yet, include it in the files array with the correct path and full content. This is expected and encouraged when the task calls for it.
+7. You CAN create entirely new files when the task clearly requires it. BUT: if the task text contains any of "do not create new files", "touch only", "only modify these files", "only these N files", you MUST NOT introduce any new file that is not already present in the provided FILE CONTEXT. Violating an explicit scope constraint is worse than producing an empty patch.
+8. If the task declares specific target files (e.g. "delete X from src/data/mockUsers.js"), your output MUST include those files in the `files` array with the intended modification applied. Do not route the change through newly created wrapper/helper modules.
+9. If you cannot satisfy the task without violating constraints (e.g. the target files are missing from FILE CONTEXT), output {"files": [], "error": "targets_not_in_context"} instead of fabricating unrelated changes.
 
 EXAMPLE 1 (modify existing file):
 Given a file app/greet.py with content:
@@ -93,17 +100,25 @@ class CodeGenerator:
         del task_id
         providers = self._resolve_provider_chain()
 
+        import logging as _log
+        _logger = _log.getLogger("codegen.provider_chain")
+        _logger.info("Provider chain: %s", providers)
+
         for provider_idx, provider in enumerate(providers):
+            _logger.info("Trying provider %d/%d: %s", provider_idx + 1, len(providers), provider)
             try:
-                return self._try_provider(
+                result = self._try_provider(
                     provider=provider,
                     plan_json=plan_json,
                     context_files=context_files,
                     task_description=task_description,
                 )
+                _logger.info("Provider %s succeeded: %d files changed", provider, len(result.files_changed))
+                return result
             except CodegenError as exc:
+                _logger.warning("Provider %s failed: %s", provider, str(exc)[:300])
                 if _is_provider_level_error(exc) and provider_idx < len(providers) - 1:
-                    # Provider-level failure (auth, billing, network) — try next provider
+                    _logger.info("Classified as provider-level error — trying next provider")
                     continue
                 raise
 
@@ -150,6 +165,10 @@ class CodeGenerator:
                     )
 
             try:
+                if provider == "claude_code":
+                    return self._call_claude_code(call_prompt, context_files=context_files)
+                if provider == "codex":
+                    return self._call_codex(call_prompt, context_files=context_files)
                 if provider == "anthropic":
                     return self._call_anthropic(call_prompt)
                 if provider == "deepseek":
@@ -172,11 +191,23 @@ class CodeGenerator:
 
     def _resolve_provider_chain(self) -> list[str]:
         """Return an ordered list of providers to try. Auto mode returns all configured providers."""
+        # Explicit codegen_provider override takes priority
+        codegen_override = getattr(self.settings, "codegen_provider", None)
+        if codegen_override and codegen_override != "auto":
+            return [codegen_override]
+
         provider = self.settings.primary_agent_provider
-        if provider != "auto":
+        if provider not in ("auto", "claude_code"):
             return [provider]
 
         chain: list[str] = []
+        # Prefer codex first — its --full-auto sandbox mode reliably edits
+        # files.  claude_code sandbox still needs debugging (the CLI doesn't
+        # modify files when stdin/stdout are piped via --dangerously-skip-permissions).
+        if shutil.which(self.settings.codex_command):
+            chain.append("codex")
+        if shutil.which(self.settings.claude_code_command):
+            chain.append("claude_code")
         if getattr(self.settings, "anthropic_api_key", None):
             chain.append("anthropic")
         if getattr(self.settings, "deepseek_api_key", None):
@@ -247,6 +278,264 @@ class CodeGenerator:
         except httpx.HTTPError as exc:
             raise CodegenError(f"Anthropic API error: {exc}") from exc
 
+    def _call_claude_code(self, prompt: str, *, context_files: dict[str, str]) -> CodegenResult:
+        """Call Claude Code CLI for code generation via sandbox file editing."""
+        claude_cmd = shutil.which(self.settings.claude_code_command)
+        if not claude_cmd:
+            raise CodegenError(f"Claude Code CLI not found: {self.settings.claude_code_command}")
+
+        workdir = tempfile.mkdtemp(prefix="ops_claude_code_")
+        try:
+            # Write context files into the working directory
+            for rel_path, content in context_files.items():
+                full = Path(workdir) / rel_path
+                full.parent.mkdir(parents=True, exist_ok=True)
+                full.write_text(content, encoding="utf-8")
+
+            # Initialize git repo so claude trusts the directory
+            subprocess.run(
+                ["git", "init"], cwd=workdir,
+                capture_output=True, timeout=10,
+            )
+            subprocess.run(
+                ["git", "add", "."], cwd=workdir,
+                capture_output=True, timeout=10,
+            )
+            subprocess.run(
+                ["git", "-c", "user.name=ops", "-c", "user.email=ops@local",
+                 "commit", "-m", "init", "--allow-empty"],
+                cwd=workdir, capture_output=True, timeout=10,
+            )
+
+            # Build instruction for Claude Code
+            claude_instruction = (
+                "You are modifying files in this directory to implement the following task.\n"
+                "Only modify or create the files described. Do not delete unrelated files.\n\n"
+                + prompt
+            )
+
+            env = {**os.environ}
+            # Do NOT pass ANTHROPIC_API_KEY - Claude Code CLI should use its own
+            # OAuth session, not the possibly-exhausted API key.
+            env.pop("ANTHROPIC_API_KEY", None)
+            # Windows: Claude Code CLI needs git-bash path
+            if os.name == "nt" and "CLAUDE_CODE_GIT_BASH_PATH" not in env:
+                git_bash_candidates = [
+                    "D:\\Git\\bin\\bash.exe",
+                    "C:\\Program Files\\Git\\bin\\bash.exe",
+                    "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+                ]
+                for candidate in git_bash_candidates:
+                    if os.path.isfile(candidate):
+                        env["CLAUDE_CODE_GIT_BASH_PATH"] = candidate
+                        break
+
+            # Write prompt to temp file for stdin (Windows pipe buffer workaround)
+            prompt_file = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", delete=False, encoding="utf-8",
+            )
+            prompt_file.write(claude_instruction)
+            prompt_file.close()
+
+            # Run claude WITHOUT --print so it edits files directly in the sandbox
+            claude_args = self.settings.claude_code_args.split()
+            # Remove --print/-p if present (we want file editing, not text output)
+            claude_args = [a for a in claude_args if a not in ("--print", "-p")]
+            # Add --dangerously-skip-permissions so tool use works non-interactively
+            # (equivalent of codex --full-auto). Safe because we run in a temp sandbox.
+            if "--dangerously-skip-permissions" not in claude_args:
+                claude_args.append("--dangerously-skip-permissions")
+            cmd = [claude_cmd, *claude_args, "-"]
+            timeout_sec = int(self.settings.claude_code_timeout_seconds)
+
+            try:
+                with open(prompt_file.name, "r", encoding="utf-8") as stdin_f:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdin=stdin_f,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        cwd=workdir,
+                        env=env,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    try:
+                        stdout, stderr = proc.communicate(timeout=timeout_sec)
+                    except subprocess.TimeoutExpired:
+                        if os.name == "nt":
+                            subprocess.run(
+                                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                                capture_output=True, timeout=10,
+                            )
+                        else:
+                            proc.kill()
+                        proc.wait(timeout=5)
+                        raise CodegenError(
+                            f"Claude Code CLI timed out after {timeout_sec}s"
+                        )
+            finally:
+                try:
+                    os.unlink(prompt_file.name)
+                except OSError:
+                    pass
+
+            if proc.returncode != 0:
+                stderr_text = (stderr or "").strip()[:500]
+                raise CodegenError(f"Claude Code CLI codegen failed (rc={proc.returncode}): {stderr_text}")
+
+            # Diff original vs modified files (same approach as _call_codex)
+            modified_files: list[dict[str, str]] = []
+            work_path = Path(workdir)
+            for file_path in work_path.rglob("*"):
+                if file_path.is_dir():
+                    continue
+                rel = str(file_path.relative_to(work_path)).replace("\\", "/")
+                # Skip git internals
+                if rel.startswith(".git/") or rel.startswith(".git\\"):
+                    continue
+                try:
+                    new_content = file_path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                original_content = context_files.get(rel, "")
+                if new_content != original_content:
+                    modified_files.append({
+                        "path": rel,
+                        "content": new_content,
+                        "summary": "Modified by Claude Code CLI",
+                    })
+
+            if not modified_files:
+                raise CodegenError("Claude Code CLI did not modify any files.")
+
+            diff_text, files_changed = self._generate_diff_from_files(context_files, modified_files)
+            file_summaries = [{"path": f["path"], "summary": f["summary"]} for f in modified_files]
+            summary = f"Generated patch modifying {len(files_changed)} file(s): {', '.join(files_changed[:5])}"
+
+            return CodegenResult(
+                diff=diff_text,
+                summary=summary,
+                files_changed=files_changed,
+                file_summaries=file_summaries,
+                provider_name="claude_code",
+                model_name="claude-code-cli",
+            )
+        except CodegenError:
+            raise
+        except subprocess.TimeoutExpired:
+            raise CodegenError(f"Claude Code CLI timed out after {self.settings.claude_code_timeout_seconds}s")
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    def _call_codex(self, prompt: str, *, context_files: dict[str, str]) -> CodegenResult:
+        """Call OpenAI Codex CLI (codex exec) for code generation.
+
+        Strategy: write context files into a temp directory, run ``codex exec``
+        there, then diff original vs modified files to produce a unified diff.
+        """
+        codex_cmd = shutil.which(self.settings.codex_command)
+        if not codex_cmd:
+            raise CodegenError(f"Codex CLI not found: {self.settings.codex_command}")
+
+        workdir = tempfile.mkdtemp(prefix="ops_codex_")
+        try:
+            # Write context files into the working directory
+            for rel_path, content in context_files.items():
+                full = Path(workdir) / rel_path
+                full.parent.mkdir(parents=True, exist_ok=True)
+                full.write_text(content, encoding="utf-8")
+
+            # Initialize git repo so codex trusts the directory
+            subprocess.run(
+                ["git", "init"], cwd=workdir,
+                capture_output=True, timeout=10,
+            )
+            subprocess.run(
+                ["git", "add", "."], cwd=workdir,
+                capture_output=True, timeout=10,
+            )
+            subprocess.run(
+                ["git", "-c", "user.name=ops", "-c", "user.email=ops@local",
+                 "commit", "-m", "init", "--allow-empty"],
+                cwd=workdir, capture_output=True, timeout=10,
+            )
+
+            # Build instruction for Codex — passed via stdin to avoid
+            # Windows command-line length limits
+            codex_instruction = (
+                "You are modifying files in this directory to implement the following task.\n"
+                "Only modify or create the files described. Do not delete unrelated files.\n\n"
+                f"{prompt}"
+            )
+
+            env = {**os.environ}
+            if self.settings.openai_api_key:
+                env["OPENAI_API_KEY"] = self.settings.openai_api_key
+
+            cmd = [
+                codex_cmd, "exec",
+                "--full-auto",
+                "-",  # read prompt from stdin
+            ]
+
+            result = subprocess.run(
+                cmd,
+                input=codex_instruction,
+                cwd=workdir,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=int(self.settings.codex_timeout_seconds),
+            )
+
+            if result.returncode != 0:
+                stderr = (result.stderr or "").strip()[:500]
+                raise CodegenError(f"Codex CLI failed (rc={result.returncode}): {stderr}")
+
+            # Diff original vs modified files
+            modified_files: list[dict[str, str]] = []
+            work_path = Path(workdir)
+            for file_path in work_path.rglob("*"):
+                if file_path.is_dir():
+                    continue
+                rel = str(file_path.relative_to(work_path)).replace("\\", "/")
+                # Skip git internals
+                if rel.startswith(".git/") or rel.startswith(".git\\"):
+                    continue
+                try:
+                    new_content = file_path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                original_content = context_files.get(rel, "")
+                if new_content != original_content:
+                    modified_files.append({
+                        "path": rel,
+                        "content": new_content,
+                        "summary": "Modified by Codex CLI",
+                    })
+
+            if not modified_files:
+                raise CodegenError("Codex CLI did not modify any files.")
+
+            diff_text, files_changed = self._generate_diff_from_files(context_files, modified_files)
+            file_summaries = [{"path": f["path"], "summary": f["summary"]} for f in modified_files]
+            summary = f"Generated patch modifying {len(files_changed)} file(s): {', '.join(files_changed[:5])}"
+
+            return CodegenResult(
+                diff=diff_text,
+                summary=summary,
+                files_changed=files_changed,
+                file_summaries=file_summaries,
+                provider_name="codex",
+                model_name="codex-cli",
+            )
+        except subprocess.TimeoutExpired:
+            raise CodegenError(f"Codex CLI timed out after {self.settings.codex_timeout_seconds}s")
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
     def _build_prompt(
         self,
         plan_json: dict[str, Any],
@@ -268,7 +557,7 @@ class CodeGenerator:
                 "- ONLY include files you actually changed or newly created. Do NOT include unchanged files.",
                 "- If a file has no relevant code to modify, skip it entirely.",
                 "- The 'content' field must be the COMPLETE file after your modifications.",
-                "- You CAN and SHOULD create new files when the task requires them, even if they are not listed in FILE CONTEXT.",
+                "- Only create new files when the task explicitly requires new files. If the task says to modify existing files, modify THOSE files — do NOT create wrapper or helper files instead.",
                 "- Return only valid JSON using the required files array.",
             ]
         else:
@@ -292,6 +581,23 @@ class CodeGenerator:
 
         if task_description.strip():
             parts.extend(["", "=== TASK DESCRIPTION ===", task_description.strip()])
+
+        # Inject constraints from translation if available
+        constraints = plan_json.get("constraints") or []
+        if not constraints:
+            # Try to extract from the task description for backwards compat
+            td_lower = task_description.lower()
+            if "do not create new files" in td_lower or "touch only" in td_lower:
+                constraints.append("Do not create new files.")
+            if "only" in td_lower and "files" in td_lower:
+                import re as _re
+                m = _re.search(r"touch only (?:those |these )?(\w+) files?", td_lower)
+                if m:
+                    constraints.append(f"Touch only the {m.group(1)} specified files.")
+        if constraints:
+            parts.extend(["", "=== CONSTRAINTS (MUST OBEY) ==="])
+            for c in constraints:
+                parts.append(f"- {c}")
 
         # Compact plan: only include steps, not full JSON
         steps = plan_json.get("steps", [])
@@ -383,7 +689,7 @@ class CodeGenerator:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
-            "max_tokens": 8192,
+            "max_tokens": 32768,
         }
         try:
             response = httpx.post(
@@ -592,7 +898,7 @@ class CodeGenerator:
         )
 
     def _parse_json_codegen_response(self, content: str) -> list[dict[str, Any]]:
-        """Parse MiniMax JSON codegen response. Handles markdown code fences."""
+        """Parse JSON codegen response (MiniMax, Claude Code, Ollama). Handles markdown code fences."""
         text = content.strip()
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -601,24 +907,28 @@ class CodeGenerator:
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise CodegenError(f"MiniMax JSON response could not be parsed: {exc}") from exc
+            # Include the first 300 chars of content for debugging
+            preview = text[:300].replace("\n", "\\n")
+            raise CodegenError(
+                f"JSON codegen response could not be parsed: {exc} | content_preview: {preview}"
+            ) from exc
 
         if not isinstance(data, dict):
-            raise CodegenError("MiniMax JSON response must be an object with a files array.")
+            raise CodegenError("JSON codegen response must be an object with a files array.")
 
         files = data.get("files", [])
         if not files:
-            raise CodegenError("MiniMax JSON response contains no files.")
+            raise CodegenError("JSON codegen response contains no files.")
         if not isinstance(files, list):
-            raise CodegenError("MiniMax JSON response files field must be a list.")
+            raise CodegenError("JSON codegen response files field must be a list.")
 
         for file_entry in files:
             if not isinstance(file_entry, dict):
-                raise CodegenError("MiniMax JSON response has a non-object file entry.")
+                raise CodegenError("JSON codegen response has a non-object file entry.")
             if not isinstance(file_entry.get("path"), str) or not file_entry["path"].strip():
-                raise CodegenError("MiniMax JSON response has file entry with missing path.")
+                raise CodegenError("JSON codegen response has file entry with missing path.")
             if not isinstance(file_entry.get("content"), str):
-                raise CodegenError(f"MiniMax JSON response has no content for {file_entry['path']}.")
+                raise CodegenError(f"JSON codegen response has no content for {file_entry['path']}.")
 
         return files
 
@@ -660,7 +970,7 @@ class CodeGenerator:
             files_changed.append(path)
 
         if not diff_parts:
-            raise CodegenError("MiniMax JSON response produced no files with changes.")
+            raise CodegenError("JSON codegen response produced no files with changes.")
 
         return "\n".join(diff_parts) + "\n", files_changed
 
@@ -681,6 +991,7 @@ def _is_retryable_codegen_error(exc: CodegenError) -> bool:
             "json",
             "no files",
             "missing path",
+            "empty output",
         )
     )
 
@@ -694,11 +1005,13 @@ def _is_provider_level_error(exc: CodegenError) -> bool:
         for key in (
             "api error",
             "credit balance",
+            "usage limit",
             "unauthorized",
             "forbidden",
             "rate limit",
             "timeout",
             "not configured",
+            "not found",
             "connection",
             "503",
             "502",
