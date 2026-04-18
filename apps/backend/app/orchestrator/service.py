@@ -2161,30 +2161,36 @@ class PrimaryOrchestrator:
             pipeline_state["compile_gate_done"] = True
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
 
-        # --- Runtime validation gate ---
+        # --- Runtime validation gate (with 1 repair cycle) ---
         if not pipeline_state.get("runtime_validation_done"):
-            from app.services.runtime_validation import validate_diff_semantics
+            from app.services.runtime_validation import validate_diff_semantics, build_repair_prompt
+            import logging as _rv_logging
 
-            try:
-                rv_report = validate_diff_semantics(
-                    diff=diff,
-                    context_files=pipeline_state.get("context_files", {}),
-                    request_text=task.request_text or "",
-                )
-            except Exception as exc:
-                rv_report = None
-                record_event(
-                    self.db,
-                    task_id=task.id,
-                    event_type=EventType.TOOL_FAILED,
-                    source=EventSource.ORCHESTRATOR,
-                    stage=WorkflowStage.REVIEW,
-                    role=RoleName.REVIEWER,
-                    tool_name="runtime_validation.check",
-                    message=f"Runtime validation errored: {exc}",
-                    payload={"error": str(exc)},
-                )
-            if rv_report is not None:
+            _rv_logger = _rv_logging.getLogger("orchestrator.runtime_validation")
+            _rv_max_passes = 2  # initial check + 1 repair attempt
+
+            for rv_pass in range(_rv_max_passes):
+                try:
+                    rv_report = validate_diff_semantics(
+                        diff=diff,
+                        context_files=pipeline_state.get("context_files", {}),
+                        request_text=task.request_text or "",
+                    )
+                except Exception as exc:
+                    rv_report = None
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_FAILED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="runtime_validation.check",
+                        message=f"Runtime validation errored: {exc}",
+                        payload={"error": str(exc)},
+                    )
+                    break
+
                 pipeline_state["runtime_validation"] = rv_report.to_payload()
                 record_event(
                     self.db,
@@ -2201,28 +2207,99 @@ class PrimaryOrchestrator:
                     message=rv_report.summary(),
                     payload=rv_report.to_payload(),
                 )
-                # Log warnings even when passed - they inform the diff reviewer.
-                if rv_report.findings:
-                    import logging
 
-                    rv_logger = logging.getLogger("orchestrator.runtime_validation")
-                    for finding in rv_report.findings:
-                        rv_logger.warning(
-                            "Runtime validation [%s] %s: %s",
-                            finding.severity,
-                            finding.file,
-                            finding.message,
-                        )
-                if not rv_report.passed:
-                    self._fail_develop_pipeline(
-                        task=task,
-                        event_type=EventType.REVIEW_FAILED,
-                        stage=WorkflowStage.REVIEW,
-                        role=RoleName.REVIEWER,
-                        message=f"Runtime validation: {rv_report.summary()}",
-                        payload=rv_report.to_payload(),
+                for finding in rv_report.findings:
+                    _rv_logger.warning(
+                        "Runtime validation [%s] %s: %s",
+                        finding.severity, finding.file, finding.message,
                     )
-                    return
+
+                if rv_report.passed:
+                    break  # Gate passed
+
+                # --- Attempt semantic repair (first pass only) ---
+                if rv_pass == 0:
+                    repair_prompt = build_repair_prompt(rv_report.findings)
+                    if repair_prompt:
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_CALL_REQUESTED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            tool_name="runtime_validation.repair",
+                            message="Attempting semantic repair based on runtime validation findings",
+                        )
+
+                        time.sleep(15)  # Rate-limit cooldown
+
+                        repair_payload = {
+                            "plan_json": {"objective": "Fix runtime validation issues", "steps": []},
+                            "context_files": pipeline_state.get("context_files", {}),
+                            "task_description": repair_prompt,
+                        }
+                        try:
+                            repair_result = self._execute_develop_tool(
+                                task=task,
+                                actor_name=actor_name,
+                                tool_name="codegen.generate_patch",
+                                payload=repair_payload,
+                                stage=WorkflowStage.REVIEW,
+                                role=RoleName.REVIEWER,
+                                approval_id=approval_id,
+                                pipeline_state=pipeline_state,
+                            )
+                            repair_diff = str((repair_result or {}).get("diff", "")).strip()
+                            if repair_diff:
+                                # Apply repair diff to sandbox and re-run validation
+                                diff = repair_diff
+                                pipeline_state["diff"] = diff
+                                record_event(
+                                    self.db,
+                                    task_id=task.id,
+                                    event_type=EventType.TOOL_SUCCEEDED,
+                                    source=EventSource.ORCHESTRATOR,
+                                    stage=WorkflowStage.REVIEW,
+                                    role=RoleName.REVIEWER,
+                                    tool_name="runtime_validation.repair",
+                                    message="Semantic repair produced a patch; re-validating",
+                                )
+                                continue  # Re-run validation with repaired diff
+                            else:
+                                record_event(
+                                    self.db,
+                                    task_id=task.id,
+                                    event_type=EventType.TOOL_FAILED,
+                                    source=EventSource.ORCHESTRATOR,
+                                    stage=WorkflowStage.REVIEW,
+                                    role=RoleName.REVIEWER,
+                                    tool_name="runtime_validation.repair",
+                                    message="Semantic repair produced no diff",
+                                )
+                        except Exception as exc:
+                            record_event(
+                                self.db,
+                                task_id=task.id,
+                                event_type=EventType.TOOL_FAILED,
+                                source=EventSource.ORCHESTRATOR,
+                                stage=WorkflowStage.REVIEW,
+                                role=RoleName.REVIEWER,
+                                tool_name="runtime_validation.repair",
+                                message=f"Semantic repair codegen failed: {exc}",
+                            )
+
+                # Final failure — repair exhausted or not attempted
+                self._fail_develop_pipeline(
+                    task=task,
+                    event_type=EventType.REVIEW_FAILED,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    message=f"Runtime validation: {rv_report.summary()}",
+                    payload=rv_report.to_payload(),
+                )
+                return
+
             pipeline_state["runtime_validation_done"] = True
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
 

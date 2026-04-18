@@ -49,6 +49,9 @@ class ValidationReport:
         }
 
 
+_WARN_ESCALATION_THRESHOLD = 3
+
+
 def validate_diff_semantics(
     diff: str,
     context_files: dict[str, str],
@@ -70,6 +73,14 @@ def validate_diff_semantics(
     findings.extend(_check_case_sensitive_comparisons(diff, context_files))
     findings.extend(_check_replacement_completeness(diff, context_files))
 
+    # Escalate to block when too many warnings of the same rule accumulate
+    rule_counts: dict[str, int] = {}
+    for f in findings:
+        rule_counts[f.rule] = rule_counts.get(f.rule, 0) + 1
+    for f in findings:
+        if f.severity == "warn" and rule_counts.get(f.rule, 0) >= _WARN_ESCALATION_THRESHOLD:
+            f.severity = "block"
+
     has_block = any(f.severity == "block" for f in findings)
     return ValidationReport(passed=not has_block, findings=findings)
 
@@ -80,6 +91,7 @@ def _check_case_sensitive_comparisons(
 ) -> list[ValidationFinding]:
     """Detect added strict comparisons where the original used different casing."""
     findings: list[ValidationFinding] = []
+    seen: set[tuple[str, str, str]] = set()
 
     current_file = ""
     for line in diff.splitlines():
@@ -93,9 +105,13 @@ def _check_case_sensitive_comparisons(
                 if not original:
                     continue
                 pattern = re.compile(re.escape(match), re.IGNORECASE)
-                orig_matches = pattern.findall(original)
-                for om in orig_matches:
+                orig_variants = set(pattern.findall(original))
+                for om in orig_variants:
                     if om != match and om.lower() == match.lower():
+                        key = (current_file, match, om)
+                        if key in seen:
+                            continue
+                        seen.add(key)
                         findings.append(
                             ValidationFinding(
                                 file=current_file,
@@ -245,6 +261,38 @@ def _check_health_endpoint() -> RuntimeFinding | None:
         return None
     except (urllib.error.URLError, OSError):
         return None
+
+
+def build_repair_prompt(findings: list[ValidationFinding]) -> str:
+    """Build a codegen repair prompt from runtime validation findings."""
+    blocks = [f for f in findings if f.severity == "block"]
+    if not blocks:
+        return ""
+
+    files = sorted({f.file for f in blocks})
+    issues_by_file: dict[str, list[str]] = {}
+    for f in blocks:
+        issues_by_file.setdefault(f.file, []).append(f"  - [{f.rule}] {f.message}")
+
+    lines = [
+        "RUNTIME VALIDATION REPAIR — fix semantic issues detected by automated analysis.\n",
+        "The following files have issues that would break at runtime:\n",
+    ]
+    for path in files:
+        lines.append(f"\n### {path}")
+        for issue in issues_by_file[path]:
+            lines.append(issue)
+
+    lines.append(
+        "\n\nRULES:\n"
+        "- Fix ONLY the issues listed above.\n"
+        "- Use case-insensitive comparisons (.toLowerCase() / .lower()) "
+        "when the data source may use different casing.\n"
+        "- Ensure string replacements are complete across all affected files.\n"
+        "- Do NOT add new features or change unrelated logic.\n"
+        "- Output ONLY valid unified diff hunks.\n"
+    )
+    return "\n".join(lines)
 
 
 def check_browser_smoke() -> RuntimeReport:
