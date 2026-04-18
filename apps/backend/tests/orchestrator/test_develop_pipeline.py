@@ -21,7 +21,7 @@ from app.agents.schemas import (  # noqa: E402
     PlanStep,
     PlanTool,
 )
-from app.core.enums import EventType, RiskLevel, RoleName, TaskStatus, ToolPermissionCategory, WorkflowStage  # noqa: E402
+from app.core.enums import ActorRole, EventType, RiskLevel, RoleName, TaskStatus, ToolPermissionCategory, WorkflowStage  # noqa: E402
 from app.orchestrator.service import PrimaryOrchestrator, classify_request  # noqa: E402
 
 
@@ -112,6 +112,7 @@ def _task(plan: GeneratedPlan) -> SimpleNamespace:
         id="task-1",
         session_id="session-1",
         actor_name="tester",
+        actor_role=ActorRole.ADMIN,
         request_text="\u628a OPS-123 \u505a\u4e86",
         scenario="jira_issue_develop",
         status=TaskStatus.QUEUED,
@@ -121,6 +122,8 @@ def _task(plan: GeneratedPlan) -> SimpleNamespace:
         latest_result_json=None,
         pending_approval=False,
         retry_count=0,
+        risk_level=RiskLevel.MEDIUM,
+        risk_category=RiskLevel.MEDIUM,
     )
 
 
@@ -146,6 +149,7 @@ class DevelopPipelineTests(unittest.TestCase):
         orchestrator.tool_gateway.settings.sandbox_base_dir = str(self.temp_dir)
         orchestrator.tool_gateway.settings.knowledge_source_path = None
         orchestrator.tool_gateway.settings.knowledge_max_file_bytes = 120_000
+        orchestrator.tool_gateway.settings.develop_require_jira_approval = False
         orchestrator._sync_retry_count = Mock()
         return orchestrator
 

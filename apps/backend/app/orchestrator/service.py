@@ -2161,6 +2161,71 @@ class PrimaryOrchestrator:
             pipeline_state["compile_gate_done"] = True
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
 
+        # --- Runtime validation gate ---
+        if not pipeline_state.get("runtime_validation_done"):
+            from app.services.runtime_validation import validate_diff_semantics
+
+            try:
+                rv_report = validate_diff_semantics(
+                    diff=diff,
+                    context_files=pipeline_state.get("context_files", {}),
+                    request_text=task.request_text or "",
+                )
+            except Exception as exc:
+                rv_report = None
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_FAILED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="runtime_validation.check",
+                    message=f"Runtime validation errored: {exc}",
+                    payload={"error": str(exc)},
+                )
+            if rv_report is not None:
+                pipeline_state["runtime_validation"] = rv_report.to_payload()
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=(
+                        EventType.TOOL_SUCCEEDED
+                        if rv_report.passed
+                        else EventType.REVIEW_FAILED
+                    ),
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="runtime_validation.check",
+                    message=rv_report.summary(),
+                    payload=rv_report.to_payload(),
+                )
+                # Log warnings even when passed - they inform the diff reviewer.
+                if rv_report.findings:
+                    import logging
+
+                    rv_logger = logging.getLogger("orchestrator.runtime_validation")
+                    for finding in rv_report.findings:
+                        rv_logger.warning(
+                            "Runtime validation [%s] %s: %s",
+                            finding.severity,
+                            finding.file,
+                            finding.message,
+                        )
+                if not rv_report.passed:
+                    self._fail_develop_pipeline(
+                        task=task,
+                        event_type=EventType.REVIEW_FAILED,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        message=f"Runtime validation: {rv_report.summary()}",
+                        payload=rv_report.to_payload(),
+                    )
+                    return
+            pipeline_state["runtime_validation_done"] = True
+            self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+
         review_result = pipeline_state.get("review_result")
         if not isinstance(review_result, dict):
             try:
