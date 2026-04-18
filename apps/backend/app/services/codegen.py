@@ -201,9 +201,8 @@ class CodeGenerator:
             return [provider]
 
         chain: list[str] = []
-        # Prefer codex first — its --full-auto sandbox mode reliably edits
-        # files.  claude_code sandbox still needs debugging (the CLI doesn't
-        # modify files when stdin/stdout are piped via --dangerously-skip-permissions).
+        # Both CLIs use a temp-dir sandbox.  Codex uses --full-auto;
+        # Claude Code uses -p --dangerously-skip-permissions.
         if shutil.which(self.settings.codex_command):
             chain.append("codex")
         if shutil.which(self.settings.claude_code_command):
@@ -279,7 +278,19 @@ class CodeGenerator:
             raise CodegenError(f"Anthropic API error: {exc}") from exc
 
     def _call_claude_code(self, prompt: str, *, context_files: dict[str, str]) -> CodegenResult:
-        """Call Claude Code CLI for code generation via sandbox file editing."""
+        """Call Claude Code CLI for code generation via sandbox file editing.
+
+        Uses ``-p`` (print/non-interactive mode) combined with
+        ``--dangerously-skip-permissions`` so the CLI can use its built-in
+        Edit/Bash tools without prompting.  ``-p`` does NOT disable tool use;
+        it only makes the CLI read a prompt, execute, print output, and exit
+        — exactly what we need for a headless sandbox run.
+
+        Previous versions omitted ``-p``, which caused the CLI to start in
+        interactive/TTY mode.  With stdin/stdout piped (no TTY) the
+        interactive session would exit cleanly (rc 0) without editing any
+        files.
+        """
         claude_cmd = shutil.which(self.settings.claude_code_command)
         if not claude_cmd:
             raise CodegenError(f"Claude Code CLI not found: {self.settings.claude_code_command}")
@@ -307,10 +318,11 @@ class CodeGenerator:
                 cwd=workdir, capture_output=True, timeout=10,
             )
 
-            # Build instruction for Claude Code
+            # Build instruction for Claude Code — tell it to edit files in cwd
             claude_instruction = (
                 "You are modifying files in this directory to implement the following task.\n"
-                "Only modify or create the files described. Do not delete unrelated files.\n\n"
+                "Only modify or create the files described. Do not delete unrelated files.\n"
+                "Use the Edit and Write tools to make changes directly to the files.\n\n"
                 + prompt
             )
 
@@ -337,16 +349,29 @@ class CodeGenerator:
             prompt_file.write(claude_instruction)
             prompt_file.close()
 
-            # Run claude WITHOUT --print so it edits files directly in the sandbox
+            # Build CLI args.
+            # -p (print mode) is REQUIRED for non-interactive / piped usage.
+            # Without -p the CLI enters interactive/TTY mode which silently
+            # does nothing when stdin/stdout are not a terminal.
+            # --dangerously-skip-permissions allows Edit/Bash tool use without
+            # prompting (equivalent of codex --full-auto).  Safe because we
+            # run inside a disposable temp-dir sandbox.
             claude_args = self.settings.claude_code_args.split()
-            # Remove --print/-p if present (we want file editing, not text output)
-            claude_args = [a for a in claude_args if a not in ("--print", "-p")]
-            # Add --dangerously-skip-permissions so tool use works non-interactively
-            # (equivalent of codex --full-auto). Safe because we run in a temp sandbox.
+            # Ensure -p / --print is present
+            if "-p" not in claude_args and "--print" not in claude_args:
+                claude_args.append("--print")
+            # Ensure --dangerously-skip-permissions is present
             if "--dangerously-skip-permissions" not in claude_args:
                 claude_args.append("--dangerously-skip-permissions")
+            # Use --output-format json for structured output we can inspect
+            if "--output-format" not in " ".join(claude_args):
+                claude_args.extend(["--output-format", "json"])
             cmd = [claude_cmd, *claude_args, "-"]
             timeout_sec = int(self.settings.claude_code_timeout_seconds)
+
+            import logging as _log
+            _logger = _log.getLogger("codegen.claude_code")
+            _logger.info("Claude Code CLI cmd: %s (cwd=%s)", cmd, workdir)
 
             try:
                 with open(prompt_file.name, "r", encoding="utf-8") as stdin_f:
@@ -381,11 +406,19 @@ class CodeGenerator:
                 except OSError:
                     pass
 
+            _logger.info(
+                "Claude Code CLI finished (rc=%d, stdout=%d chars, stderr=%d chars)",
+                proc.returncode, len(stdout or ""), len(stderr or ""),
+            )
             if proc.returncode != 0:
                 stderr_text = (stderr or "").strip()[:500]
                 raise CodegenError(f"Claude Code CLI codegen failed (rc={proc.returncode}): {stderr_text}")
 
-            # Diff original vs modified files (same approach as _call_codex)
+            # Diff original vs modified files (same approach as _call_codex).
+            # In -p mode with --dangerously-skip-permissions, Claude Code CLI
+            # edits files in cwd using its built-in Edit/Write tools, then
+            # prints its conversation output to stdout.  We diff the sandbox
+            # filesystem to find what changed.
             modified_files: list[dict[str, str]] = []
             work_path = Path(workdir)
             for file_path in work_path.rglob("*"):
@@ -407,8 +440,22 @@ class CodeGenerator:
                         "summary": "Modified by Claude Code CLI",
                     })
 
+            # If -p mode didn't edit files (e.g. CLI version doesn't support
+            # tool use in print mode), fall back to parsing the JSON/text
+            # output for file contents.
+            if not modified_files and stdout and stdout.strip():
+                _logger.info("No file modifications detected in sandbox; attempting to parse CLI output")
+                modified_files = self._parse_claude_code_output(stdout, context_files)
+
             if not modified_files:
-                raise CodegenError("Claude Code CLI did not modify any files.")
+                # Include a snippet of stdout/stderr for diagnostics
+                out_preview = (stdout or "")[:300].replace("\n", "\\n")
+                err_preview = (stderr or "")[:200].replace("\n", "\\n")
+                raise CodegenError(
+                    f"Claude Code CLI did not modify any files. "
+                    f"stdout[:{min(len(stdout or ''), 300)}]: {out_preview} | "
+                    f"stderr[:{min(len(stderr or ''), 200)}]: {err_preview}"
+                )
 
             diff_text, files_changed = self._generate_diff_from_files(context_files, modified_files)
             file_summaries = [{"path": f["path"], "summary": f["summary"]} for f in modified_files]
@@ -428,6 +475,56 @@ class CodeGenerator:
             raise CodegenError(f"Claude Code CLI timed out after {self.settings.claude_code_timeout_seconds}s")
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+
+    def _parse_claude_code_output(
+        self,
+        stdout: str,
+        context_files: dict[str, str],
+    ) -> list[dict[str, str]]:
+        """Best-effort extraction of file contents from Claude Code CLI output.
+
+        When ``-p --output-format json`` is used, the CLI emits a JSON object
+        with a ``result`` field containing the assistant's text response.  If
+        the response itself contains a JSON code block with a ``files`` array
+        (matching our JSON-mode codegen schema), we parse it.  Otherwise we
+        attempt to extract raw JSON from the output.
+
+        Returns an empty list if nothing useful can be extracted (caller
+        should raise CodegenError).
+        """
+        text = stdout.strip()
+
+        # --output-format json wraps the response in {"result": "...", ...}
+        try:
+            wrapper = json.loads(text)
+            if isinstance(wrapper, dict) and "result" in wrapper:
+                text = wrapper["result"]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        # Try direct JSON parse (the response may be pure JSON)
+        try:
+            return self._parse_json_codegen_response(text)
+        except CodegenError:
+            pass
+
+        # Try to find a JSON code block inside the text
+        json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if json_match:
+            try:
+                return self._parse_json_codegen_response(json_match.group(1))
+            except CodegenError:
+                pass
+
+        # Try to find raw {"files": [...]} anywhere in the text
+        files_match = re.search(r'(\{"files"\s*:\s*\[.*?\]\s*\})', text, re.DOTALL)
+        if files_match:
+            try:
+                return self._parse_json_codegen_response(files_match.group(1))
+            except CodegenError:
+                pass
+
+        return []
 
     def _call_codex(self, prompt: str, *, context_files: dict[str, str]) -> CodegenResult:
         """Call OpenAI Codex CLI (codex exec) for code generation.
