@@ -52,6 +52,8 @@ def _settings(provider: str = "mock") -> SimpleNamespace:
         internal_db_url=None,
         internal_db_timeout_seconds=8.0,
         internal_db_retry_count=0,
+        claude_code_command="npx",
+        codex_command="codex",
     )
 
 
@@ -256,17 +258,19 @@ class CodeGeneratorTests(unittest.TestCase):
         self.assertEqual(definition.permission_category, ToolPermissionCategory.WRITE)
         self.assertIn("codegen", definition.tags)
 
-    def test_resolve_provider_anthropic_auto(self) -> None:
+    @patch("shutil.which", return_value=None)
+    def test_resolve_provider_anthropic_auto(self, _mock_which) -> None:
         settings = _settings("auto")
         settings.anthropic_api_key = "sk-test"
 
-        # Auto mode now returns a chain; the first entry is the preferred provider.
+        # With no CLIs available, anthropic key should be first in chain.
         self.assertEqual(CodeGenerator(settings)._resolve_provider_chain()[0], "anthropic")
 
     def test_resolve_provider_anthropic_explicit(self) -> None:
         self.assertEqual(CodeGenerator(_settings("anthropic"))._resolve_provider_chain(), ["anthropic"])
 
-    def test_resolve_provider_auto_prefers_anthropic_over_minimax(self) -> None:
+    @patch("shutil.which", return_value=None)
+    def test_resolve_provider_auto_prefers_anthropic_over_minimax(self, _mock_which) -> None:
         settings = _settings("auto")
         settings.anthropic_api_key = "sk-test"
         settings.minimax_api_key = "minimax-test"

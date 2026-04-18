@@ -30,6 +30,8 @@ def _settings(provider: str = "auto") -> SimpleNamespace:
         anthropic_api_key="sk-test",
         anthropic_base_url="https://api.anthropic.com",
         anthropic_model="claude-sonnet-4-20250514",
+        claude_code_command="npx",
+        codex_command="codex",
     )
 
 
