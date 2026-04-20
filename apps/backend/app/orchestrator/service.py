@@ -1234,6 +1234,10 @@ class PrimaryOrchestrator:
             payload={"plan_id": plan.plan_id, "approval_id": approval_id},
         )
 
+        # Resolve once — reused throughout the pipeline to avoid repeated
+        # disk/config lookups (previously called ~8 times per pipeline run).
+        _pipeline_source_path = self._resolve_knowledge_source_path()
+
         context_files = self._gather_codegen_context(task=task, plan=plan)
         if not context_files:
             # Check if the plan expects new files to be created — if so, proceed with empty context
@@ -1270,7 +1274,7 @@ class PrimaryOrchestrator:
 
         # Also detect new-file-creation when context_files is non-empty but
         # the plan references paths that don't exist in the gathered context.
-        source_path = self._resolve_knowledge_source_path()
+        source_path = _pipeline_source_path
         sandbox_dir = self._develop_sandbox_dir(task)
         if not pipeline_state.get("_new_file_task"):
             new_file_stubs_added = False
@@ -1339,7 +1343,7 @@ class PrimaryOrchestrator:
                 evidence = build_evidence_bundle(
                     request_text=task.request_text,
                     normalized_request=translation.get("normalized_request"),
-                    source_tree=self._resolve_knowledge_source_path(),
+                    source_tree=_pipeline_source_path,
                     grounding_terms=translation.get("grounding_terms"),
                     planner_must_touch=getattr(plan, "must_touch_files", None) or [],
                     has_destructive_verb=_has_destructive_verb(task.request_text or ""),
@@ -1465,6 +1469,15 @@ class PrimaryOrchestrator:
             existing_files = [(p, c) for p, c in context_files.items() if c.strip()]
             new_file_stubs = [(p, c) for p, c in context_files.items() if not c.strip()]
 
+            # Use pipeline-level source path for batch construction + codegen calls
+            _source_path = _pipeline_source_path
+
+            # Worktree mode: Claude Code has full repo visibility, so batching
+            # just causes duplicate runs that produce the same diff.  Collapse
+            # all context files into a single batch when a valid source repo is
+            # available (which triggers worktree codegen in codegen.py).
+            _use_worktree_single_batch = bool(_source_path)
+
             # If this is a new-file task (detected by any of the three paths
             # above), only run ONE batch with the new-file stubs plus a small
             # grounding slice. The existing_files that appeared in context are
@@ -1473,7 +1486,10 @@ class PrimaryOrchestrator:
             is_new_file_task = bool(pipeline_state.get("_new_file_task"))
 
             batches: list[dict[str, str]] = []
-            if is_new_file_task and new_file_stubs:
+            if _use_worktree_single_batch:
+                # Single batch: all files together — worktree gives full repo access
+                batches.append(dict(context_files))
+            elif is_new_file_task and new_file_stubs:
                 new_batch = dict(new_file_stubs)
                 for p, c in existing_files[:batch_size]:
                     new_batch.setdefault(p, c)
@@ -1539,6 +1555,7 @@ class PrimaryOrchestrator:
                                 pipeline_state=pipeline_state,
                                 batch_files=batch_files,
                             ),
+                            "source_repo_path": str(_source_path) if _source_path else None,
                         },
                         stage=WorkflowStage.ACTION,
                         role=RoleName.ACTION,
@@ -1722,16 +1739,27 @@ class PrimaryOrchestrator:
                     self._detect_rename_pair(task)
                 )
                 if rename_pair:
+                    # Rename task: grep for OLD identifier (should be gone)
                     pipeline_state["_rename_pair"] = rename_pair
                     completeness_keywords = [rename_pair[0]]
                 else:
-                    translation = task.translation_json or {}
-                    completeness_keywords = [
-                        t for t in translation.get("grounding_terms", [])
-                        if isinstance(t, str)
-                        and len(t) >= 3
-                        and " " not in t  # single-word identifiers only
-                    ]
+                    # Non-rename tasks: keyword completeness check only makes
+                    # sense for destructive operations (remove/delete/replace)
+                    # where grounding_terms should disappear after the patch.
+                    # For additive tasks (add JSDoc, add feature) the terms
+                    # will still be present — grepping for them produces false
+                    # negatives that trigger wasteful auto-retries.
+                    from app.services.spec_conformance import _has_destructive_verb
+                    if _has_destructive_verb(task.request_text or ""):
+                        translation = task.translation_json or {}
+                        completeness_keywords = [
+                            t for t in translation.get("grounding_terms", [])
+                            if isinstance(t, str)
+                            and len(t) >= 3
+                            and " " not in t  # single-word identifiers only
+                        ]
+                    else:
+                        completeness_keywords = []
                 already_changed: set[str] = set()
                 for p in pipeline_state.get("files_changed", []):
                     already_changed.add(self._normalize_codegen_path(str(p)) or str(p))
@@ -1783,7 +1811,7 @@ class PrimaryOrchestrator:
         ):
             retry_file_paths = list((completeness.get("details") or {}).keys())
             sandbox_dir = self._develop_sandbox_dir(task)
-            source_path = self._resolve_knowledge_source_path()
+            source_path = _pipeline_source_path
             retry_context: dict[str, str] = {}
             for rpath in retry_file_paths:
                 content = self._read_context_file(
@@ -1863,6 +1891,7 @@ class PrimaryOrchestrator:
                                         pipeline_state=pipeline_state,
                                         batch_files=rb_files,
                                     ),
+                                    "source_repo_path": str(source_path) if source_path else None,
                                 },
                                 stage=WorkflowStage.ACTION,
                                 role=RoleName.ACTION,
@@ -2365,7 +2394,7 @@ class PrimaryOrchestrator:
                     request_text=task.request_text,
                     normalized_request=normalized_request if isinstance(normalized_request, str) else None,
                     diff=diff,
-                    source_tree=self._resolve_knowledge_source_path(),
+                    source_tree=_pipeline_source_path,
                     must_touch_files=getattr(plan, "must_touch_files", []) or [],
                 )
             except Exception as exc:
@@ -2421,7 +2450,7 @@ class PrimaryOrchestrator:
                                 else None
                             ),
                             diff=diff,
-                            source_tree=self._resolve_knowledge_source_path(),
+                            source_tree=_pipeline_source_path,
                         )
                     except Exception as exc:
                         attestation = {"error": str(exc)}
@@ -2557,7 +2586,7 @@ class PrimaryOrchestrator:
                     request_text=task.request_text or "",
                     diff=diff,
                     file_shapes=gd_shapes,
-                    source_tree=self._resolve_knowledge_source_path(),
+                    source_tree=_pipeline_source_path,
                     attestation=pipeline_state.get("goal_attestation"),
                 )
             except Exception as exc:
@@ -2595,7 +2624,7 @@ class PrimaryOrchestrator:
             try:
                 sym_report = check_symbol_references(
                     diff=diff,
-                    source_tree=self._resolve_knowledge_source_path(),
+                    source_tree=_pipeline_source_path,
                 )
             except Exception as exc:
                 sym_report = None

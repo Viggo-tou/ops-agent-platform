@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     codex_command: str = "codex"
     codex_timeout_seconds: float = 300.0
     codex_model: str = "gpt-5.4"
+    # CLI retry: retry codegen/planning subprocess on timeout or transient failure
+    cli_max_retries: int = 1
+    gate_repair_max_attempts: int = 1
+    gate_repair_timeout_seconds: float = 300.0
     semantic_translator_provider: Literal["auto", "mock", "minimax"] = "auto"
     semantic_translator_model: str = "MiniMax-M2.7"
     semantic_translator_timeout_seconds: float = 30.0

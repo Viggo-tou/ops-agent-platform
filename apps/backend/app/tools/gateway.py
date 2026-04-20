@@ -635,12 +635,16 @@ class ToolGateway:
         task_description_value = payload.get("task_description")
         task_description = task_description_value if isinstance(task_description_value, str) else ""
 
+        source_repo_path_value = payload.get("source_repo_path")
+        source_repo_path = str(source_repo_path_value) if isinstance(source_repo_path_value, str) else None
+
         try:
             result = CodeGenerator(self.settings).generate_patch(
                 task_id=task_id,
                 plan_json=dict(plan_json_value),
                 context_files={str(path): str(content) for path, content in context_files_value.items()},
                 task_description=task_description,
+                source_repo_path=source_repo_path,
             )
         except CodegenError as exc:
             raise ToolInvocationError(str(exc), retryable=False) from exc

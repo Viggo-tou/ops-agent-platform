@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +27,7 @@ from app.tools.registry import ToolRegistry  # noqa: E402
 def _settings(provider: str = "mock") -> SimpleNamespace:
     return SimpleNamespace(
         primary_agent_provider=provider,
+        codegen_provider=None,
         primary_agent_model="gpt-4o-mini",
         primary_agent_timeout_seconds=30.0,
         minimax_api_key=None,
@@ -53,7 +57,11 @@ def _settings(provider: str = "mock") -> SimpleNamespace:
         internal_db_timeout_seconds=8.0,
         internal_db_retry_count=0,
         claude_code_command="npx",
+        claude_code_args="--print",
+        claude_code_timeout_seconds=30.0,
+        cli_max_retries=0,
         codex_command="codex",
+        codex_timeout_seconds=30.0,
     )
 
 
@@ -368,6 +376,137 @@ class CodeGeneratorTests(unittest.TestCase):
             )
 
         self.assertEqual(len(calls), 1)
+
+    def test_generate_patch_passes_source_repo_path_to_claude_code(self) -> None:
+        settings = _settings("claude_code")
+        settings.codegen_provider = "claude_code"
+        generator = CodeGenerator(settings)
+        captured: dict[str, object] = {}
+
+        def fake_call(
+            prompt: str,
+            *,
+            context_files: dict[str, str],
+            source_repo_path: str | None = None,
+            task_id: str | None = None,
+        ) -> CodegenResult:
+            captured["prompt"] = prompt
+            captured["context_files"] = context_files
+            captured["source_repo_path"] = source_repo_path
+            captured["task_id"] = task_id
+            return CodegenResult(
+                diff=_diff_for(),
+                summary="mock claude code",
+                files_changed=["app/example.py"],
+                provider_name="claude_code",
+                model_name="mock",
+            )
+
+        generator._call_claude_code = fake_call  # type: ignore[method-assign]
+
+        result = generator.generate_patch(
+            task_id="TASK-123456",
+            plan_json={
+                "objective": "Update the greeting.",
+                "affected_code_locations": [{"relative_path": "app/example.py"}],
+            },
+            context_files={"app/example.py": "old line\n"},
+            source_repo_path="D:/target/repo",
+        )
+
+        self.assertEqual(result.provider_name, "claude_code")
+        self.assertEqual(captured["source_repo_path"], "D:/target/repo")
+        self.assertEqual(captured["task_id"], "TASK-123456")
+
+    @patch("app.services.codegen.shutil.which", return_value="claude")
+    def test_claude_code_falls_back_to_tempdir_without_git_repo(self, _mock_which) -> None:
+        generator = CodeGenerator(_settings("claude_code"))
+        expected = CodegenResult(
+            diff=_diff_for(),
+            summary="mock tempdir",
+            files_changed=["app/example.py"],
+            provider_name="claude_code",
+            model_name="mock",
+        )
+
+        with patch.object(
+            generator,
+            "_call_claude_code_tempdir",
+            return_value=expected,
+        ) as fallback:
+            result = generator._call_claude_code(
+                "prompt",
+                context_files={"app/example.py": "old line\n"},
+                source_repo_path="Z:/missing/repo",
+                task_id="TASK-123",
+            )
+
+        self.assertIs(result, expected)
+        fallback.assert_called_once()
+
+    @patch("app.services.codegen.shutil.which", return_value="claude")
+    @patch("app.services.codegen.subprocess.Popen")
+    @patch("app.services.codegen.subprocess.run")
+    def test_claude_code_worktree_extracts_git_diff_head(
+        self,
+        mock_run,
+        mock_popen,
+        _mock_which,
+    ) -> None:
+        temp_base = BACKEND_ROOT / ".tmp-pytest"
+        temp_base.mkdir(parents=True, exist_ok=True)
+        real_mkdtemp = tempfile.mkdtemp
+        source_repo = Path(real_mkdtemp(prefix="codegen-source-", dir=str(temp_base)))
+        diff = _diff_for("app/example.py")
+        run_calls: list[list[str]] = []
+
+        def local_mkdtemp(prefix: str = "", *args, **kwargs) -> str:
+            del args, kwargs
+            return real_mkdtemp(prefix=prefix, dir=str(temp_base))
+
+        def completed(args: list[str], stdout: str = "", returncode: int = 0):
+            return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr="")
+
+        def fake_run(args, *unused_args, **unused_kwargs):
+            run_calls.append(list(args))
+            if args[:4] == ["git", "-C", str(source_repo), "rev-parse"]:
+                return completed(args, stdout=f"{source_repo}\n")
+            if args[:3] == ["git", "worktree", "add"]:
+                Path(args[5]).mkdir(parents=True, exist_ok=True)
+                return completed(args)
+            if args[:3] == ["git", "diff", "HEAD"]:
+                return completed(args, stdout=diff)
+            return completed(args)
+
+        proc = Mock()
+        proc.communicate.return_value = ('{"result":"ok"}', "")
+        proc.returncode = 0
+        mock_popen.return_value = proc
+        mock_run.side_effect = fake_run
+
+        try:
+            with (
+                patch("app.services.codegen.tempfile.mkdtemp", side_effect=local_mkdtemp),
+                patch("pathlib.Path.mkdir"),
+                patch("pathlib.Path.write_text"),
+            ):
+                result = CodeGenerator(_settings("claude_code"))._call_claude_code(
+                    "prompt",
+                    context_files={"app/example.py": "old line\n"},
+                    source_repo_path=str(source_repo),
+                    task_id="TASK-123456",
+                )
+        finally:
+            shutil.rmtree(source_repo, ignore_errors=True)
+
+        self.assertEqual(result.files_changed, ["app/example.py"])
+        self.assertEqual(result.diff, diff.strip())
+        self.assertTrue(
+            any(call[:4] == ["git", "worktree", "add", "-b"] for call in run_calls)
+        )
+        self.assertTrue(any(call[:3] == ["git", "diff", "HEAD"] for call in run_calls))
+        add_call = next(call for call in run_calls if call[:4] == ["git", "worktree", "add", "-b"])
+        self.assertTrue(add_call[4].startswith("codegen/TASK-123456-"))
 
 
 if __name__ == "__main__":

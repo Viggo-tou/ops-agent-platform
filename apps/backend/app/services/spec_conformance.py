@@ -180,7 +180,7 @@ def check_spec_conformance(
                         severity="block",
                         message=(
                             "Request references specific identifiers ("
-                            + ", ".join(sorted(anchors))
+                            + ", ".join(sorted(removal_anchors))
                             + ") but NONE of them appear in the "
                             "configured knowledge source. This likely "
                             "means the task is targeting a different "
@@ -188,7 +188,7 @@ def check_spec_conformance(
                             "configuration or re-check the request."
                         ),
                         evidence={
-                            "anchors": sorted(anchors),
+                            "anchors": sorted(removal_anchors),
                             "source_tree": str(source_tree),
                         },
                     )
