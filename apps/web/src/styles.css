@@ -469,6 +469,12 @@ dt {
   background: white;
 }
 
+.diff-line-add .hljs-comment,
+.diff-line-remove .hljs-comment {
+  color: inherit;
+  opacity: 0.7;
+}
+
 .diff-line-meta {
   color: #777;
 }

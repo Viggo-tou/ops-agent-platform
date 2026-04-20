@@ -1,3 +1,22 @@
+import { useMemo } from "react";
+import hljs from "highlight.js/lib/core";
+import bash from "highlight.js/lib/languages/bash";
+import css from "highlight.js/lib/languages/css";
+import javascript from "highlight.js/lib/languages/javascript";
+import json from "highlight.js/lib/languages/json";
+import python from "highlight.js/lib/languages/python";
+import typescript from "highlight.js/lib/languages/typescript";
+import xml from "highlight.js/lib/languages/xml";
+import "highlight.js/styles/github.css";
+
+hljs.registerLanguage("bash", bash);
+hljs.registerLanguage("css", css);
+hljs.registerLanguage("javascript", javascript);
+hljs.registerLanguage("json", json);
+hljs.registerLanguage("python", python);
+hljs.registerLanguage("typescript", typescript);
+hljs.registerLanguage("xml", xml);
+
 interface DiffViewerProps {
   diff: string;
 }
@@ -25,6 +44,19 @@ interface DiffFile {
   hunks: DiffHunk[];
 }
 
+interface HighlightedDiffLine extends DiffLine {
+  highlightedHtml: string | null;
+}
+
+interface HighlightedDiffHunk extends Omit<DiffHunk, "lines"> {
+  lines: HighlightedDiffLine[];
+}
+
+interface HighlightedDiffFile extends Omit<DiffFile, "hunks"> {
+  hunks: HighlightedDiffHunk[];
+  language: string | null;
+}
+
 const HUNK_HEADER_PATTERN = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
 
 function cleanDiffPath(path: string): string {
@@ -38,6 +70,54 @@ function cleanDiffPath(path: string): string {
 function readGitDiffPath(line: string): string {
   const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
   return match?.[2] ?? line.replace(/^diff --git\s+/, "").trim();
+}
+
+export function detectLanguage(path: string): string | null {
+  const normalizedPath = path.toLowerCase();
+
+  if (normalizedPath.endsWith(".ts") || normalizedPath.endsWith(".tsx")) {
+    return "typescript";
+  }
+
+  if (
+    normalizedPath.endsWith(".js") ||
+    normalizedPath.endsWith(".jsx") ||
+    normalizedPath.endsWith(".mjs") ||
+    normalizedPath.endsWith(".cjs")
+  ) {
+    return "javascript";
+  }
+
+  if (normalizedPath.endsWith(".py")) {
+    return "python";
+  }
+
+  if (normalizedPath.endsWith(".json")) {
+    return "json";
+  }
+
+  if (
+    normalizedPath.endsWith(".css") ||
+    normalizedPath.endsWith(".scss") ||
+    normalizedPath.endsWith(".less")
+  ) {
+    return "css";
+  }
+
+  if (normalizedPath.endsWith(".sh") || normalizedPath.endsWith(".bash")) {
+    return "bash";
+  }
+
+  if (
+    normalizedPath.endsWith(".html") ||
+    normalizedPath.endsWith(".xml") ||
+    normalizedPath.endsWith(".vue") ||
+    normalizedPath.endsWith(".svg")
+  ) {
+    return "xml";
+  }
+
+  return null;
 }
 
 function ensureFile(files: DiffFile[]): DiffFile {
@@ -157,8 +237,51 @@ export function countDiffFiles(diff: string): number {
   return parseUnifiedDiff(diff).length;
 }
 
+function canHighlightLine(kind: DiffLineKind): boolean {
+  return kind === "add" || kind === "remove" || kind === "context";
+}
+
+function buildHighlightedFiles(files: DiffFile[]): HighlightedDiffFile[] {
+  const highlightedHtmlByPair = new Map<string, string | null>();
+
+  return files.map((file) => {
+    const language = detectLanguage(file.newPath ?? file.oldPath ?? file.path);
+
+    return {
+      ...file,
+      language,
+      hunks: file.hunks.map((hunk) => ({
+        ...hunk,
+        lines: hunk.lines.map((line) => {
+          let highlightedHtml: string | null = null;
+
+          if (language && canHighlightLine(line.kind)) {
+            const cacheKey = `${language}\0${line.content}`;
+
+            if (!highlightedHtmlByPair.has(cacheKey)) {
+              try {
+                highlightedHtmlByPair.set(
+                  cacheKey,
+                  hljs.highlight(line.content, { language, ignoreIllegals: true }).value,
+                );
+              } catch {
+                highlightedHtmlByPair.set(cacheKey, null);
+              }
+            }
+
+            highlightedHtml = highlightedHtmlByPair.get(cacheKey) ?? null;
+          }
+
+          return { ...line, highlightedHtml };
+        }),
+      })),
+    };
+  });
+}
+
 export function DiffViewer({ diff }: DiffViewerProps) {
-  const files = parseUnifiedDiff(diff);
+  const files = useMemo(() => parseUnifiedDiff(diff), [diff]);
+  const highlightedFiles = useMemo(() => buildHighlightedFiles(files), [files]);
 
   if (files.length === 0) {
     return <pre className="diff-viewer diff-viewer-fallback">{diff}</pre>;
@@ -166,7 +289,7 @@ export function DiffViewer({ diff }: DiffViewerProps) {
 
   return (
     <div className="diff-viewer">
-      {files.map((file, fileIndex) => (
+      {highlightedFiles.map((file, fileIndex) => (
         <section className="diff-file" key={`${file.path}-${fileIndex}`}>
           <div className="diff-file-header">{file.path}</div>
           {file.hunks.map((hunk, hunkIndex) => (
@@ -178,7 +301,11 @@ export function DiffViewer({ diff }: DiffViewerProps) {
                   <span className="diff-line-number">{line.newLine ?? ""}</span>
                   <span className="diff-line-content">
                     {line.kind === "add" ? "+" : line.kind === "remove" ? "-" : line.kind === "context" ? " " : ""}
-                    {line.content}
+                    {line.highlightedHtml ? (
+                      <span dangerouslySetInnerHTML={{ __html: line.highlightedHtml }} />
+                    ) : (
+                      line.content
+                    )}
                   </span>
                 </div>
               ))}
