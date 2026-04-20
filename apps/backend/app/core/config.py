@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     debug: bool = True
     api_prefix: str = "/api"
     database_url: str = f"sqlite:///{(BASE_DIR / 'ops_agent_platform.db').as_posix()}"
+    pipeline_max_workers: int = 2
     primary_agent_provider: Literal["auto", "mock", "openai", "minimax", "anthropic", "deepseek", "ollama", "claude_code", "codex"] = "auto"
     planner_provider: Literal["auto", "claude_code", "anthropic", "openai", "minimax", "mock"] | None = None
     codegen_provider: Literal["auto", "claude_code", "codex", "anthropic", "openai", "minimax", "deepseek", "ollama", "mock"] | None = None

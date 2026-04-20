@@ -21,6 +21,7 @@ ApprovalDecisionActorCtx = Annotated[ActorContext, Depends(require_permission("a
 
 @router.post("", response_model=TaskDetail, status_code=status.HTTP_201_CREATED)
 def create_task(payload: TaskCreateRequest, db: DbSession, _actor: TaskCreateActorCtx) -> TaskDetail:
+    """Return the initial CREATED task; clients should poll GET /tasks/{id} for progress."""
     # TODO: task:create_high_risk gate based on risk_level
     service = TaskService(db)
     task = service.create_task(payload)

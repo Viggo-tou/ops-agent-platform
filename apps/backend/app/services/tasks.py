@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from app.core.db import SessionLocal
 from app.core.enums import (
     ActorRole,
     ApprovalStatus,
@@ -17,6 +19,7 @@ from app.core.enums import (
     WorkflowStage,
 )
 from app.core.jira import extract_jira_issue_reference
+from app.core.pipeline_executor import submit_pipeline_job
 from app.models.event import Event
 from app.models.task import Task
 from app.models.tool_execution import ToolExecution
@@ -25,11 +28,62 @@ from app.schemas.task import TaskCreateRequest, TaskRollbackRequest
 from app.services.events import record_event, set_task_status
 from app.services.rollback import RollbackExecutor
 
+logger = logging.getLogger("app.services.tasks")
+
+
+def run_pipeline_job(task_id: str, actor_name: str) -> None:
+    """Runs inside the thread pool. Owns its own SessionLocal."""
+    db = SessionLocal()
+    try:
+        task = db.get(Task, task_id)
+        if task is None:
+            logger.warning("Pipeline job could not find task %s", task_id)
+            return
+
+        try:
+            orchestrator = PrimaryOrchestrator(db)
+            orchestrator.bootstrap_task(task, actor_name=actor_name)
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            logger.exception("Background pipeline job crashed for task %s", task_id)
+            db2 = SessionLocal()
+            try:
+                failed_task = db2.get(Task, task_id)
+                if failed_task is None:
+                    logger.warning("Pipeline crash handler could not find task %s", task_id)
+                    return
+
+                error_payload = {"error_type": type(exc).__name__, "error": str(exc)}
+                set_task_status(
+                    db2,
+                    task=failed_task,
+                    new_status=TaskStatus.FAILED,
+                    new_stage=WorkflowStage.DONE,
+                    role=RoleName.SYSTEM,
+                    message=f"Pipeline crashed: {type(exc).__name__}: {exc}",
+                    payload=error_payload,
+                )
+                record_event(
+                    db2,
+                    task_id=failed_task.id,
+                    event_type=EventType.EXECUTION_FAILED,
+                    source=EventSource.SYSTEM,
+                    stage=WorkflowStage.DONE,
+                    role=RoleName.SYSTEM,
+                    message="Background pipeline job raised an unhandled exception.",
+                    payload=error_payload,
+                )
+                db2.commit()
+            finally:
+                db2.close()
+    finally:
+        db.close()
+
 
 class TaskService:
     def __init__(self, db: Session):
         self.db = db
-        self.orchestrator = PrimaryOrchestrator(db)
 
     def create_task(self, payload: TaskCreateRequest) -> Task:
         intent_text = self._extract_user_intent_text(payload.request)
@@ -95,8 +149,10 @@ class TaskService:
             },
         )
 
-        self.orchestrator.bootstrap_task(task, actor_name=payload.actor_name)
         self.db.commit()
+        future = submit_pipeline_job(run_pipeline_job, task.id, payload.actor_name)
+        if future.done() and getattr(future, "_pipeline_executor_override", False):
+            self.db.expire_all()
 
         return self.get_task(task.id, raise_if_missing=True)
 

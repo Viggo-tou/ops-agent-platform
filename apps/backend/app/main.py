@@ -19,6 +19,7 @@ from app.core.config import get_settings
 from app.core.db import Base, SessionLocal, engine, ensure_local_schema
 from app.core.logging import configure_logging
 from app.core.middleware import RequestLoggingMiddleware
+from app.core.pipeline_executor import init_pipeline_executor, shutdown_pipeline_executor
 from app.core.telemetry import configure_telemetry
 from app.services.governance import bootstrap_governance_data
 from app.services.model_config import bootstrap_model_catalog
@@ -34,7 +35,11 @@ async def lifespan(_: FastAPI):
     bootstrap_governance_data()
     with SessionLocal() as db:
         bootstrap_model_catalog(db)
-    yield
+    init_pipeline_executor(settings.pipeline_max_workers)
+    try:
+        yield
+    finally:
+        shutdown_pipeline_executor(wait=True)
 
 
 settings = get_settings()
