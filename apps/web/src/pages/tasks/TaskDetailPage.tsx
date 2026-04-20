@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { useState } from "react";
 
 import { ApprovalPanel } from "../../components/tasks/ApprovalPanel";
+import { GateStatusPanel } from "../../components/tasks/GateStatusPanel";
 import { KnowledgeResultPanel, readKnowledgeSearchResult } from "../../components/tasks/KnowledgeResultPanel";
 import { PlanBreakdown, readTaskPlanDocument } from "../../components/tasks/PlanBreakdown";
 import { PlanProviderBadge } from "../../components/tasks/PlanProviderBadge";
@@ -153,6 +154,8 @@ export function TaskDetailPage() {
           <RiskBadge level={task.risk_level} />
         </div>
       </section>
+
+      <GateStatusPanel events={events} />
 
       <section className="detail-grid">
         <article className="detail-card">

@@ -1,0 +1,203 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`GateStatusPanel > renders mixed gate status output 1`] = `
+<section
+  class="detail-card gate-panel"
+>
+  <div
+    class="section-header"
+  >
+    <div>
+      <div
+        class="eyebrow"
+      >
+        Develop Pipeline
+      </div>
+      <h3>
+        Pipeline Gates
+      </h3>
+      <p>
+        Latest develop-pipeline gate results from the task event stream.
+      </p>
+    </div>
+  </div>
+  <div
+    aria-label="Pipeline gate statuses"
+    class="gate-strip"
+  >
+    <article
+      class="gate-card gate-card--pass"
+    >
+      <div
+        class="gate-card-head"
+      >
+        <span
+          class="gate-number"
+        >
+          1
+        </span>
+        <strong>
+          Compile Gate
+        </strong>
+      </div>
+      <div
+        class="gate-card-meta"
+      >
+        <span
+          class="gate-verdict"
+        >
+          pass
+        </span>
+      </div>
+    </article>
+    <article
+      class="gate-card gate-card--running"
+    >
+      <div
+        class="gate-card-head"
+      >
+        <span
+          class="gate-number"
+        >
+          2
+        </span>
+        <strong>
+          Runtime Validation
+        </strong>
+      </div>
+      <div
+        class="gate-card-meta"
+      >
+        <span
+          class="gate-verdict"
+        >
+          running
+        </span>
+      </div>
+    </article>
+    <article
+      class="gate-card gate-card--skipped"
+    >
+      <div
+        class="gate-card-head"
+      >
+        <span
+          class="gate-number"
+        >
+          3
+        </span>
+        <strong>
+          Semantic Review
+        </strong>
+      </div>
+      <div
+        class="gate-card-meta"
+      >
+        <span
+          class="gate-verdict"
+        >
+          skipped
+        </span>
+      </div>
+    </article>
+    <article
+      class="gate-card gate-card--fail"
+    >
+      <div
+        class="gate-card-head"
+      >
+        <span
+          class="gate-number"
+        >
+          4
+        </span>
+        <strong>
+          Diff Reviewer
+        </strong>
+      </div>
+      <div
+        class="gate-card-meta"
+      >
+        <span
+          class="gate-verdict"
+        >
+          fail
+        </span>
+      </div>
+    </article>
+    <article
+      class="gate-card gate-card--pass"
+    >
+      <div
+        class="gate-card-head"
+      >
+        <span
+          class="gate-number"
+        >
+          5
+        </span>
+        <strong>
+          Spec Conformance
+        </strong>
+      </div>
+      <div
+        class="gate-card-meta"
+      >
+        <span
+          class="gate-verdict"
+        >
+          pass
+        </span>
+      </div>
+    </article>
+    <article
+      class="gate-card gate-card--skipped"
+    >
+      <div
+        class="gate-card-head"
+      >
+        <span
+          class="gate-number"
+        >
+          6
+        </span>
+        <strong>
+          Goal Attestation
+        </strong>
+      </div>
+      <div
+        class="gate-card-meta"
+      >
+        <span
+          class="gate-verdict"
+        >
+          skipped
+        </span>
+      </div>
+    </article>
+  </div>
+  <div
+    class="gate-failures"
+  >
+    <article
+      class="gate-failure-row"
+    >
+      <div>
+        <strong>
+          Diff Reviewer
+        </strong>
+        <span
+          class="muted-text"
+        >
+          01 Jan 2026, 10:02 am
+        </span>
+      </div>
+      <p
+        title="Diff reviewer blocked the patch because required evidence was missing."
+      >
+        Diff reviewer blocked the patch because required evidence was missing.
+      </p>
+    </article>
+  </div>
+</section>
+`;
