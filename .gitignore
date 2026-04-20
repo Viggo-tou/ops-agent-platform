@@ -63,6 +63,9 @@ apps/backend/data/uploads/
 # Per-task orchestrator sandboxes (runtime state)
 apps/backend/data/sandboxes/
 
+# Repo-root e2e/test scratch dir (reports, sandboxes, tmp)
+/data/
+
 # Stray test-artifact directories
 apps/backend/manual-mode-777/
 apps/backend/manual-pathlib-default/

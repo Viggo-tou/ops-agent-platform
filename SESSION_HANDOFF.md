@@ -1,6 +1,86 @@
 # Session Handoff
 
-Last updated: 2026-04-17
+Last updated: 2026-04-20
+
+## Session 2026-04-20: T-042-S Sandbox Agent Codegen (Worktree Architecture)
+
+### What happened this session
+
+Tag: `session-start/2026-04-20-1300`
+
+1. **Worktree-based codegen** — replaced temp-dir codegen with git worktree from source repo:
+   - `_call_claude_code()` now dispatches to `_call_claude_code_worktree()` when `source_repo_path` points to a valid git repo
+   - Worktree gives Claude Code full repo visibility (explore, verify, iterate)
+   - Diff extracted via `git diff HEAD` instead of filesystem comparison
+   - Falls back to `_call_claude_code_tempdir()` when no source repo available
+   - Shared `_run_claude_cli()` handles subprocess, retry, Windows process cleanup
+
+2. **Wired `source_repo_path` through the stack**:
+   - `generate_patch()` in `codegen.py` accepts `source_repo_path: str | None`
+   - `_execute_codegen_generate_patch()` in `gateway.py` passes it from payload
+   - Orchestrator codegen call site reads `_resolve_knowledge_source_path()` and includes it in payload
+
+3. **Settings additions** in `config.py`:
+   - `cli_max_retries: int = 1`
+   - `gate_repair_max_attempts: int = 1`
+   - `gate_repair_timeout_seconds: float = 300.0`
+
+4. **Provider chain reordered** — Claude Code first, Codex as fallback (supports worktree)
+
+5. **Tests**: 257 passed, 2 xfailed, 0 failed (committed test suite)
+   - 3 new worktree codegen tests added to `test_codegen.py`
+   - 8 untracked test files (from prior sessions) need their orchestrator methods re-added
+
+### Files changed (tracked)
+
+| File | Change |
+|------|--------|
+| `apps/backend/app/services/codegen.py` | +713 -114: worktree codegen, tempdir fallback, shared CLI runner |
+| `apps/backend/app/tools/gateway.py` | +4: pass source_repo_path |
+| `apps/backend/app/orchestrator/service.py` | +3: pass source_repo_path in payload |
+| `apps/backend/app/core/config.py` | +4: cli_max_retries, gate_repair_max_attempts, gate_repair_timeout_seconds |
+| `apps/backend/tests/services/test_codegen.py` | +135: worktree tests |
+
+### Known issues
+
+- **Untracked tests expect missing methods**: 8 test files from prior sessions reference `_run_targeted_repair`, `_build_compile_repair_prompt`, etc. that were never committed. These need to be re-added to the orchestrator (they were part of T-042 gate repair from the prior session).
+- **`test_runtime_validation_scope.py`**: imports `_is_source_file` which doesn't exist in `runtime_validation.py`
+
+### Architecture diagram
+
+```
+Orchestrator._execute_develop_pipeline
+  |
+  +-- _gather_codegen_context()    <-- still provides batch context
+  |
+  +-- codegen.generate_patch()     <-- NEW: accepts source_repo_path
+  |     |
+  |     +-- _call_claude_code()
+  |           |
+  |           +-- source_repo_path valid?
+  |           |     YES -> _call_claude_code_worktree()
+  |           |              1. git worktree add
+  |           |              2. Write .claude/CLAUDE.md with constraints
+  |           |              3. claude -p --dangerously-skip-permissions
+  |           |              4. git diff HEAD
+  |           |              5. cleanup worktree + branch
+  |           |     NO  -> _call_claude_code_tempdir()
+  |           |              (legacy: temp dir + filesystem diff)
+  |           |
+  |           +-- _run_claude_cli()  <-- shared subprocess runner with retry
+  |
+  +-- sandbox.apply_patch()         <-- unchanged
+  +-- compile_gate                  <-- unchanged
+  +-- spec_conformance              <-- unchanged
+```
+
+### Next tasks
+
+1. Re-add targeted repair methods to orchestrator (from prior session's T-042 work)
+2. E2E test: run a develop pipeline from frontend with worktree codegen
+3. Consider adding `_strip_inline_file_context()` to reduce prompt tokens in worktree mode
+
+---
 
 ## Session 2026-04-17: T-041 Defense Matrix + Pipeline Provider Swap
 
