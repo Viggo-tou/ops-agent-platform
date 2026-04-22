@@ -21,6 +21,13 @@ class Settings(BaseSettings):
     primary_agent_model: str = "gpt-4o-mini"
     primary_agent_timeout_seconds: float = 30.0
     minimax_planner_timeout_seconds: float = 90.0
+    knowledge_synthesis_enabled: bool = True
+    knowledge_synthesis_model: str = "MiniMax-M2.7"
+    knowledge_synthesis_timeout_seconds: float = 45.0
+    knowledge_synthesis_max_snippet_chars: int = 1200
+    llm_retry_on_rate_limit: bool = True
+    llm_retry_max_attempts: int = 3
+    llm_retry_base_delay_sec: float = 2.0
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
     deepseek_api_key: str | None = None

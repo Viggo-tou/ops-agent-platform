@@ -48,6 +48,7 @@ class KnowledgeAnswerTrace(BaseModel):
     citation_count: int = Field(..., description="Number of citations included in the answer")
     hallucination_risk: str = Field(..., description="Risk level of potential hallucination in the answer")
     rationale: str = Field(..., description="Explanation for why this answer was generated")
+    answer_provider: str = Field(default="template", description="Provider used to produce the final answer text")
 
 
 class KnowledgeSearchResult(BaseModel):

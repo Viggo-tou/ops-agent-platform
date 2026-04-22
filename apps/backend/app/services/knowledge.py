@@ -335,7 +335,7 @@ class KnowledgeService:
             str(selected_sources[0].path) if selected_sources else "",
         ) if selected_source_names else (str(selected_sources[0].path) if selected_sources else "")
 
-        answer = self._build_answer(
+        answer, answer_provider = self._synthesize_or_template(
             query=query,
             citations=citations,
             hallucination_risk=hallucination_risk,
@@ -371,6 +371,7 @@ class KnowledgeService:
                 citation_count=citation_count,
                 hallucination_risk=hallucination_risk,
                 rationale=rationale,
+                answer_provider=answer_provider,
             ),
             packaged_context=packaged_context,
         )
@@ -975,3 +976,41 @@ class KnowledgeService:
         parts.append("I would debug it in this order:\n- " + "\n- ".join(next_steps))
         parts.append(confidence_summary)
         return "\n\n".join(parts)
+
+    def _synthesize_or_template(
+        self,
+        *,
+        query: str,
+        citations: list[KnowledgeCitation],
+        hallucination_risk: str,
+        route_kind: str,
+        language: str | None,
+    ) -> tuple[str, str]:
+        """Return answer text and provider, falling back to the deterministic template."""
+        from app.services.knowledge_synthesis import (
+            KnowledgeSynthesisError,
+            KnowledgeSynthesizer,
+        )
+
+        if citations and self.settings.knowledge_synthesis_enabled:
+            synthesizer = KnowledgeSynthesizer(self.settings)
+            try:
+                answer = synthesizer.synthesize(
+                    query=query,
+                    citations=citations,
+                    hallucination_risk=hallucination_risk,
+                    route_kind=route_kind,
+                    language=language,
+                )
+                return answer, "minimax"
+            except KnowledgeSynthesisError:
+                pass
+
+        template_answer = self._build_answer(
+            query=query,
+            citations=citations,
+            hallucination_risk=hallucination_risk,
+            route_kind=route_kind,
+            language=language,
+        )
+        return template_answer, "template"
