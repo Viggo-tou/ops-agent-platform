@@ -1,6 +1,38 @@
 # Session Handoff
 
-Last updated: 2026-04-20
+Last updated: 2026-04-22
+
+## Session 2026-04-22: batch1 优化集成 + ship 到 main
+
+### 成果
+
+- **Ship**: `main` → `6a35bdc merge: batch1 optimizations (prompt-cache + parallel-gates + pytest-xdist + Phase X+Y + e2e fixtures)`
+- **T-SANDBOX-TEMPLATE 回退** (commit `52aa143` on batch1)：相对路径在 `git -C <template> worktree add` 下被 template dir 解析成错误位置。未来修好后可重新引入。
+- **Phase Z 写入** `docs/ai/phase-summary-zh.md`，包含 batch1 整合 + 基线校准经验。
+- **Follow-up ticket**: `docs/ai/tasks/T-PHASE-Y-ANCHOR-FOLLOWUP.md` — fx_neg_nonexistent 从 knowledge 分支改走 code_develop 分支绕过 anchor check。
+- **Memory 新规则**: `~/.claude/projects/.../memory/feedback_verify_baseline_first.md` — 判断 regression 前必须先实测基线，不可继承 summary 里的 "X passes" 断言。
+
+### 关键发现
+
+之前 session summary 里写的 "e2e_quick 4/4 pass" 基线**不可复现**。今天在 `ops-worktrees/e2e-fixtures` @ `e76c4f4`（纯 `t-e2e-fixtures` 无优化）上跑 e2e_quick 仍然 0/4。batch1 合并后也是 0/4，但失败模式改变（3/4 fixture 能正确进 codegen，不再短路走 knowledge.search）——这不是 regression，是**行为改善撞到了更深层的 pre-existing bug**。
+
+### 文件清单
+
+| 文件 | 状态 | 说明 |
+|---|---|---|
+| `main` branch | committed (`6a35bdc`) | batch1 merge + T-SANDBOX-TEMPLATE revert |
+| `integrate/optimizations-batch1` | committed | 所有集成历史保留，含 revert commit |
+| `docs/ai/phase-summary-zh.md` | **未 commit** (on `checkpoint/pre-reclassify`) | 加了 Phase Z + Phase Y 勘误 |
+| `docs/ai/tasks/T-PHASE-Y-ANCHOR-FOLLOWUP.md` | **未 commit** (新文件) | follow-up ticket |
+| `SESSION_HANDOFF.md` | **未 commit** | 本段 |
+
+### 后续
+
+1. 把未 commit 的 docs 合进 `main`（需要用户明确授权；当前只在 `checkpoint/pre-reclassify` 工作区）。
+2. 修 T-PHASE-Y-ANCHOR-FOLLOWUP（给 code_develop 分支加 anchor check 覆盖点）。
+3. fx_bugfix_nullcheck / fx_css / fx_newfile 三个 pre-existing fixture 失败各自独立 ticket 跟进。
+
+---
 
 ## Session 2026-04-20: T-042-S Sandbox Agent Codegen (Worktree Architecture)
 

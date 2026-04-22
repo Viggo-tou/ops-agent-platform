@@ -2,7 +2,7 @@
 
 > 本文件是给人看的自然语言解释，不是给模型的 spec。每个 Phase 完成后更新。
 >
-> 最后更新：2026-04-12
+> 最后更新：2026-04-22
 
 ---
 
@@ -447,6 +447,300 @@ structlog 告诉你"发生了什么"，但看不出**因果关系和时间分布
 
 ---
 
+## Phase Q — 多门防御流水线（Pipeline Defense Gates）✅
+
+### 做了什么
+
+在原有 codegen → apply_patch 路径上，加了七道"闸门"（gates），顺序是：`diff_shape`（语法形状）→ `compile_gate`（编译通过）→ `runtime_validation`（运行时静态检查）→ `spec_conformance.check`（规格约束）→ `spec_conformance.attest`（目标达成证据）→ `goal_decomposition.check`（目标分解校验）→ `evidence_chain`（证据链完整）。每道门只要不通过就把任务打回去。
+
+同时给 `runtime_validation` 配了一个"自修复循环"：发现问题 → 把问题丢回 codegen 让它修 → 重新跑 → 最多重试 N 次。小问题不用人介入，codegen 自己兜底。
+
+还有一个关键修复：sandbox 执行 `claude_code` 时原先丢了 `-p` 非交互标志，导致子进程挂起；补回来后 codegen 才能稳定跑通。
+
+### 原理
+
+**为什么要这么多门：** 以前只有"codegen 产出 unified diff → 直接 apply"一条路径，任何一步出错都得靠人肉 debug。七门是把"LLM 随机性"切成可观测、可重试的阶段，每一步失败都有明确的错误类型和下一步动作（重试 / 自修复 / 升级到人审）。
+
+**每道门干什么：**
+- `diff_shape`：unified diff 格式是否合法（`---/+++/@@` 头存在、hunk 行数对齐）
+- `compile_gate`：把 diff 应用到 sandbox 后，目标项目能不能过编译（JS 走 `tsc --noEmit`，Python 走 `compileall`）
+- `runtime_validation`：静态扫描变更文件的明显运行时问题（null 解引用、未定义变量、拼写错漏等）
+- `spec_conformance.check`：原始需求里明确点名的文件/符号，在 diff 里是否被触及
+- `spec_conformance.attest`：每个"目标锚点"是否真正达成（anchor count 变化、关键字出现等）
+- `goal_decomposition.check`：LLM 之前分解的子目标是否都有对应修改
+- `evidence_chain`：把所有门的证据串起来，确保没有未达标项目悄悄过去
+
+**自修复循环怎么做：** `runtime_validation` 把 finding 列表（文件、行号、问题描述）塞进提示给 codegen，要求输出"只修这些问题"的增量 patch，再把两份 patch 合并，重复直至通过或耗尽重试预算。
+
+### 怎么验证
+
+- 故意写个有 null 解引用的 fixture → `runtime_validation` 报错 → 自修复一轮后通过
+- fixture `fx_newfile` 跑完 → 七个 gate 全绿，终止状态 `awaiting_approval`
+- 流水线事件流里能看到每个 gate 的 `gate_started` / `gate_passed` / `gate_failed` 事件
+
+---
+
+## Phase R — 异步流水线执行池 ✅
+
+### 做了什么
+
+把原来"任务一来就在 FastAPI 请求线程里同步跑到底"的模式改成"提交到后台线程池异步执行"。前端发 POST 立刻返回任务 ID，后台慢慢跑，前端通过 SSE 订阅事件流拿进度。
+
+同时保留了一个后门：测试里可以通过 `set_pipeline_executor_override()` 塞一个 `_ImmediateExecutor`，把异步退化回同步，让测试不用等真的 ThreadPool 调度。
+
+### 原理
+
+**为什么要异步：** 流水线一次完整跑完要几分钟（codegen + 七个 gate），HTTP 请求线程不能占这么久。线程池让后端能同时处理多个任务，前端也不会在提交那一刻卡住。
+
+**为什么保留同步后门：** 压力测试和 E2E 需要确定性——"发起任务 → 等它终结"，真的异步会让测试要轮询或装 SSE 客户端。`_ImmediateExecutor.submit()` 直接调用 `fn(*args)` 同步返回 Future，对外看起来仍是 Executor 接口。
+
+### 怎么验证
+
+- 前端提交一个任务 → `task_created` 事件立刻到，`task_completed` 几分钟后到
+- 同时提交两个任务 → 两条事件流并行推进，互不阻塞
+- 测试里调 `set_pipeline_executor_override(_ImmediateExecutor())` → 测试退化成同步
+- 观察 `ThreadPoolExecutor` 线程数不失控（上限从 `PIPELINE_EXECUTOR_MAX_WORKERS` 配置）
+
+---
+
+## Phase S — 场景分类重判 + code_develop 场景 ✅
+
+### 做了什么
+
+之前的 `scenario` 字段（`code_write` / `code_review` 等）是翻译阶段根据原始请求一把梭哈确定的。翻译会误判——把"给 UserManagement 加列"判成 `code_review`（没碰源码）。
+
+加了一个"翻译后重分类"（post-translation reclassification）：翻译完成 → 看翻译后的结构化字段（verbs / targets / work_type）→ 如果和原始 scenario 矛盾，覆盖一次。同时新增 `code_develop` 场景，专门对应"在已有代码基础上增量开发"的需求（区别于从零写新代码的 `code_write`）。
+
+### 原理
+
+**为什么要重分类：** 翻译阶段 LLM 拿到的只是原始中文，容易被表面动词（"检查"、"看看"）误导。翻译完成后拿到 normalized request（动词、名词、work_type）信号更稳，这时候再判一次 scenario 准确率高很多。
+
+**`code_develop` 和 `code_write` 的区别：** `code_write` = 从零新建文件/模块；`code_develop` = 在已有代码上改/加/扩展。流水线对二者的门有区别——`code_develop` 需要 `spec_conformance` 确认动到已有锚点，`code_write` 不需要。
+
+### 怎么验证
+
+- 原始请求"给 UserManagement 表加 Last Login 列" → 初判 `code_review` → 重分类后变 `code_develop`
+- 原始请求"新建一个订单管理模块" → scenario 保持 `code_write`
+- `tests/orchestrator/test_scenario_reclassification.py` 覆盖典型 case
+
+---
+
+## Phase T — 前端 Diff 高亮 + Gate 状态面板 ✅
+
+### 做了什么
+
+`TaskDetailPage` 的 diff 预览原先是纯单色文本，看不出哪是加哪是减、哪是 JS 关键字。接了 `highlight.js`：按文件扩展名自动选语言（.js/.jsx/.ts/.tsx/.py/.css…），diff 的 `+` / `-` 行用绿/红背景加语法色。
+
+同时做了个 `GateStatusPanel`：把七个 gate 的状态以圆点 + 标签横向排列（灰=未跑 / 蓝=进行中 / 绿=通过 / 红=失败）。失败时点一下能展开 gate 详情（失败原因、相关锚点、建议下一步）。
+
+### 原理
+
+**选 highlight.js 而非 Prism / shiki：** 体积小（约 100KB gzip），懒加载只拉用到的语言包，CDN 不稳时 fallback 到纯文本，对浏览器 UI 足够。
+
+**为什么 diff 和普通代码高亮要区别处理：** unified diff 的 `+` / `-` 本身是语义（增/删），不能当成行首字符给 highlight.js 当代码喂。实现上先按行切分，识别 diff 前缀，对行剩余部分单独做高亮，再把前缀颜色合进去。
+
+**GateStatusPanel 为什么横向：** 七个 gate 按顺序走，横向布局和时间线对齐，用户扫一眼就知道卡在哪一步。纵向会和右侧 diff 抢空间。
+
+### 怎么验证
+
+- 打开一个跑完的任务 → diff 区域有颜色 + 语法高亮 + 加减行背景
+- 打开一个 gate 失败的任务 → 失败 gate 红点 + 下方展开失败详情
+- 切换深/浅主题 → 颜色不翻车
+- `npx tsc --noEmit` 无类型错误
+
+---
+
+## Phase U — E2E Fixture 覆盖矩阵（T-E2E-EXPAND）✅
+
+### 做了什么
+
+E2E 测试原先只有 4 个 fixture（feature / newfile / css / rename），覆盖面远远不够。这一轮扩到 16 个，按"改动类型"分组：
+
+- **增量开发类：** fx_feature、fx_add_prop、fx_prop_types、fx_config_env、fx_route_add、fx_test_add
+- **缺陷修复类：** fx_bugfix_nullcheck
+- **重构类：** fx_refactor_extract_hook、fx_rename_component、fx_remove_dead_code
+- **样式/体验类：** fx_css、fx_style_spacing、fx_a11y
+- **新文件类：** fx_newfile、fx_rename
+- **负向用例：** fx_neg_nonexistent（请求一个不存在的锚点 → 期望任务失败，终止状态 `error`，原因包含"not found"）
+
+每个 fixture 是一个 JSON，包含 `request_text`、`terminal_status`、`reason_contains`（负向用例用）。测试用 glob 自动发现 fixture 文件，不需要硬编码列表。
+
+还配了 `e2e_quick` pytest marker：从 16 个里挑 4 个代表性 fixture（feature + bugfix + rename + neg），迭代时跑 4 分钟而非 30 分钟。
+
+### 原理
+
+**为什么要这么多 fixture：** 流水线每个 gate 的代码分支都得跑到才算测到。"加属性"走 target 锚点分支、"删死代码"走 removal 锚点分支、负向用例走"锚点找不到"的早退路径——没有多样 fixture，很多分支从来没有真跑过。
+
+**为什么分六类：** 对应 `work_type` 和 `scenario` 的主要覆盖面。将来要改某一类时，直接跑该组 fixture 就能看回归。
+
+**`e2e_quick` 的意义：** 完整 16 个 fixture 要跑 ≈30 分钟，开发中不可能每改一行都等。选 4 个代表性 fixture 做 smoke test，每 commit 前跑一下能 catch 80% 的回归。完整矩阵放 CI 或发布前跑。
+
+### 怎么验证
+
+- `pytest -m e2e_quick tests/e2e/` → 4 个 fixture 跑过
+- `pytest -m e2e tests/e2e/` → 16 个 fixture 全跑
+- 负向 fixture `fx_neg_nonexistent` → 终止状态 `error`，原因含"not found"
+- 新增一个 fixture JSON → 无需改测试代码，glob 自动拾取
+
+---
+
+## Phase V — 压力测试框架（T-STRESS）✅
+
+### 做了什么
+
+写了一个独立的压力测试驱动 `scripts/e2e_stress.py`：拿同一个 fixture 跑 N 次（串行或多进程并发），输出一份 markdown 报告，看三件事：
+
+1. **延迟稳定性**：p50 / p95 / p99 的 wall time、各 gate 耗时
+2. **确定性**：每次跑出来的 patch 哈希是否一致（或聚成几类）
+3. **资源漂移**：RSS（内存）和 FD（文件句柄）在多轮之间是否单调上涨（内存/FD 泄漏）
+
+还会检测：通过率漂移（比如 50 轮里有 3 轮失败）、告警 / 推荐的下一步。报告写到 `data/stress-reports/<timestamp>/summary.md`，每轮一个 run-NNN.json 存原始数据。
+
+### 原理
+
+**为什么要压测：** 单次 E2E 通过 ≠ 稳定。LLM 有随机性，sandbox 有残留状态，线程池有竞态。只有跑很多轮才能发现"10 轮偶尔有 1 轮挂"这种隐藏问题。
+
+**每轮 in-memory SQLite 而非复用主库：** 压测不能污染开发库。每轮 `sqlite://` 内存库 + monkey-patch `SessionLocal`，跑完即释放，天然隔离。
+
+**并发用 multiprocessing 而非 ThreadPool：** orchestrator 用模块级 `SessionLocal`，ThreadPool 里多个线程共享会踩脏数据。进程隔离虽然启动慢但最干净。
+
+**为什么要看 patch 哈希聚类：** 理想状态是所有轮产出完全一样的 diff（byte-exact）。现实里 LLM 有温度，可能产出"语义等价但字节不同"的 diff——聚类能告诉你"10 轮里有几种不同输出"，数量越少越确定。
+
+### 怎么验证
+
+- `python scripts/e2e_stress.py --fixture fx_feature --runs 5 --output data/stress-reports/smoke` → 产出 summary.md + 5 个 run-NNN.json
+- summary.md 有 7 个 section：概览 / 延迟 / 确定性 / 资源 / 失败列表 / 告警 / 推荐
+- `--fixture 不存在的名字` → exit code 2，明确报错
+- `--concurrency 4 --runs 20` → 4 进程并行跑 20 轮
+- 详细操作手册：`docs/runbooks/stress-test.md`
+
+---
+
+## Phase W — 方向感知 Spec Conformance + Goal Attestation（T-SPEC-ADDITIVE）✅
+
+### 做了什么
+
+之前 `spec_conformance` 的两道门（check + attest）默认当成"破坏性请求"处理：预期请求会减少某些锚点（删文件、移除函数）。但实际用户大部分请求是**增量**的（加列、加属性、加路由），代码量应该增加而非减少。于是这些增量请求莫名其妙被 spec_conformance 判失败。
+
+这一轮分两个 phase 修：
+
+**Phase 1（check 门）：** 引入方向分类器 `_classify_request_direction_with_source()`，返回 `(direction, source)`。direction 有 `destructive` / `additive` / `mixed` 三种。根据 `work_type=feature` 或"增加/新增/加入"这类动词推断方向。check 门的三条规则根据方向取不同行为：
+
+- removal anchor 的 hit_delta 检查：destructive 走 block，additive 走 skip，mixed 走 warn
+- 显式引号锚点（"加到 UserManagement 表"）只对 additive 启用
+- 路径归一化（`_normalize_for_compare`）处理 `handyman-admin-dashboard/src/...` 和 `src/...` 前缀不一致
+
+**Phase 2（attest 门）：** 同样的方向盲病——`build_goal_attestation` 默认每个锚点方向是 `removal`，成功条件是"count 减少"。增量请求 count 不变 → 全部判 `not_achieved`。修法：引入第三种锚点方向 `location`（"目标位置"），条件是"增量请求 + 锚点已存在于源码树"。`location` 锚点的达成条件改成"diff 动到了至少一个包含该锚点的文件"。
+
+### 原理
+
+**为什么分 phase：** phase 1 改 check 门时以为 attest 门会跟着修好，实际跑 E2E 发现 check 通过了但 attest 还是 not_achieved——因为是两条独立代码路径，各有一套直接写死 `direction=removal` 的地方。拆开两个 phase 让每次改动可审可独立验证。
+
+**`location` 这个新方向的必要性：** 不能让所有增量请求 attest 都无条件通过——如果 codegen 跑偏了（应该动 UserManagement.js 却动了 LoginForm.js），attest 必须把它 catch 住。`location` 的规则是"锚点在源码树 + diff 必须触及某个含锚点的文件"，既让正常增量通过，又能揪出跑偏的 codegen。
+
+**为什么用 `work_type` 而不是猜动词：** 动词推断脆弱（"修改"可能是加也可能是删）。`work_type` 由翻译阶段 LLM 填字段，语义稳定，作为 primary signal 最可靠。动词推断作为兜底，覆盖 `work_type` 缺失的旧 request。
+
+### 怎么验证
+
+- `fx_feature`（"给 UserManagement 表加 Last Login 列"）→ check 门：`direction=additive, direction_source=work_type:feature`；attest 门：UserManagement 锚点 `direction=location, status=achieved`；任务终止状态 `awaiting_approval`，wall ≈174s
+- 破坏性请求"删除 UserManagement 功能"+ diff 未触及 UserManagement → attest 仍 `not_achieved`（防止增量语义覆盖范围过大）
+- 增量请求但 diff 错过了目标文件 → attest `not_achieved`（揪住 codegen 跑偏）
+- 45 个新单元测试覆盖 check + attest 三组方向 × 命中/未命中
+- `tests/services/test_spec_conformance_additive.py` 全部通过
+
+---
+
+## Phase X — Planner 过滤构建产物 + 共享路径分类器（T-PLANNER-BUILD-FILTER）✅
+
+### 做了什么
+
+Phase W 修好了增量方向后，再跑 16-fixture 回归发现新的死法：`fx_bugfix_nullcheck`、`fx_css`、`fx_rename` 这些在 `handyman-admin-dashboard` 上的 fixture 被 `spec_conformance` 的 `planner_must_touch` 规则卡住。根本原因是：RAG 检索会把 `build-before/`、`build-after/`、`dist/` 这些 webpack 打包产物（`main.abcdef1.chunk.js`、`.map` 文件）当作"相关文件"召回。planner agent 于是把这些构建产物写进 `must_touch_paths`，但没有人类开发者会去改构建产物——codegen 只改了 `src/...`，`planner_must_touch` 就判 "unmet"，整个任务失败。
+
+这一轮在两个层面挡掉构建产物：
+
+- **Layer 1（planner 前置过滤）：** `apps/backend/app/agents/service.py` 的引用列表构建阶段，调用 `filter_build_artifacts()` 把引用里的构建产物剔除，planner 根本看不到它们。
+- **Layer 2（spec 锚点扫描）：** `apps/backend/app/services/spec_conformance.py` 的 `must_touch_clean` 计算 + anchor 扫描阶段，再过一道 `filter_build_artifacts()`，防止万一有漏网之鱼。
+
+过滤逻辑统一落在新模块 `apps/backend/app/services/path_classifier.py`，两层共享，避免规则漂移。
+
+### 原理
+
+**为什么分两层：** Layer 1 是预防（让 planner 从一开始就不提交构建产物），Layer 2 是兜底（即使 planner 绕过了过滤，spec 门也要能抓住）。双重防御，单层失守不炸整体。
+
+**为什么要一个共享 classifier 而不是各写各的：** 原来 `agents/service.py` 和 `spec_conformance.py` 各自有一套 "这是不是构建产物" 的判断，规则会漂移（一方加了 `.min.js`，另一方忘加）。抽成 `path_classifier.py` 后，`is_build_artifact()` / `filter_build_artifacts()` 是唯一真相源，规则演进不会分叉。
+
+**`_BUILD_DIR_PREFIXES` 的覆盖范围：** `build/`、`build-before/`、`build-after/`（webpack dump 目录）、`dist/`、`out/`、`.next/`、`node_modules/`、`__pycache__/`、`.pytest_cache/`、`.tox/`、`.venv/`、`venv/`、`coverage/`、`htmlcov/`、`target/`。`_BUILD_FILE_SUFFIXES`：`.min.js`、`.min.css`、`.chunk.js`、`.bundle.js`、`.map`、`.pyc`、`.pyo`。再加一条正则匹配 webpack 打出来的哈希命名（`main.abcdef1.js`）。
+
+**为什么不删掉 RAG 对构建产物的召回：** RAG 层本身应该是"尽量召回"，过滤发生在下游才对。让 RAG 去理解"哪些是产物"会污染检索召回率指标。分离关注点：RAG 负责找，path_classifier 负责滤。
+
+### 怎么验证
+
+- 53 个单元测试：`test_path_classifier.py` + `test_spec_conformance_build_filter.py` + `test_must_touch_citation_filter.py` 全过
+- `fx_bugfix_nullcheck` 单独跑 e2e_quick → spec_conformance 不再因 `planner_must_touch` 卡住（改前 failed，改后进入下一门）
+- `is_build_artifact("handyman-admin-dashboard/build-after/static/js/main.abcdef1.chunk.js")` → True
+- `is_build_artifact("src/pages/UserManagement.js")` → False
+
+---
+
+## Phase Y — 默认工作类型不再是破坏性 + fixture 文本修正（T-SPEC-W-FOLLOWUP）✅
+
+### 做了什么
+
+Phase W 的 `DESTRUCTIVE_WORK_TYPES` 包含 `{"refactor", "bugfix", "fix", "chore"}`——意思是"只要 work_type 是这四种之一就按破坏性处理"。实际这四种语义**都是混合的**：bugfix 可能是加 null guard（增量），也可能是删死代码（破坏性）；refactor 可能是抽函数（加行数），也可能是合并重复代码（减行数）。直接按"破坏性"默认会把"加 null guard" 这种任务卡住——`fx_bugfix_nullcheck` 加了 `if (!user) return null;`，但 `displayName` 锚点的 count 没减少，attest 判 "not_achieved"，evidence_chain 报 "Unmet goals: ['displayName']"。
+
+这一轮两处小改：
+
+- **`DESTRUCTIVE_WORK_TYPES` 改成空 frozenset。** work_type=bugfix/fix/refactor/chore 不再默认按破坏性，走 fall-through 到 `"mixed"`。如果请求里有真正的破坏性动词（"删除"、"移除"、"drop"），verb 检测还是会把它识别成 destructive——并不会漏掉真的破坏性 bugfix。
+- **`fx_neg_nonexistent.json` 的 `reason_contains` 从 `"anchors_missing_from_tree"` 改成 `"anchors not found"`。** 前者是内部规则名，不会出现在用户可见的拒绝文本里；后者才是 orchestrator 实际输出的字符串。fixture 自己的 assertion 写错了。
+
+### 原理
+
+**为什么不引入 `MIXED_WORK_TYPES` 常量：** 没必要。`DESTRUCTIVE_WORK_TYPES` 空集 + `ADDITIVE_WORK_TYPES={"feature"}` 已经够了，其它 work_type 自然 fall-through 到 `("mixed", "no_direction_signal")`。再加一个常量只是增加需要同步维护的点。
+
+**为什么保留 `DESTRUCTIVE_WORK_TYPES` 这个常量不删：** 未来如果真出现 `"deprecation"`、`"removal"` 这种**语义上只做减法**的 work_type，还是要往这个集合里加。删掉常量等于删掉了那个扩展点。
+
+**fixture 文本 bug 的教训：** E2E fixture 的 expected 值如果依赖内部规则名而非用户可见文本，任何内部命名调整都会莫名其妙打破 E2E。规则是"expected 只 assert 用户可见的东西"。
+
+### 怎么验证
+
+- 5 个新单元测试：`test_bugfix_work_type_is_mixed_not_destructive` / `test_bugfix_work_type_with_destructive_verb_stays_destructive` / `test_refactor_work_type_is_mixed_not_destructive` / `test_chore_work_type_is_mixed_not_destructive` / `test_bugfix_attestation_uses_location_direction` 全过
+- 58 个 Phase W 相关测试全过（未回归）
+- `grep DESTRUCTIVE_WORK_TYPES apps/backend/app` 只在 `spec_conformance.py` 出现，没有其它消费者
+- 5 个单元测试全过，58 个 Phase W 相关测试未回归
+- ⚠️ **原先这里写的 "e2e_quick 4/4 过" 后来证伪**：2026-04-22 session 重新测基线发现 `t-e2e-fixtures` 单独（未合并优化）跑 e2e_quick 就是 0/4。Phase Y 当时的 4/4 claim 不可复现，大概率是当时 fixture 内容或 knowledge_source 状态与现在不同所致。见 Phase Z。
+
+---
+
+## Phase Z — batch1 优化集成 + 基线校准（2026-04-22）✅
+
+### 做了什么
+
+把四项优化（T-PROMPT-CACHE / T-PARALLEL-GATES / T-PYTEST-XDIST / T-SANDBOX-TEMPLATE）+ Phase X+Y + T-E2E-FIXTURES 整合到 `integrate/optimizations-batch1`，跑 e2e_quick 回归，合并到 main（commit `6a35bdc`）。过程中发现并回退了 T-SANDBOX-TEMPLATE（保留其它三项 + Phase X+Y）。
+
+- **T-PROMPT-CACHE**：`apps/backend/app/core/anthropic_cache.py` 新增 `make_cached_system()`，给 4 个 LLM 调用点（codegen / request_refinement / semantic_review / agents.service）的 system prompt 加 `cache_control: ephemeral`。日志会打印 `cache_creation_input_tokens` / `cache_read_input_tokens`。
+- **T-PARALLEL-GATES**：stage-3 三道 post-apply 闸门（spec_conformance / goal_decomposition / evidence_chain）从串行改并发，用 `submit_pipeline_job` + `wait(FIRST_EXCEPTION, timeout=120s)`。config 加了 `gate_parallel_enabled=True` / `gate_parallel_timeout_sec=120`。
+- **T-PYTEST-XDIST**：pytest 加 `-n 2 --dist loadfile` 并行；所有 Anthropic 调用点统一包 `app/services/llm_retry.py` 的 `retry_on_rate_limit()`（指数退避 429）。
+- **T-SANDBOX-TEMPLATE 已回退**（commit `52aa143`）：原本用 git worktree 从模板开 sandbox（12× 加速），但 `git -C <template> worktree add <relpath>` 把相对路径 `data/sandboxes/<task_id>` 解析到 template 目录下，导致 sandbox 落在错误位置，随后 apply_patch 报 "Sandbox does not exist"。可以未来修好后重新引入（传绝对路径即可）。
+
+### 原理
+
+**为什么 batch1 的 e2e_quick 最终 0/4 PASS 还是能 ship：** 集成前先跑了一次 `t-e2e-fixtures` 纯基线（commit `e76c4f4`，无任何优化），结果也是 0/4。也就是这 4 个 fixture 在主干本来就不过；batch1 没引入新的失败，只是换了失败模式（由于 Phase Y 调整了场景分类，3/4 fixture 从"走 knowledge 查资料"改为"正确进 codegen"——这反倒是行为改善，只是进去之后又撞到别的预存 bug）。
+
+**Phase Y 的副作用**：`fx_neg_nonexistent` 从 knowledge 分支改走 code_develop 分支，绕过了 `_verify_anchors_exist_in_source()` 这道防御线。这是 batch1 唯一真实的行为回归，已立 follow-up ticket `docs/ai/tasks/T-PHASE-Y-ANCHOR-FOLLOWUP.md`。
+
+**教训（已进 memory `feedback_verify_baseline_first.md`）：** Prior session summary 里的 "4/4 pass" 被当成事实用了，实际它是时间冻结的快照，不可复现。以后判断 regression 前必须**先**在未合并状态下实测基线，不能继承断言。
+
+### 怎么验证
+
+- `main` @ `6a35bdc` = batch1 merge；`git log --first-parent main -5` 能看到 merge commit
+- 基线对照：`d:/项目/ops-worktrees/e2e-fixtures` @ `e76c4f4` 跑 e2e_quick 是 0/4（用时 1:35，全走 knowledge 分支）
+- batch1 post-revert e2e_quick 也是 0/4（用时 12:26，3/4 正确进 codegen），说明优化**没引入 regression**
+- 84/84 单元测试过，`python -m py_compile` 核心模块全过
+- prompt-cache 生效验证：重跑 codegen 后日志里应有 `cache_read_input_tokens > 0`
+- parallel-gates 生效验证：日志里有 `Starting parallel post-apply gates` → `Parallel post-apply gates completed` 成对出现
+
+---
+
 ## 全景路线图
 
 ```
@@ -456,10 +750,59 @@ structlog 告诉你"发生了什么"，但看不出**因果关系和时间分布
 
 Provider 层：                                    P（Anthropic 接入）
 
+防御层：                                             Q → W → X → Y
+                                          异步层：        R
+                                          分类层：         S
+                                          前端层：          T
+                                          测试层：           U → V
+
 M = 代码生成（keystone）
 N = 端到端编排（集成）
 O = Diff 展示 + 审批交互（前端体验）
 P = Anthropic/Claude 作为 codegen + planning provider
+Q = 多门防御流水线（七门 + 自修复）
+R = 异步流水线执行池
+S = 场景重分类 + code_develop
+T = 前端 diff 高亮 + GateStatusPanel
+U = 16-fixture E2E 覆盖矩阵 + e2e_quick
+V = 压力测试框架（延迟/确定性/资源漂移）
+W = 方向感知 spec_conformance + goal attestation
+X = Planner 过滤构建产物 + 共享路径分类器
+Y = 默认工作类型不再是破坏性 + fixture 文本修正
 ```
 
-Phase H 是功能层和可观测层的衔接点。Phase M 是打通端到端 demo 的关键。Phase O 是用户体验的收尾。Phase P 让 demo 能用真正的强代码模型跑通。
+Phase H 是功能层和可观测层的衔接点。Phase M 是打通端到端 demo 的关键。Phase O 是用户体验的收尾。Phase P 让 demo 能用真正的强代码模型跑通。Phase Q-W 把流水线从"能跑"推进到"可观测、可压测、方向正确、前端友好"的阶段。
+
+---
+
+## ⚠️ 底层规则（对所有后续开发者——Claude / codex / 人 都适用）
+
+**所有阶段性或关键性的开发成果，完成后必须写进本文件。** 不写进来的开发等于没做。
+
+**每个 Phase 的格式固定三段式：**
+
+1. **做了什么** — 写得像跟同事说话，不要列代码路径，要讲"这一轮改了哪些用户能感知的行为"
+2. **原理** — 讲"为什么这么改 / 为什么选这条路线 / 和其他方案的取舍"，关键设计决策必须有**为什么**
+3. **怎么验证** — 具体的验证命令、可观察的结果、测试数量、终止状态等，不要抽象的"跑测试通过"
+
+**语言要求：**
+
+- **中文白话**，不要堆英文术语；必要时用"xxx（英文名）"的括号补充
+- **要非常详细**，宁可长一点也不要省略关键原理；目标是"三个月后的自己看一眼就能想起来"
+- 代码路径用反引号括起（如 `apps/backend/app/services/spec_conformance.py`），不要在正文里暴露完整绝对路径
+- 每个 Phase 末尾用 `---` 分隔
+
+**触发更新的场景：**
+
+- 完成一个 Task（T-xxx）并合并 / 提交
+- 引入一个新的架构概念或门（如"第八道门"、"新的 provider"）
+- 修复一个会影响用户感知的 bug（不是小 typo）
+- 做了一次 schema / 接口的非兼容变更
+
+**谁来写：**
+
+- Claude、codex、人都可以
+- 如果是 codex 写，在 prompt 里明确要求"中文白话 + 三段式 + 详细"
+- 写完后 Claude 或人做一次 review，确保"原理"段真的讲清楚了为什么
+
+**Phase 命名：** 按字母顺序延续（当前最新是 W，下一个是 X、Y、Z，然后 AA、AB…）。一个 Phase 对应一次"有故事可讲"的开发闭环，不是一个 commit。
