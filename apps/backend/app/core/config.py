@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     cli_max_retries: int = 1
     gate_repair_max_attempts: int = 1
     gate_repair_timeout_seconds: float = 300.0
+    # Per-file parallel codegen: concurrent workers for develop pipeline codegen.
+    # 1 = serial (old batched behavior), 2-3 = parallel (faster, no truncation).
+    codegen_parallel_max: int = 2
     semantic_translator_provider: Literal["auto", "mock", "minimax"] = "auto"
     semantic_translator_model: str = "MiniMax-M2.7"
     semantic_translator_timeout_seconds: float = 30.0

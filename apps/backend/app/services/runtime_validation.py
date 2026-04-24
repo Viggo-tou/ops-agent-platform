@@ -133,19 +133,49 @@ def _check_replacement_completeness(
     diff: str,
     context_files: dict[str, str],
 ) -> list[ValidationFinding]:
-    """Check that string replacements are complete across all context files."""
+    """Check that string replacements are complete across all context files.
+
+    Heuristic: strings that a CLI agent wholesale-deletes when rewriting a
+    single file are NOT refactor targets — the agent just regenerated the
+    file and dropped some lines. We detect wholesale-rewrite hunks
+    (``@@ -1,N +0,0 @@`` or very large ``-`` blocks with minimal ``+``
+    counterpart) and exclude their removed strings from the "replaced" set,
+    otherwise every common import like "react" triggers 90+ false positives.
+    """
     findings: list[ValidationFinding] = []
 
+    # Track which strings appear on - lines ONLY in targeted replacement
+    # hunks, not wholesale-rewrite hunks. A targeted hunk has both - and +
+    # lines with roughly balanced substring counts; wholesale rewrites tend
+    # to be one gigantic - block + one gigantic + block (or all-delete).
     removed_strings: set[str] = set()
     added_strings: set[str] = set()
 
-    for line in diff.splitlines():
-        if line.startswith("-") and not line.startswith("---"):
-            for m in re.findall(r'["\']([^"\']{3,})["\']', line[1:]):
-                removed_strings.add(m)
-        elif line.startswith("+") and not line.startswith("+++"):
-            for m in re.findall(r'["\']([^"\']{3,})["\']', line[1:]):
+    current_hunk_minus: list[str] = []
+    current_hunk_plus: list[str] = []
+
+    def _flush_hunk() -> None:
+        # Only count removals from "small" hunks; treat hunks with >40 minus
+        # lines as a wholesale rewrite and skip their removed-string contribution.
+        is_wholesale = len(current_hunk_minus) > 40
+        if not is_wholesale:
+            for line in current_hunk_minus:
+                for m in re.findall(r'["\']([^"\']{3,})["\']', line):
+                    removed_strings.add(m)
+        for line in current_hunk_plus:
+            for m in re.findall(r'["\']([^"\']{3,})["\']', line):
                 added_strings.add(m)
+
+    for line in diff.splitlines():
+        if line.startswith("@@"):
+            _flush_hunk()
+            current_hunk_minus = []
+            current_hunk_plus = []
+        elif line.startswith("-") and not line.startswith("---"):
+            current_hunk_minus.append(line[1:])
+        elif line.startswith("+") and not line.startswith("+++"):
+            current_hunk_plus.append(line[1:])
+    _flush_hunk()
 
     replaced = removed_strings - added_strings
 

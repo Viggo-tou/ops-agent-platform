@@ -1,6 +1,7 @@
 import type { EventRecord } from "../../types";
 import { ApprovalActions } from "./ApprovalActions";
 import { DiffBlock } from "./DiffBlock";
+import { ReservationsBlock } from "./ReservationsBlock";
 
 interface EventTimelineProps {
   events: EventRecord[];
@@ -69,6 +70,27 @@ function readDiffSummary(event: EventRecord): string {
 
 function readApprovalId(event: EventRecord): string | null {
   return readPayloadString(event, ["approval_id", "approvalId", "id"]);
+}
+
+function readReservations(event: EventRecord): string[] {
+  const payload = event.payload_json;
+  if (!payload) {
+    return [];
+  }
+  const raw = (payload as Record<string, unknown>).reservations;
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const cleaned: string[] = [];
+  for (const item of raw) {
+    if (typeof item === "string") {
+      const trimmed = item.trim();
+      if (trimmed) {
+        cleaned.push(trimmed);
+      }
+    }
+  }
+  return cleaned;
 }
 
 export function formatEventMessage(event: EventRecord): string | null {
@@ -142,6 +164,9 @@ export function EventTimeline({ events }: EventTimelineProps) {
           <div className="event-timeline-main">
             <span className="event-timeline-text">{text}</span>
             {readDiff(event) ? <DiffBlock diff={readDiff(event)!} summary={readDiffSummary(event)} /> : null}
+            {event.event_type === "approval_requested" && readReservations(event).length > 0 ? (
+              <ReservationsBlock reservations={readReservations(event)} />
+            ) : null}
             {event.event_type === "approval_requested" && readApprovalId(event) ? (
               <ApprovalActions
                 approvalId={readApprovalId(event)!}
