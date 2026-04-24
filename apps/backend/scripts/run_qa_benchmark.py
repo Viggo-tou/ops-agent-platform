@@ -21,6 +21,22 @@ REPO_ROOT = SCRIPT_PATH.parents[3]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
+# Load backend .env regardless of the caller's CWD so judge credentials
+# (OPS_AGENT_ANTHROPIC_API_KEY, OPS_AGENT_MINIMAX_API_KEY) are picked up
+# when the runner is invoked from the repo root / a worktree root.
+_BACKEND_ENV = BACKEND_ROOT / ".env"
+if _BACKEND_ENV.is_file():
+    import os
+    for _line in _BACKEND_ENV.read_text(encoding="utf-8").splitlines():
+        _line = _line.strip()
+        if not _line or _line.startswith("#") or "=" not in _line:
+            continue
+        _k, _, _v = _line.partition("=")
+        _k = _k.strip()
+        _v = _v.strip().strip('"').strip("'")
+        if _k and _k not in os.environ:
+            os.environ[_k] = _v
+
 from app.core.config import get_settings
 
 DEFAULT_DATASET_PATH = REPO_ROOT / "apps" / "backend" / "tests" / "benchmarks" / "qa_benchmark_dataset.jsonl"
@@ -236,15 +252,30 @@ class KeypointJudge:
         if self.requested_mode == "rule":
             return self._judge_with_rule(answer=answer, keypoints=keypoints), "rule"
 
+        if self.requested_mode == "anthropic":
+            return self._judge_with_anthropic(question=question, answer=answer, keypoints=keypoints), "anthropic"
+
         if self.requested_mode == "minimax":
             return self._judge_with_minimax(question=question, answer=answer, keypoints=keypoints), "minimax"
 
+        # auto: prefer Anthropic (cross-family vs MiniMax synthesizer →
+        # avoids self-evaluation bias), fall back to MiniMax, then rule.
         if self._auto_force_rule:
             return self._judge_with_rule(answer=answer, keypoints=keypoints), "rule"
 
+        if self.settings.anthropic_api_key:
+            try:
+                return self._judge_with_anthropic(question=question, answer=answer, keypoints=keypoints), "anthropic"
+            except (httpx.HTTPError, json.JSONDecodeError, RuntimeError) as exc:
+                # Don't force-rule yet — fall through to MiniMax before giving up.
+                self.auto_rule_reason = f"Anthropic judge failed, falling back to MiniMax: {exc}"
+
         if not self.settings.minimax_api_key:
             self._auto_force_rule = True
-            self.auto_rule_reason = "OPS_AGENT_MINIMAX_API_KEY not configured"
+            self.auto_rule_reason = (
+                self.auto_rule_reason
+                or "Neither OPS_AGENT_ANTHROPIC_API_KEY nor OPS_AGENT_MINIMAX_API_KEY configured"
+            )
             return self._judge_with_rule(answer=answer, keypoints=keypoints), "rule"
 
         try:
@@ -336,6 +367,73 @@ class KeypointJudge:
         for item in raw_hits:
             if not isinstance(item, bool):
                 raise RuntimeError("MiniMax judge returned a non-boolean hit value")
+            hits.append(item)
+        return hits
+
+    def _judge_with_anthropic(self, *, question: str, answer: str, keypoints: Sequence[str]) -> list[bool]:
+        """Cross-family judge using Anthropic Claude. Used when the synthesis
+        side is MiniMax — Anthropic judges MiniMax's output without the
+        self-evaluation bias that 'MiniMax judges MiniMax' has.
+        """
+        if not self.settings.anthropic_api_key:
+            raise RuntimeError("OPS_AGENT_ANTHROPIC_API_KEY not configured")
+
+        system_prompt = (
+            "You are a strict benchmark judge for repository-grounded Q&A. "
+            "Decide whether each expected keypoint is clearly supported by the answer text. "
+            "Treat close paraphrases as hits, but do not infer facts that are absent. "
+            "Return JSON only with this shape: {\"hits\": [true, false]}."
+        )
+        numbered_keypoints = "\n".join(f"{index + 1}. {item}" for index, item in enumerate(keypoints))
+        user_prompt = (
+            f"Question:\n{question}\n\n"
+            f"Answer:\n{answer}\n\n"
+            f"Expected keypoints:\n{numbered_keypoints}\n\n"
+            f"Return JSON only. The `hits` array must have exactly {len(keypoints)} booleans."
+        )
+
+        payload = {
+            "model": self.settings.anthropic_model,
+            "max_tokens": 512,
+            "temperature": 0,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_prompt}],
+        }
+        headers = {
+            "x-api-key": self.settings.anthropic_api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+
+        with httpx.Client(timeout=self.settings.knowledge_synthesis_timeout_seconds) as client:
+            response = client.post(
+                f"{self.settings.anthropic_base_url.rstrip('/')}/v1/messages",
+                headers=headers,
+                json=payload,
+            )
+            response.raise_for_status()
+            response_payload = response.json()
+
+        # Anthropic messages API: response.content is a list of content blocks.
+        content_blocks = response_payload.get("content") or []
+        text_parts: list[str] = []
+        for block in content_blocks:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(str(block.get("text") or ""))
+        content = "".join(text_parts)
+        if not content.strip():
+            raise RuntimeError("Anthropic judge returned empty content")
+
+        parsed = json.loads(strip_json_fence(content))
+        if not isinstance(parsed, dict):
+            raise RuntimeError("Anthropic judge did not return a JSON object")
+        raw_hits = parsed.get("hits")
+        if not isinstance(raw_hits, list) or len(raw_hits) != len(keypoints):
+            raise RuntimeError("Anthropic judge returned an invalid hits array")
+        hits: list[bool] = []
+        for item in raw_hits:
+            if not isinstance(item, bool):
+                raise RuntimeError("Anthropic judge returned a non-boolean hit value")
             hits.append(item)
         return hits
 
@@ -511,7 +609,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR), help="Directory where JSONL run artifacts are written.")
     parser.add_argument("--actor-name", default="qa-benchmark", help="Actor name sent to the backend task API.")
     parser.add_argument("--limit", type=int, default=None, help="Only run the first N dataset rows.")
-    parser.add_argument("--judge-mode", choices=("auto", "minimax", "rule"), default="auto", help="Scoring judge mode.")
+    parser.add_argument(
+        "--judge-mode",
+        choices=("auto", "anthropic", "minimax", "rule"),
+        default="auto",
+        help=(
+            "Scoring judge mode. 'auto' prefers Anthropic (cross-family, avoids "
+            "self-evaluation bias vs MiniMax synthesizer), falls back to MiniMax, "
+            "then rule judge."
+        ),
+    )
     return parser.parse_args()
 
 
