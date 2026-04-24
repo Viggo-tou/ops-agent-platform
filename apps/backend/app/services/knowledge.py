@@ -50,7 +50,55 @@ TEXT_EXTENSIONS = {
     ".py",
     ".vue",
 }
-IGNORED_PARTS = {".git", ".gradle", "build", ".idea", "__pycache__", "node_modules", "dist", ".next", "coverage", ".venv"}
+IGNORED_PARTS = {
+    ".git", ".gradle", ".idea", "__pycache__", "node_modules",
+    "build", "dist", ".next", "out", "target", "bin", "obj",
+    ".cache", ".turbo", ".parcel-cache", ".vite", ".svelte-kit",
+    "coverage", ".nyc_output", ".venv", "venv", ".tox",
+    # Common "build" sibling directories used for A/B comparisons
+    "build-before", "build-after", "dist-before", "dist-after",
+}
+# Directory part prefixes that indicate build output regardless of exact name.
+IGNORED_PART_PREFIXES = ("build-", "dist-")
+# File name patterns (basename) to exclude even if extension is listed in
+# TEXT_EXTENSIONS. These are generated / bundled / lock files that pollute
+# retrieval results (e.g. A-05 baseline pulled build/.../main.xxx.js.LICENSE.txt
+# into the top-5 before the real src/components/ExportReportButton.js).
+IGNORED_FILENAME_SUFFIXES = (
+    ".min.js", ".min.css",
+    ".bundle.js", ".bundle.css",
+    ".chunk.js", ".chunk.css",
+    ".map",
+    ".LICENSE.txt",
+    "-lock.json",
+)
+IGNORED_FILENAMES = frozenset({
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    "composer.lock", "Gemfile.lock", "poetry.lock", "Cargo.lock",
+    "firebase-debug.log",
+})
+
+
+def _is_ignored_path(file_path: Path) -> bool:
+    """Central deny rule: return True if the path should be excluded from
+    knowledge retrieval. Covers directory-part matches, prefix matches on
+    build-* siblings, basename-level deny list, and suffix patterns for
+    generated / minified / lock / sourcemap artefacts.
+    """
+    parts = file_path.parts
+    for part in parts:
+        if part in IGNORED_PARTS:
+            return True
+        for prefix in IGNORED_PART_PREFIXES:
+            if part.startswith(prefix):
+                return True
+    name = file_path.name
+    if name in IGNORED_FILENAMES:
+        return True
+    for suffix in IGNORED_FILENAME_SUFFIXES:
+        if name.endswith(suffix):
+            return True
+    return False
 TOKEN_PATTERN = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]+")
 CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 SEMANTIC_EXPANSIONS = {
@@ -592,7 +640,7 @@ class KnowledgeService:
         for file_path in source_path.rglob("*"):
             if not file_path.is_file():
                 continue
-            if any(part in IGNORED_PARTS for part in file_path.parts):
+            if _is_ignored_path(file_path):
                 continue
             if file_path.suffix.lower() not in TEXT_EXTENSIONS:
                 continue
