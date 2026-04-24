@@ -61,6 +61,19 @@ class GeneratedPlanPayload(BaseModel):
             "Empty for pure new-file or scaffold tasks."
         ),
     )
+    expected_new_files: list[str] = Field(
+        default_factory=list,
+        max_length=8,
+        description=(
+            "Files that the patch MUST CREATE (files that do not yet exist "
+            "in the repository) for the task to count as complete. Populated "
+            "by the planner when the task requires a new configuration file, "
+            "rule file, schema file, or similar artifact. The orchestrator "
+            "uses this list to assign per-file codegen batches for new files "
+            "and to enforce the artifact-existence gate. Empty when the task "
+            "only modifies existing files."
+        ),
+    )
     tools: list[PlanTool] = Field(min_length=1, max_length=6)
     steps: list[PlanStep] = Field(min_length=1, max_length=10)
     final_output_contract: FinalOutputContract
@@ -163,6 +176,7 @@ class CodegenResult(BaseModel):
     summary: str = Field(min_length=1, max_length=500)
     files_changed: list[str] = Field(default_factory=list)
     file_summaries: list[dict[str, str]] = Field(default_factory=list)
+    attempt_history: list[dict[str, Any]] | None = None
     provider_name: str = ""
     model_name: str | None = None
     input_tokens: int = 0

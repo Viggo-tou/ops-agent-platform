@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from sqlalchemy import select
@@ -19,7 +20,7 @@ from app.models.approval import Approval
 from app.models.event import Event
 from app.models.task import Task
 from app.models.tool_execution import ToolExecution
-from app.services.events import record_event, set_task_status
+from app.services.events import commit_checkpoint, record_event, set_task_status
 from app.services.sandbox import ExecutionSandbox, SandboxError
 from app.services.spec_conformance import (
     ConformanceReport,
@@ -290,6 +291,7 @@ class PrimaryOrchestrator:
                 "fallback_reason": planning_result.fallback_reason,
             },
         )
+        commit_checkpoint(self.db, label="plan_generated")
 
         set_task_status(
             self.db,
@@ -332,6 +334,7 @@ class PrimaryOrchestrator:
                 message="Reviewer approved the execution plan.",
                 payload={"review": task.review_json},
             )
+            commit_checkpoint(self.db, label="review_passed_pre_execution")
             self._execute_plan(task=task, actor_name=actor_name, plan=plan_document)
             return
 
@@ -415,6 +418,7 @@ class PrimaryOrchestrator:
                     "review_summary": review_result.review.summary,
                 },
             )
+            commit_checkpoint(self.db, label="awaiting_approval_pre_execution")
             return
 
         record_event(
@@ -1472,57 +1476,64 @@ class PrimaryOrchestrator:
             # Use pipeline-level source path for batch construction + codegen calls
             _source_path = _pipeline_source_path
 
-            # Worktree mode: Claude Code has full repo visibility, so batching
-            # just causes duplicate runs that produce the same diff.  Collapse
-            # all context files into a single batch when a valid source repo is
-            # available (which triggers worktree codegen in codegen.py).
-            _use_worktree_single_batch = bool(_source_path)
-
-            # If this is a new-file task (detected by any of the three paths
-            # above), only run ONE batch with the new-file stubs plus a small
-            # grounding slice. The existing_files that appeared in context are
-            # knowledge-retrieval grounding, not edit targets, so generating
-            # patches for them is waste.
+            # Per-file batching: each file gets its own codegen call. Cuts
+            # single-call output size from 10K+ tokens (all files in one diff)
+            # to ~500 tokens (one file's diff), eliminating LLM token-limit
+            # truncation. Batches run in parallel via ThreadPoolExecutor.
             is_new_file_task = bool(pipeline_state.get("_new_file_task"))
 
+            # Targets come from planner's must_touch_files (the files the
+            # planner explicitly committed to modifying). existing_files may
+            # include broader grounding from knowledge.search (e.g. package.json,
+            # cors.json) that the model needs to see but MUST NOT rewrite.
+            _must_touch = set(getattr(plan, "must_touch_files", None) or [])
+            _must_touch_existing = [
+                (p, c) for p, c in existing_files if p in _must_touch
+            ]
+            # expected_new_files from planner → stubs that become their own
+            # batches so each new file gets an explicit codegen call scoped
+            # to creating it (rather than relying on CLI agents to "remember"
+            # to create them as a side-effect of another batch).
+            _expected_new = list(getattr(plan, "expected_new_files", None) or [])
+            _planner_new_stubs = [
+                (p, "") for p in _expected_new
+                if not any(p == np for np, _ in new_file_stubs)
+            ]
+            # Fallback: if planner didn't specify must_touch_files (empty set),
+            # keep the legacy batched-single-call behavior to avoid dispatching
+            # per-context-file, which blew up to 19 calls in testing.
+            _has_targets = (
+                bool(_must_touch_existing)
+                or bool(new_file_stubs)
+                or bool(_planner_new_stubs)
+            )
+
             batches: list[dict[str, str]] = []
-            if _use_worktree_single_batch:
-                # Single batch: all files together — worktree gives full repo access
-                batches.append(dict(context_files))
-            elif is_new_file_task and new_file_stubs:
+            if is_new_file_task and new_file_stubs:
                 new_batch = dict(new_file_stubs)
-                for p, c in existing_files[:batch_size]:
+                for p, c in existing_files[:3]:
                     new_batch.setdefault(p, c)
                 batches.append(new_batch)
-                record_event(
-                    self.db,
-                    task_id=task.id,
-                    event_type=EventType.TOOL_SKIPPED,
-                    source=EventSource.ORCHESTRATOR,
-                    stage=WorkflowStage.ACTION,
-                    role=RoleName.ACTION,
-                    message=(
-                        f"New-file task detected: {len(new_file_stubs)} new file(s), "
-                        f"{len(existing_files)} grounding file(s) \u2014 using single batch."
-                    ),
-                    payload={
-                        "new_file_paths": [p for p, _ in new_file_stubs],
-                        "grounding_count": len(existing_files),
-                    },
-                )
-            else:
+            elif _has_targets:
                 if new_file_stubs:
-                    # Mixed task: new files need generation, existing files may
-                    # need modification. Put new files in one batch with some
-                    # grounding, then process remaining existing files normally.
                     new_batch = dict(new_file_stubs)
-                    for p, c in existing_files[:batch_size]:
+                    for p, c in existing_files[:3]:
                         new_batch.setdefault(p, c)
                     batches.append(new_batch)
-
-                # Remaining existing files in normal batches
-                for i in range(0, len(existing_files), batch_size):
-                    batches.append(dict(existing_files[i : i + batch_size]))
+                # Per-file: only planner-declared must_touch targets get batches.
+                for path, content in _must_touch_existing:
+                    batches.append({path: content})
+                # Planner-declared new files: each gets its own stub batch with
+                # a small grounding slice so the model understands context.
+                for path, _ in _planner_new_stubs:
+                    stub_batch: dict[str, str] = {path: ""}
+                    for gp, gc in existing_files[:2]:
+                        stub_batch.setdefault(gp, gc)
+                    batches.append(stub_batch)
+            else:
+                # No must_touch targets at all — fall back to single batch
+                # with everything, so codegen can still run (legacy path).
+                batches.append(dict(context_files))
 
             merged_diff_parts: list[str] = []
             merged_files_changed: list[str] = []
@@ -1536,56 +1547,191 @@ class PrimaryOrchestrator:
             if _translation.get("constraints"):
                 _plan_json_for_codegen["constraints"] = _translation["constraints"]
 
-            for batch_idx, batch_files in enumerate(batches):
-                # Delay between CLI-based codegen batches to avoid rate limiting
-                if batch_idx > 0:
-                    time.sleep(15)
-                batch_label = f"batch {batch_idx + 1}/{len(batches)}"
-                try:
-                    batch_result = self._execute_develop_tool(
-                        task=task,
-                        actor_name=actor_name,
-                        tool_name="codegen.generate_patch",
-                        payload={
-                            "plan_json": _plan_json_for_codegen,
-                            "context_files": batch_files,
-                            "task_description": self._build_codegen_task_description(
-                                task=task,
-                                plan=plan,
-                                pipeline_state=pipeline_state,
-                                batch_files=batch_files,
-                            ),
-                            "source_repo_path": str(_source_path) if _source_path else None,
-                        },
-                        stage=WorkflowStage.ACTION,
-                        role=RoleName.ACTION,
-                        approval_id=approval_id,
-                        pipeline_state=pipeline_state,
-                    )
-                except Exception as exc:
-                    record_event(
-                        self.db,
-                        task_id=task.id,
-                        event_type=EventType.TOOL_FAILED,
-                        source=EventSource.ORCHESTRATOR,
-                        stage=WorkflowStage.ACTION,
-                        role=RoleName.ACTION,
-                        tool_name="codegen.generate_patch",
-                        message=f"Codegen {batch_label} failed: {exc}",
-                        payload={"batch": batch_idx, "files": list(batch_files.keys())},
-                    )
-                    continue
-                if batch_result is None:
-                    continue
+            parallel_max = getattr(
+                self.tool_gateway.settings, "codegen_parallel_max", 2
+            )
+            parallel_max = max(1, min(parallel_max, len(batches)))
 
+            # Main-thread: record TOOL_CALL_REQUESTED up-front so UI shows N
+            # pending batches before any worker returns.
+            for batch_idx, batch_files in enumerate(batches):
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_CALL_REQUESTED,
+                    source=EventSource.TOOL_GATEWAY,
+                    stage=WorkflowStage.ACTION,
+                    role=RoleName.ACTION,
+                    tool_name="codegen.generate_patch",
+                    message=(
+                        f"Codegen batch {batch_idx + 1}/{len(batches)} dispatched "
+                        f"(parallel_max={parallel_max}, files={list(batch_files.keys())[:2]})"
+                    ),
+                    payload={
+                        "batch": batch_idx,
+                        "files": list(batch_files.keys()),
+                        "parallel_max": parallel_max,
+                    },
+                )
+            commit_checkpoint(
+                self.db, label=f"codegen_parallel_start_{len(batches)}_batches"
+            )
+
+            # Worker runs in pool thread. For multi-batch parallel, workers
+            # bypass tool_gateway entirely and call CodeGenerator directly: no
+            # DB writes in worker threads, so no SQLite write-lock contention.
+            # ToolExecution + CostTracker rows are skipped on this path (TODO:
+            # record them from main thread post-join). Single-batch path keeps
+            # self.tool_gateway so test mocks still apply.
+            _use_direct_codegen = len(batches) > 1
+
+            def _worker_codegen(
+                b_idx: int, b_files: dict[str, str]
+            ) -> tuple[int, dict | None, Exception | None]:
+                task_description = self._build_codegen_task_description(
+                    task=task,
+                    plan=plan,
+                    pipeline_state=pipeline_state,
+                    batch_files=b_files,
+                )
+                if _use_direct_codegen:
+                    from app.services.codegen import CodeGenerator, CodegenError
+
+                    try:
+                        result = CodeGenerator(self.tool_gateway.settings).generate_patch(
+                            task_id=task.id,
+                            plan_json=_plan_json_for_codegen,
+                            context_files=b_files,
+                            task_description=task_description,
+                            source_repo_path=str(_source_path) if _source_path else None,
+                        )
+                        dump = result.model_dump(mode="json")
+                        # Defensive scope-lock: single-file batches must only
+                        # MODIFY their target existing file. New-file creation
+                        # hunks (detected by 'new file mode' header) are kept
+                        # across all batches — multi-batch duplicate creation
+                        # is deduplicated later by the merge step's seen_files
+                        # set, so first batch wins.
+                        if len(b_files) == 1:
+                            target = next(iter(b_files.keys()))
+                            diff_text = str(dump.get("diff") or "")
+                            kept_sections: list[str] = []
+                            kept_file_paths: list[str] = []
+                            for section in re.split(
+                                r"(?=^diff --git )", diff_text, flags=re.MULTILINE
+                            ):
+                                section = section.strip()
+                                if not section:
+                                    continue
+                                m = re.match(r"diff --git a/(.+?) b/", section)
+                                if m is None:
+                                    continue
+                                hunk_file = m.group(1).strip()
+                                is_target = (
+                                    hunk_file == target
+                                    or hunk_file.endswith("/" + target)
+                                )
+                                # Detect new-file creation from diff header:
+                                # git formats these as 'new file mode 100644'
+                                # plus 'index 0000000..xxxxxxx'.
+                                is_new_file = (
+                                    "new file mode " in section
+                                    or bool(re.search(r"^index 0{7,}\.\.", section, re.MULTILINE))
+                                )
+                                if is_target or is_new_file:
+                                    kept_sections.append(section)
+                                    kept_file_paths.append(hunk_file)
+                            dump["diff"] = "\n".join(kept_sections)
+                            fc = dump.get("files_changed") or []
+                            # Keep the target + any new files that survived
+                            dump["files_changed"] = [
+                                f for f in fc
+                                if f == target
+                                or f.endswith("/" + target)
+                                or f in kept_file_paths
+                                or any(k.endswith("/" + f) for k in kept_file_paths)
+                            ]
+                        return b_idx, dump, None
+                    except CodegenError as exc:
+                        return b_idx, None, exc
+                    except Exception as exc:  # noqa: BLE001
+                        return b_idx, None, exc
+                else:
+                    try:
+                        result = self.tool_gateway.execute(
+                            task_id=task.id,
+                            tool_name="codegen.generate_patch",
+                            payload={
+                                "plan_json": _plan_json_for_codegen,
+                                "context_files": b_files,
+                                "task_description": task_description,
+                                "source_repo_path": str(_source_path) if _source_path else None,
+                            },
+                            actor_context={"actor_name": actor_name, "task_id": task.id},
+                            session_id=task.session_id,
+                            stage=WorkflowStage.ACTION,
+                            role=RoleName.ACTION,
+                            approval_id=approval_id,
+                        )
+                        return b_idx, result, None
+                    except Exception as exc:  # noqa: BLE001
+                        return b_idx, None, exc
+
+            results_by_idx: dict[int, dict] = {}
+            with ThreadPoolExecutor(
+                max_workers=parallel_max, thread_name_prefix="codegen"
+            ) as pool:
+                futures = [
+                    pool.submit(_worker_codegen, i, batches[i])
+                    for i in range(len(batches))
+                ]
+                for fut in as_completed(futures):
+                    batch_idx, batch_result, err = fut.result()
+                    batch_label = f"batch {batch_idx + 1}/{len(batches)}"
+                    if err is not None:
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_FAILED,
+                            source=EventSource.TOOL_GATEWAY,
+                            stage=WorkflowStage.ACTION,
+                            role=RoleName.ACTION,
+                            tool_name="codegen.generate_patch",
+                            message=f"Codegen {batch_label} failed: {err}",
+                            payload={
+                                "batch": batch_idx,
+                                "files": list(batches[batch_idx].keys()),
+                                "error": str(err)[:500],
+                            },
+                        )
+                    elif batch_result is not None:
+                        results_by_idx[batch_idx] = batch_result
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_SUCCEEDED,
+                            source=EventSource.TOOL_GATEWAY,
+                            stage=WorkflowStage.ACTION,
+                            role=RoleName.ACTION,
+                            tool_name="codegen.generate_patch",
+                            message=(
+                                f"Codegen {batch_label} done "
+                                f"({len(batch_result.get('files_changed') or [])} files)"
+                            ),
+                            payload=batch_result,
+                        )
+                    commit_checkpoint(
+                        self.db, label=f"codegen_batch_{batch_idx}_done"
+                    )
+
+            # Merge by batch index so downstream file ordering is stable.
+            for batch_idx in sorted(results_by_idx):
+                batch_result = results_by_idx[batch_idx]
                 batch_diff = str(batch_result.get("diff") or "").strip()
                 batch_changed = batch_result.get("files_changed")
                 if isinstance(batch_changed, list):
-                    # Deduplicate: skip files already produced by an earlier batch
                     novel_files = [f for f in batch_changed if f not in seen_files]
                     if novel_files and batch_diff:
-                        # Strip diff hunks for already-seen files to prevent
-                        # overlapping patches that corrupt file content.
                         if seen_files:
                             batch_diff = self._strip_duplicate_diff_hunks(
                                 batch_diff, seen_files,
@@ -1603,7 +1749,9 @@ class PrimaryOrchestrator:
                         s for s in batch_summaries
                         if isinstance(s, dict) and s.get("path") not in seen_files
                     )
-                codegen_provider = str(batch_result.get("provider_name") or codegen_provider)
+                codegen_provider = str(
+                    batch_result.get("provider_name") or codegen_provider
+                )
 
             if not merged_diff_parts:
                 self._fail_develop_pipeline(
@@ -2602,6 +2750,22 @@ class PrimaryOrchestrator:
                 )
             if goal_report is not None:
                 pipeline_state["goal_decomposition"] = goal_report.to_payload()
+                # Comment-only escalation: if any unjustified file's changes
+                # are purely comments/whitespace, flag as block — that's the
+                # "CLI agent added a self-documenting note to placate review"
+                # pattern we saw in P69-8 task 5de6b5d3.
+                from app.services.comment_only_detector import classify_diff
+                comment_reports = classify_diff(diff)
+                comment_only_unjustified: list[str] = []
+                for unjf in goal_report.unjustified_files or []:
+                    # match by suffix because diff paths may have different prefixes
+                    for rep_path, rep in comment_reports.items():
+                        if (
+                            rep.is_comment_only
+                            and (rep_path == unjf or rep_path.endswith("/" + unjf) or unjf.endswith("/" + rep_path))
+                        ):
+                            comment_only_unjustified.append(rep_path)
+                            break
                 record_event(
                     self.db, task_id=task.id,
                     event_type=EventType.TOOL_SUCCEEDED,
@@ -2612,9 +2776,35 @@ class PrimaryOrchestrator:
                         f"Goals: {len(goal_report.sub_goals)}, "
                         f"all met: {goal_report.all_goals_met}, "
                         f"unjustified files: {goal_report.unjustified_files}"
+                        + (
+                            f", comment-only unjustified: {comment_only_unjustified}"
+                            if comment_only_unjustified else ""
+                        )
                     ),
-                    payload=goal_report.to_payload(),
+                    payload={
+                        **goal_report.to_payload(),
+                        "comment_only_unjustified": comment_only_unjustified,
+                    },
                 )
+                if comment_only_unjustified:
+                    self._fail_develop_pipeline(
+                        task=task,
+                        message=(
+                            "Goal decomposition escalated to block: "
+                            f"{len(comment_only_unjustified)} file(s) had comment-only "
+                            f"changes that don't advance any goal: "
+                            + ", ".join(comment_only_unjustified[:3])
+                            + (f" (+{len(comment_only_unjustified) - 3} more)"
+                               if len(comment_only_unjustified) > 3 else "")
+                        ),
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        payload={
+                            "comment_only_unjustified": comment_only_unjustified,
+                            "goal_report": goal_report.to_payload(),
+                        },
+                    )
+                    return
             pipeline_state["goal_decomp_done"] = True
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
 
@@ -2649,6 +2839,75 @@ class PrimaryOrchestrator:
                     payload=sym_report.to_payload(),
                 )
             pipeline_state["symbol_ref_done"] = True
+            self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+
+        # --- Artifact existence gate ---
+        # Verify planner-declared files actually exist in the sandbox after
+        # the patch. Closes the gap where scope-lock or merge logic silently
+        # drops a core deliverable (e.g. new rules file) and every other gate
+        # passes on the remaining cosmetic changes.
+        if not pipeline_state.get("artifact_existence_done"):
+            from app.services.artifact_existence import check_artifact_existence
+            import re as _re
+            must_touch_plan = list(getattr(plan, "must_touch_files", []) or [])
+            expected_new_plan = list(getattr(plan, "expected_new_files", []) or [])
+            # Derive paths touched by the applied diff from its headers.
+            diff_touched: set[str] = set()
+            for _m in _re.finditer(r"^\+\+\+ b/(\S+)", diff, flags=_re.MULTILINE):
+                diff_touched.add(_m.group(1).strip())
+            art_report = None
+            try:
+                art_report = check_artifact_existence(
+                    sandbox_dir=self._develop_sandbox_dir(task),
+                    must_touch_files=must_touch_plan,
+                    expected_new_files=expected_new_plan,
+                    diff_touched_paths=diff_touched,
+                )
+            except Exception as exc:  # noqa: BLE001
+                record_event(
+                    self.db, task_id=task.id,
+                    event_type=EventType.TOOL_FAILED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW, role=RoleName.REVIEWER,
+                    tool_name="artifact_existence.check",
+                    message=f"Artifact existence check errored (non-blocking): {exc}",
+                    payload={"error": str(exc)[:500]},
+                )
+            if art_report is not None:
+                pipeline_state["artifact_existence"] = art_report.to_payload()
+                blockers = art_report.blocking_findings
+                record_event(
+                    self.db, task_id=task.id,
+                    event_type=(
+                        EventType.REVIEW_FAILED if blockers
+                        else EventType.TOOL_SUCCEEDED
+                    ),
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW, role=RoleName.REVIEWER,
+                    tool_name="artifact_existence.check",
+                    message=(
+                        f"Artifact existence: {len(blockers)} blocking, "
+                        f"{len(art_report.findings) - len(blockers)} warn "
+                        f"(must_touch={len(must_touch_plan)}, "
+                        f"expected_new={len(expected_new_plan)})"
+                    ),
+                    payload=art_report.to_payload(),
+                )
+                if blockers:
+                    block_msgs = "; ".join(f.message for f in blockers[:3])
+                    self._fail_develop_pipeline(
+                        task=task,
+                        message=(
+                            "Artifact existence gate blocked the diff: "
+                            + block_msgs
+                            + (f" (+{len(blockers) - 3} more)" if len(blockers) > 3 else "")
+                        ),
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        payload={"artifact_report": art_report.to_payload()},
+                    )
+                    return
+            pipeline_state["artifact_existence_done"] = True
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
 
         # --- T-041-04: evidence chain validation before approval ---
@@ -2971,6 +3230,7 @@ class PrimaryOrchestrator:
             message=f"Development pipeline tool '{tool_name}' completed.",
             payload=result,
         )
+        commit_checkpoint(self.db, label=f"develop_tool_{tool_name}")
         return result
 
     def _gather_codegen_context(self, *, task: Task, plan: GeneratedPlan) -> dict[str, str]:
@@ -3663,6 +3923,44 @@ class PrimaryOrchestrator:
                     "cannot see."
                 )
 
+        # Per-file parallel codegen: when batch has exactly 1 target file, add
+        # a hard scope-lock directive. Otherwise CLI agents in worktree mode
+        # (codex, claude_code) see the whole repo and decide to "helpfully"
+        # also modify related files (e.g. database.rules.json, package.json),
+        # causing overlapping diffs across parallel batches that corrupt each
+        # other when merged.
+        if batch_files is not None and len(batch_files) == 1:
+            only_file = next(iter(batch_files.keys()))
+            directives.append(
+                f"CRITICAL SCOPE LOCK: This codegen call is ONE of several "
+                f"parallel calls, each assigned exactly ONE target file. "
+                f"YOUR ONLY TARGET FILE IS: {only_file}\n\n"
+                f"Other parallel calls are handling the other EXISTING files "
+                f"in the plan. You MUST NOT modify ANY other EXISTING file "
+                f"than {only_file}. However, you MAY CREATE new files that "
+                f"the task explicitly requires (e.g. new config files, rule "
+                f"files, or documentation files) if those new files do not "
+                f"currently exist in the repository. Do not modify or delete "
+                f"any other existing file — even if you think a related "
+                f"change would be helpful. Cross-file modifications from "
+                f"multiple parallel calls will conflict and corrupt the "
+                f"patch.\n\n"
+                f"If {only_file} depends on changes to other files, note that "
+                f"in your summary but do NOT implement those other changes — "
+                f"they are someone else's responsibility in this pipeline.\n\n"
+                f"Your output diff must contain hunks for EXACTLY ONE file: "
+                f"{only_file}.\n\n"
+                f"MINIMAL EDIT REQUIREMENT: Make the SMALLEST possible change "
+                f"to {only_file} that achieves the task. Do NOT rewrite the "
+                f"whole file. Do NOT restructure, reformat, or reorganise "
+                f"existing code. Do NOT remove unrelated imports, variables, "
+                f"functions, or comments. Only add/change/remove the lines "
+                f"that are DIRECTLY required by this specific task. Preserve "
+                f"all other existing code character-for-character. Aim for a "
+                f"diff of under 30 lines changed unless the task explicitly "
+                f"calls for more."
+            )
+
         feedback = pipeline_state.get("conformance_feedback")
         if isinstance(feedback, list) and feedback:
             joined = "; ".join(str(item) for item in feedback if item)
@@ -4059,6 +4357,53 @@ class PrimaryOrchestrator:
         diff = str(pipeline_state.get("diff") or codegen_result.get("diff") or "")
         files_changed = codegen_result.get("files_changed") or pipeline_state.get("files_changed") or []
         summary_md = self._build_develop_summary(pipeline_state)
+
+        # Reservations reviewer: LLM flags risks/trade-offs/gotchas a human
+        # approver should see before approving. Fails safe to empty list.
+        reservations: list[str] = []
+        try:
+            from app.services.reservations import build_reservations
+            _reservations_report = build_reservations(
+                task_request=task.request_text or "",
+                change_summary=plan.change_summary or "",
+                diff=diff,
+                plan_objective=getattr(plan, "objective", "") or "",
+                settings=self.tool_gateway.settings,
+            )
+            reservations = _reservations_report.reservations
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_SUCCEEDED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="reservations.review",
+                message=(
+                    f"Reservations reviewer flagged {len(reservations)} item(s)."
+                    if reservations
+                    else "Reservations reviewer found no flags."
+                ),
+                payload={
+                    "reservations": reservations,
+                    "provider": _reservations_report.provider,
+                    "model": _reservations_report.model,
+                },
+            )
+            commit_checkpoint(self.db, label="reservations_reviewer_done")
+        except Exception as exc:  # noqa: BLE001
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_FAILED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="reservations.review",
+                message=f"Reservations reviewer failed (non-blocking): {exc}",
+                payload={"error": str(exc)[:500]},
+            )
+
         preview_result = {
             "scenario": "jira_issue_develop",
             "issue_key": issue_key,
@@ -4071,6 +4416,7 @@ class PrimaryOrchestrator:
             "jira_transitioned": False,
             "conformance_report": pipeline_state.get("conformance_report"),
             "goal_attestation": attestation,
+            "reservations": reservations,
         }
 
         approval = Approval(
@@ -4148,8 +4494,10 @@ class PrimaryOrchestrator:
                 "approver_role": approval.approver_role,
                 "issue_key": issue_key,
                 "files_changed": list(files_changed),
+                "reservations": reservations,
             },
         )
+        commit_checkpoint(self.db, label="awaiting_approval_jira_transition")
 
     def _fail_develop_pipeline(
         self,
@@ -4303,6 +4651,7 @@ class PrimaryOrchestrator:
             message=f"Approval requested for tool '{tool_name}'.",
             payload={"approval_id": approval_id, "execution_id": execution_id},
         )
+        commit_checkpoint(self.db, label="awaiting_approval_tool_gate")
 
     def _execute_writeback_plan(
         self,

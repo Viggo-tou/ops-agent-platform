@@ -12,6 +12,24 @@ from app.models.task import Task
 _event_logger = get_logger(component="events")
 
 
+def commit_checkpoint(db: Session, *, label: str) -> None:
+    """Persist all pending pipeline state to DB at a stable boundary.
+
+    Why: run_pipeline_job wraps the entire orchestrator in one transaction and
+    only commits at the end. Calling this at stable gates (plan generated,
+    review passed, codegen done, sandbox applied, compile passed, approval
+    reached, before long external RPCs) makes progress visible to the UI in
+    near-real time AND ensures a backend crash leaves a recoverable checkpoint
+    instead of losing all mid-flight events.
+    """
+    try:
+        db.commit()
+    except Exception as exc:
+        _event_logger.warning("commit_checkpoint_failed", label=label, error=str(exc)[:200])
+        db.rollback()
+        raise
+
+
 def record_event(
     db: Session,
     *,

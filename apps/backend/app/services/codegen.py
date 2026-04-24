@@ -105,6 +105,7 @@ class CodeGenerator:
         _logger = _log.getLogger("codegen.provider_chain")
         _logger.info("Provider chain: %s", providers)
 
+        attempts: list[dict[str, Any]] = []
         for provider_idx, provider in enumerate(providers):
             _logger.info("Trying provider %d/%d: %s", provider_idx + 1, len(providers), provider)
             try:
@@ -117,9 +118,19 @@ class CodeGenerator:
                     source_repo_path=source_repo_path,
                 )
                 _logger.info("Provider %s succeeded: %d files changed", provider, len(result.files_changed))
+                attempts.append({"provider": provider, "status": "succeeded"})
+                try:
+                    result.attempt_history = attempts
+                except Exception:
+                    result = result.model_copy(update={"attempt_history": attempts})
                 return result
             except CodegenError as exc:
                 _logger.warning("Provider %s failed: %s", provider, str(exc)[:300])
+                attempts.append({
+                    "provider": provider,
+                    "status": "failed",
+                    "error": str(exc)[:300],
+                })
                 if _is_provider_level_error(exc) and provider_idx < len(providers) - 1:
                     _logger.info("Classified as provider-level error — trying next provider")
                     continue
