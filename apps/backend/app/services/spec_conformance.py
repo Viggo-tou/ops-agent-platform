@@ -614,6 +614,114 @@ def _find_files_containing_anchor(
     return counts
 
 
+# ---- Fuzzy anchor matcher (for the rejection gate) -----------------------
+# The strict _find_files_containing_anchor is correct for spec conformance
+# (did we remove this exact string?). But the "anchor_precheck" rejection
+# gate uses it to answer "does this concept exist in the repo?", and natural
+# language phrases like "shared confirmation modal" never literally appear
+# in a file called `ConfirmModal.js`. This fuzzy variant applies token-level
+# + CamelCase + prefix-stem matching so a QA question about "job management"
+# matches `JobManagement.js`.
+
+_ANCHOR_STOPWORDS = frozenset({
+    "a", "an", "the", "of", "in", "on", "and", "or", "for", "to", "is", "as",
+    "at", "by", "be", "with", "from", "that", "this", "these", "those", "it",
+    "its", "but", "not", "no", "so",
+    # common UI/doc filler that muddles substring matches
+    "component", "page", "module", "file", "function", "method", "class",
+    "screen", "view", "ui", "flow",
+    # organizational descriptors that rarely appear in actual identifiers
+    "shared", "common", "main", "base", "global", "generic", "default",
+    "parent", "root", "wrapper", "container",
+})
+
+
+def _tokenize_anchor(anchor: str) -> list[str]:
+    """Lower-case, CamelCase-aware tokens with stopwords + 1-char words dropped."""
+    # Split camelCase / PascalCase boundaries: insert space before transitions
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", anchor)
+    spaced = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", spaced)
+    words = re.findall(r"[A-Za-z][A-Za-z0-9]*", spaced.lower())
+    return [w for w in words if len(w) > 1 and w not in _ANCHOR_STOPWORDS]
+
+
+def _pascal_case(tokens: list[str]) -> str:
+    return "".join(t.capitalize() for t in tokens)
+
+
+def _has_prefix_match(needle: str, text_lower: str) -> bool:
+    """True if any identifier-like run in ``text_lower`` starts with ``needle``
+    (or the needle's first 4+ chars when the needle is longer than 5). This
+    lets "confirmation" match "Confirm..." identifiers without needing a
+    full stemmer. Also returns True on plain substring match.
+    """
+    if not needle:
+        return False
+    if needle in text_lower:
+        return True
+    # Use prefix of length 4-6 for long words; catches confirm↔confirmation,
+    # handyman↔handymen, analytic↔analytics, etc.
+    if len(needle) >= 6:
+        prefix = needle[: max(4, len(needle) - 3)]
+        # word-boundary-ish: preceding char must be non-alphanumeric
+        pattern = re.compile(r"(^|[^a-z0-9])" + re.escape(prefix) + r"[a-z0-9]*")
+        return bool(pattern.search(text_lower))
+    return False
+
+
+def _anchor_matches_fuzzy(source_tree: Path, anchor: str) -> bool:
+    """True if any file in ``source_tree`` plausibly contains the anchor.
+
+    Match strategies (OR-combined, any one wins):
+      1. Strict substring (anchor as-is in file content) — delegates to the
+         existing exact matcher for backwards compatibility.
+      2. CamelCase/PascalCase of anchor tokens appears as substring in a
+         file path or content (catches "job management" ↔ JobManagement.js).
+      3. Every non-stopword anchor token has a prefix-match in either the
+         file path (case-insensitive) or the file content (small files only).
+    """
+    # Strategy 1: strict
+    if _find_files_containing_anchor(source_tree, anchor):
+        return True
+
+    tokens = _tokenize_anchor(anchor)
+    if not tokens:
+        return False
+
+    pascal = _pascal_case(tokens).lower()
+    root = source_tree.resolve()
+
+    for path in _iter_text_files(root):
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            continue
+        rel_lower = str(rel).replace("\\", "/").lower()
+        name_lower = path.name.lower()
+
+        # Strategy 2: PascalCase form appears in path
+        if pascal and len(pascal) >= 4 and pascal in rel_lower:
+            return True
+
+        # Strategy 3: all anchor tokens prefix-match in path OR content
+        if all(_has_prefix_match(tok, rel_lower) for tok in tokens):
+            return True
+
+        # Check content only when path alone didn't resolve — content read is
+        # expensive, size-cap it.
+        try:
+            if path.stat().st_size > _MAX_SCAN_BYTES:
+                continue
+            data_lower = path.read_text(encoding="utf-8", errors="ignore").lower()
+        except OSError:
+            continue
+
+        if all(_has_prefix_match(tok, data_lower) for tok in tokens):
+            return True
+
+    return False
+
+
 def _iter_text_files(root: Path):
     stack = [root]
     while stack:

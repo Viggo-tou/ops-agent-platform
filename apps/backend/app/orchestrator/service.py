@@ -4128,9 +4128,14 @@ class PrimaryOrchestrator:
         if source_path is None:
             return False
 
-        from app.services.spec_conformance import _find_files_containing_anchor
+        from app.services.spec_conformance import _anchor_matches_fuzzy
 
-        missing = [a for a in anchors if not _find_files_containing_anchor(source_path, a)]
+        # Fuzzy match (CamelCase-aware, prefix-stem, path+content): avoids
+        # rejecting natural-language QA queries like "job management page"
+        # that reference files named JobManagement.js. Strict substring
+        # match stays inside spec_conformance's other callers where
+        # exact-match semantics matter.
+        missing = [a for a in anchors if not _anchor_matches_fuzzy(source_path, a)]
         if missing and len(missing) == len(anchors):
             msg = (
                 "## Task rejected: anchors not found\n\n"
