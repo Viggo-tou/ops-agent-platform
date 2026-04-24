@@ -1,5 +1,6 @@
 import type { EventRecord } from "../../types";
 import { ApprovalActions } from "./ApprovalActions";
+import { AttemptHistoryChips } from "./AttemptHistoryChips";
 import { DiffBlock } from "./DiffBlock";
 import { ReservationsBlock } from "./ReservationsBlock";
 
@@ -93,6 +94,38 @@ function readReservations(event: EventRecord): string[] {
   return cleaned;
 }
 
+interface AttemptHistoryEntry {
+  provider: string;
+  status: string;
+  error?: string;
+}
+
+function readAttemptHistory(event: EventRecord): AttemptHistoryEntry[] {
+  const payload = event.payload_json;
+  if (!payload) {
+    return [];
+  }
+  const raw = (payload as Record<string, unknown>).attempt_history;
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: AttemptHistoryEntry[] = [];
+  for (const item of raw) {
+    if (item && typeof item === "object") {
+      const rec = item as Record<string, unknown>;
+      const provider = typeof rec.provider === "string" ? rec.provider : "";
+      const status = typeof rec.status === "string" ? rec.status : "";
+      if (!provider || !status) continue;
+      const entry: AttemptHistoryEntry = { provider, status };
+      if (typeof rec.error === "string" && rec.error.trim()) {
+        entry.error = rec.error.trim();
+      }
+      out.push(entry);
+    }
+  }
+  return out;
+}
+
 export function formatEventMessage(event: EventRecord): string | null {
   if (hiddenEventTypes.has(event.event_type)) {
     return null;
@@ -164,6 +197,11 @@ export function EventTimeline({ events }: EventTimelineProps) {
           <div className="event-timeline-main">
             <span className="event-timeline-text">{text}</span>
             {readDiff(event) ? <DiffBlock diff={readDiff(event)!} summary={readDiffSummary(event)} /> : null}
+            {event.tool_name === "codegen.generate_patch" &&
+            event.event_type === "tool_succeeded" &&
+            readAttemptHistory(event).length > 0 ? (
+              <AttemptHistoryChips attempts={readAttemptHistory(event)} />
+            ) : null}
             {event.event_type === "approval_requested" && readReservations(event).length > 0 ? (
               <ReservationsBlock reservations={readReservations(event)} />
             ) : null}

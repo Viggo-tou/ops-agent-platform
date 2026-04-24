@@ -672,6 +672,59 @@ dt {
   color: #8a7249;
 }
 
+.attempt-history-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  margin: 0.35rem 0;
+  font-size: 0.75rem;
+  color: #555;
+}
+
+.attempt-history-label {
+  color: #888;
+  margin-right: 0.15rem;
+}
+
+.attempt-chip-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.attempt-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 9999px;
+  border: 1px solid transparent;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  cursor: default;
+}
+
+.attempt-chip-ok {
+  background: #e9f7ef;
+  border-color: #b8e0c7;
+  color: #2d6a4f;
+}
+
+.attempt-chip-fail {
+  background: #fbeaea;
+  border-color: #e4b4b4;
+  color: #8a3a3a;
+}
+
+.attempt-chip-dot {
+  font-weight: 700;
+  font-size: 0.7rem;
+}
+
+.attempt-chip-arrow {
+  color: #aaa;
+}
+
 .approval-label {
   color: #666;
   font-size: 0.8rem;
