@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -252,23 +255,45 @@ class KeypointJudge:
         if self.requested_mode == "rule":
             return self._judge_with_rule(answer=answer, keypoints=keypoints), "rule"
 
+        if self.requested_mode == "claude_code":
+            return self._judge_with_claude_code(question=question, answer=answer, keypoints=keypoints), "claude_code"
+
+        if self.requested_mode == "codex":
+            return self._judge_with_codex(question=question, answer=answer, keypoints=keypoints), "codex"
+
         if self.requested_mode == "anthropic":
             return self._judge_with_anthropic(question=question, answer=answer, keypoints=keypoints), "anthropic"
 
         if self.requested_mode == "minimax":
             return self._judge_with_minimax(question=question, answer=answer, keypoints=keypoints), "minimax"
 
-        # auto: prefer Anthropic (cross-family vs MiniMax synthesizer →
-        # avoids self-evaluation bias), fall back to MiniMax, then rule.
+        # auto: prefer CLI judges (cross-family vs MiniMax synthesizer
+        # AND no API credit billing) → fall back to Anthropic API →
+        # MiniMax → rule.
         if self._auto_force_rule:
             return self._judge_with_rule(answer=answer, keypoints=keypoints), "rule"
+
+        # Claude Code CLI: cross-family judge using local OAuth — best
+        # bias profile, no billing dependency.
+        if shutil.which(self.settings.claude_code_command):
+            try:
+                return self._judge_with_claude_code(question=question, answer=answer, keypoints=keypoints), "claude_code"
+            except Exception as exc:  # noqa: BLE001
+                self.auto_rule_reason = f"Claude Code CLI judge failed: {exc}; trying next."
+
+        # Codex CLI: also cross-family vs MiniMax, uses ChatGPT auth.
+        if shutil.which(self.settings.codex_command):
+            try:
+                return self._judge_with_codex(question=question, answer=answer, keypoints=keypoints), "codex"
+            except Exception as exc:  # noqa: BLE001
+                self.auto_rule_reason = (self.auto_rule_reason or "") + f" Codex CLI judge failed: {exc};"
 
         if self.settings.anthropic_api_key:
             try:
                 return self._judge_with_anthropic(question=question, answer=answer, keypoints=keypoints), "anthropic"
             except (httpx.HTTPError, json.JSONDecodeError, RuntimeError) as exc:
                 # Don't force-rule yet — fall through to MiniMax before giving up.
-                self.auto_rule_reason = f"Anthropic judge failed, falling back to MiniMax: {exc}"
+                self.auto_rule_reason = (self.auto_rule_reason or "") + f" Anthropic judge failed: {exc};"
 
         if not self.settings.minimax_api_key:
             self._auto_force_rule = True
@@ -436,6 +461,159 @@ class KeypointJudge:
                 raise RuntimeError("Anthropic judge returned a non-boolean hit value")
             hits.append(item)
         return hits
+
+    @staticmethod
+    def _build_judge_prompt(*, question: str, answer: str, keypoints: Sequence[str]) -> str:
+        numbered_keypoints = "\n".join(f"{i + 1}. {k}" for i, k in enumerate(keypoints))
+        return (
+            "You are a strict benchmark judge for repository-grounded Q&A. "
+            "Decide whether each expected keypoint is clearly supported by "
+            "the answer text. Treat close paraphrases as hits, but do not "
+            "infer facts that are absent.\n\n"
+            f"Question:\n{question}\n\n"
+            f"Answer:\n{answer}\n\n"
+            f"Expected keypoints:\n{numbered_keypoints}\n\n"
+            f"Return JSON ONLY in this exact shape: "
+            f'{{"hits": [{", ".join(["true"] * len(keypoints))}]}} '
+            f"with exactly {len(keypoints)} boolean values, one per keypoint, "
+            f"in the same order. No prose before or after the JSON."
+        )
+
+    def _parse_hits_from_text(self, text: str, *, keypoints_count: int) -> list[bool]:
+        """Extract a {"hits": [bool, ...]} object from arbitrary CLI text output."""
+        cleaned = (text or "").strip()
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r"\s*```\s*$", "", cleaned, flags=re.MULTILINE)
+        # Find first JSON object containing a "hits" key.
+        for match in re.finditer(r"\{[^{}]*?\"hits\"\s*:\s*\[[^\]]*\][^{}]*\}", cleaned, flags=re.DOTALL):
+            try:
+                parsed = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                continue
+            raw = parsed.get("hits") if isinstance(parsed, dict) else None
+            if isinstance(raw, list) and len(raw) == keypoints_count and all(isinstance(x, bool) for x in raw):
+                return list(raw)
+        # Fallback: any top-level JSON
+        m = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if m is not None:
+            try:
+                parsed = json.loads(m.group(0))
+                raw = parsed.get("hits") if isinstance(parsed, dict) else None
+                if isinstance(raw, list) and len(raw) == keypoints_count and all(isinstance(x, bool) for x in raw):
+                    return list(raw)
+            except json.JSONDecodeError:
+                pass
+        raise RuntimeError(f"could not parse hits array from CLI output: {cleaned[:300]!r}")
+
+    def _judge_with_claude_code(self, *, question: str, answer: str, keypoints: Sequence[str]) -> list[bool]:
+        """Use the Claude Code CLI as a cross-family judge.
+
+        Avoids API billing (CLI uses local OAuth) and avoids the
+        self-evaluation bias of MiniMax-judges-MiniMax. Slower than an
+        API call (~30-60s per question) but no per-call cost.
+        """
+        claude_cmd = shutil.which(self.settings.claude_code_command)
+        if not claude_cmd:
+            raise RuntimeError(f"Claude Code CLI not found: {self.settings.claude_code_command}")
+
+        prompt = self._build_judge_prompt(question=question, answer=answer, keypoints=keypoints)
+
+        env = {**os.environ}
+        # The CLI uses its own OAuth; remove any API key that might switch
+        # the CLI into API-billing mode.
+        env.pop("ANTHROPIC_API_KEY", None)
+        if os.name == "nt" and "CLAUDE_CODE_GIT_BASH_PATH" not in env:
+            for candidate in [
+                "D:\\Git\\bin\\bash.exe",
+                "C:\\Program Files\\Git\\bin\\bash.exe",
+                "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+            ]:
+                if os.path.isfile(candidate):
+                    env["CLAUDE_CODE_GIT_BASH_PATH"] = candidate
+                    break
+
+        claude_args = self.settings.claude_code_args.split()
+        if "-p" not in claude_args and "--print" not in claude_args:
+            claude_args.append("--print")
+        if "--dangerously-skip-permissions" not in claude_args:
+            claude_args.append("--dangerously-skip-permissions")
+        if "--output-format" not in " ".join(claude_args):
+            claude_args.extend(["--output-format", "json"])
+
+        cmd = [claude_cmd, *claude_args, "-"]
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        ) as prompt_file:
+            prompt_file.write(prompt)
+            prompt_file_path = prompt_file.name
+
+        try:
+            with open(prompt_file_path, "r", encoding="utf-8") as stdin_f:
+                proc = subprocess.run(
+                    cmd,
+                    stdin=stdin_f,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=int(self.settings.claude_code_timeout_seconds),
+                )
+        finally:
+            try:
+                os.unlink(prompt_file_path)
+            except OSError:
+                pass
+
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Claude Code CLI returned rc={proc.returncode}: {(proc.stderr or proc.stdout)[:300]}"
+            )
+
+        # CLI in --output-format json mode wraps the assistant response in
+        # a JSON envelope: {"type":"result","subtype":"success","result":"<text>"}.
+        try:
+            envelope = json.loads(proc.stdout)
+            inner = envelope.get("result") if isinstance(envelope, dict) else None
+        except json.JSONDecodeError:
+            inner = proc.stdout
+        if not isinstance(inner, str):
+            inner = proc.stdout
+
+        return self._parse_hits_from_text(inner, keypoints_count=len(keypoints))
+
+    def _judge_with_codex(self, *, question: str, answer: str, keypoints: Sequence[str]) -> list[bool]:
+        """Use the Codex CLI (`codex exec`) as judge. Auth via ChatGPT
+        subscription, no per-call API billing.
+        """
+        codex_cmd = shutil.which(self.settings.codex_command)
+        if not codex_cmd:
+            raise RuntimeError(f"Codex CLI not found: {self.settings.codex_command}")
+
+        prompt = self._build_judge_prompt(question=question, answer=answer, keypoints=keypoints)
+
+        env = {**os.environ}
+        if self.settings.openai_api_key:
+            env["OPENAI_API_KEY"] = self.settings.openai_api_key
+
+        # codex exec reads prompt from stdin via "-"; --full-auto avoids
+        # interactive confirmations.
+        cmd = [codex_cmd, "exec", "--full-auto", "-"]
+
+        proc = subprocess.run(
+            cmd,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=int(self.settings.codex_timeout_seconds),
+        )
+
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Codex CLI returned rc={proc.returncode}: {(proc.stderr or proc.stdout)[:300]}"
+            )
+
+        return self._parse_hits_from_text(proc.stdout, keypoints_count=len(keypoints))
 
 
 class BenchmarkClient:
@@ -611,12 +789,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None, help="Only run the first N dataset rows.")
     parser.add_argument(
         "--judge-mode",
-        choices=("auto", "anthropic", "minimax", "rule"),
+        choices=("auto", "claude_code", "codex", "anthropic", "minimax", "rule"),
         default="auto",
         help=(
-            "Scoring judge mode. 'auto' prefers Anthropic (cross-family, avoids "
-            "self-evaluation bias vs MiniMax synthesizer), falls back to MiniMax, "
-            "then rule judge."
+            "Scoring judge mode. 'auto' prefers CLI judges (claude_code, then "
+            "codex) — they're cross-family vs the MiniMax synthesizer AND don't "
+            "consume API credits — then falls back to Anthropic API, MiniMax, "
+            "rule. Explicit modes pin the choice."
         ),
     )
     return parser.parse_args()
