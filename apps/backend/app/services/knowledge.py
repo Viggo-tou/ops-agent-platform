@@ -244,6 +244,19 @@ class KnowledgeService:
         query_tokens = _tokenize(query)
         expanded_tokens = _expand_tokens(query_tokens)
 
+        # Query rewrite: ask LLM for additional likely-source tokens (e.g.
+        # CamelCase identifiers, synonyms, adjacent concepts) to lift recall
+        # for natural-language phrases. Fails safe to empty set.
+        if getattr(self.settings, "knowledge_query_rewrite_enabled", False):
+            from app.services.query_rewrite import expand_query_tokens
+            llm_tokens = expand_query_tokens(
+                query=query,
+                settings=self.settings,
+                existing_tokens=set(query_tokens) | expanded_tokens,
+            )
+            if llm_tokens:
+                expanded_tokens = expanded_tokens | llm_tokens
+
         scored_documents: list[ScoredDocument] = []
         for document in documents:
             scored = self._score_document(

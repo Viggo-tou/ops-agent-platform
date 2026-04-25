@@ -68,6 +68,17 @@ class Settings(BaseSettings):
     knowledge_rerank_pool_size: int = 15
     knowledge_rerank_timeout_seconds: float = 20.0
     knowledge_rerank_snippet_chars: int = 600
+    # Query expansion: ask an LLM for additional likely-source tokens to
+    # add to the retrieval token set, addressing the recall gap where
+    # natural-language phrases don't share surface tokens with actual
+    # identifiers (e.g. "approval workflow" vs HandymanVerification.js).
+    # OFF by default — initial benchmark showed mixed results: A-tier
+    # regressed (-6 mean) because expansion tokens diluted precision on
+    # narrow queries (e.g. ConfirmModal lookup got pulled toward Login.js
+    # by auth-adjacent expansion tokens). Keep the code path so opt-in
+    # operators can experiment + iterate on the prompt.
+    knowledge_query_rewrite_enabled: bool = False
+    knowledge_query_rewrite_timeout_seconds: float = 15.0
     knowledge_upload_root: str = str((BASE_DIR / "data" / "uploads").as_posix())
     knowledge_upload_default_source: str = "uploads"
     knowledge_upload_max_bytes: int = 2_000_000
