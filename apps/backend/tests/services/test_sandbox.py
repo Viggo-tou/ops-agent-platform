@@ -129,7 +129,7 @@ class ExecutionSandboxTests(unittest.TestCase):
 
         result = sandbox.clone(str(source_dir))
 
-        self.assertEqual(result["method"], "copytree")
+        self.assertEqual(result["method"], "copytree_hardlink")
         self.assertEqual(result["source"], str(source_dir))
         self.assertTrue((sandbox.work_dir / "message.txt").is_file())
         self.assertTrue((sandbox.work_dir / ".git").is_dir())

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import time
@@ -43,6 +44,56 @@ class ExecutionSandbox:
     def work_dir(self) -> Path:
         return self.sandbox_dir
 
+    # Directories that pollute the sandbox without ever needing to be
+    # patched. Skipping them at copy time is the second half of the
+    # speedup (the first half is hardlinking). Mirrors knowledge.py's
+    # IGNORED_PARTS but keeps a local copy so sandbox isolation doesn't
+    # depend on the retrieval module.
+    _SKIP_AT_COPY = frozenset({
+        ".git", ".gradle", ".idea", "__pycache__", "node_modules",
+        "build", "dist", ".next", "out", "target", "bin", "obj",
+        ".cache", ".turbo", ".parcel-cache", ".vite", ".svelte-kit",
+        "coverage", ".nyc_output", ".venv", "venv", ".tox",
+    })
+
+    @classmethod
+    def _copytree_with_hardlinks(cls, src: Path, dst: Path) -> None:
+        """copytree variant that uses os.link for files (where supported)
+        and skips known-noise directories. Two-axis speedup vs the
+        previous shutil.copytree + byte copy:
+
+        1. Hardlinks: ~10× faster per file copied. Safety contract:
+           sandbox writes go through ``git apply`` which uses atomic
+           rename → new inode → source repo untouched. Direct in-place
+           ``open(...,'w')`` would propagate to source — none of our
+           code does this today.
+        2. Skip node_modules / build / .git / cache dirs at copy time.
+           These are never patched and walking them dominates the copy
+           cost on JS/TS repos (Handyman ships ~78k entries dominated
+           by node_modules; skipping cuts to ~600 entries).
+
+        Falls back to shutil.copy2 on per-file hardlink errors
+        (cross-volume, permission, ReFS dedup conflict). Degrades
+        gracefully if hardlinking fails entirely.
+        """
+        def _copy_one(s: str, d: str) -> str:
+            try:
+                os.link(s, d)
+            except OSError:
+                shutil.copy2(s, d)
+            return d
+
+        def _ignore(_dir: str, names: list[str]) -> list[str]:
+            return [n for n in names if n in cls._SKIP_AT_COPY]
+
+        shutil.copytree(
+            str(src),
+            str(dst),
+            copy_function=_copy_one,
+            ignore=_ignore,
+            dirs_exist_ok=True,
+        )
+
     def clone(
         self,
         repo_url_or_path: str,
@@ -54,7 +105,15 @@ class ExecutionSandbox:
         source_path = Path(repo_url_or_path)
 
         if source_path.is_dir() and not (source_path / ".git").is_dir():
-            shutil.copytree(str(source_path), str(self.sandbox_dir), dirs_exist_ok=True)
+            # Use hardlinks instead of byte-by-byte copy where supported.
+            # Speedup is ~10× on local filesystems (NTFS ReFS / ext4 / APFS).
+            # Safety: subsequent sandbox writes go through `git apply` which
+            # writes via temp-file + rename → creates a new inode and breaks
+            # the hardlink, leaving the source file untouched. `git init/
+            # add/commit` only read files into the index. As long as nothing
+            # in this codebase mutates sandbox files via in-place open()+
+            # write(), the source repo is safe.
+            self._copytree_with_hardlinks(source_path, self.sandbox_dir)
             for command, step_timeout in (
                 ("git init", 30),
                 ("git add .", 60),
@@ -69,7 +128,7 @@ class ExecutionSandbox:
                     raise SandboxError(f"{command} failed: {str(step_result['stderr'])[:500]}")
             self._cloned = True
             return {
-                "method": "copytree",
+                "method": "copytree_hardlink",
                 "source": str(source_path),
                 "branch": branch,
                 "sandbox_dir": str(self.sandbox_dir),
