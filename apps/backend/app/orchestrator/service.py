@@ -57,6 +57,48 @@ def _set_task_span_attributes(span: object, *, task: Task, actor_name: str | Non
     _set_span_attribute(span, "actor.name", actor_name or task.actor_name)
 
 
+# Heuristic: phrases that mean "user is asking ABOUT something" rather
+# than "user is asking the system to DO something". When no Jira issue
+# key is present and the prompt is clearly question-form, the request
+# should route to process_question regardless of which content nouns
+# (ticket, issue, access, etc.) appear later in the sentence.
+_QUESTION_LEAD_EN = (
+    "what ", "where ", "when ", "why ", "who ", "which ", "how ",
+    "explain ", "explain:", "describe ", "describe:", "tell me ",
+    "show me ", "trace ", "summarize ", "summarise ",
+    "list the", "list all", "list every",
+    "walk me through", "walk through",
+    "is there", "is the", "are there", "are the",
+    "does the", "do the", "did the",
+    "can you explain", "can you describe", "can you show",
+)
+_QUESTION_LEAD_ZH = (
+    "什么", "哪里", "哪个", "哪些", "怎么", "如何", "为什么", "为何",
+    "解释", "说明", "描述", "介绍",
+    "在哪", "请问",
+)
+
+
+def _looks_like_question(request_text: str) -> bool:
+    """Heuristic check: does this prompt read like a question rather than
+    an action request? Returns True for natural-language QA phrasing
+    (e.g. "Where is the support page?", "How does the X work?", "Trace
+    the Y pipeline.") even when later words happen to overlap with
+    action-routing keywords (ticket, access, etc.).
+    """
+    text = request_text.strip()
+    if not text:
+        return False
+    if "?" in text or "?" in text:
+        return True
+    lowered = text.lower()
+    if any(lowered.startswith(p) for p in _QUESTION_LEAD_EN):
+        return True
+    if any(p in text for p in _QUESTION_LEAD_ZH):
+        return True
+    return False
+
+
 def classify_request(request_text: str) -> str:
     lowered = request_text.lower()
     jira_reference = extract_jira_issue_reference(request_text)
@@ -90,6 +132,14 @@ def classify_request(request_text: str) -> str:
         # Bare Jira reference or Jira + any action keyword → develop pipeline.
         # This is the most common intent when a user pastes a Jira key.
         return "jira_issue_develop"
+    # Question-form short-circuit: when no Jira issue key is present and
+    # the prompt clearly reads as a question ("Where is X?", "How does
+    # Y work?", "Trace Z..."), route to process_question regardless of
+    # incidental content keywords (ticket, access, change). Closes the
+    # gap where QA prompts about support/admin/feedback were misrouted
+    # to jira_issue_create / action_with_approval and got rejected.
+    if _looks_like_question(request_text):
+        return "process_question"
     if "#" in lowered or _contains_word(lowered, "slack", "channel"):
         return "slack_message"
     if _contains_word(lowered, "jira", "ticket", "issue", "bug", "story"):
