@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     knowledge_synthesis_enabled: bool = True
     knowledge_synthesis_model: str = "MiniMax-M2.7"
     knowledge_synthesis_timeout_seconds: float = 45.0
+    # Per-citation snippet cap fed to the answer synthesiser. Tested 1200
+    # vs 3500 on 4/25 cross-family judge: 3500 net-regressed by -4.36 on
+    # A+B+C (C-tier hit -10.88). Bigger context dilutes focus — the model
+    # writes longer, less specific answers. 1200 chars (~30 lines) is the
+    # sweet spot for the current synthesiser (MiniMax-M2.7); bumping the
+    # synthesiser to a stronger model would change this calculus.
     knowledge_synthesis_max_snippet_chars: int = 1200
     llm_retry_on_rate_limit: bool = True
     llm_retry_max_attempts: int = 3
