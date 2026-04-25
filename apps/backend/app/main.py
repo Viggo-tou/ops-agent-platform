@@ -86,6 +86,114 @@ def _sweep_orphaned_tasks() -> None:
         _startup_logger.info("orphan_sweep_done", count=len(orphans))
 
 
+def _sweep_old_sandboxes() -> None:
+    """Delete sandbox directories for tasks that finished long ago.
+
+    Why: ExecutionSandbox.clone() leaves data/sandboxes/<task_id>/ behind
+    after every task. With the develop pipeline running multiple tasks
+    per day each cloning the Handyman repo, the directory will grow
+    without bound. This sweep deletes sandboxes belonging to tasks that
+    are in a terminal status (completed / failed / rolled_back) and
+    older than `sandbox_retention_hours` (default 168 = 7 days).
+
+    Active sandboxes (task is still pending / executing / awaiting
+    approval) are preserved unconditionally — they're load-bearing for
+    the resume_after_approval flow.
+    """
+    import os
+    import shutil
+    import stat
+    from datetime import datetime, timedelta, timezone
+    from pathlib import Path
+
+    def _rm_readonly(func, path, _exc_info):
+        """rmtree onerror handler: git pack files are marked read-only on
+        Windows, so the default rmtree fails with WinError 5. Clear the
+        read-only bit and retry the operation that failed.
+        """
+        try:
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+            func(path)
+        except Exception:  # noqa: BLE001
+            # Last-ditch swallow; outer try/except logs the original error.
+            pass
+
+    settings = get_settings()
+    base_dir = Path(getattr(settings, "sandbox_base_dir", "data/sandboxes"))
+    if not base_dir.is_dir():
+        return
+
+    retention_hours = float(getattr(settings, "sandbox_retention_hours", 168.0))
+    cutoff_aware = datetime.now(timezone.utc) - timedelta(hours=retention_hours)
+    # SQLite stores datetimes as naive even when the column is declared
+    # tz-aware. Normalise both sides to naive-UTC for comparison.
+    cutoff = cutoff_aware.replace(tzinfo=None)
+    terminal_statuses = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.ROLLED_BACK}
+
+    def _naive_utc(dt):
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            return dt
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+    with SessionLocal() as db:
+        # Build a {task_id: (status, finished_at)} map for terminal tasks.
+        # Task model has created_at + updated_at; updated_at on a terminal
+        # task corresponds to the moment its final status was written.
+        terminal = {
+            t.id: (t.status, _naive_utc(t.updated_at or t.created_at))
+            for t in db.query(Task).filter(Task.status.in_(list(terminal_statuses))).all()
+        }
+
+    deleted = 0
+    skipped_active = 0
+    skipped_recent = 0
+    failed = 0
+    for child in base_dir.iterdir():
+        if not child.is_dir():
+            continue
+        task_id = child.name
+        info = terminal.get(task_id)
+        if info is None:
+            skipped_active += 1
+            continue
+        _, finished_at = info
+        if finished_at is None or finished_at >= cutoff:
+            skipped_recent += 1
+            continue
+        try:
+            shutil.rmtree(child, onerror=_rm_readonly)
+            if child.exists():
+                # Some files survived even the chmod retry — count as fail
+                # so the operator sees it, but don't crash the sweep.
+                failed += 1
+                _startup_logger.warning(
+                    "sandbox_sweep_partial_remaining",
+                    task_id=task_id,
+                    sandbox_dir=str(child),
+                )
+            else:
+                deleted += 1
+        except Exception as exc:  # noqa: BLE001
+            _startup_logger.warning(
+                "sandbox_sweep_delete_failed",
+                task_id=task_id,
+                error=str(exc)[:200],
+            )
+            failed += 1
+
+    if deleted or failed:
+        _startup_logger.info(
+            "sandbox_sweep_done",
+            deleted=deleted,
+            skipped_active=skipped_active,
+            skipped_recent=skipped_recent,
+            failed=failed,
+            retention_hours=retention_hours,
+        )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
@@ -94,6 +202,7 @@ async def lifespan(_: FastAPI):
     with SessionLocal() as db:
         bootstrap_model_catalog(db)
     _sweep_orphaned_tasks()
+    _sweep_old_sandboxes()
     init_pipeline_executor(settings.pipeline_max_workers)
     try:
         yield

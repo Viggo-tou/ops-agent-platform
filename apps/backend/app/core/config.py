@@ -100,6 +100,10 @@ class Settings(BaseSettings):
     tool_default_retry_count: int = 1
     sandbox_base_dir: str = "data/sandboxes"
     sandbox_clone_timeout_seconds: float = 120.0
+    # Sandbox retention: at startup, delete sandbox dirs whose owning task
+    # is in a terminal status AND completed earlier than this many hours
+    # ago. Active / pending tasks are never swept regardless of age.
+    sandbox_retention_hours: float = 168.0  # 7 days
     sandbox_command_timeout_seconds: float = 60.0
     sandbox_max_output_bytes: int = 65536
     alert_webhook_url: str | None = None
