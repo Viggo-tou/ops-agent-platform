@@ -258,6 +258,47 @@ class KnowledgeService:
             scored_documents.append(scored)
 
         scored_documents.sort(key=lambda item: item.score, reverse=True)
+
+        # Semantic rerank: take a larger pool of keyword-top candidates and
+        # ask an LLM to reorder by true relevance, then slice to top_k.
+        # Fails safe — if reranker is disabled, no MiniMax key, or LLM call
+        # fails, the original keyword order is preserved.
+        rerank_enabled = bool(getattr(self.settings, "knowledge_rerank_enabled", False))
+        pool_size = max(
+            top_k,
+            int(getattr(self.settings, "knowledge_rerank_pool_size", top_k)),
+        )
+        if rerank_enabled and len(scored_documents) > top_k:
+            from app.services.knowledge_rerank import RerankCandidate, rerank_candidates
+
+            pool = scored_documents[:pool_size]
+            snippet_cap = int(getattr(self.settings, "knowledge_rerank_snippet_chars", 600))
+            rerank_input = [
+                RerankCandidate(
+                    candidate_id=idx,
+                    relative_path=scored.document.relative_path,
+                    source_name=scored.document.source_name,
+                    snippet=(scored.document.content or "")[:snippet_cap],
+                )
+                for idx, scored in enumerate(pool)
+            ]
+            ranked_ids = rerank_candidates(
+                query=query,
+                candidates=rerank_input,
+                settings=self.settings,
+            )
+            # Reorder pool by ranked_ids; entries not in ranked_ids stay in
+            # original order at the tail (rerank_candidates already handles
+            # that, but be defensive).
+            id_to_scored = {idx: scored for idx, scored in enumerate(pool)}
+            ranked_pool = [id_to_scored[i] for i in ranked_ids if i in id_to_scored]
+            if len(ranked_pool) < len(pool):
+                seen = set(ranked_ids)
+                ranked_pool.extend(
+                    id_to_scored[i] for i in range(len(pool)) if i not in seen
+                )
+            scored_documents = ranked_pool + scored_documents[pool_size:]
+
         selected = scored_documents[:top_k]
         citations = [self._build_citation(scored=scored, query_tokens=query_tokens) for scored in selected]
 

@@ -61,6 +61,13 @@ class Settings(BaseSettings):
     knowledge_source_specs: str | None = None
     knowledge_top_k: int = 4
     knowledge_max_file_bytes: int = 120_000
+    # Semantic reranker: when enabled, the keyword-based retriever picks
+    # knowledge_rerank_pool_size top candidates, then an LLM reranks them
+    # and the final top_k slice is taken from the LLM-ranked order.
+    knowledge_rerank_enabled: bool = True
+    knowledge_rerank_pool_size: int = 15
+    knowledge_rerank_timeout_seconds: float = 20.0
+    knowledge_rerank_snippet_chars: int = 600
     knowledge_upload_root: str = str((BASE_DIR / "data" / "uploads").as_posix())
     knowledge_upload_default_source: str = "uploads"
     knowledge_upload_max_bytes: int = 2_000_000
