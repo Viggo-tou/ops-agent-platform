@@ -241,16 +241,60 @@ def extract_minimax_content(response_payload: dict[str, Any]) -> str:
 
 
 class KeypointJudge:
-    def __init__(self, requested_mode: str) -> None:
+    def __init__(self, requested_mode: str, samples: int = 1) -> None:
         self.requested_mode = requested_mode
         self.settings = get_settings()
         self.judge_model = self.settings.knowledge_synthesis_model or "MiniMax-M2.7"
         self.auto_rule_reason: str | None = None
         self._auto_force_rule = False
+        # Multi-sample judging: ask the same judge to evaluate the same
+        # answer N times and take per-keypoint majority. Dampens the
+        # ±3-5 pt single-run noise we observed when comparing close
+        # benchmark variants. samples=1 preserves the original behaviour.
+        self.samples = max(1, int(samples))
 
     def judge(self, *, question: str, answer: str, keypoints: Sequence[str]) -> tuple[list[bool], str]:
         if not answer.strip():
             return [False] * len(keypoints), "rule"
+
+        if self.samples > 1:
+            return self._judge_multi_sample(
+                question=question, answer=answer, keypoints=keypoints
+            )
+        return self._judge_one(question=question, answer=answer, keypoints=keypoints)
+
+    def _judge_multi_sample(
+        self, *, question: str, answer: str, keypoints: Sequence[str]
+    ) -> tuple[list[bool], str]:
+        """Run ``self.samples`` independent judge calls and take per-keypoint
+        majority vote. If samples disagree on the judge mode actually used
+        (e.g. one fell back to rule), the first non-rule mode wins for the
+        reported judge_mode field; if all fell back to rule, "rule" wins.
+        """
+        per_sample_hits: list[list[bool]] = []
+        modes_used: list[str] = []
+        for _ in range(self.samples):
+            hits, mode = self._judge_one(
+                question=question, answer=answer, keypoints=keypoints
+            )
+            per_sample_hits.append(hits)
+            modes_used.append(mode)
+        # Per-keypoint majority. Ties (1-1 with 2 samples, etc.) resolved
+        # in favour of False (more conservative; do not credit unstable hits).
+        n = len(keypoints)
+        majority: list[bool] = []
+        for i in range(n):
+            true_count = sum(
+                1 for sample in per_sample_hits if i < len(sample) and sample[i]
+            )
+            majority.append(true_count > self.samples // 2)
+        # Pick the most-informative mode label.
+        non_rule = next((m for m in modes_used if m != "rule"), None)
+        reported_mode = non_rule or modes_used[0]
+        return majority, reported_mode
+
+    def _judge_one(self, *, question: str, answer: str, keypoints: Sequence[str]) -> tuple[list[bool], str]:
+        """Single judge invocation following the legacy mode-selection chain."""
 
         if self.requested_mode == "rule":
             return self._judge_with_rule(answer=answer, keypoints=keypoints), "rule"
@@ -788,6 +832,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--actor-name", default="qa-benchmark", help="Actor name sent to the backend task API.")
     parser.add_argument("--limit", type=int, default=None, help="Only run the first N dataset rows.")
     parser.add_argument(
+        "--judge-samples",
+        type=int,
+        default=1,
+        help=(
+            "Number of independent judge calls per question; per-keypoint "
+            "majority vote dampens single-run noise. 3 is a good baseline. "
+            "Cost: roughly N× the judge time (judge is the cheap step "
+            "compared to the pipeline run, so 3× judge ≈ 1.4× total)."
+        ),
+    )
+    parser.add_argument(
         "--judge-mode",
         choices=("auto", "claude_code", "codex", "anthropic", "minimax", "rule"),
         default="auto",
@@ -814,7 +869,7 @@ def main() -> int:
     timestamp = started_at.strftime("%Y%m%dT%H%M%SZ")
     out_path = out_dir / f"qa-run-{timestamp}.jsonl"
 
-    judge = KeypointJudge(args.judge_mode)
+    judge = KeypointJudge(args.judge_mode, samples=args.judge_samples)
     client = BenchmarkClient(backend_url=args.backend_url, actor_name=args.actor_name)
     records: list[dict[str, Any]] = []
     infrastructure_failed = False
