@@ -33,8 +33,15 @@ def _settings(**overrides: object) -> Settings:
         "knowledge_synthesis_model": "minimax-text-01",
         "knowledge_synthesis_timeout_seconds": 3.0,
         "knowledge_synthesis_max_snippet_chars": 1200,
+        # Pin source_name to the fixture's value so the test is independent
+        # of any local OPS_AGENT_KNOWLEDGE_SOURCE_NAME env override.
+        "knowledge_source_name": "handymanapp",
         "knowledge_source_path": None,
         "knowledge_upload_root": "__missing_upload_root__",
+        # Disable retrieval-side LLM features so the test isolates the
+        # synthesis path; both have their own dedicated tests.
+        "knowledge_rerank_enabled": False,
+        "knowledge_query_rewrite_enabled": False,
     }
     values.update(overrides)
     return Settings(**values)
