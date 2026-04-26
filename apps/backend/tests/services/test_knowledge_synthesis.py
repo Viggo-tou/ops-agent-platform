@@ -32,7 +32,7 @@ def _settings(**overrides: object) -> Settings:
         "knowledge_synthesis_enabled": True,
         "knowledge_synthesis_model": "minimax-text-01",
         "knowledge_synthesis_timeout_seconds": 3.0,
-        "knowledge_synthesis_max_snippet_chars": 1200,
+        "knowledge_synthesis_max_snippet_chars": 6000,
         # Pin source_name to the fixture's value so the test is independent
         # of any local OPS_AGENT_KNOWLEDGE_SOURCE_NAME env override.
         "knowledge_source_name": "handymanapp",
