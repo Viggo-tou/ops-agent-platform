@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -30,6 +30,21 @@ class KnowledgeCitation(BaseModel):
     snippet: str = Field(..., description="Text snippet of the citation")
     score: float = Field(..., description="Relevance score of the citation")
     metadata: dict[str, Any] = Field(default_factory=dict, description="Additional metadata for the citation")
+
+
+class KnowledgeClaim(BaseModel):
+    text: str = Field(..., description="Factual statement emitted by answer synthesis")
+    citation_indices: list[int] = Field(
+        default_factory=list,
+        description="0-indexed citations from KnowledgeSearchResult.citations that support this claim",
+    )
+    confidence: Literal["high", "medium", "low"] = Field(
+        ..., description="How directly the cited snippets support the claim"
+    )
+    chunk_kind_hint: str | None = Field(
+        default=None,
+        description="Optional diagnostic hint about the evidence chunk kind used by synthesis",
+    )
 
 
 class KnowledgeAnswerTrace(BaseModel):
@@ -68,6 +83,11 @@ class KnowledgeSearchResult(BaseModel):
     query: str = Field(..., description="The search query string")
     answer: str = Field(..., description="Generated answer text")
     citations: list[KnowledgeCitation] = Field(default_factory=list, description="Citations supporting the answer")
+    claims: list[KnowledgeClaim] = Field(default_factory=list, description="Claim-level citation bindings")
+    ungrounded_claim_count: int = Field(
+        default=0,
+        description="Claims emitted by synthesis that did not bind to any citation.",
+    )
     answer_trace: KnowledgeAnswerTrace = Field(..., description="Detailed trace of the answer generation process")
     packaged_context: str = Field(..., description="Formatted context string used for generation")
 

@@ -83,6 +83,8 @@ HostedDashboard/
 .playwright-mcp/
 
 # Codex temp pytest artifacts
+.pytest-tmp/
+pytest-basetemp/
 apps/backend/.tmp-pytest/
 apps/backend/.pytest_tmp/
 apps/backend/.tmp-test/

@@ -67,4 +67,6 @@ def test_search_response_includes_answer_provider(monkeypatch) -> None:
     assert body["answer"]
     assert body["answer_trace"]["answer_provider"] == "minimax"
     assert body["citations"][0]["relative_path"] == "src/auth.py"
+    assert body["claims"] == []
+    assert body["ungrounded_claim_count"] == 0
     search.assert_called_once_with(query="login failure", top_k=None, source_name=None)

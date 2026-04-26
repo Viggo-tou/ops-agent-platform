@@ -406,6 +406,15 @@ class KnowledgeService:
             route_kind=route.kind,
             language=language,
         )
+        claims = []
+        ungrounded_claim_count = 0
+        if answer_provider != "template":
+            from app.services.claim_extraction import extract_claims
+
+            answer, claims, ungrounded_claim_count = extract_claims(
+                raw_synthesis=answer,
+                citation_count=len(citations),
+            )
         packaged_context = "\n\n".join(
             [
                 f"[{citation.source_name}:{citation.relative_path}:{citation.line_start}-{citation.line_end}]\n{citation.snippet}"
@@ -437,6 +446,8 @@ class KnowledgeService:
             query=query,
             answer=answer,
             citations=citations,
+            claims=claims,
+            ungrounded_claim_count=ungrounded_claim_count,
             answer_trace=KnowledgeAnswerTrace(
                 source_name=primary_source_name,
                 source_path=primary_source_path,
