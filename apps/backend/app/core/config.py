@@ -24,13 +24,10 @@ class Settings(BaseSettings):
     knowledge_synthesis_enabled: bool = True
     knowledge_synthesis_model: str = "MiniMax-M2.7"
     knowledge_synthesis_timeout_seconds: float = 45.0
-    # Per-citation snippet cap fed to the answer synthesiser. Tested 1200
-    # vs 3500 on 4/25 cross-family judge: 3500 net-regressed by -4.36 on
-    # A+B+C (C-tier hit -10.88). Bigger context dilutes focus — the model
-    # writes longer, less specific answers. 1200 chars (~30 lines) is the
-    # sweet spot for the current synthesiser (MiniMax-M2.7); bumping the
-    # synthesiser to a stronger model would change this calculus.
-    knowledge_synthesis_max_snippet_chars: int = 1200
+    # Per-citation snippet cap fed to the answer synthesiser. AST chunking
+    # now returns whole function bodies, so keep enough context for later
+    # control-flow and validation logic inside a cited function.
+    knowledge_synthesis_max_snippet_chars: int = 6000
     llm_retry_on_rate_limit: bool = True
     llm_retry_max_attempts: int = 3
     llm_retry_base_delay_sec: float = 2.0
@@ -74,6 +71,17 @@ class Settings(BaseSettings):
     knowledge_source_specs: str | None = None
     knowledge_top_k: int = 4
     knowledge_max_file_bytes: int = 120_000
+    knowledge_chunk_max_lines: int = 300
+    knowledge_chunk_min_lines: int = 5
+    knowledge_chunk_fallback_radius: int = 10
+    knowledge_excluded_extensions: str = (
+        ".css,.scss,.sass,.less,"
+        ".svg,.png,.jpg,.jpeg,.gif,.webp,.ico,.bmp,"
+        ".woff,.woff2,.ttf,.otf,.eot,"
+        ".pdf,.zip,.tar,.gz,.7z,.rar,"
+        ".mp3,.mp4,.mov,.wav,.avi,.mkv,"
+        ".lock,.min.js,.min.css"
+    )
     # Semantic reranker: when enabled, the keyword-based retriever picks
     # knowledge_rerank_pool_size top candidates, then an LLM reranks them
     # and the final top_k slice is taken from the LLM-ranked order.

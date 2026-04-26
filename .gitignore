@@ -84,7 +84,10 @@ HostedDashboard/
 
 # Codex temp pytest artifacts
 apps/backend/.tmp-pytest/
+apps/backend/.pytest_tmp/
+apps/backend/.tmp-test/
 apps/backend/manual-pytest-temp/
+pytest-cache-files-*/
 
 # MCP config (machine-local)
 .mcp.json
