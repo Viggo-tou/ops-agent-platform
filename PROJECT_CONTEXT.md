@@ -6,7 +6,11 @@ This file is the long-lived project context for continuing development in a new 
 
 ## Purpose
 
-Ops Agent Platform is an enterprise AI assistant and governed agent workflow platform.
+Ops Agent Platform is a **single-tenant agent runtime** for one team's
+Jira-tied development and Q&A workflows. The aspirational framing is
+"enterprise agent platform," but the current implementation is honest
+about what's MVP-grade vs what's production-grade — see "Honest scope"
+below before quoting the headline.
 
 Current product target:
 
@@ -19,6 +23,46 @@ Current product target:
 - model/provider settings
 - login state and RBAC-aware controls
 - governed backend task, tool, approval, policy, and audit paths
+
+## Honest scope (what to claim vs what to caveat)
+
+What is genuinely production-grade:
+- Per-task audit log (event_log, payload_json, trace_id) — every step
+  persisted with structured payload. Defensible "auditability" claim.
+- Approval queue + policy snapshot on `Approval` rows — defensible
+  "human-in-the-loop governance" claim.
+- Provider fallback chain across codex/claude_code/anthropic/minimax —
+  defensible "provider-agnostic" claim.
+- Cross-family judge (Claude Code CLI judging MiniMax synthesis) — gives
+  benchmark numbers without self-evaluation bias.
+
+What needs explicit caveats:
+- "Sandbox isolation": the develop pipeline copies the source repo
+  into `data/sandboxes/<task_id>/` and runs `git apply` there. This is
+  **filesystem-level isolation only** — the LLM running in the sandbox
+  can still touch global git config, write to the user's home dir
+  (`~/.ssh/`, `~/.gitconfig`), spawn arbitrary subprocesses, and reach
+  the network. There is no process-level / capability-level sandbox.
+  Claim "scoped working directory for code changes" — never claim
+  "secure sandbox" or "enterprise isolation."
+- "Multi-tenant": there is none. Single SQLite DB, single user model,
+  no row-level security. The Approval / Governance rows have an
+  `actor_role` field but it's enforced by application code, not the
+  database.
+- "Production scale": single SQLite + single ThreadPoolExecutor for
+  background pipeline work. No durable job queue, no PostgreSQL, no
+  Alembic migrations. Crash recovery is a startup orphan-sweep, not a
+  resumable job runner.
+- "Enterprise security": API keys in plaintext `.env`, codegen output
+  not scanned for malicious patterns (eval, network calls), Q&A
+  endpoint may not enforce governance roles consistently.
+
+The right framing for an external audience: "MVP-quality single-tenant
+agent runtime with production-grade auditability and governance hooks,
+running against a small fixture repository. The components needed to
+become a true multi-tenant enterprise platform (process sandboxing,
+durable job queue, multi-tenant DB, secret management) are out of
+scope for the current implementation."
 
 ## Current Architecture
 

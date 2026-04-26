@@ -54,7 +54,16 @@ Without a baseline tag, no git operation can separate "this session's work" from
 
 ## Project Goal
 
-Build an enterprise AI assistant platform with:
+Build a single-tenant agent runtime that **looks like** an enterprise
+AI assistant platform from the audit / approval / governance side
+(those parts are real), while being honest that several "enterprise"
+ingredients (process-level sandbox, multi-tenant DB, durable job
+queue, secret management) are out of scope for the current
+implementation. See `PROJECT_CONTEXT.md` "Honest scope" for the
+precise claim/caveat split before reusing the "enterprise" word
+externally.
+
+Concretely:
 
 - a minimal white AI workbench frontend
 - chat-first task creation and conversation switching
