@@ -740,45 +740,112 @@ class KnowledgeService:
                 continue
             yield file_path
 
-    @staticmethod
-    def _route_query(*, query: str, source_specs: list[SourceSpec]) -> QueryRoute:
+    def _route_query(self, *, query: str, source_specs: list[SourceSpec]) -> QueryRoute:
         lowered = query.lower()
         source_candidates = tuple(spec.name for spec in source_specs if spec.name in lowered)
+        extension_counts = self._extension_counts(source_specs)
+        available_extensions = set(extension_counts)
+        dominant_extensions = self._dominant_extensions(extension_counts)
 
-        if any(keyword in lowered for keyword in ("test", "assert", "junit", "androidtest", "instrumented")):
+        test_extensions = tuple(ext for ext in (".kt", ".java") if ext in available_extensions)
+        test_keywords = ("test", "assert", "junit", "androidtest", "instrumented")
+        if test_extensions and any(keyword in lowered for keyword in test_keywords):
             return QueryRoute(
                 kind="test_failure",
-                reason="The query mentions tests or assertions, so test paths and Kotlin/Java files should be prioritized.",
-                preferred_extensions=(".kt", ".java"),
+                reason=(
+                    "The query mentions tests or assertions, so indexed "
+                    "test-related source files should be prioritized."
+                ),
+                preferred_extensions=test_extensions,
                 preferred_path_terms=("src/test", "androidTest", "Test", "test"),
                 source_candidates=source_candidates,
             )
 
-        if any(keyword in lowered for keyword in ("layout", "xml", "theme", "drawable", "navigation", "fragment")):
+        resource_extensions = tuple(ext for ext in (".xml",) if ext in available_extensions)
+        resource_keywords = ("layout", "xml", "theme", "drawable", "navigation", "fragment")
+        if resource_extensions and any(keyword in lowered for keyword in resource_keywords):
             return QueryRoute(
                 kind="android_resource_debug",
                 reason="The query mentions Android UI or resources, so XML and res paths should be prioritized.",
-                preferred_extensions=(".xml",),
+                preferred_extensions=resource_extensions,
                 preferred_path_terms=("res/layout", "res/navigation", "res/values", "drawable", "fragment"),
                 source_candidates=source_candidates,
             )
 
-        if any(keyword in lowered for keyword in ("gradle", "build", "manifest", "dependency", "config")):
+        config_extensions = tuple(
+            ext for ext in (".gradle", ".properties", ".xml", ".json") if ext in available_extensions
+        )
+        config_keywords = ("gradle", "build", "manifest", "dependency", "config")
+        if config_extensions and any(keyword in lowered for keyword in config_keywords):
             return QueryRoute(
                 kind="build_config",
-                reason="The query mentions build or configuration concerns, so Gradle and manifest files should be prioritized.",
-                preferred_extensions=(".gradle", ".properties", ".xml", ".json"),
-                preferred_path_terms=("gradle", "build.gradle", "settings.gradle", "AndroidManifest", "google-services", "firebase"),
+                reason=(
+                    "The query mentions build or configuration concerns, so "
+                    "indexed configuration files should be prioritized."
+                ),
+                preferred_extensions=config_extensions,
+                preferred_path_terms=(
+                    "gradle",
+                    "build.gradle",
+                    "settings.gradle",
+                    "AndroidManifest",
+                    "google-services",
+                    "firebase",
+                ),
                 source_candidates=source_candidates,
+            )
+
+        if dominant_extensions:
+            extension_label = ", ".join(dominant_extensions)
+            reason = (
+                "The query looks like a code or debug request, so indexed "
+                f"{extension_label} files from the selected source should be prioritized."
+            )
+        else:
+            reason = (
+                "The query looks like a code or debug request, but no dominant indexed file "
+                "extension was found, so retrieval will rely on token and path matches."
             )
 
         return QueryRoute(
             kind="code_debug",
-            reason="The query looks like a code or debug request, so Kotlin and Java application files should be prioritized.",
-            preferred_extensions=(".kt", ".java", ".xml"),
+            reason=reason,
+            preferred_extensions=dominant_extensions,
             preferred_path_terms=("src/main", "viewmodel", "activity", "fragment", "login", "chat"),
             source_candidates=source_candidates,
         )
+
+    def _extension_counts(self, source_specs: list[SourceSpec]) -> Counter[str]:
+        source_names = [spec.name for spec in source_specs]
+        if not source_names:
+            return Counter()
+
+        rows = self.db.execute(
+            select(KnowledgeDocument.extension, func.count(KnowledgeDocument.id))
+            .where(KnowledgeDocument.source_name.in_(source_names))
+            .group_by(KnowledgeDocument.extension)
+        )
+        counts: Counter[str] = Counter()
+        for extension, count in rows:
+            normalized = (extension or "").strip().lower()
+            if not normalized:
+                continue
+            counts[normalized] = int(count)
+        return counts
+
+    @staticmethod
+    def _dominant_extensions(extension_counts: Counter[str]) -> tuple[str, ...]:
+        total = sum(extension_counts.values())
+        if total <= 0:
+            return ()
+
+        ranked = sorted(extension_counts.items(), key=lambda item: (-item[1], item[0]))
+        dominant = [
+            extension
+            for extension, count in ranked
+            if count == ranked[0][1] or (count / total) >= 0.25
+        ]
+        return tuple(dominant[:4])
 
     @staticmethod
     def _score_document(
