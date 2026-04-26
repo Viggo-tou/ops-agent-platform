@@ -82,7 +82,14 @@ def test_synthesize_success_returns_llm_text(monkeypatch: pytest.MonkeyPatch) ->
 
     assert result == "Use src/auth.py lines 10-14."
     client_factory.assert_called_once_with(timeout=3.0)
-    assert client.post.call_args.kwargs["json"]["model"] == "minimax-text-01"
+    payload = client.post.call_args.kwargs["json"]
+    assert payload["model"] == "minimax-text-01"
+    system_prompt = payload["messages"][0]["content"]
+    assert "<answer>" in system_prompt
+    assert '<claim id="N">' in system_prompt
+    assert "<claims>" in system_prompt
+    assert "cite=[] confidence=low" in system_prompt
+    assert "Citation indices are 1-indexed" in system_prompt
 
 
 def test_synthesize_no_api_key_raises() -> None:
@@ -142,7 +149,7 @@ def test_synthesize_respects_max_snippet_chars() -> None:
 
 
 @pytest.fixture()
-def db_session(tmp_path: Path):
+def db_session():
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
@@ -152,8 +159,7 @@ def db_session(tmp_path: Path):
     Base.metadata.create_all(bind=engine)
     SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
     session = SessionLocal()
-    source_root = tmp_path / "source"
-    source_root.mkdir()
+    source_root = BACKEND_ROOT / "tests" / "fixtures"
     content = "def login_failure_handler():\n    return 'login failure auth path'\n"
     session.add(
         KnowledgeDocument(
@@ -194,6 +200,8 @@ def test_search_repositories_falls_back_to_template_on_synth_error(
 
     assert result.answer_trace.answer_provider == "template"
     assert "I would start with" in result.answer
+    assert result.claims == []
+    assert result.ungrounded_claim_count == 0
 
 
 def test_search_repositories_uses_minimax_when_configured(
@@ -211,5 +219,36 @@ def test_search_repositories_uses_minimax_when_configured(
     result = service.search_repositories(query="login failure", top_k=1)
 
     assert result.answer == "LLM synthesized answer with handymanapp:src/auth.py (lines 1-2)."
+    assert result.answer_trace.answer_provider == "minimax"
+    assert result.claims == []
+    assert result.ungrounded_claim_count == 0
+
+
+def test_search_repositories_extracts_claims_from_minimax_synthesis(
+    monkeypatch: pytest.MonkeyPatch,
+    db_session,
+) -> None:
+    session, source_root = db_session
+    monkeypatch.setattr(
+        "app.services.knowledge_synthesis.KnowledgeSynthesizer.synthesize",
+        Mock(
+            return_value=(
+                "<answer><claim id=\"1\">The login failure handler is in src/auth.py.</claim></answer>\n"
+                "<claims>\n"
+                "1. cite=[1] confidence=high - The handler is in src/auth.py.\n"
+                "</claims>"
+            )
+        ),
+    )
+    service = KnowledgeService(session)
+    service.settings = _settings(knowledge_source_path=str(source_root))
+
+    result = service.search_repositories(query="login failure", top_k=1)
+
+    assert result.answer == "The login failure handler is in src/auth.py."
+    assert result.claims[0].text == "The login failure handler is in src/auth.py."
+    assert result.claims[0].citation_indices == [0]
+    assert result.claims[0].confidence == "high"
+    assert result.ungrounded_claim_count == 0
     assert result.answer_trace.answer_provider == "minimax"
 
