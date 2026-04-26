@@ -23,6 +23,7 @@ from app.schemas.knowledge import (
     KnowledgeUploadResponse,
     KnowledgeUploadSkipped,
 )
+from app.services.knowledge_chunking import build_snippet
 
 UPLOAD_ACCEPTED_EXTENSIONS = {".md", ".txt", ".json", ".yml", ".yaml", ".properties"}
 SOURCE_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -44,10 +45,10 @@ TEXT_EXTENSIONS = {
     ".tsx",
     ".mjs",
     ".cjs",
+    ".py",
     ".css",
     ".scss",
     ".html",
-    ".py",
     ".vue",
 }
 IGNORED_PARTS = {
@@ -99,6 +100,47 @@ def _is_ignored_path(file_path: Path) -> bool:
         if name.endswith(suffix):
             return True
     return False
+
+
+def _excluded_file_patterns(settings: object | None = None) -> set[str]:
+    settings = settings or get_settings()
+    raw_value = str(getattr(settings, "knowledge_excluded_extensions", "") or "")
+    patterns: set[str] = set()
+    for raw_item in raw_value.replace(";", ",").split(","):
+        item = raw_item.strip().lower()
+        if not item:
+            continue
+        if not item.startswith("."):
+            item = f".{item}"
+        patterns.add(item)
+    return patterns
+
+
+def _is_excluded_resource_file(file_path: Path, settings: object | None = None) -> bool:
+    name = file_path.name.lower()
+    suffix = file_path.suffix.lower()
+    for pattern in _excluded_file_patterns(settings):
+        if suffix == pattern or name.endswith(pattern):
+            return True
+    return False
+
+
+def _decode_indexable_content(raw_bytes: bytes) -> str | None:
+    try:
+        content = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if _non_printable_ratio(content) > 0.01:
+        return None
+    return content
+
+
+def _non_printable_ratio(content: str) -> float:
+    if not content:
+        return 0.0
+    allowed_controls = {"\n", "\r", "\t", "\f"}
+    non_printable = sum(1 for char in content if not char.isprintable() and char not in allowed_controls)
+    return non_printable / len(content)
 TOKEN_PATTERN = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]+")
 CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 SEMANTIC_EXPANSIONS = {
@@ -134,6 +176,13 @@ def _language_from_extension(extension: str) -> str | None:
         ".yml": "yaml",
         ".yaml": "yaml",
         ".txt": "text",
+        ".py": "python",
+        ".js": "javascript",
+        ".jsx": "javascript",
+        ".mjs": "javascript",
+        ".cjs": "javascript",
+        ".ts": "typescript",
+        ".tsx": "tsx",
     }
     return mapping.get(extension.lower())
 
@@ -325,7 +374,10 @@ class KnowledgeService:
             scored_documents = ranked_pool + scored_documents[pool_size:]
 
         selected = scored_documents[:top_k]
-        citations = [self._build_citation(scored=scored, query_tokens=query_tokens) for scored in selected]
+        citations = [
+            self._build_citation(scored=scored, query_tokens=query_tokens, settings=self.settings)
+            for scored in selected
+        ]
 
         matched_tokens = sorted({token for scored in selected for token in scored.matched_tokens})
         token_coverage = (
@@ -446,12 +498,15 @@ class KnowledgeService:
         indexed_documents = 0
 
         for file_path in self._iter_source_files(spec.path):
+            raw_bytes = file_path.read_bytes()
+            content = _decode_indexable_content(raw_bytes)
+            if content is None:
+                continue
+
             relative_path = file_path.relative_to(spec.path).as_posix()
             seen_paths.add(relative_path)
 
-            raw_bytes = file_path.read_bytes()
             content_hash = hashlib.sha256(raw_bytes).hexdigest()
-            content = raw_bytes.decode("utf-8", errors="ignore")
             line_count = len(content.splitlines()) if content else 0
             extension = file_path.suffix.lower()
             metadata = {
@@ -584,6 +639,14 @@ class KnowledgeService:
                 skipped.append(KnowledgeUploadSkipped(file_name=raw_name, reason="empty file name"))
                 continue
             extension = Path(safe_name).suffix.lower()
+            if _is_excluded_resource_file(Path(safe_name), self.settings):
+                skipped.append(
+                    KnowledgeUploadSkipped(
+                        file_name=safe_name,
+                        reason=f"excluded non-text extension {extension or '(none)'}",
+                    )
+                )
+                continue
             if extension not in UPLOAD_ACCEPTED_EXTENSIONS:
                 skipped.append(
                     KnowledgeUploadSkipped(
@@ -604,10 +667,14 @@ class KnowledgeService:
                 )
                 continue
 
+            content = _decode_indexable_content(data)
+            if content is None:
+                skipped.append(KnowledgeUploadSkipped(file_name=safe_name, reason="binary or non-text content"))
+                continue
+
             destination = source_dir / safe_name
             destination.write_bytes(data)
 
-            content = data.decode("utf-8", errors="ignore")
             content_hash = hashlib.sha256(data).hexdigest()
             line_count = len(content.splitlines()) if content else 0
             metadata = {
@@ -727,16 +794,17 @@ class KnowledgeService:
             )
         return specs
 
-    @staticmethod
-    def _iter_source_files(source_path: Path):
+    def _iter_source_files(self, source_path: Path):
         for file_path in source_path.rglob("*"):
             if not file_path.is_file():
                 continue
             if _is_ignored_path(file_path):
                 continue
+            if _is_excluded_resource_file(file_path, self.settings):
+                continue
             if file_path.suffix.lower() not in TEXT_EXTENSIONS:
                 continue
-            if file_path.stat().st_size > get_settings().knowledge_max_file_bytes:
+            if file_path.stat().st_size > self.settings.knowledge_max_file_bytes:
                 continue
             yield file_path
 
@@ -806,7 +874,12 @@ class KnowledgeService:
         return ScoredDocument(document=document, score=score, matched_tokens=matched_tokens)
 
     @staticmethod
-    def _build_citation(*, scored: ScoredDocument, query_tokens: list[str]) -> KnowledgeCitation:
+    def _build_citation(
+        *,
+        scored: ScoredDocument,
+        query_tokens: list[str],
+        settings: object | None = None,
+    ) -> KnowledgeCitation:
         document = scored.document
         lines = document.content.splitlines() or [document.content]
         best_line_index = 0
@@ -819,24 +892,33 @@ class KnowledgeService:
                 best_line_score = line_score
                 best_line_index = index
 
-        start = max(0, best_line_index - 2)
-        end = min(len(lines), best_line_index + 3)
-        snippet = "\n".join(lines[start:end]).strip()
+        settings = settings or get_settings()
+        chunk = build_snippet(
+            content=document.content,
+            extension=document.extension,
+            target_line=best_line_index + 1,
+            min_lines=int(getattr(settings, "knowledge_chunk_min_lines", 5)),
+            max_lines=int(getattr(settings, "knowledge_chunk_max_lines", 150)),
+            fallback_radius=int(getattr(settings, "knowledge_chunk_fallback_radius", 10)),
+        )
 
         return KnowledgeCitation(
             document_id=document.id,
             source_name=document.source_name,
             title=document.title,
             relative_path=document.relative_path,
-            line_start=start + 1,
-            line_end=end,
-            snippet=snippet,
+            line_start=chunk.line_start,
+            line_end=chunk.line_end,
+            snippet=chunk.snippet,
             score=round(scored.score, 2),
             metadata={
                 "extension": document.extension,
                 "language": document.language,
                 "size_bytes": document.size_bytes,
                 "line_count": document.line_count,
+                "enclosing_symbol": chunk.enclosing_symbol,
+                "chunk_kind": chunk.chunk_kind,
+                "truncated": chunk.truncated,
             },
         )
 
