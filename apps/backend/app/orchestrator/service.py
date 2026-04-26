@@ -2800,26 +2800,22 @@ class PrimaryOrchestrator:
                 )
             if goal_report is not None:
                 pipeline_state["goal_decomposition"] = goal_report.to_payload()
-                # Phase-2 migration: comment-only escalation routes through
-                # the new Gate ABC. The classification logic still lives in
-                # services.comment_only_detector; CommentOnlyGate adapts the
-                # output to the canonical GateReport shape and gives us a
-                # single per-keypoint-finding payload format consistent with
-                # the artifact-existence gate.
-                from app.orchestrator.gates import GateContext, GateVerdict
-                from app.orchestrator.gates.comment_only_gate import CommentOnlyGate
-
-                comment_only_ctx = GateContext(
-                    task_id=task.id,
-                    diff=diff,
-                    sandbox_dir=None,  # the gate only inspects diff text
-                    plan=plan,
-                    extra={"unjustified_files": list(goal_report.unjustified_files or [])},
-                )
-                co_report = CommentOnlyGate().run(comment_only_ctx)
-                comment_only_unjustified = list(
-                    co_report.metadata.get("comment_only_unjustified") or []
-                )
+                # Comment-only escalation: if any unjustified file's changes
+                # are purely comments/whitespace, flag as block — that's the
+                # "CLI agent added a self-documenting note to placate review"
+                # pattern we saw in P69-8 task 5de6b5d3.
+                from app.services.comment_only_detector import classify_diff
+                comment_reports = classify_diff(diff)
+                comment_only_unjustified: list[str] = []
+                for unjf in goal_report.unjustified_files or []:
+                    # match by suffix because diff paths may have different prefixes
+                    for rep_path, rep in comment_reports.items():
+                        if (
+                            rep.is_comment_only
+                            and (rep_path == unjf or rep_path.endswith("/" + unjf) or unjf.endswith("/" + rep_path))
+                        ):
+                            comment_only_unjustified.append(rep_path)
+                            break
                 record_event(
                     self.db, task_id=task.id,
                     event_type=EventType.TOOL_SUCCEEDED,
@@ -2838,10 +2834,9 @@ class PrimaryOrchestrator:
                     payload={
                         **goal_report.to_payload(),
                         "comment_only_unjustified": comment_only_unjustified,
-                        "comment_only_report": co_report.to_payload(),
                     },
                 )
-                if co_report.verdict == GateVerdict.BLOCK:
+                if comment_only_unjustified:
                     self._fail_develop_pipeline(
                         task=task,
                         message=(
@@ -2857,7 +2852,6 @@ class PrimaryOrchestrator:
                         payload={
                             "comment_only_unjustified": comment_only_unjustified,
                             "goal_report": goal_report.to_payload(),
-                            "comment_only_report": co_report.to_payload(),
                         },
                     )
                     return
@@ -2903,36 +2897,22 @@ class PrimaryOrchestrator:
         # drops a core deliverable (e.g. new rules file) and every other gate
         # passes on the remaining cosmetic changes.
         if not pipeline_state.get("artifact_existence_done"):
-            # Phase-2 migration first move: route artifact_existence through
-            # the new Gate ABC. Same inputs (must_touch + expected_new +
-            # diff-touched-paths derived from diff headers), same outputs
-            # (top-level findings/findings_blocking/findings_total preserved
-            # for any caller; checked_must_touch/checked_expected_new moved
-            # into report.metadata). Frontend doesn't read these specifics
-            # so the shape change is safe.
-            from app.orchestrator.gates import GateContext, GateVerdict
-            from app.orchestrator.gates.artifact_existence_gate import (
-                ArtifactExistenceGate,
-            )
+            from app.services.artifact_existence import check_artifact_existence
             import re as _re
             must_touch_plan = list(getattr(plan, "must_touch_files", []) or [])
             expected_new_plan = list(getattr(plan, "expected_new_files", []) or [])
+            # Derive paths touched by the applied diff from its headers.
             diff_touched: set[str] = set()
             for _m in _re.finditer(r"^\+\+\+ b/(\S+)", diff, flags=_re.MULTILINE):
                 diff_touched.add(_m.group(1).strip())
-
-            gate_ctx = GateContext(
-                task_id=task.id,
-                diff=diff,
-                sandbox_dir=self._develop_sandbox_dir(task),
-                plan=plan,
-                must_touch_files=must_touch_plan,
-                expected_new_files=expected_new_plan,
-                diff_touched_paths=diff_touched,
-            )
             art_report = None
             try:
-                art_report = ArtifactExistenceGate().run(gate_ctx)
+                art_report = check_artifact_existence(
+                    sandbox_dir=self._develop_sandbox_dir(task),
+                    must_touch_files=must_touch_plan,
+                    expected_new_files=expected_new_plan,
+                    diff_touched_paths=diff_touched,
+                )
             except Exception as exc:  # noqa: BLE001
                 record_event(
                     self.db, task_id=task.id,
@@ -2949,8 +2929,7 @@ class PrimaryOrchestrator:
                 record_event(
                     self.db, task_id=task.id,
                     event_type=(
-                        EventType.REVIEW_FAILED
-                        if art_report.verdict == GateVerdict.BLOCK
+                        EventType.REVIEW_FAILED if blockers
                         else EventType.TOOL_SUCCEEDED
                     ),
                     source=EventSource.ORCHESTRATOR,
@@ -2958,14 +2937,13 @@ class PrimaryOrchestrator:
                     tool_name="artifact_existence.check",
                     message=(
                         f"Artifact existence: {len(blockers)} blocking, "
-                        f"{len(art_report.warn_findings)} warn "
-                        f"(verdict={art_report.verdict.value}, "
-                        f"must_touch={len(must_touch_plan)}, "
+                        f"{len(art_report.findings) - len(blockers)} warn "
+                        f"(must_touch={len(must_touch_plan)}, "
                         f"expected_new={len(expected_new_plan)})"
                     ),
                     payload=art_report.to_payload(),
                 )
-                if art_report.verdict == GateVerdict.BLOCK:
+                if blockers:
                     block_msgs = "; ".join(f.message for f in blockers[:3])
                     self._fail_develop_pipeline(
                         task=task,
