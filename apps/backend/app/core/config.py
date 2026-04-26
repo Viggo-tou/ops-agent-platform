@@ -93,12 +93,9 @@ class Settings(BaseSettings):
     # add to the retrieval token set, addressing the recall gap where
     # natural-language phrases don't share surface tokens with actual
     # identifiers (e.g. "approval workflow" vs HandymanVerification.js).
-    # OFF by default — initial benchmark showed mixed results: A-tier
-    # regressed (-6 mean) because expansion tokens diluted precision on
-    # narrow queries (e.g. ConfirmModal lookup got pulled toward Login.js
-    # by auth-adjacent expansion tokens). Keep the code path so opt-in
-    # operators can experiment + iterate on the prompt.
-    knowledge_query_rewrite_enabled: bool = False
+    # ON by default: expansion is additive-only, deterministic, timeout
+    # bounded, and fails safe to the original retrieval token set.
+    knowledge_query_rewrite_enabled: bool = True
     knowledge_query_rewrite_timeout_seconds: float = 15.0
     knowledge_upload_root: str = str((BASE_DIR / "data" / "uploads").as_posix())
     knowledge_upload_default_source: str = "uploads"
