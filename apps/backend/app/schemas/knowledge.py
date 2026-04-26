@@ -49,6 +49,19 @@ class KnowledgeAnswerTrace(BaseModel):
     hallucination_risk: str = Field(..., description="Risk level of potential hallucination in the answer")
     rationale: str = Field(..., description="Explanation for why this answer was generated")
     answer_provider: str = Field(default="template", description="Provider used to produce the final answer text")
+    # --- Retrieval / synthesis configuration snapshot (versioning) ---
+    # Recorded so a benchmark run can group-by these dimensions and
+    # attribute score changes to specific config knobs rather than
+    # guessing whether yesterday's bigger-snippet experiment was the
+    # cause or LLM noise. None values mean "not applicable" (e.g.
+    # synthesis_prompt_version when answer_provider == "template").
+    rerank_enabled: bool | None = Field(default=None, description="Whether the LLM reranker ran on the keyword-top pool")
+    rerank_pool_size: int | None = Field(default=None, description="Pool size fed to the reranker before top_k slice")
+    query_rewrite_enabled: bool | None = Field(default=None, description="Whether LLM query-token expansion ran")
+    query_rewrite_added_tokens: int | None = Field(default=None, description="Number of LLM-suggested tokens unioned into retrieval set")
+    synthesis_max_snippet_chars: int | None = Field(default=None, description="Per-citation snippet cap fed to synthesiser")
+    synthesis_prompt_version: str | None = Field(default=None, description="Identifier of the synthesis system-prompt version")
+    synthesis_model: str | None = Field(default=None, description="Model identifier used for synthesis (None when answer_provider=='template')")
 
 
 class KnowledgeSearchResult(BaseModel):

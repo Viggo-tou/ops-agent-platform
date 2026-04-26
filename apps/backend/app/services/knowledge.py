@@ -244,16 +244,27 @@ class KnowledgeService:
         query_tokens = _tokenize(query)
         expanded_tokens = _expand_tokens(query_tokens)
 
+        # Trace fields: capture retrieval/synthesis configuration as the
+        # search runs so the AnswerTrace at the end can record exactly
+        # what knobs produced this answer. Lets benchmark runs group by
+        # config dimension and attribute score deltas to specific knobs.
+        query_rewrite_enabled_setting = bool(
+            getattr(self.settings, "knowledge_query_rewrite_enabled", False)
+        )
+        query_rewrite_added_tokens_count: int | None = None
+        actual_rerank_pool_size: int | None = None
+
         # Query rewrite: ask LLM for additional likely-source tokens (e.g.
         # CamelCase identifiers, synonyms, adjacent concepts) to lift recall
         # for natural-language phrases. Fails safe to empty set.
-        if getattr(self.settings, "knowledge_query_rewrite_enabled", False):
+        if query_rewrite_enabled_setting:
             from app.services.query_rewrite import expand_query_tokens
             llm_tokens = expand_query_tokens(
                 query=query,
                 settings=self.settings,
                 existing_tokens=set(query_tokens) | expanded_tokens,
             )
+            query_rewrite_added_tokens_count = len(llm_tokens)
             if llm_tokens:
                 expanded_tokens = expanded_tokens | llm_tokens
 
@@ -285,6 +296,7 @@ class KnowledgeService:
             from app.services.knowledge_rerank import RerankCandidate, rerank_candidates
 
             pool = scored_documents[:pool_size]
+            actual_rerank_pool_size = len(pool)
             snippet_cap = int(getattr(self.settings, "knowledge_rerank_snippet_chars", 600))
             rerank_input = [
                 RerankCandidate(
@@ -351,6 +363,24 @@ class KnowledgeService:
         if not packaged_context:
             packaged_context = "No repository citations matched this query."
 
+        # Synthesis trace fields. None when the template fallback was used,
+        # populated when MiniMax actually synthesised the answer text.
+        synth_was_used = answer_provider != "template"
+        synthesis_max_snippet = (
+            int(getattr(self.settings, "knowledge_synthesis_max_snippet_chars", 0))
+            if synth_was_used else None
+        ) or None
+        synthesis_model_used = (
+            str(getattr(self.settings, "knowledge_synthesis_model", "") or "") or None
+        ) if synth_was_used else None
+        synthesis_prompt_v = None
+        if synth_was_used:
+            try:
+                from app.services.knowledge_synthesis import SYNTHESIS_PROMPT_VERSION
+                synthesis_prompt_v = SYNTHESIS_PROMPT_VERSION
+            except Exception:  # noqa: BLE001
+                synthesis_prompt_v = "unknown"
+
         return KnowledgeSearchResult(
             query=query,
             answer=answer,
@@ -372,6 +402,13 @@ class KnowledgeService:
                 hallucination_risk=hallucination_risk,
                 rationale=rationale,
                 answer_provider=answer_provider,
+                rerank_enabled=rerank_enabled,
+                rerank_pool_size=actual_rerank_pool_size,
+                query_rewrite_enabled=query_rewrite_enabled_setting,
+                query_rewrite_added_tokens=query_rewrite_added_tokens_count,
+                synthesis_max_snippet_chars=synthesis_max_snippet,
+                synthesis_prompt_version=synthesis_prompt_v,
+                synthesis_model=synthesis_model_used,
             ),
             packaged_context=packaged_context,
         )

@@ -9,6 +9,14 @@ from app.core.config import Settings, get_settings
 from app.schemas.knowledge import KnowledgeCitation
 
 
+# Bumped when the synthesis system-prompt is materially revised. Recorded
+# in KnowledgeAnswerTrace.synthesis_prompt_version so benchmark runs can
+# attribute score changes to specific prompt revisions instead of guessing.
+# History:
+#   v1-baseline: original prompt, citations + concrete-answer constraint.
+SYNTHESIS_PROMPT_VERSION = "v1-baseline"
+
+
 class KnowledgeSynthesisError(RuntimeError):
     """Raised when MiniMax synthesis fails; caller must fall back."""
 
