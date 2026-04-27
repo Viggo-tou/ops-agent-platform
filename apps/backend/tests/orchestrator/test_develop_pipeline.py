@@ -222,6 +222,153 @@ class DevelopPipelineTests(unittest.TestCase):
             "No Jira issue key was found in the planning request.",
         )
 
+    def test_jira_error_classification_kinds(self) -> None:
+        """Each known HTTP failure mode maps to a distinct error_kind + user message."""
+        from app.tools.gateway import ToolInvocationError
+
+        cases = [
+            (ToolInvocationError("401", http_status=401), "auth_expired", "expired or been revoked"),
+            (ToolInvocationError("403", http_status=403), "permission_denied", "lacks permission"),
+            (ToolInvocationError("404", http_status=404), "not_found_or_invisible", "may be deleted"),
+            (ToolInvocationError("500", http_status=500), "transient_server_error", "transient"),
+            (ToolInvocationError("502", http_status=502), "transient_server_error", "transient"),
+            (ToolInvocationError("429", http_status=429), "rate_limited", "rate-limited"),
+            (ToolInvocationError("timeout", timed_out=True), "transient_timeout", "timed out"),
+            (ToolInvocationError("garbage"), "unknown", "Failed to load"),
+        ]
+        for exc, expected_kind, expected_substring in cases:
+            kind, message = PrimaryOrchestrator._classify_jira_error(exc, "P69-7")
+            self.assertEqual(kind, expected_kind, f"exc={exc} status={getattr(exc, 'http_status', None)}")
+            self.assertIn(expected_substring, message, f"kind={kind} message={message!r}")
+
+    def test_probe_upgrades_404_to_auth_expired_when_token_dead(self) -> None:
+        """When issue lookup fails 404 AND /myself returns 401, surface auth_expired.
+
+        Without the probe, P69-7's real failure mode (token expired, but
+        per-issue endpoint returns 404 because Jira hides issue existence
+        from unauthenticated callers) gets misreported as
+        not_found_or_invisible — wrong remediation in the user message.
+        """
+        from app.tools.gateway import ToolInvocationError
+
+        task = SimpleNamespace(
+            id="task-probe",
+            session_id="session-probe",
+            actor_name="tester",
+            request_text="完成Jira上的P69-7",
+            scenario="jira_issue_develop",
+            status=TaskStatus.QUEUED,
+            workflow_stage=WorkflowStage.INTAKE,
+            translation_json=None,
+            plan_json=None,
+            latest_result_json=None,
+            pending_approval=False,
+            retry_count=0,
+        )
+        orchestrator = self._orchestrator()
+        orchestrator.tool_gateway.execute = Mock(
+            side_effect=ToolInvocationError("404 not found", http_status=404)
+        )
+        # Probe says token is dead.
+        orchestrator._probe_jira_auth_health = Mock(return_value=401)
+
+        with patch("app.orchestrator.service.record_event"), patch("app.orchestrator.service.set_task_status"):
+            result = orchestrator._prefetch_jira_issue_context(
+                task=task,
+                actor_name="tester",
+                issue_key="P69-7",
+            )
+
+        self.assertIsNone(result)
+        # The probe was consulted because the initial classification was 404.
+        orchestrator._probe_jira_auth_health.assert_called_once()
+        # Final error_kind upgraded to auth_expired.
+        self.assertEqual(task.latest_result_json["error_kind"], "auth_expired")
+        self.assertIn("expired or been revoked", task.latest_result_json["message"])
+
+    def test_probe_keeps_404_when_token_healthy(self) -> None:
+        """If /myself returns 200, the original 404 is genuine — don't upgrade."""
+        from app.tools.gateway import ToolInvocationError
+
+        task = SimpleNamespace(
+            id="task-probe-2",
+            session_id="session-probe-2",
+            actor_name="tester",
+            request_text="implement P69-999",
+            scenario="jira_issue_develop",
+            status=TaskStatus.QUEUED,
+            workflow_stage=WorkflowStage.INTAKE,
+            translation_json=None,
+            plan_json=None,
+            latest_result_json=None,
+            pending_approval=False,
+            retry_count=0,
+        )
+        orchestrator = self._orchestrator()
+        orchestrator.tool_gateway.execute = Mock(
+            side_effect=ToolInvocationError("404 not found", http_status=404)
+        )
+        orchestrator._probe_jira_auth_health = Mock(return_value=200)
+
+        with patch("app.orchestrator.service.record_event"), patch("app.orchestrator.service.set_task_status"):
+            orchestrator._prefetch_jira_issue_context(
+                task=task,
+                actor_name="tester",
+                issue_key="P69-999",
+            )
+
+        orchestrator._probe_jira_auth_health.assert_called_once()
+        self.assertEqual(task.latest_result_json["error_kind"], "not_found_or_invisible")
+        self.assertNotIn("expired or been revoked", task.latest_result_json["message"])
+
+    def test_jira_develop_aborts_when_issue_unfetchable(self) -> None:
+        """Regression for the P69-7 incident.
+
+        When the Jira issue can't be fetched (deleted ticket, wrong project,
+        permission error), the orchestrator must NOT fall back to a synthetic
+        issue context and continue. Continuing causes codegen to invent
+        requirements for a ghost ticket — exactly what produced the bogus
+        password-toggle change for non-existent P69-7.
+        """
+        task = SimpleNamespace(
+            id="task-ghost",
+            session_id="session-ghost",
+            actor_name="tester",
+            request_text="完成Jira上的P69-7",
+            scenario="jira_issue_develop",
+            status=TaskStatus.QUEUED,
+            workflow_stage=WorkflowStage.INTAKE,
+            translation_json=None,
+            plan_json=None,
+            latest_result_json=None,
+            pending_approval=False,
+            retry_count=0,
+        )
+        orchestrator = self._orchestrator()
+        orchestrator._translate_request = Mock(
+            return_value=_semantic_translation(issue_key="P69-7")
+        )
+        # Jira lookup fails: returns None (mirrors the real failure path
+        # where _prefetch_jira_issue_context marks the task FAILED and returns).
+        orchestrator._prefetch_jira_issue_context = Mock(return_value=None)
+        # The pipeline must NOT reach planning, codegen, or any tool that
+        # would have invented requirements.
+        orchestrator._prefetch_planning_repository_context = Mock()
+        orchestrator.primary_agent.generate_plan = Mock()
+        orchestrator.reviewer_agent.review_plan = Mock()
+        orchestrator._gather_codegen_context = Mock()
+
+        with patch("app.orchestrator.service.record_event"), patch("app.orchestrator.service.set_task_status"):
+            orchestrator._bootstrap_task_impl(task=task, actor_name="tester")
+
+        orchestrator._prefetch_jira_issue_context.assert_called_once()
+        # Hard guard: nothing downstream should fire when the Jira issue
+        # can't be fetched.
+        orchestrator._prefetch_planning_repository_context.assert_not_called()
+        orchestrator.primary_agent.generate_plan.assert_not_called()
+        orchestrator.reviewer_agent.review_plan.assert_not_called()
+        orchestrator._gather_codegen_context.assert_not_called()
+
     def test_gather_codegen_context_from_sandbox(self) -> None:
         plan = _plan()
         task = _task(plan)

@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -379,41 +380,23 @@ class PrimaryOrchestrator:
                 actor_name=actor_name,
                 issue_key=semantic_translation.issue_key,
             )
-            if issue_context is None and task.scenario == "jira_issue_develop":
-                # Graceful fallback: proceed with translation-only context
-                # when the Jira issue can't be loaded (e.g. deleted project).
-                # _prefetch_jira_issue_context already marked the task as FAILED,
-                # so reset it back to CREATED to allow the pipeline to continue.
-                issue_context = {
-                    "key": semantic_translation.issue_key or "UNKNOWN",
-                    "summary": semantic_translation.objective or task.request_text or "",
-                    "description": semantic_translation.normalized_request or task.request_text or "",
-                    "status": "Unknown",
-                    "_synthetic": True,
-                }
-                set_task_status(
-                    self.db,
-                    task=task,
-                    new_status=TaskStatus.CREATED,
-                    new_stage=WorkflowStage.INTAKE,
-                    role=RoleName.PRIMARY,
-                    source=EventSource.ORCHESTRATOR,
-                    message="Jira issue unavailable — proceeding with translation-only context.",
-                )
-            elif issue_context is None:
+            if issue_context is None:
+                # Refuse to fabricate requirements for a missing Jira issue.
+                # _prefetch_jira_issue_context has already marked the task FAILED.
+                # See P69-7 incident: the previous "graceful fallback" reset
+                # the task to CREATED and synthesised an empty issue body, which
+                # caused codegen to invent a generic Login.js change for a ghost
+                # ticket. The downstream gates can't catch this because they
+                # only validate diff shape, not whether the requirement existed.
                 return
 
-            # Skip 2nd translation pass when using synthetic issue context —
-            # the 1st pass already has concrete grounding terms; re-translating
-            # with the empty synthetic context produces generic/unusable terms.
-            if not issue_context.get("_synthetic"):
-                semantic_translation = self._translate_request(
-                    task=task,
-                    actor_name=actor_name,
-                    issue_context=issue_context,
-                )
-                self._apply_jira_issue_key_fallback(task=task, semantic_translation=semantic_translation)
-                task.translation_json = semantic_translation.model_dump(mode="json")
+            semantic_translation = self._translate_request(
+                task=task,
+                actor_name=actor_name,
+                issue_context=issue_context,
+            )
+            self._apply_jira_issue_key_fallback(task=task, semantic_translation=semantic_translation)
+            task.translation_json = semantic_translation.model_dump(mode="json")
             planning_knowledge_context = self._prefetch_planning_repository_context(
                 task=task,
                 actor_name=actor_name,
@@ -461,12 +444,7 @@ class PrimaryOrchestrator:
         # If translation extracted grounding_terms/anchors, verify at least one
         # exists in the knowledge source tree. If ALL are missing, the task is
         # likely targeting the wrong repository — fail fast before planning.
-        # Skip when using synthetic Jira context — the grounding terms are just
-        # the Jira issue key, which will never appear in the codebase.
-        _skip_anchor = (
-            issue_context is not None and issue_context.get("_synthetic")
-        )
-        if not _skip_anchor and self._anchor_precheck_fails(task):
+        if self._anchor_precheck_fails(task):
             return
 
         set_task_status(
@@ -874,6 +852,21 @@ class PrimaryOrchestrator:
         except Exception as exc:
             self._sync_retry_count(task)
             event_type = EventType.TOOL_TIMED_OUT if isinstance(exc, ToolInvocationError) and exc.timed_out else EventType.TOOL_FAILED
+            error_kind, user_message = self._classify_jira_error(exc, issue_key)
+            # Disambiguate 404: Jira returns 404 for both "issue missing" and
+            # "token can't see project". Probe /myself to detect the
+            # token-expiry case so the user gets the right remediation.
+            if error_kind == "not_found_or_invisible":
+                probe_status = self._probe_jira_auth_health()
+                if probe_status == 401:
+                    error_kind = "auth_expired"
+                    user_message = (
+                        f"Jira authentication failed (HTTP 401 on /myself). The API token has "
+                        f"expired or been revoked, which makes issue lookups appear as 404. "
+                        f"Refresh OPS_AGENT_JIRA_API_TOKEN in apps/backend/.env from "
+                        f"https://id.atlassian.com/manage-profile/security/api-tokens and restart the backend. "
+                        f"(Original failure: {exc})"
+                    )
             record_event(
                 self.db,
                 task_id=task.id,
@@ -883,12 +876,19 @@ class PrimaryOrchestrator:
                 role=RoleName.PLANNER,
                 tool_name="jira.get_issue",
                 message="Planner failed to load Jira issue context before plan generation.",
-                payload={"issue_key": issue_key, "error": str(exc)},
+                payload={
+                    "issue_key": issue_key,
+                    "error": str(exc),
+                    "error_kind": error_kind,
+                    "http_status": getattr(exc, "http_status", None),
+                },
             )
             task.latest_result_json = {
                 "status": TaskStatus.FAILED.value,
-                "message": f"Failed to load Jira issue {issue_key} before planning.",
+                "message": user_message,
                 "error": str(exc),
+                "error_kind": error_kind,
+                "http_status": getattr(exc, "http_status", None),
                 "semantic_translation": task.translation_json,
             }
             set_task_status(
@@ -898,7 +898,7 @@ class PrimaryOrchestrator:
                 new_stage=WorkflowStage.DONE,
                 role=RoleName.PRIMARY,
                 source=EventSource.ORCHESTRATOR,
-                message="Task failed before planning because the Jira issue context could not be loaded.",
+                message=user_message,
             )
             record_event(
                 self.db,
@@ -908,7 +908,7 @@ class PrimaryOrchestrator:
                 stage=WorkflowStage.DONE,
                 role=RoleName.PRIMARY,
                 message="Final response emitted after Jira context preload failure.",
-                payload={"issue_key": issue_key},
+                payload={"issue_key": issue_key, "error_kind": error_kind},
             )
             return None
 
@@ -924,6 +924,102 @@ class PrimaryOrchestrator:
             payload=result,
         )
         return result
+
+    def _probe_jira_auth_health(self) -> int | None:
+        """Probe /rest/api/3/myself to disambiguate 404 vs 401 on issue lookups.
+
+        Returns the HTTP status code, or None if we couldn't reach Jira
+        (connection error, timeout, missing config). Caller uses 401 → token
+        expired; 200 → token healthy so the upstream 404 is genuine; anything
+        else is treated as inconclusive.
+
+        Kept narrow: short timeout (5s), no retries, swallows all errors —
+        this is a diagnostic call, not a primary code path.
+        """
+        try:
+            base_url = (self.settings.jira_base_url or "").rstrip("/")
+            if not base_url:
+                return None
+            headers = {"Accept": "application/json"}
+            auth: tuple[str, str] | None = None
+            if getattr(self.settings, "jira_bearer_token", None):
+                headers["Authorization"] = f"Bearer {self.settings.jira_bearer_token}"
+            elif self.settings.jira_email and self.settings.jira_api_token:
+                auth = (self.settings.jira_email, self.settings.jira_api_token)
+            else:
+                return None
+            with httpx.Client(timeout=5.0) as client:
+                response = client.get(
+                    f"{base_url}/rest/api/3/myself",
+                    headers=headers,
+                    auth=auth,
+                )
+            return response.status_code
+        except Exception:
+            return None
+
+    @staticmethod
+    def _classify_jira_error(exc: Exception, issue_key: str) -> tuple[str, str]:
+        """Map a Jira tool exception to (error_kind, user_facing_message).
+
+        Jira returns 404 for both "issue does not exist" and "no permission to
+        see it" — the API deliberately conflates them to avoid leaking issue
+        existence. Token expiry surfaces as 401 on /myself but as 404 on
+        /issue/X. Distinguishing matters because the remediation differs:
+
+          - 401 anywhere -> token is invalid; user must refresh credentials
+          - 403 -> token valid but no project access
+          - 404 -> issue genuinely missing OR token can't see the project
+          - 408/429/5xx -> transient; retry safe
+
+        We only see the status code when the tool layer raises
+        ToolInvocationError with `http_status` populated (added 2026-04-27).
+        """
+        http_status = getattr(exc, "http_status", None)
+        timed_out = bool(getattr(exc, "timed_out", False))
+
+        if timed_out:
+            return (
+                "transient_timeout",
+                f"Jira lookup for {issue_key} timed out. The Jira service may be slow — retry shortly.",
+            )
+        if http_status == 401:
+            return (
+                "auth_expired",
+                (
+                    f"Jira authentication failed (HTTP 401). The API token has expired or been "
+                    f"revoked. Refresh OPS_AGENT_JIRA_API_TOKEN in apps/backend/.env from "
+                    f"https://id.atlassian.com/manage-profile/security/api-tokens and restart the backend."
+                ),
+            )
+        if http_status == 403:
+            return (
+                "permission_denied",
+                f"Jira denied access to {issue_key} (HTTP 403). The token is valid but the account lacks permission for this project.",
+            )
+        if http_status == 404:
+            return (
+                "not_found_or_invisible",
+                (
+                    f"Jira issue {issue_key} could not be retrieved (HTTP 404). The issue may be "
+                    f"deleted, in a different project, or the API token may not have access. "
+                    f"Verify the key, then if the issue should exist, try refreshing OPS_AGENT_JIRA_API_TOKEN."
+                ),
+            )
+        if http_status is not None and 500 <= http_status < 600:
+            return (
+                "transient_server_error",
+                f"Jira returned HTTP {http_status} for {issue_key}. Likely transient — retry shortly.",
+            )
+        if http_status in {408, 429}:
+            return (
+                "rate_limited",
+                f"Jira rate-limited the request for {issue_key} (HTTP {http_status}). Retry after backoff.",
+            )
+        return (
+            "unknown",
+            f"Failed to load Jira issue {issue_key}: {exc}",
+        )
 
     def _prefetch_planning_repository_context(
         self,
