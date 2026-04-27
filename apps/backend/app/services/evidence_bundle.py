@@ -15,9 +15,12 @@ the bundle verdict is "insufficient" and codegen should not proceed.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Iterable
+
+from app.core.config import get_settings
 
 
 @dataclass(frozen=True)
@@ -65,18 +68,24 @@ def build_evidence_bundle(
     grounding_terms: list[str] | None = None,
     planner_must_touch: list[str] | None = None,
     has_destructive_verb: bool = False,
+    settings: object | None = None,
 ) -> EvidenceBundle:
     """Build a pre-codegen evidence bundle.
 
     This runs BEFORE codegen to prove the task targets real code.
     If evidence is insufficient, codegen should not proceed.
     """
+    settings = settings or get_settings()
+
     if source_tree is None or not source_tree.exists():
         return EvidenceBundle(
             verdict="skip",
             anchors_searched=[],
             anchor_hits={},
-            must_touch_files=planner_must_touch or [],
+            must_touch_files=_filter_must_touch_files(
+                planner_must_touch or [],
+                settings=settings,
+            ),
             forbidden_files=[],
             candidate_files=[],
             coverage_score=0.0,
@@ -103,7 +112,10 @@ def build_evidence_bundle(
             verdict="skip",
             anchors_searched=[],
             anchor_hits={},
-            must_touch_files=planner_must_touch or [],
+            must_touch_files=_filter_must_touch_files(
+                planner_must_touch or [],
+                settings=settings,
+            ),
             forbidden_files=[],
             candidate_files=[],
             coverage_score=0.0,
@@ -126,6 +138,7 @@ def build_evidence_bundle(
         anchor_hits=anchor_hits,
         planner_must_touch=planner_must_touch or [],
         candidate_files=all_candidate_files,
+        settings=settings,
     )
 
     forbidden = _derive_forbidden(candidate_files=all_candidate_files)
@@ -174,6 +187,7 @@ def _derive_must_touch(
     anchor_hits: dict[str, dict[str, int]],
     planner_must_touch: list[str],
     candidate_files: set[str],
+    settings: object | None = None,
 ) -> list[str]:
     """Merge planner commitments with evidence-derived targets."""
     must: set[str] = set()
@@ -189,7 +203,7 @@ def _derive_must_touch(
             if not _is_protected(norm):
                 must.add(norm)
 
-    return sorted(must)[:20]
+    return _filter_must_touch_files(sorted(must), settings=settings)[:20]
 
 
 def _derive_forbidden(*, candidate_files: set[str]) -> list[str]:
@@ -206,3 +220,81 @@ def _is_protected(filepath: str) -> bool:
         if pattern.search(filepath):
             return True
     return False
+
+
+def _filter_must_touch_files(
+    filepaths: Iterable[str],
+    *,
+    settings: object | None = None,
+) -> list[str]:
+    """Return only paths suitable as edit targets for must_touch_files."""
+    settings = settings or get_settings()
+    include_configs = bool(
+        getattr(settings, "evidence_must_touch_include_configs", False)
+    )
+    filtered: list[str] = []
+    seen: set[str] = set()
+
+    for filepath in filepaths:
+        norm = str(filepath or "").strip().replace("\\", "/")
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        if _is_must_touch_excluded_path(
+            norm,
+            settings=settings,
+            include_configs=include_configs,
+        ):
+            continue
+        filtered.append(norm)
+
+    return filtered
+
+
+def _is_must_touch_excluded_path(
+    filepath: str,
+    *,
+    settings: object | None = None,
+    include_configs: bool | None = None,
+) -> bool:
+    settings = settings or get_settings()
+    norm = filepath.strip().replace("\\", "/")
+    lower = norm.lower()
+    name = lower.rsplit("/", 1)[-1]
+
+    for pattern in _split_setting(
+        getattr(settings, "evidence_must_touch_excluded_extensions", "")
+    ):
+        if name.endswith(pattern):
+            return True
+
+    padded = f"/{lower.strip('/')}/"
+    for segment in _split_setting(
+        getattr(settings, "evidence_must_touch_excluded_path_segments", "")
+    ):
+        segment = segment.strip("/")
+        if segment and f"/{segment}/" in padded:
+            return True
+
+    allow_configs = (
+        bool(getattr(settings, "evidence_must_touch_include_configs", False))
+        if include_configs is None
+        else include_configs
+    )
+    if not allow_configs:
+        for pattern in _split_setting(
+            getattr(settings, "evidence_must_touch_excluded_filenames", "")
+        ):
+            if fnmatch(name, pattern.lower()):
+                return True
+
+    return False
+
+
+def _split_setting(raw_value: object) -> list[str]:
+    values: list[str] = []
+    for raw_item in str(raw_value or "").replace(";", ",").split(","):
+        item = raw_item.strip().lower()
+        if item:
+            values.append(item)
+    return values
