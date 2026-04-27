@@ -52,10 +52,12 @@ class ToolInvocationError(RuntimeError):
         *,
         retryable: bool = False,
         timed_out: bool = False,
+        http_status: int | None = None,
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.timed_out = timed_out
+        self.http_status = http_status
 
 
 class ToolApprovalRequired(Exception):
@@ -1125,6 +1127,7 @@ class ToolGateway:
             raise ToolInvocationError(
                 f"{method} {url} returned HTTP {status_code}: {response_text}",
                 retryable=status_code in {408, 409, 425, 429, 500, 502, 503, 504},
+                http_status=status_code,
             ) from exc
         except httpx.HTTPError as exc:
             raise ToolInvocationError(

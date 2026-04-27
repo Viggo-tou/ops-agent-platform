@@ -650,6 +650,7 @@ class PrimaryOrchestrator:
         except Exception as exc:
             self._sync_retry_count(task)
             event_type = EventType.TOOL_TIMED_OUT if isinstance(exc, ToolInvocationError) and exc.timed_out else EventType.TOOL_FAILED
+            error_kind, user_message = self._classify_jira_error(exc, issue_key)
             record_event(
                 self.db,
                 task_id=task.id,
@@ -659,12 +660,19 @@ class PrimaryOrchestrator:
                 role=RoleName.PLANNER,
                 tool_name="jira.get_issue",
                 message="Planner failed to load Jira issue context before plan generation.",
-                payload={"issue_key": issue_key, "error": str(exc)},
+                payload={
+                    "issue_key": issue_key,
+                    "error": str(exc),
+                    "error_kind": error_kind,
+                    "http_status": getattr(exc, "http_status", None),
+                },
             )
             task.latest_result_json = {
                 "status": TaskStatus.FAILED.value,
-                "message": f"Failed to load Jira issue {issue_key} before planning.",
+                "message": user_message,
                 "error": str(exc),
+                "error_kind": error_kind,
+                "http_status": getattr(exc, "http_status", None),
                 "semantic_translation": task.translation_json,
             }
             set_task_status(
@@ -674,7 +682,7 @@ class PrimaryOrchestrator:
                 new_stage=WorkflowStage.DONE,
                 role=RoleName.PRIMARY,
                 source=EventSource.ORCHESTRATOR,
-                message="Task failed before planning because the Jira issue context could not be loaded.",
+                message=user_message,
             )
             record_event(
                 self.db,
@@ -684,7 +692,7 @@ class PrimaryOrchestrator:
                 stage=WorkflowStage.DONE,
                 role=RoleName.PRIMARY,
                 message="Final response emitted after Jira context preload failure.",
-                payload={"issue_key": issue_key},
+                payload={"issue_key": issue_key, "error_kind": error_kind},
             )
             return None
 
@@ -700,6 +708,69 @@ class PrimaryOrchestrator:
             payload=result,
         )
         return result
+
+    @staticmethod
+    def _classify_jira_error(exc: Exception, issue_key: str) -> tuple[str, str]:
+        """Map a Jira tool exception to (error_kind, user_facing_message).
+
+        Jira returns 404 for both "issue does not exist" and "no permission to
+        see it" — the API deliberately conflates them to avoid leaking issue
+        existence. Token expiry surfaces as 401 on /myself but as 404 on
+        /issue/X. Distinguishing matters because the remediation differs:
+
+          - 401 anywhere -> token is invalid; user must refresh credentials
+          - 403 -> token valid but no project access
+          - 404 -> issue genuinely missing OR token can't see the project
+          - 408/429/5xx -> transient; retry safe
+
+        We only see the status code when the tool layer raises
+        ToolInvocationError with `http_status` populated (added 2026-04-27).
+        """
+        http_status = getattr(exc, "http_status", None)
+        timed_out = bool(getattr(exc, "timed_out", False))
+
+        if timed_out:
+            return (
+                "transient_timeout",
+                f"Jira lookup for {issue_key} timed out. The Jira service may be slow — retry shortly.",
+            )
+        if http_status == 401:
+            return (
+                "auth_expired",
+                (
+                    f"Jira authentication failed (HTTP 401). The API token has expired or been "
+                    f"revoked. Refresh OPS_AGENT_JIRA_API_TOKEN in apps/backend/.env from "
+                    f"https://id.atlassian.com/manage-profile/security/api-tokens and restart the backend."
+                ),
+            )
+        if http_status == 403:
+            return (
+                "permission_denied",
+                f"Jira denied access to {issue_key} (HTTP 403). The token is valid but the account lacks permission for this project.",
+            )
+        if http_status == 404:
+            return (
+                "not_found_or_invisible",
+                (
+                    f"Jira issue {issue_key} could not be retrieved (HTTP 404). The issue may be "
+                    f"deleted, in a different project, or the API token may not have access. "
+                    f"Verify the key, then if the issue should exist, try refreshing OPS_AGENT_JIRA_API_TOKEN."
+                ),
+            )
+        if http_status is not None and 500 <= http_status < 600:
+            return (
+                "transient_server_error",
+                f"Jira returned HTTP {http_status} for {issue_key}. Likely transient — retry shortly.",
+            )
+        if http_status in {408, 429}:
+            return (
+                "rate_limited",
+                f"Jira rate-limited the request for {issue_key} (HTTP {http_status}). Retry after backoff.",
+            )
+        return (
+            "unknown",
+            f"Failed to load Jira issue {issue_key}: {exc}",
+        )
 
     def _prefetch_planning_repository_context(
         self,

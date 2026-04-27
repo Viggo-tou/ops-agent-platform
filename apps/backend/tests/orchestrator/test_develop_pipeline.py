@@ -222,6 +222,25 @@ class DevelopPipelineTests(unittest.TestCase):
             "No Jira issue key was found in the planning request.",
         )
 
+    def test_jira_error_classification_kinds(self) -> None:
+        """Each known HTTP failure mode maps to a distinct error_kind + user message."""
+        from app.tools.gateway import ToolInvocationError
+
+        cases = [
+            (ToolInvocationError("401", http_status=401), "auth_expired", "expired or been revoked"),
+            (ToolInvocationError("403", http_status=403), "permission_denied", "lacks permission"),
+            (ToolInvocationError("404", http_status=404), "not_found_or_invisible", "may be deleted"),
+            (ToolInvocationError("500", http_status=500), "transient_server_error", "transient"),
+            (ToolInvocationError("502", http_status=502), "transient_server_error", "transient"),
+            (ToolInvocationError("429", http_status=429), "rate_limited", "rate-limited"),
+            (ToolInvocationError("timeout", timed_out=True), "transient_timeout", "timed out"),
+            (ToolInvocationError("garbage"), "unknown", "Failed to load"),
+        ]
+        for exc, expected_kind, expected_substring in cases:
+            kind, message = PrimaryOrchestrator._classify_jira_error(exc, "P69-7")
+            self.assertEqual(kind, expected_kind, f"exc={exc} status={getattr(exc, 'http_status', None)}")
+            self.assertIn(expected_substring, message, f"kind={kind} message={message!r}")
+
     def test_jira_develop_aborts_when_issue_unfetchable(self) -> None:
         """Regression for the P69-7 incident.
 
