@@ -22,7 +22,9 @@ from app.models.event import Event
 from app.models.task import Task
 from app.models.tool_execution import ToolExecution
 from app.schemas.evidence import EvidenceItem
+from app.schemas.knowledge import KnowledgeClaim
 from app.services.events import commit_checkpoint, record_event, set_task_status
+from app.services.evidence_chain import EvidenceChainReport, check_evidence_chain
 from app.services.sandbox import ExecutionSandbox, SandboxError
 from app.services.spec_conformance import (
     ConformanceReport,
@@ -190,12 +192,26 @@ class PrimaryOrchestrator:
         except Exception:  # noqa: BLE001
             return None
 
-    def _workspace_write_intent(self, task: Task) -> None:
+    def _workspace_write_intent(
+        self,
+        task: Task,
+        *,
+        issue_context: dict[str, object] | None = None,
+        write_checkpoint: bool = True,
+    ) -> None:
         language = detect_user_language(task.request_text or "")
+        jira_issue_key = ""
+        jira_issue_body = ""
+        if issue_context:
+            jira_issue_key = str(issue_context.get("issue_key") or "").strip()
+            jira_issue_body = self._jira_issue_body_from_context(issue_context)
 
         def _write(workspace: TaskWorkspace) -> None:
             workspace.write_intent(
                 intent_text=task.request_text or "",
+                request_text=task.request_text or "",
+                jira_issue_body=jira_issue_body,
+                jira_issue_key=jira_issue_key,
                 language=language,
                 must_touch_files=[],
                 scenario=task.scenario,
@@ -207,15 +223,65 @@ class PrimaryOrchestrator:
                     "scenario": task.scenario,
                     "language": language,
                     "request_text": task.request_text,
+                    "jira_issue_key": jira_issue_key,
+                    "jira_issue_body_present": bool(jira_issue_body),
                 },
             )
-            workspace.write_checkpoint(
-                stage_completed="intake",
-                next_stage="semantic_translation",
-                resume_args={"task_id": task.id},
-            )
+            if write_checkpoint:
+                workspace.write_checkpoint(
+                    stage_completed="intake",
+                    next_stage="semantic_translation",
+                    resume_args={"task_id": task.id},
+                )
 
         self._workspace_call(task, _write)
+        if issue_context:
+            self._workspace_add_spec_anchor_evidence(task, issue_context=issue_context)
+
+    @staticmethod
+    def _jira_issue_body_from_context(issue_context: dict[str, object]) -> str:
+        parts: list[str] = []
+        for label, key in (("Summary", "summary"), ("Description", "description")):
+            value = str(issue_context.get(key) or "").strip()
+            if value:
+                parts.append(f"{label}: {value}")
+        return "\n\n".join(parts).strip()
+
+    def _workspace_add_spec_anchor_evidence(
+        self,
+        task: Task,
+        *,
+        issue_context: dict[str, object],
+    ) -> None:
+        jira_issue_body = self._jira_issue_body_from_context(issue_context)
+        if not jira_issue_body:
+            return
+        anchor_text = "\n".join(
+            part
+            for part in (
+                task.request_text or "",
+                str(issue_context.get("summary") or ""),
+                str(issue_context.get("description") or ""),
+            )
+            if part.strip()
+        )
+        file_paths = self._extract_filenames_from_request(anchor_text)
+        if not file_paths:
+            return
+        issue_key = str(issue_context.get("issue_key") or "").strip()
+        items = [
+            EvidenceItem(
+                id=f"spec_anchor:{task.id}:{index}",
+                source="spec_anchor",
+                file_path=file_path,
+                snippet=jira_issue_body[:4000],
+                chunk_kind="synthetic",
+                retrieval_channel="jira_issue_body",
+                metadata={"issue_key": issue_key},
+            )
+            for index, file_path in enumerate(file_paths, start=1)
+        ]
+        self._workspace_call(task, lambda workspace: workspace.add_evidence(items))
 
     def _workspace_append_audit(self, task: Task, event_name: str, payload: dict[str, object]) -> None:
         self._workspace_call(task, lambda workspace: workspace.append_audit(event_name, payload))
@@ -389,6 +455,11 @@ class PrimaryOrchestrator:
                 # ticket. The downstream gates can't catch this because they
                 # only validate diff shape, not whether the requirement existed.
                 return
+            self._workspace_write_intent(
+                task,
+                issue_context=issue_context,
+                write_checkpoint=False,
+            )
 
             semantic_translation = self._translate_request(
                 task=task,
@@ -417,6 +488,11 @@ class PrimaryOrchestrator:
             )
             if issue_context is None:
                 return
+            self._workspace_write_intent(
+                task,
+                issue_context=issue_context,
+                write_checkpoint=False,
+            )
 
             semantic_translation = self._translate_request(
                 task=task,
@@ -1902,6 +1978,7 @@ class PrimaryOrchestrator:
             merged_diff_parts: list[str] = []
             merged_files_changed: list[str] = []
             merged_file_summaries: list[dict[str, str]] = []
+            merged_claims: list[dict[str, object]] = []
             seen_files: set[str] = set()
             codegen_provider = "unknown"
 
@@ -2113,6 +2190,11 @@ class PrimaryOrchestrator:
                         s for s in batch_summaries
                         if isinstance(s, dict) and s.get("path") not in seen_files
                     )
+                batch_claims = batch_result.get("claims")
+                if isinstance(batch_claims, list):
+                    merged_claims.extend(
+                        claim for claim in batch_claims if isinstance(claim, dict)
+                    )
                 codegen_provider = str(
                     batch_result.get("provider_name") or codegen_provider
                 )
@@ -2131,6 +2213,8 @@ class PrimaryOrchestrator:
                 "file_summaries": merged_file_summaries,
                 "provider_name": codegen_provider,
             }
+            if merged_claims:
+                codegen_result["claims"] = merged_claims
             pipeline_state["codegen_result"] = codegen_result
             pipeline_state["diff"] = codegen_result["diff"]
             pipeline_state["files_changed"] = merged_files_changed
@@ -3294,42 +3378,85 @@ class PrimaryOrchestrator:
             pipeline_state["artifact_existence_done"] = True
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
 
-        # --- T-041-04: evidence chain validation before approval ---
+        # --- T-041-04: evidence chain validation before approval/writeback ---
         if not pipeline_state.get("evidence_chain_validated"):
-            chain_gaps: list[str] = []
-            attestation = pipeline_state.get("goal_attestation")
-            if isinstance(attestation, dict) and attestation.get("all_goals_met") is False:
-                unmet = [
-                    a["anchor"] for a in attestation.get("anchors", [])
-                    if a.get("status") == "not_achieved"
-                ]
-                if unmet:
-                    chain_gaps.append(f"Unmet goals: {unmet!r}")
-            conf = pipeline_state.get("conformance_report")
-            if isinstance(conf, dict) and conf.get("verdict") == "block":
-                chain_gaps.append("Conformance verdict is block")
-            shape = pipeline_state.get("diff_shape")
-            if isinstance(shape, dict) and shape.get("verdict") == "block":
-                chain_gaps.append("Diff shape verdict is block")
-            evidence = pipeline_state.get("evidence_bundle")
-            if isinstance(evidence, dict) and evidence.get("verdict") == "insufficient":
-                chain_gaps.append("Evidence bundle insufficient")
-            ft_gate = pipeline_state.get("failing_test_gate")
-            if isinstance(ft_gate, dict) and ft_gate.get("verdict") == "block":
-                chain_gaps.append("Failing test gate blocked")
+            if bool(getattr(self.tool_gateway.settings, "evidence_chain_gate_enabled", True)):
+                workspace = self._task_workspace(task)
+                try:
+                    citations = workspace.list_evidence()
+                except Exception:  # noqa: BLE001
+                    citations = []
+                chain_attestation = self._evidence_chain_attestation(pipeline_state)
+                evidence_chain_report = check_evidence_chain(
+                    workspace=workspace,
+                    diff=diff,
+                    plan=plan,
+                    claims=self._extract_evidence_chain_claims(
+                        pipeline_state=pipeline_state,
+                        codegen_result=codegen_result,
+                        review_result=review_result,
+                    ),
+                    citations=citations,
+                    attestation=chain_attestation,
+                    settings=self.tool_gateway.settings,
+                )
+                pipeline_state["evidence_chain"] = evidence_chain_report.to_payload()
+                pipeline_state["evidence_chain_validated"] = True
 
-            pipeline_state["evidence_chain_validated"] = True
-            pipeline_state["evidence_chain_gaps"] = chain_gaps
-            if chain_gaps:
-                self._fail_develop_pipeline(
-                    task=task,
-                    event_type=EventType.REVIEW_FAILED,
+                if not evidence_chain_report.closed:
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.REVIEW_FAILED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="evidence_chain.broken",
+                        message=evidence_chain_report.summary,
+                        payload=evidence_chain_report.to_payload(),
+                    )
+                    self._fail_develop_pipeline(
+                        task=task,
+                        event_type=EventType.REVIEW_FAILED,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        message=self._evidence_chain_block_message(evidence_chain_report),
+                        payload={
+                            "evidence_chain": evidence_chain_report.to_payload(),
+                            "plan_id": plan.plan_id,
+                        },
+                    )
+                    return
+
+                warnings = [
+                    finding
+                    for finding in evidence_chain_report.findings
+                    if finding.severity == "warn"
+                ]
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_SUCCEEDED,
+                    source=EventSource.ORCHESTRATOR,
                     stage=WorkflowStage.REVIEW,
                     role=RoleName.REVIEWER,
-                    message=f"Evidence chain incomplete: {'; '.join(chain_gaps)}",
-                    payload={"gaps": chain_gaps},
+                    tool_name=(
+                        "evidence_chain.warning"
+                        if warnings
+                        else "evidence_chain.check"
+                    ),
+                    message=evidence_chain_report.summary,
+                    payload=evidence_chain_report.to_payload(),
                 )
-                return
+            else:
+                pipeline_state["evidence_chain"] = {
+                    "closed": True,
+                    "skipped": True,
+                    "summary": "Evidence chain gate disabled by configuration.",
+                    "findings": [],
+                    "diagnostic": {},
+                }
+                pipeline_state["evidence_chain_validated"] = True
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
 
         # --- T-039: human approval gate before Jira transition ---
@@ -3352,6 +3479,7 @@ class PrimaryOrchestrator:
                 codegen_result=codegen_result,
                 review_result=review_result,
                 attestation=pipeline_state.get("goal_attestation"),
+                evidence_chain=pipeline_state.get("evidence_chain"),
             )
             return
 
@@ -3408,6 +3536,7 @@ class PrimaryOrchestrator:
                 "jira_transitioned": bool(jira_writeback.get("transition")),
                 "completeness_check": pipeline_state.get("completeness_check"),
                 "goal_attestation": pipeline_state.get("goal_attestation"),
+                "evidence_chain": pipeline_state.get("evidence_chain"),
             },
             "codegen": codegen_result,
             "sandbox": sandbox_result,
@@ -4725,6 +4854,83 @@ class PrimaryOrchestrator:
         normalized = error_message.casefold()
         return "config not found" in normalized or ("not found" in normalized and "config" in normalized)
 
+    @staticmethod
+    def _evidence_chain_attestation(pipeline_state: dict[str, object]) -> dict[str, object] | None:
+        attestation = pipeline_state.get("goal_attestation")
+        if not isinstance(attestation, dict):
+            return None
+        payload: dict[str, object] = dict(attestation)
+        goal_decomposition = pipeline_state.get("goal_decomposition")
+        if isinstance(goal_decomposition, dict):
+            file_justifications = goal_decomposition.get("file_justifications")
+            if isinstance(file_justifications, list) and file_justifications:
+                payload["file_justifications"] = file_justifications
+        return payload
+
+    @staticmethod
+    def _extract_evidence_chain_claims(
+        *,
+        pipeline_state: dict[str, object],
+        codegen_result: dict[str, object],
+        review_result: dict[str, object],
+    ) -> list[KnowledgeClaim]:
+        claims: list[KnowledgeClaim] = []
+        for container in (codegen_result, review_result, pipeline_state):
+            raw_claims = container.get("claims") if isinstance(container, dict) else None
+            if not isinstance(raw_claims, list):
+                continue
+            for raw_claim in raw_claims:
+                if isinstance(raw_claim, KnowledgeClaim):
+                    claims.append(raw_claim)
+                    continue
+                if not isinstance(raw_claim, dict):
+                    continue
+                try:
+                    claims.append(KnowledgeClaim.model_validate(raw_claim))
+                except Exception:  # noqa: BLE001
+                    continue
+        return claims
+
+    @staticmethod
+    def _evidence_chain_block_message(report: EvidenceChainReport) -> str:
+        block_findings = [
+            finding for finding in report.findings if finding.severity == "block"
+        ]
+        if not block_findings:
+            return report.summary
+        untracked = [
+            finding for finding in block_findings if finding.rule == "untracked_file"
+        ]
+        if len(untracked) > 1:
+            return (
+                "Evidence chain broken: "
+                f"{len(untracked)} modified files have no evidence backing."
+            )
+        return block_findings[0].message
+
+    @staticmethod
+    def _approval_evidence_chain_payload(evidence_chain: object | None) -> dict[str, object]:
+        payload = evidence_chain if isinstance(evidence_chain, dict) else {}
+        findings = payload.get("findings") if isinstance(payload, dict) else []
+        diagnostic = payload.get("diagnostic") if isinstance(payload, dict) else {}
+        warnings = [
+            finding
+            for finding in findings
+            if isinstance(finding, dict) and finding.get("severity") == "warn"
+        ] if isinstance(findings, list) else []
+        diagnostic_dict = diagnostic if isinstance(diagnostic, dict) else {}
+        return {
+            "closed": bool(payload.get("closed", True)) if isinstance(payload, dict) else True,
+            "warnings": warnings,
+            "evidence_count": int(diagnostic_dict.get("evidence_count") or 0),
+            "modified_files_with_evidence": list(
+                diagnostic_dict.get("modified_files_with_evidence") or []
+            ),
+            "claims_high_confidence": int(
+                diagnostic_dict.get("claims_high_confidence") or 0
+            ),
+        }
+
     def _request_jira_transition_approval(
         self,
         *,
@@ -4734,6 +4940,7 @@ class PrimaryOrchestrator:
         codegen_result: dict[str, object],
         review_result: dict[str, object],
         attestation: object,
+        evidence_chain: object | None = None,
     ) -> None:
         """Create a pending Approval for the final Jira transition step and
         park the task in AWAITING_APPROVAL. The diff, change summary,
@@ -4746,6 +4953,7 @@ class PrimaryOrchestrator:
         diff = str(pipeline_state.get("diff") or codegen_result.get("diff") or "")
         files_changed = codegen_result.get("files_changed") or pipeline_state.get("files_changed") or []
         summary_md = self._build_develop_summary(pipeline_state)
+        evidence_chain_payload = self._approval_evidence_chain_payload(evidence_chain)
 
         # Reservations reviewer: LLM flags risks/trade-offs/gotchas a human
         # approver should see before approving. Fails safe to empty list.
@@ -4806,6 +5014,7 @@ class PrimaryOrchestrator:
             "conformance_report": pipeline_state.get("conformance_report"),
             "goal_attestation": attestation,
             "reservations": reservations,
+            "evidence_chain": evidence_chain_payload,
         }
 
         approval = Approval(
@@ -4831,6 +5040,7 @@ class PrimaryOrchestrator:
                 "review_verdict": review_result.get("verdict"),
                 "conformance_report": pipeline_state.get("conformance_report"),
                 "goal_attestation": attestation,
+                "evidence_chain": evidence_chain_payload,
             },
             policy_snapshot_json={
                 "decision": "require_approval",
@@ -4884,6 +5094,7 @@ class PrimaryOrchestrator:
                 "issue_key": issue_key,
                 "files_changed": list(files_changed),
                 "reservations": reservations,
+                "evidence_chain": evidence_chain_payload,
             },
         )
         attempt_index = pipeline_state.get("workspace_attempt_index")

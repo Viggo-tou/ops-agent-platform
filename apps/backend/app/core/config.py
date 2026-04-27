@@ -133,6 +133,12 @@ class Settings(BaseSettings):
     agent_workspace_retention_hours: int = 168
     agent_workspace_archive_on_complete: bool = False
     agent_workspace_snippet_inline_threshold: int = 4000
+    evidence_chain_gate_enabled: bool = True
+    evidence_chain_min_confident_claims: int = 3
+    evidence_chain_strong_sources: str = (
+        "rag_lexical,rag_fts5,rag_card,cc_glob,cc_grep,cc_read,spec_anchor"
+    )
+    evidence_chain_block_on_attestation_mismatch: bool = True
     alert_webhook_url: str | None = None
     slack_base_url: str = "https://slack.com"
     slack_bot_token: str | None = None
