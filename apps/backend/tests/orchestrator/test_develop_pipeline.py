@@ -150,6 +150,7 @@ class DevelopPipelineTests(unittest.TestCase):
         orchestrator.tool_gateway.settings.knowledge_source_path = None
         orchestrator.tool_gateway.settings.knowledge_max_file_bytes = 120_000
         orchestrator.tool_gateway.settings.develop_require_jira_approval = False
+        orchestrator.tool_gateway.settings.evidence_chain_gate_enabled = False
         orchestrator._sync_retry_count = Mock()
         return orchestrator
 

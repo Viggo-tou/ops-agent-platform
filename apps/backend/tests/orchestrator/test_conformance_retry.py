@@ -185,6 +185,7 @@ class ConformanceRetryTests(unittest.TestCase):
         orchestrator.tool_gateway.settings.knowledge_source_path = str(self.source_tree)
         orchestrator.tool_gateway.settings.knowledge_max_file_bytes = 120_000
         orchestrator.tool_gateway.settings.develop_require_jira_approval = False
+        orchestrator.tool_gateway.settings.evidence_chain_gate_enabled = False
         orchestrator._sync_retry_count = Mock()
         orchestrator._gather_codegen_context = Mock(
             return_value={"src/a.py": 'user = "Minij"\nother = "ok"\n'}

@@ -56,6 +56,7 @@ def _settings(workspace_root: Path, sandbox_root: Path | None = None, source_roo
         sandbox_base_dir=str(sandbox_root or workspace_root / "sandboxes"),
         knowledge_source_path=str(source_root) if source_root else None,
         develop_require_jira_approval=True,
+        evidence_chain_gate_enabled=False,
         knowledge_synthesis_enabled=False,
         knowledge_rerank_enabled=False,
         knowledge_query_rewrite_enabled=False,

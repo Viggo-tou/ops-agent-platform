@@ -109,15 +109,23 @@ class TaskWorkspace:
         language: str | None,
         must_touch_files: list[str],
         scenario: str,
+        request_text: str | None = None,
+        jira_issue_body: str | None = None,
+        jira_issue_key: str | None = None,
     ) -> None:
         self._ensure_task_layout()
         safe_must_touch = [
             _safe_relative_path(path, field_name="must_touch_files")
             for path in must_touch_files
         ]
+        normalized_request = (request_text if request_text is not None else intent_text).strip()
+        normalized_jira_body = (jira_issue_body or "").strip()
         payload = {
             "task_id": self.task_id,
             "intent_text": intent_text,
+            "request_text": normalized_request,
+            "jira_issue_body": normalized_jira_body,
+            "jira_issue_key": (jira_issue_key or "").strip(),
             "language": language,
             "must_touch_files": safe_must_touch,
             "scenario": scenario,
@@ -139,6 +147,8 @@ class TaskWorkspace:
         else:
             lines.append("- none")
         lines.extend(["", "## Request", "", intent_text.rstrip(), ""])
+        if normalized_jira_body:
+            lines.extend(["## Jira Issue Body", "", normalized_jira_body, ""])
         self._atomic_write_text(self.root / "intent.md", "\n".join(lines))
 
     def read_intent(self) -> dict[str, Any] | None:
