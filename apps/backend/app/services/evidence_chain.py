@@ -126,16 +126,16 @@ def check_evidence_chain(
         normalized = _normalize_path(file_path)
         if not normalized:
             continue
-        if normalized in evidence_paths:
+        if _path_in(normalized, evidence_paths):
             backed_files.add(normalized)
             continue
-        if normalized in attestation_files:
+        if _path_in(normalized, attestation_files):
             backed_files.add(normalized)
             continue
-        if shape == "create" and normalized in expected_new_files:
+        if shape == "create" and _path_in(normalized, expected_new_files):
             backed_files.add(normalized)
             continue
-        if normalized in justification_files:
+        if _path_in(normalized, justification_files):
             backed_files.add(normalized)
             findings.append(
                 EvidenceChainFinding(
@@ -411,7 +411,11 @@ def _check_attestation(
         return
 
     attested_files = _extract_attestation_modified_files(attestation)
-    unexpected = sorted(attested_files - {_normalize_path(path) for path in touched_files})
+    diff_paths = {_normalize_path(path) for path in touched_files}
+    unexpected = sorted(
+        path for path in attested_files
+        if not _path_in(path, diff_paths)
+    )
     if unexpected:
         block = bool(
             getattr(settings, "evidence_chain_block_on_attestation_mismatch", True)
@@ -529,6 +533,40 @@ def _normalize_path(value: object) -> str:
     while text.startswith("./"):
         text = text[2:]
     return text.strip("/")
+
+
+def _paths_match(left: str, right: str) -> bool:
+    """Path-segment suffix-tolerant equality for normalized repo paths.
+
+    Returns True iff two paths refer to the same file even when one has a
+    leading source-name prefix (e.g. ``handyman-admin-dashboard/src/foo.js``)
+    and the other is rooted at the source root (``src/foo.js``).
+
+    Codegen.repair sometimes re-emits patches with the source-name prefix
+    inlined while EvidenceItem.file_path stays repo-relative. Without this
+    tolerance every repaired file gets flagged as untracked even though
+    the corresponding evidence exists. Match must be on segment boundaries
+    so "src/foo.js" doesn't accidentally match "rc/foo.js".
+    """
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    if right.endswith("/" + left):
+        return True
+    if left.endswith("/" + right):
+        return True
+    return False
+
+
+def _path_in(needle: str, haystack: Iterable[str]) -> bool:
+    """Suffix-tolerant ``needle in haystack`` for normalized repo paths."""
+    if not needle:
+        return False
+    for candidate in haystack:
+        if _paths_match(needle, candidate):
+            return True
+    return False
 
 
 def _clean_text(value: object) -> str:

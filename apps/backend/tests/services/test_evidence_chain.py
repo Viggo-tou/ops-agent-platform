@@ -17,7 +17,7 @@ from app.core.config import Settings
 from app.core.enums import RiskLevel, RoleName, ToolPermissionCategory
 from app.schemas.evidence import EvidenceItem
 from app.schemas.knowledge import KnowledgeClaim
-from app.services.evidence_chain import check_evidence_chain
+from app.services.evidence_chain import check_evidence_chain, _path_in, _paths_match
 from app.services.task_workspace import TaskWorkspace
 
 
@@ -354,3 +354,92 @@ def test_user_provided_evidence_alone_is_weak(workspace_root: Path) -> None:
 
     assert report.closed is False
     assert any(f.rule == "evidence_weak" and f.severity == "block" for f in report.findings)
+
+
+# --- Path normalization (suffix-tolerant matching) -----------------------------------
+
+def test_paths_match_handles_source_prefix_mismatch() -> None:
+    # Diff has source-name prefix (codegen.repair re-emitted with it),
+    # evidence has repo-relative path. Must match.
+    assert _paths_match(
+        "handyman-admin-dashboard/src/pages/JobManagement.js",
+        "src/pages/JobManagement.js",
+    )
+    # Reverse direction also matches.
+    assert _paths_match(
+        "src/pages/JobManagement.js",
+        "handyman-admin-dashboard/src/pages/JobManagement.js",
+    )
+    # Equal strings match.
+    assert _paths_match("src/foo.js", "src/foo.js")
+
+
+def test_paths_match_rejects_substring_collision() -> None:
+    # Suffix matching must respect path-segment boundaries: "rc/foo.js"
+    # is a substring of "src/foo.js" but NOT a path suffix.
+    assert not _paths_match("src/foo.js", "rc/foo.js")
+    # Empty inputs never match.
+    assert not _paths_match("", "src/foo.js")
+    assert not _paths_match("src/foo.js", "")
+    # Different files don't match even with shared prefix.
+    assert not _paths_match("src/a.js", "src/b.js")
+
+
+def test_path_in_iterable_with_prefix_mismatch() -> None:
+    evidence_paths = {"src/pages/Login.js", "src/firebase.js"}
+    # Modified path with source-name prefix should still resolve.
+    assert _path_in("handyman-admin-dashboard/src/pages/Login.js", evidence_paths)
+    # Modified path without prefix matches identical evidence.
+    assert _path_in("src/firebase.js", evidence_paths)
+    # No match for unrelated file.
+    assert not _path_in("src/components/Sidebar.js", evidence_paths)
+
+
+def test_evidence_chain_accepts_diff_with_source_prefix_when_evidence_unprefixed(
+    workspace_root: Path,
+) -> None:
+    """Regression for the P69-7 follow-up: codegen.repair patched files using
+    ``handyman-admin-dashboard/src/...`` paths while evidence_items recorded
+    ``src/...``. Without suffix-tolerant matching, evidence_chain blocked
+    every repaired file as untracked.
+    """
+    workspace = _workspace(workspace_root)
+    workspace.add_evidence([
+        EvidenceItem(
+            id="ev-1",
+            source="rag_lexical",
+            file_path="src/pages/JobManagement.js",
+            line_start=1,
+            line_end=10,
+            snippet="...",
+        )
+    ])
+    diff_with_prefix = (
+        "diff --git a/handyman-admin-dashboard/src/pages/JobManagement.js "
+        "b/handyman-admin-dashboard/src/pages/JobManagement.js\n"
+        "--- a/handyman-admin-dashboard/src/pages/JobManagement.js\n"
+        "+++ b/handyman-admin-dashboard/src/pages/JobManagement.js\n"
+        "@@ -1 +1 @@\n-old\n+new\n"
+    )
+    attestation = {
+        "goals": [],
+        "modified_files": ["src/pages/JobManagement.js"],
+    }
+    report = check_evidence_chain(
+        workspace=workspace,
+        diff=diff_with_prefix,
+        plan=_plan(),
+        claims=[],
+        citations=[],
+        attestation=attestation,
+        settings=_settings(workspace_root),
+    )
+
+    untracked_blocks = [
+        f for f in report.findings
+        if f.rule == "untracked_file" and f.severity == "block"
+    ]
+    assert untracked_blocks == [], (
+        "modified file with evidence (path-prefixed) should not be flagged untracked: "
+        f"{untracked_blocks}"
+    )
