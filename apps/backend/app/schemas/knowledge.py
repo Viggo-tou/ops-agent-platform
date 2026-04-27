@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.evidence import EvidenceItem
+
 
 class KnowledgeSyncResponse(BaseModel):
     source_name: str = Field(..., description="Name of the knowledge source being synced")
@@ -84,6 +86,10 @@ class KnowledgeSearchResult(BaseModel):
     answer: str = Field(..., description="Generated answer text")
     citations: list[KnowledgeCitation] = Field(default_factory=list, description="Citations supporting the answer")
     claims: list[KnowledgeClaim] = Field(default_factory=list, description="Claim-level citation bindings")
+    evidence_items: list[EvidenceItem] = Field(
+        default_factory=list,
+        description="Unified evidence items populated alongside backward-compatible citations.",
+    )
     ungrounded_claim_count: int = Field(
         default=0,
         description="Claims emitted by synthesis that did not bind to any citation.",

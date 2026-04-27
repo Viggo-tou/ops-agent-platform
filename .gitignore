@@ -62,6 +62,7 @@ apps/backend/data/uploads/
 
 # Per-task orchestrator sandboxes (runtime state)
 apps/backend/data/sandboxes/
+apps/backend/data/agent_workspace/
 
 # Repo-root e2e/test scratch dir (reports, sandboxes, tmp)
 /data/
@@ -86,6 +87,7 @@ HostedDashboard/
 .pytest-tmp/
 pytest-basetemp/
 apps/backend/.tmp-pytest/
+apps/backend/.tmp-*/
 apps/backend/.pytest_tmp/
 apps/backend/.tmp-test/
 apps/backend/manual-pytest-temp/

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import io
 import os
-import tempfile
 import unicodedata
 import zipfile
 
@@ -139,28 +138,28 @@ def extract_zip_safely(archive_bytes: bytes) -> list[tuple[str, bytes]]:
     # whitelist) + ADR §8 (atomic via TemporaryDirectory — we only hand back
     # the collected bytes if every entry survives).
     results: list[tuple[str, bytes]] = []
-    with tempfile.TemporaryDirectory(prefix="knowledge-zip-") as tmp_dir:
-        for info in infos:
-            if info.is_dir():
-                continue
+    virtual_root = os.path.abspath(os.path.join(os.getcwd(), ".knowledge-zip-virtual-root"))
+    for info in infos:
+        if info.is_dir():
+            continue
 
-            raw_name = info.filename
-            base_name = os.path.basename(raw_name)
-            if not base_name:
-                continue
+        raw_name = info.filename
+        base_name = os.path.basename(raw_name)
+        if not base_name:
+            continue
 
-            candidate = os.path.join(tmp_dir, raw_name)
-            _assert_within_root(candidate, tmp_dir, raw_name)
+        candidate = os.path.join(virtual_root, raw_name)
+        _assert_within_root(candidate, virtual_root, raw_name)
 
-            _, ext = os.path.splitext(base_name)
-            if ext.lower() not in UPLOAD_ACCEPTED_EXTENSIONS:
-                continue
+        _, ext = os.path.splitext(base_name)
+        if ext.lower() not in UPLOAD_ACCEPTED_EXTENSIONS:
+            continue
 
-            with zf.open(info, "r") as src:
-                data = src.read(MAX_PER_ENTRY_UNCOMPRESSED_BYTES + 1)
-            if len(data) > MAX_PER_ENTRY_UNCOMPRESSED_BYTES:
-                raise ZipImportError(reason="size_exceeded", entry=_sanitize_for_error(raw_name))
+        with zf.open(info, "r") as src:
+            data = src.read(MAX_PER_ENTRY_UNCOMPRESSED_BYTES + 1)
+        if len(data) > MAX_PER_ENTRY_UNCOMPRESSED_BYTES:
+            raise ZipImportError(reason="size_exceeded", entry=_sanitize_for_error(raw_name))
 
-            results.append((base_name, data))
+        results.append((base_name, data))
 
     return results

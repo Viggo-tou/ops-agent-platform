@@ -21,6 +21,7 @@ from app.models.approval import Approval
 from app.models.event import Event
 from app.models.task import Task
 from app.models.tool_execution import ToolExecution
+from app.schemas.evidence import EvidenceItem
 from app.services.events import commit_checkpoint, record_event, set_task_status
 from app.services.sandbox import ExecutionSandbox, SandboxError
 from app.services.spec_conformance import (
@@ -28,6 +29,7 @@ from app.services.spec_conformance import (
     build_goal_attestation,
     check_spec_conformance,
 )
+from app.services.task_workspace import TaskWorkspace
 from app.tools.gateway import ToolApprovalRequired, ToolGateway, ToolInvocationError
 
 
@@ -179,6 +181,182 @@ class PrimaryOrchestrator:
         self.reviewer_agent = ReviewerAgent()
         self.tool_gateway = ToolGateway(db)
 
+    def _task_workspace(self, task: Task) -> TaskWorkspace:
+        return TaskWorkspace.for_task(task.id, settings=self.tool_gateway.settings)
+
+    def _workspace_call(self, task: Task, fn):
+        try:
+            return fn(self._task_workspace(task))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _workspace_write_intent(self, task: Task) -> None:
+        language = detect_user_language(task.request_text or "")
+
+        def _write(workspace: TaskWorkspace) -> None:
+            workspace.write_intent(
+                intent_text=task.request_text or "",
+                language=language,
+                must_touch_files=[],
+                scenario=task.scenario,
+            )
+            workspace.append_audit(
+                "intake",
+                {
+                    "task_id": task.id,
+                    "scenario": task.scenario,
+                    "language": language,
+                    "request_text": task.request_text,
+                },
+            )
+            workspace.write_checkpoint(
+                stage_completed="intake",
+                next_stage="semantic_translation",
+                resume_args={"task_id": task.id},
+            )
+
+        self._workspace_call(task, _write)
+
+    def _workspace_append_audit(self, task: Task, event_name: str, payload: dict[str, object]) -> None:
+        self._workspace_call(task, lambda workspace: workspace.append_audit(event_name, payload))
+
+    def _workspace_write_checkpoint(
+        self,
+        task: Task,
+        *,
+        stage_completed: str,
+        next_stage: str | None,
+        resume_args: dict[str, object],
+    ) -> None:
+        self._workspace_call(
+            task,
+            lambda workspace: workspace.write_checkpoint(
+                stage_completed=stage_completed,
+                next_stage=next_stage,
+                resume_args=resume_args,
+            ),
+        )
+
+    def _workspace_write_plan(self, task: Task, plan: GeneratedPlan, *, reason: str) -> None:
+        def _write(workspace: TaskWorkspace) -> None:
+            workspace.write_plan(plan_payload=plan, reason=reason)
+            workspace.append_audit(
+                "plan",
+                {
+                    "plan_id": plan.plan_id,
+                    "scenario": plan.scenario,
+                    "must_touch_files": list(getattr(plan, "must_touch_files", []) or []),
+                },
+            )
+            workspace.write_checkpoint(
+                stage_completed="plan",
+                next_stage="codegen" if task.scenario == "jira_issue_develop" else "execution",
+                resume_args={"plan_id": plan.plan_id},
+            )
+
+        self._workspace_call(task, _write)
+
+    def _workspace_add_evidence_from_result(
+        self,
+        task: Task,
+        result: dict[str, object],
+        *,
+        event_name: str,
+    ) -> None:
+        raw_items = result.get("evidence_items")
+        if not isinstance(raw_items, list) or not raw_items:
+            return
+
+        def _write(workspace: TaskWorkspace) -> None:
+            items = [
+                EvidenceItem.model_validate(item)
+                for item in raw_items
+                if isinstance(item, dict)
+            ]
+            if not items:
+                return
+            workspace.add_evidence(items)
+            workspace.append_audit(
+                event_name,
+                {
+                    "evidence_count": len(items),
+                    "sources": sorted({item.source for item in items}),
+                    "paths": [item.file_path for item in items[:10]],
+                },
+            )
+
+        self._workspace_call(task, _write)
+
+    def _workspace_attempt_index(self, task: Task, pipeline_state: dict[str, object]) -> int:
+        existing = pipeline_state.get("workspace_attempt_index")
+        if isinstance(existing, int) and existing >= 1:
+            return existing
+        index = self._workspace_call(task, lambda workspace: workspace.next_attempt_index())
+        if not isinstance(index, int) or index < 1:
+            index = 1
+        pipeline_state["workspace_attempt_index"] = index
+        return index
+
+    def _workspace_write_attempt_diff(
+        self,
+        task: Task,
+        pipeline_state: dict[str, object],
+        *,
+        diff: str,
+        next_stage: str = "review",
+    ) -> None:
+        attempt_index = self._workspace_attempt_index(task, pipeline_state)
+
+        def _write(workspace: TaskWorkspace) -> None:
+            workspace.write_attempt_diff(attempt_index, diff)
+            workspace.append_audit(
+                "attempt.diff",
+                {"attempt": attempt_index, "diff_chars": len(diff)},
+            )
+            workspace.write_checkpoint(
+                stage_completed=f"attempt_{attempt_index:03d}",
+                next_stage=next_stage,
+                resume_args={"attempt": attempt_index},
+            )
+
+        self._workspace_call(task, _write)
+
+    def _workspace_write_attempt_compile(
+        self,
+        task: Task,
+        pipeline_state: dict[str, object],
+        *,
+        result_dict: dict[str, object],
+    ) -> None:
+        attempt_index = self._workspace_attempt_index(task, pipeline_state)
+        self._workspace_call(
+            task,
+            lambda workspace: workspace.write_attempt_compile(attempt_index, result_dict),
+        )
+
+    def _workspace_write_attempt_review(
+        self,
+        task: Task,
+        pipeline_state: dict[str, object],
+        *,
+        report_dict: dict[str, object],
+        narrative: str,
+    ) -> None:
+        attempt_index = self._workspace_attempt_index(task, pipeline_state)
+
+        def _write(workspace: TaskWorkspace) -> None:
+            workspace.write_attempt_review(
+                attempt_index,
+                report_dict=report_dict,
+                narrative=narrative,
+            )
+            workspace.append_audit(
+                "attempt.review",
+                {"attempt": attempt_index, "blocked": bool(report_dict.get("blocked"))},
+            )
+
+        self._workspace_call(task, _write)
+
     def bootstrap_task(self, task: Task, *, actor_name: str) -> None:
         with get_tracer().start_as_current_span("task.bootstrap") as span:
             _set_task_span_attributes(span, task=task, actor_name=actor_name)
@@ -187,6 +365,7 @@ class PrimaryOrchestrator:
             return self._bootstrap_task_impl(task=task, actor_name=actor_name)
 
     def _bootstrap_task_impl(self, task: Task, *, actor_name: str) -> None:
+        self._workspace_write_intent(task)
         planning_request_text = task.request_text
         semantic_translation = self._translate_request(task=task, actor_name=actor_name, issue_context=None)
         self._apply_jira_issue_key_fallback(task=task, semantic_translation=semantic_translation)
@@ -319,6 +498,7 @@ class PrimaryOrchestrator:
                 "fallback_reason": planning_result.fallback_reason,
             },
         )
+        self._workspace_write_plan(task, plan_document, reason="planner_generated")
         commit_checkpoint(self.db, label="plan_generated")
 
         set_task_status(
@@ -446,6 +626,12 @@ class PrimaryOrchestrator:
                     "review_summary": review_result.review.summary,
                 },
             )
+            self._workspace_write_checkpoint(
+                task,
+                stage_completed="plan",
+                next_stage="approval",
+                resume_args={"approval_id": approval.id, "plan_id": plan_document.plan_id},
+            )
             commit_checkpoint(self.db, label="awaiting_approval_pre_execution")
             return
 
@@ -499,6 +685,12 @@ class PrimaryOrchestrator:
                 pipeline_state["jira_approval_granted"] = True
                 pipeline_state.pop("pending_jira_approval_id", None)
                 self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+                self._workspace_write_checkpoint(
+                    task,
+                    stage_completed="approval",
+                    next_stage="writeback",
+                    resume_args={"approval_id": approval_id},
+                )
                 self._execute_develop_pipeline(
                     task=task, actor_name=actor_name, plan=plan_document, approval_id=approval_id
                 )
@@ -574,6 +766,15 @@ class PrimaryOrchestrator:
                 "model_name": translation_result.model_name,
                 "used_fallback": translation_result.used_fallback,
                 "fallback_reason": translation_result.fallback_reason,
+            },
+        )
+        self._workspace_append_audit(
+            task,
+            "semantic_translation",
+            {
+                "provider_name": translation_result.provider_name,
+                "model_name": translation_result.model_name,
+                "used_fallback": translation_result.used_fallback,
             },
         )
         return translation_document
@@ -882,6 +1083,12 @@ class PrimaryOrchestrator:
             message="Repository context retrieved before plan generation.",
             payload=result,
         )
+        if isinstance(result, dict):
+            self._workspace_add_evidence_from_result(
+                task,
+                result,
+                event_name="knowledge.prefetch",
+            )
         return result
 
     @staticmethod
@@ -1141,6 +1348,12 @@ class PrimaryOrchestrator:
                 approval_id=approval_id,
             )
             self._sync_retry_count(task)
+            if tool_name == "knowledge.search" and isinstance(result, dict):
+                self._workspace_add_evidence_from_result(
+                    task,
+                    result,
+                    event_name="knowledge.search",
+                )
         except ToolApprovalRequired as exc:
             self._sync_retry_count(task)
             self._pause_for_tool_approval(
@@ -1560,6 +1773,11 @@ class PrimaryOrchestrator:
                     pipeline_state["files_changed"] = codegen_result.get("files_changed", [])
                     pipeline_state["codegen_provider"] = "deterministic_rename"
                     pipeline_state["file_summaries"] = codegen_result.get("file_summaries", [])
+                    self._workspace_write_attempt_diff(
+                        task,
+                        pipeline_state,
+                        diff=str(codegen_result.get("diff") or ""),
+                    )
                     self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
                     record_event(
                         self.db,
@@ -1918,6 +2136,11 @@ class PrimaryOrchestrator:
             pipeline_state["files_changed"] = merged_files_changed
             pipeline_state["codegen_provider"] = codegen_provider
             pipeline_state["file_summaries"] = merged_file_summaries
+            self._workspace_write_attempt_diff(
+                task,
+                pipeline_state,
+                diff=str(codegen_result.get("diff") or ""),
+            )
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
             record_event(
                 self.db,
@@ -2416,6 +2639,11 @@ class PrimaryOrchestrator:
                     "passed": compile_result.passed,
                     "errors": compile_result.errors,
                 }
+                self._workspace_write_attempt_compile(
+                    task,
+                    pipeline_state,
+                    result_dict=pipeline_state["compile_gate"],
+                )
 
                 if compile_result.passed:
                     record_event(
@@ -2711,6 +2939,16 @@ class PrimaryOrchestrator:
                 # ConformanceReport local is used for the block/retry
                 # logic below but is not persisted.
                 pipeline_state["conformance_report"] = conformance_report.to_payload()
+                self._workspace_write_attempt_review(
+                    task,
+                    pipeline_state,
+                    report_dict=pipeline_state["conformance_report"],
+                    narrative=(
+                        "Spec conformance passed."
+                        if not conformance_report.blocked
+                        else "\n".join(conformance_report.block_messages())
+                    ),
+                )
                 record_event(
                     self.db,
                     task_id=task.id,
@@ -4648,6 +4886,23 @@ class PrimaryOrchestrator:
                 "reservations": reservations,
             },
         )
+        attempt_index = pipeline_state.get("workspace_attempt_index")
+        stage_completed = (
+            f"attempt_{attempt_index:03d}"
+            if isinstance(attempt_index, int) and attempt_index >= 1
+            else "review"
+        )
+        self._workspace_append_audit(
+            task,
+            "approval.requested",
+            {"approval_id": approval.id, "action_name": approval.action_name},
+        )
+        self._workspace_write_checkpoint(
+            task,
+            stage_completed=stage_completed,
+            next_stage="approval",
+            resume_args={"approval_id": approval.id},
+        )
         commit_checkpoint(self.db, label="awaiting_approval_jira_transition")
 
     def _fail_develop_pipeline(
@@ -4694,6 +4949,11 @@ class PrimaryOrchestrator:
             role=RoleName.PRIMARY,
             message="Final response emitted after Jira issue development pipeline failure.",
             payload={"message": message},
+        )
+        self._workspace_append_audit(
+            task,
+            "pipeline.failed",
+            {"message": message, "stage": stage.value if hasattr(stage, "value") else str(stage)},
         )
 
     @staticmethod

@@ -6,12 +6,14 @@ import shutil
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.models.knowledge_document import KnowledgeDocument
+from app.schemas.evidence import ChunkKind, EvidenceItem
 from app.schemas.knowledge import (
     KnowledgeAnswerTrace,
     KnowledgeCitation,
@@ -78,6 +80,7 @@ IGNORED_FILENAMES = frozenset({
     "composer.lock", "Gemfile.lock", "poetry.lock", "Cargo.lock",
     "firebase-debug.log",
 })
+_EVIDENCE_CHUNK_KINDS = set(ChunkKind.__args__)
 
 
 def _is_ignored_path(file_path: Path) -> bool:
@@ -378,6 +381,7 @@ class KnowledgeService:
             self._build_citation(scored=scored, query_tokens=query_tokens, settings=self.settings)
             for scored in selected
         ]
+        evidence_items = self._citations_to_evidence_items(citations)
 
         matched_tokens = sorted({token for scored in selected for token in scored.matched_tokens})
         token_coverage = (
@@ -447,6 +451,7 @@ class KnowledgeService:
             answer=answer,
             citations=citations,
             claims=claims,
+            evidence_items=evidence_items,
             ungrounded_claim_count=ungrounded_claim_count,
             answer_trace=KnowledgeAnswerTrace(
                 source_name=primary_source_name,
@@ -994,11 +999,46 @@ class KnowledgeService:
                 "language": document.language,
                 "size_bytes": document.size_bytes,
                 "line_count": document.line_count,
+                "content_hash": document.content_hash,
                 "enclosing_symbol": chunk.enclosing_symbol,
                 "chunk_kind": chunk.chunk_kind,
                 "truncated": chunk.truncated,
             },
         )
+
+    @staticmethod
+    def _citations_to_evidence_items(citations: list[KnowledgeCitation]) -> list[EvidenceItem]:
+        evidence_items: list[EvidenceItem] = []
+        for citation in citations:
+            metadata = dict(citation.metadata or {})
+            chunk_kind_value = metadata.get("chunk_kind")
+            chunk_kind = chunk_kind_value if chunk_kind_value in _EVIDENCE_CHUNK_KINDS else None
+            content_hash_value = metadata.get("content_hash")
+            evidence_items.append(
+                EvidenceItem(
+                    id=str(uuid4()),
+                    source="rag_lexical",
+                    file_path=citation.relative_path,
+                    line_start=citation.line_start,
+                    line_end=citation.line_end,
+                    snippet=citation.snippet,
+                    enclosing_symbol=(
+                        metadata.get("enclosing_symbol")
+                        if isinstance(metadata.get("enclosing_symbol"), str)
+                        else None
+                    ),
+                    chunk_kind=chunk_kind,
+                    retrieval_channel="keyword",
+                    confidence=max(0.0, min(float(citation.score) / 50.0, 1.0)),
+                    content_hash=(
+                        str(content_hash_value)
+                        if isinstance(content_hash_value, str) and content_hash_value
+                        else None
+                    ),
+                    metadata={**metadata, "score": citation.score},
+                )
+            )
+        return evidence_items
 
     @staticmethod
     def _assess_risk(*, citation_count: int, token_coverage: float, top_score: float) -> tuple[str, str]:
