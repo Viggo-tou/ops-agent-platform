@@ -222,6 +222,54 @@ class DevelopPipelineTests(unittest.TestCase):
             "No Jira issue key was found in the planning request.",
         )
 
+    def test_jira_develop_aborts_when_issue_unfetchable(self) -> None:
+        """Regression for the P69-7 incident.
+
+        When the Jira issue can't be fetched (deleted ticket, wrong project,
+        permission error), the orchestrator must NOT fall back to a synthetic
+        issue context and continue. Continuing causes codegen to invent
+        requirements for a ghost ticket — exactly what produced the bogus
+        password-toggle change for non-existent P69-7.
+        """
+        task = SimpleNamespace(
+            id="task-ghost",
+            session_id="session-ghost",
+            actor_name="tester",
+            request_text="完成Jira上的P69-7",
+            scenario="jira_issue_develop",
+            status=TaskStatus.QUEUED,
+            workflow_stage=WorkflowStage.INTAKE,
+            translation_json=None,
+            plan_json=None,
+            latest_result_json=None,
+            pending_approval=False,
+            retry_count=0,
+        )
+        orchestrator = self._orchestrator()
+        orchestrator._translate_request = Mock(
+            return_value=_semantic_translation(issue_key="P69-7")
+        )
+        # Jira lookup fails: returns None (mirrors the real failure path
+        # where _prefetch_jira_issue_context marks the task FAILED and returns).
+        orchestrator._prefetch_jira_issue_context = Mock(return_value=None)
+        # The pipeline must NOT reach planning, codegen, or any tool that
+        # would have invented requirements.
+        orchestrator._prefetch_planning_repository_context = Mock()
+        orchestrator.primary_agent.generate_plan = Mock()
+        orchestrator.reviewer_agent.review_plan = Mock()
+        orchestrator._gather_codegen_context = Mock()
+
+        with patch("app.orchestrator.service.record_event"), patch("app.orchestrator.service.set_task_status"):
+            orchestrator._bootstrap_task_impl(task=task, actor_name="tester")
+
+        orchestrator._prefetch_jira_issue_context.assert_called_once()
+        # Hard guard: nothing downstream should fire when the Jira issue
+        # can't be fetched.
+        orchestrator._prefetch_planning_repository_context.assert_not_called()
+        orchestrator.primary_agent.generate_plan.assert_not_called()
+        orchestrator.reviewer_agent.review_plan.assert_not_called()
+        orchestrator._gather_codegen_context.assert_not_called()
+
     def test_gather_codegen_context_from_sandbox(self) -> None:
         plan = _plan()
         task = _task(plan)

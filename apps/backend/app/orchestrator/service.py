@@ -200,41 +200,23 @@ class PrimaryOrchestrator:
                 actor_name=actor_name,
                 issue_key=semantic_translation.issue_key,
             )
-            if issue_context is None and task.scenario == "jira_issue_develop":
-                # Graceful fallback: proceed with translation-only context
-                # when the Jira issue can't be loaded (e.g. deleted project).
-                # _prefetch_jira_issue_context already marked the task as FAILED,
-                # so reset it back to CREATED to allow the pipeline to continue.
-                issue_context = {
-                    "key": semantic_translation.issue_key or "UNKNOWN",
-                    "summary": semantic_translation.objective or task.request_text or "",
-                    "description": semantic_translation.normalized_request or task.request_text or "",
-                    "status": "Unknown",
-                    "_synthetic": True,
-                }
-                set_task_status(
-                    self.db,
-                    task=task,
-                    new_status=TaskStatus.CREATED,
-                    new_stage=WorkflowStage.INTAKE,
-                    role=RoleName.PRIMARY,
-                    source=EventSource.ORCHESTRATOR,
-                    message="Jira issue unavailable — proceeding with translation-only context.",
-                )
-            elif issue_context is None:
+            if issue_context is None:
+                # Refuse to fabricate requirements for a missing Jira issue.
+                # _prefetch_jira_issue_context has already marked the task FAILED.
+                # See P69-7 incident: the previous "graceful fallback" reset
+                # the task to CREATED and synthesised an empty issue body, which
+                # caused codegen to invent a generic Login.js change for a ghost
+                # ticket. The downstream gates can't catch this because they
+                # only validate diff shape, not whether the requirement existed.
                 return
 
-            # Skip 2nd translation pass when using synthetic issue context —
-            # the 1st pass already has concrete grounding terms; re-translating
-            # with the empty synthetic context produces generic/unusable terms.
-            if not issue_context.get("_synthetic"):
-                semantic_translation = self._translate_request(
-                    task=task,
-                    actor_name=actor_name,
-                    issue_context=issue_context,
-                )
-                self._apply_jira_issue_key_fallback(task=task, semantic_translation=semantic_translation)
-                task.translation_json = semantic_translation.model_dump(mode="json")
+            semantic_translation = self._translate_request(
+                task=task,
+                actor_name=actor_name,
+                issue_context=issue_context,
+            )
+            self._apply_jira_issue_key_fallback(task=task, semantic_translation=semantic_translation)
+            task.translation_json = semantic_translation.model_dump(mode="json")
             planning_knowledge_context = self._prefetch_planning_repository_context(
                 task=task,
                 actor_name=actor_name,
@@ -282,12 +264,7 @@ class PrimaryOrchestrator:
         # If translation extracted grounding_terms/anchors, verify at least one
         # exists in the knowledge source tree. If ALL are missing, the task is
         # likely targeting the wrong repository — fail fast before planning.
-        # Skip when using synthetic Jira context — the grounding terms are just
-        # the Jira issue key, which will never appear in the codebase.
-        _skip_anchor = (
-            issue_context is not None and issue_context.get("_synthetic")
-        )
-        if not _skip_anchor and self._anchor_precheck_fails(task):
+        if self._anchor_precheck_fails(task):
             return
 
         set_task_status(
