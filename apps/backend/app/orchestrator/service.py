@@ -35,6 +35,14 @@ from app.services.task_workspace import TaskWorkspace
 from app.tools.gateway import ToolApprovalRequired, ToolGateway, ToolInvocationError
 
 
+class RepairRoundTimeout(Exception):
+    """Raised when a single compile-repair round exceeds its deadline.
+
+    The caller in the multi-round loop catches this so the round is
+    counted as a failed round instead of poisoning the whole budget.
+    """
+
+
 def _contains_word(text: str, *keywords: str) -> bool:
     return any(re.search(rf"\b{re.escape(keyword)}\b", text) for keyword in keywords)
 
@@ -756,6 +764,23 @@ class PrimaryOrchestrator:
         # writeback + completion tail.
         if (task.scenario or "") == "jira_issue_develop":
             pipeline_state = self._load_develop_pipeline_state(task)
+            # T-PIPELINE-REPAIR-CAP: granting the compile-repair-cap approval
+            # means a reviewer has manually fixed (or chosen to accept) the
+            # sandbox state. Clear the cap flag and re-run compile_gate so
+            # the pipeline either sails through or surfaces another failure.
+            pending_compile_id = pipeline_state.get("pending_compile_repair_approval_id")
+            if pending_compile_id == approval_id:
+                pipeline_state.pop("pending_compile_repair_approval_id", None)
+                pipeline_state.pop("compile_repair_cap_exceeded", None)
+                pipeline_state.pop("compile_gate_done", None)
+                pipeline_state.pop("compile_gate", None)
+                pipeline_state.pop("evidence_chain_validated", None)
+                pipeline_state.pop("evidence_chain", None)
+                self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+                self._execute_develop_pipeline(
+                    task=task, actor_name=actor_name, plan=plan_document, approval_id=approval_id
+                )
+                return
             pending_id = pipeline_state.get("pending_jira_approval_id")
             if pending_id == approval_id or pending_id is None:
                 pipeline_state["jira_approval_granted"] = True
@@ -2684,117 +2709,20 @@ class PrimaryOrchestrator:
             pipeline_state["diff_shape_done"] = True
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
 
-        # --- Compile gate (T-040 defense line 5) with repair loop ---
+        # --- Compile gate (T-040 defense line 5) with multi-round repair ---
+        # T-PIPELINE-REPAIR-CAP: up to N repair rounds, then either pass,
+        # transition to AWAITING_APPROVAL with a structured payload (default),
+        # or fall back to legacy fail-fast when the operator opts out.
         if not pipeline_state.get("compile_gate_done"):
-            from app.services.compile_gate import run_compile_gate
-
-            sandbox_dir = self._develop_sandbox_dir(task)
-            changed = pipeline_state.get("files_changed") or []
-            max_compile_passes = 2  # initial check + 1 repair attempt
-
-            for compile_pass in range(max_compile_passes):
-                if not (sandbox_dir.exists() and changed):
-                    break
-
-                try:
-                    compile_result = run_compile_gate(
-                        sandbox_dir=sandbox_dir,
-                        changed_files=changed,
-                    )
-                except Exception as exc:
-                    compile_result = None
-                    record_event(
-                        self.db,
-                        task_id=task.id,
-                        event_type=EventType.TOOL_FAILED,
-                        source=EventSource.ORCHESTRATOR,
-                        stage=WorkflowStage.REVIEW,
-                        role=RoleName.REVIEWER,
-                        tool_name="compile_gate.check",
-                        message=f"Compile gate errored: {exc}",
-                        payload={"error": str(exc)},
-                    )
-                    break  # Can't recover from an internal error
-
-                if compile_result is None:
-                    break
-
-                pipeline_state["compile_gate"] = {
-                    "passed": compile_result.passed,
-                    "errors": compile_result.errors,
-                }
-                self._workspace_write_attempt_compile(
-                    task,
-                    pipeline_state,
-                    result_dict=pipeline_state["compile_gate"],
-                )
-
-                if compile_result.passed:
-                    record_event(
-                        self.db,
-                        task_id=task.id,
-                        event_type=EventType.TOOL_SUCCEEDED,
-                        source=EventSource.ORCHESTRATOR,
-                        stage=WorkflowStage.REVIEW,
-                        role=RoleName.REVIEWER,
-                        tool_name="compile_gate.check",
-                        message=compile_result.summary(),
-                        payload=pipeline_state["compile_gate"],
-                    )
-                    break  # Gate passed
-
-                # Gate failed — attempt repair on first pass only
-                if compile_pass == 0:
-                    record_event(
-                        self.db,
-                        task_id=task.id,
-                        event_type=EventType.REVIEW_FAILED,
-                        source=EventSource.ORCHESTRATOR,
-                        stage=WorkflowStage.REVIEW,
-                        role=RoleName.REVIEWER,
-                        tool_name="compile_gate.check",
-                        message=f"Compile gate failed (attempting repair): {compile_result.summary()}",
-                        payload=pipeline_state["compile_gate"],
-                    )
-                    repaired, repair_touched = self._attempt_compile_repair(
-                        task=task,
-                        actor_name=actor_name,
-                        compile_errors=compile_result.errors,
-                        sandbox_dir=sandbox_dir,
-                        pipeline_state=pipeline_state,
-                        approval_id=approval_id,
-                    )
-                    if repaired:
-                        # Merge repair-touched files into changed so
-                        # the next compile gate pass also checks them.
-                        changed = list(set(changed) | set(repair_touched))
-                        continue  # Re-run compile gate after repair
-                    # Repair failed or produced no changes — fall through to fail
-
-                # Final failure (repair exhausted or skipped)
-                record_event(
-                    self.db,
-                    task_id=task.id,
-                    event_type=EventType.REVIEW_FAILED,
-                    source=EventSource.ORCHESTRATOR,
-                    stage=WorkflowStage.REVIEW,
-                    role=RoleName.REVIEWER,
-                    tool_name="compile_gate.check",
-                    message=compile_result.summary(),
-                    payload=pipeline_state["compile_gate"],
-                )
-                self._fail_develop_pipeline(
-                    task=task,
-                    event_type=EventType.REVIEW_FAILED,
-                    stage=WorkflowStage.REVIEW,
-                    role=RoleName.REVIEWER,
-                    message=f"Compile gate: {compile_result.summary()}",
-                    payload=pipeline_state["compile_gate"],
-                )
+            outcome = self._run_compile_repair_loop(
+                task=task,
+                actor_name=actor_name,
+                plan=plan,
+                pipeline_state=pipeline_state,
+                approval_id=approval_id,
+            )
+            if outcome in {"approval_requested", "failed"}:
                 return
-
-            pipeline_state["compile_gate_done"] = True
-            self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
 
         # --- Runtime validation gate (with 1 repair cycle) ---
         if not pipeline_state.get("runtime_validation_done"):
@@ -3379,7 +3307,24 @@ class PrimaryOrchestrator:
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
 
         # --- T-041-04: evidence chain validation before approval/writeback ---
+        # T-PIPELINE-REPAIR-CAP: skip the chain when the task already
+        # transitioned to approval after compile-repair cap exhaust — the
+        # diff is partial and the reviewer is already in the loop.
         if not pipeline_state.get("evidence_chain_validated"):
+            if bool(pipeline_state.get("compile_repair_cap_exceeded")):
+                pipeline_state["evidence_chain"] = {
+                    "closed": True,
+                    "skipped": True,
+                    "summary": (
+                        "Evidence chain skipped: compile-repair cap exceeded "
+                        "and the task is already awaiting human approval."
+                    ),
+                    "findings": [],
+                    "diagnostic": {"reason": "compile_repair_cap_exceeded"},
+                }
+                pipeline_state["evidence_chain_validated"] = True
+                self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+                return
             if bool(getattr(self.tool_gateway.settings, "evidence_chain_gate_enabled", True)):
                 workspace = self._task_workspace(task)
                 try:
@@ -4160,6 +4105,287 @@ class PrimaryOrchestrator:
 
     # ----- Compile repair loop --------------------------------------------- #
 
+    def _run_compile_repair_loop(
+        self,
+        *,
+        task: Task,
+        actor_name: str,
+        plan: GeneratedPlan,
+        pipeline_state: dict[str, object],
+        approval_id: str | None,
+    ) -> str:
+        """Run compile_gate with up to N repair rounds.
+
+        Returns one of:
+          - ``"passed"``           — gate passed (possibly after repair); pipeline continues.
+          - ``"approval_requested"`` — cap exceeded, task parked in AWAITING_APPROVAL.
+          - ``"failed"``           — cap exceeded, task FAILED (legacy fail-fast).
+          - ``"errored"``          — gate itself errored or skipped; pipeline continues.
+        """
+        from app.services.compile_gate import run_compile_gate
+
+        sandbox_dir = self._develop_sandbox_dir(task)
+        changed = list(pipeline_state.get("files_changed") or [])
+
+        settings_obj = self.tool_gateway.settings
+        max_rounds = max(0, int(getattr(settings_obj, "codegen_max_repair_rounds", 3)))
+        files_per_round = max(
+            1, int(getattr(settings_obj, "codegen_repair_files_per_round", 5))
+        )
+        round_timeout = float(
+            getattr(settings_obj, "codegen_repair_round_timeout_seconds", 180.0)
+        )
+        fail_to_approval = bool(
+            getattr(settings_obj, "codegen_repair_cap_exceeded_to_approval", True)
+        )
+
+        rounds_summary: list[dict] = []
+        compile_passed = False
+        compile_result = None
+        compile_errored = False
+
+        if not (sandbox_dir.exists() and changed):
+            # Nothing to check — preserve legacy "skip silently" behaviour.
+            pipeline_state["compile_gate_done"] = True
+            self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+            return "errored"
+
+        for round_index in range(max_rounds + 1):
+            if compile_passed:
+                break
+            try:
+                compile_result = run_compile_gate(
+                    sandbox_dir=sandbox_dir,
+                    changed_files=changed,
+                )
+            except Exception as exc:
+                compile_result = None
+                compile_errored = True
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_FAILED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="compile_gate.check",
+                    message=f"Compile gate errored: {exc}",
+                    payload={"error": str(exc)},
+                )
+                break
+
+            if compile_result is None:
+                break
+
+            pipeline_state["compile_gate"] = {
+                "passed": compile_result.passed,
+                "errors": compile_result.errors,
+            }
+            self._workspace_write_attempt_compile(
+                task,
+                pipeline_state,
+                result_dict=pipeline_state["compile_gate"],
+            )
+
+            if compile_result.passed:
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_SUCCEEDED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="compile_gate.check",
+                    message=compile_result.summary(),
+                    payload=pipeline_state["compile_gate"],
+                )
+                compile_passed = True
+                break
+
+            if round_index == max_rounds:
+                rounds_summary.append(
+                    {
+                        "round": round_index + 1,
+                        "files_attempted": [],
+                        "files_repaired": [],
+                        "duration_seconds": 0.0,
+                        "compile_gate_after": {
+                            "passed": False,
+                            "error_count": len(compile_result.errors),
+                        },
+                        "note": "no repair budget remaining",
+                    }
+                )
+                self._workspace_append_audit(
+                    task,
+                    "compile_repair.cap_reached",
+                    {
+                        "rounds_attempted": max_rounds,
+                        "residual_error_count": len(compile_result.errors),
+                    },
+                )
+                break
+
+            files_queued = [
+                str(e.get("file") or "")
+                for e in compile_result.errors[:files_per_round]
+                if e.get("file")
+            ]
+            round_label = round_index + 1
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_CALL_REQUESTED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="compile_repair.round_started",
+                message=(
+                    f"Compile repair round {round_label} starting "
+                    f"({len(files_queued)} file(s) queued)."
+                ),
+                payload={
+                    "round_index": round_label,
+                    "files_queued": files_queued,
+                },
+            )
+            self._workspace_append_audit(
+                task,
+                "compile_repair.round_started",
+                {"round_index": round_label, "files_queued": files_queued},
+            )
+
+            round_started = time.monotonic()
+            timed_out = False
+            repaired = False
+            files_touched: list[str] = []
+            try:
+                repaired, files_touched = self._attempt_compile_repair(
+                    task=task,
+                    actor_name=actor_name,
+                    compile_errors=compile_result.errors,
+                    sandbox_dir=sandbox_dir,
+                    pipeline_state=pipeline_state,
+                    approval_id=approval_id,
+                    timeout_seconds=round_timeout,
+                    files_per_round=files_per_round,
+                )
+            except RepairRoundTimeout as timeout_exc:
+                timed_out = True
+                repaired = False
+                files_touched = []
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_FAILED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="compile_repair.round_timed_out",
+                    message=f"Compile repair round {round_label} timed out: {timeout_exc}",
+                    payload={
+                        "round_index": round_label,
+                        "timeout_seconds": round_timeout,
+                    },
+                )
+                self._workspace_append_audit(
+                    task,
+                    "compile_repair.round_timed_out",
+                    {"round_index": round_label, "timeout_seconds": round_timeout},
+                )
+
+            duration = round(time.monotonic() - round_started, 2)
+            round_record = {
+                "round": round_label,
+                "files_attempted": files_queued,
+                "files_repaired": list(files_touched) if repaired else [],
+                "duration_seconds": duration,
+                "timed_out": timed_out,
+            }
+            rounds_summary.append(round_record)
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=(
+                    EventType.TOOL_SUCCEEDED if repaired else EventType.TOOL_FAILED
+                ),
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="compile_repair.round_completed",
+                message=(
+                    f"Compile repair round {round_label} completed: "
+                    f"{len(round_record['files_repaired'])} repaired, "
+                    f"timed_out={timed_out}, duration={duration}s."
+                ),
+                payload=round_record,
+            )
+            self._workspace_append_audit(
+                task,
+                "compile_repair.round_completed",
+                round_record,
+            )
+
+            if repaired:
+                changed = list({*changed, *files_touched})
+            # Loop continues — next iteration re-runs compile_gate.
+
+        if compile_passed:
+            pipeline_state["compile_gate_done"] = True
+            pipeline_state["compile_repair_rounds"] = rounds_summary
+            self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+            return "passed"
+
+        if compile_result is None or compile_errored:
+            pipeline_state["compile_gate_done"] = True
+            self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+            return "errored"
+
+        pipeline_state["compile_repair_rounds"] = rounds_summary
+        pipeline_state["compile_repair_cap_exceeded"] = True
+        self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.REVIEW_FAILED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            tool_name="compile_repair.cap_exceeded",
+            message=(
+                f"Compile gate still failing after {max_rounds} "
+                f"repair round(s): {compile_result.summary()}"
+            ),
+            payload={
+                "rounds_attempted": max_rounds,
+                "rounds_summary": rounds_summary,
+                "residual_compile_errors": compile_result.errors,
+            },
+        )
+        if fail_to_approval:
+            self._request_compile_repair_approval(
+                task=task,
+                plan=plan,
+                pipeline_state=pipeline_state,
+                rounds_summary=rounds_summary,
+                residual_errors=compile_result.errors,
+                sandbox_dir=sandbox_dir,
+            )
+            return "approval_requested"
+
+        self._fail_develop_pipeline(
+            task=task,
+            event_type=EventType.REVIEW_FAILED,
+            stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            message=f"Compile gate: {compile_result.summary()}",
+            payload={
+                "compile_gate": pipeline_state.get("compile_gate"),
+                "rounds_summary": rounds_summary,
+            },
+        )
+        return "failed"
+
     def _attempt_compile_repair(
         self,
         *,
@@ -4169,12 +4395,19 @@ class PrimaryOrchestrator:
         sandbox_dir: Path,
         pipeline_state: dict,
         approval_id: str | None,
+        timeout_seconds: float | None = None,
+        files_per_round: int | None = None,
     ) -> tuple[bool, list[str]]:
         """Attempt a narrow syntax-only repair after compile gate failure.
 
         Processes each broken file individually (one codegen call per file)
         to stay within the 300s timeout. Returns (any_applied, files_touched)
         where files_touched is the list of file paths modified by repair diffs.
+
+        When *timeout_seconds* is provided, the round honours a deadline:
+        if the elapsed time exceeds it before all files are processed, a
+        ``RepairRoundTimeout`` is raised so the caller can record the
+        timeout cleanly and move on to the next round.
         """
         if not compile_errors:
             return False, []
@@ -4183,7 +4416,21 @@ class PrimaryOrchestrator:
         any_applied = False
         all_repair_touched: list[str] = []
 
-        for err in compile_errors[:5]:  # Cap at 5 files
+        per_round_cap = (
+            int(files_per_round)
+            if files_per_round and files_per_round > 0
+            else int(getattr(self.tool_gateway.settings, "codegen_repair_files_per_round", 5))
+        )
+        deadline: float | None = None
+        if timeout_seconds is not None and timeout_seconds > 0:
+            deadline = time.monotonic() + float(timeout_seconds)
+
+        for err in compile_errors[:per_round_cap]:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise RepairRoundTimeout(
+                    f"Repair round exceeded {timeout_seconds:.1f}s deadline "
+                    f"after touching {len(all_repair_touched)} file(s)."
+                )
             rel_path = err.get("file", "")
             error_msg = err.get("error", "syntax error")
             if not rel_path:
@@ -5115,6 +5362,134 @@ class PrimaryOrchestrator:
             resume_args={"approval_id": approval.id},
         )
         commit_checkpoint(self.db, label="awaiting_approval_jira_transition")
+
+    def _request_compile_repair_approval(
+        self,
+        *,
+        task: Task,
+        plan: GeneratedPlan,
+        pipeline_state: dict[str, object],
+        rounds_summary: list[dict],
+        residual_errors: list[dict],
+        sandbox_dir: Path,
+    ) -> None:
+        """Park the task in AWAITING_APPROVAL after the compile-repair cap is
+        exhausted. The reviewer can then (a) manually patch the sandbox and
+        grant the approval, (b) reject (→ task FAILED), or (c) extend the
+        repair budget by approving with a 'retry' annotation.
+        """
+        rounds_attempted = sum(
+            1
+            for r in rounds_summary
+            if r.get("note") != "no repair budget remaining"
+        )
+        if rounds_attempted == 0 and rounds_summary:
+            # Fallback: use the highest round number recorded.
+            rounds_attempted = max(int(r.get("round") or 0) for r in rounds_summary)
+        residual_files = sorted(
+            {str(e.get("file") or "") for e in residual_errors if e.get("file")}
+        )
+        message = (
+            "Codegen produced patches that do not compile cleanly. "
+            f"{rounds_attempted} repair round(s) attempted; "
+            f"{len(residual_files)} file(s) still fail compile. "
+            "Reviewer can: (a) manually fix in sandbox + grant approval; "
+            "(b) reject and the task will be marked failed; "
+            "(c) extend repair budget by approving with a 'retry' annotation."
+        )
+        diff_path = ""
+        try:
+            diff_path = str(sandbox_dir)
+        except Exception:  # noqa: BLE001
+            diff_path = ""
+
+        approval_payload = {
+            "decision": "compile_repair_cap_exceeded",
+            "rounds_attempted": rounds_attempted,
+            "rounds_summary": rounds_summary,
+            "residual_compile_errors": residual_errors,
+            "diff_path": diff_path,
+            "message": message,
+        }
+
+        approval = Approval(
+            task_id=task.id,
+            action_name="compile_repair_cap_exceeded",
+            status=ApprovalStatus.PENDING,
+            requested_by_role=RoleName.REVIEWER,
+            approver_role=ActorRole.TEAM_LEAD.value,
+            requested_by_actor_name=task.actor_name,
+            risk_level=task.risk_level,
+            risk_category=task.risk_category,
+            reason=(
+                "Compile gate failed across the configured repair budget; "
+                "human approval required to decide next step."
+            ),
+            request_payload_json=approval_payload,
+            policy_snapshot_json={
+                "decision": "require_approval",
+                "source": "develop_compile_repair_cap_exceeded",
+                "tool_name": "compile_repair_cap_exceeded",
+                "actor_name": task.actor_name,
+                "actor_role": task.actor_role.value,
+                "risk_level": task.risk_level.value,
+                "risk_category": task.risk_category.value,
+                "required_approver_role": ActorRole.TEAM_LEAD.value,
+            },
+        )
+        self.db.add(approval)
+        self.db.flush()
+
+        pipeline_state["pending_compile_repair_approval_id"] = approval.id
+        pipeline_state["compile_repair_cap_exceeded"] = True
+        pipeline_state["compile_repair_rounds"] = rounds_summary
+        self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+
+        task.pending_approval = True
+        task.latest_result_json = {
+            "status": TaskStatus.AWAITING_APPROVAL.value,
+            "message": message,
+            "approval_id": approval.id,
+            "result": approval_payload,
+            "pipeline_state": pipeline_state,
+        }
+
+        set_task_status(
+            self.db,
+            task=task,
+            new_status=TaskStatus.AWAITING_APPROVAL,
+            new_stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            source=EventSource.ORCHESTRATOR,
+            message="Awaiting human approval after compile-repair cap exceeded.",
+        )
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.APPROVAL_REQUESTED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            tool_name="compile_repair.cap_exceeded",
+            message="Approval requested after compile-repair cap exceeded.",
+            payload={
+                "approval_id": approval.id,
+                "action_name": approval.action_name,
+                "approver_role": approval.approver_role,
+                "rounds_attempted": rounds_attempted,
+                "residual_files": residual_files,
+            },
+        )
+        self._workspace_append_audit(
+            task,
+            "compile_repair.cap_exceeded",
+            {
+                "approval_id": approval.id,
+                "rounds_attempted": rounds_attempted,
+                "residual_error_count": len(residual_errors),
+            },
+        )
+        commit_checkpoint(self.db, label="awaiting_approval_compile_repair_cap")
 
     def _fail_develop_pipeline(
         self,

@@ -61,6 +61,16 @@ class Settings(BaseSettings):
     # Per-file parallel codegen: concurrent workers for develop pipeline codegen.
     # 1 = serial (old batched behavior), 2-3 = parallel (faster, no truncation).
     codegen_parallel_max: int = 2
+    # T-PIPELINE-REPAIR-CAP: multi-round compile_gate repair loop. When a
+    # round exceeds the timeout it counts as a failed round (not a stall).
+    # When all rounds exhaust and `..._to_approval` is True (default) the
+    # task transitions to AWAITING_APPROVAL with a structured payload so a
+    # reviewer can decide what to do; setting it False keeps the legacy
+    # fail-fast behaviour.
+    codegen_max_repair_rounds: int = 3
+    codegen_repair_files_per_round: int = 5
+    codegen_repair_round_timeout_seconds: float = 180.0
+    codegen_repair_cap_exceeded_to_approval: bool = True
     semantic_translator_provider: Literal["auto", "mock", "minimax"] = "auto"
     semantic_translator_model: str = "MiniMax-M2.7"
     semantic_translator_timeout_seconds: float = 30.0

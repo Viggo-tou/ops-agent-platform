@@ -151,6 +151,9 @@ class DevelopPipelineTests(unittest.TestCase):
         orchestrator.tool_gateway.settings.knowledge_max_file_bytes = 120_000
         orchestrator.tool_gateway.settings.develop_require_jira_approval = False
         orchestrator.tool_gateway.settings.evidence_chain_gate_enabled = False
+        # Legacy single-round compile-repair behaviour for these contract tests.
+        # Multi-round behaviour is exercised in test_compile_repair_loop.
+        orchestrator.tool_gateway.settings.codegen_max_repair_rounds = 1
         orchestrator._sync_retry_count = Mock()
         return orchestrator
 
