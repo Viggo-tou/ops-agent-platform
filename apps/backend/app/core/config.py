@@ -82,6 +82,24 @@ class Settings(BaseSettings):
         ".mp3,.mp4,.mov,.wav,.avi,.mkv,"
         ".lock,.min.js,.min.css"
     )
+    evidence_must_touch_excluded_extensions: str = (
+        ".lock,.min.js,.min.css,.map,.tar,.gz,.zip,.7z,.rar,.pdf,"
+        ".png,.jpg,.jpeg,.gif,.svg,.webp,.ico,.bmp,"
+        ".woff,.woff2,.ttf,.otf,.eot,"
+        ".mp3,.mp4,.mov,.wav,.avi,.mkv,"
+        ".pyc,.pyo,.class,.dll,.so,.dylib,.exe"
+    )
+    evidence_must_touch_excluded_path_segments: str = (
+        "build/,build-before/,build-after/,dist/,node_modules/,"
+        "__pycache__/,.next/,.cache/,.tmp/,data/sandboxes/,data/agent_workspace/"
+    )
+    evidence_must_touch_excluded_filenames: str = (
+        "package.json,package-lock.json,yarn.lock,pnpm-lock.yaml,"
+        "tsconfig.json,jsconfig.json,.eslintrc*,.prettierrc*,.editorconfig,"
+        "cors.json,firebase.json,poetry.lock,requirements.txt,requirements-*.txt,"
+        "go.sum,cargo.lock"
+    )
+    evidence_must_touch_include_configs: bool = False
     # Semantic reranker: when enabled, the keyword-based retriever picks
     # knowledge_rerank_pool_size top candidates, then an LLM reranks them
     # and the final top_k slice is taken from the LLM-ranked order.
