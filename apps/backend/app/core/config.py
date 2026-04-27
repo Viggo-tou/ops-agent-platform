@@ -111,6 +111,10 @@ class Settings(BaseSettings):
     sandbox_retention_hours: float = 168.0  # 7 days
     sandbox_command_timeout_seconds: float = 60.0
     sandbox_max_output_bytes: int = 65536
+    agent_workspace_root: str = str((BASE_DIR / "data" / "agent_workspace").as_posix())
+    agent_workspace_retention_hours: int = 168
+    agent_workspace_archive_on_complete: bool = False
+    agent_workspace_snippet_inline_threshold: int = 4000
     alert_webhook_url: str | None = None
     slack_base_url: str = "https://slack.com"
     slack_bot_token: str | None = None

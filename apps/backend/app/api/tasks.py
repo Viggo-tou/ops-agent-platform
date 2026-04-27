@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -12,6 +12,7 @@ from app.schemas.event import EventRead
 from app.schemas.task import TaskCreateRequest, TaskDetail, TaskRollbackRequest, TaskSummary
 from app.schemas.tool import ToolExecutionRead
 from app.services.tasks import TaskService
+from app.services.task_workspace import TaskWorkspace
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 DbSession = Annotated[Session, Depends(get_db)]
@@ -72,6 +73,15 @@ def list_task_tool_executions(task_id: str, db: DbSession) -> list[ToolExecution
     if not service.task_exists(task_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
     return service.list_tool_executions(task_id)
+
+
+@router.get("/{task_id}/workspace/checkpoint", response_model=dict[str, Any])
+def get_task_workspace_checkpoint(task_id: str, db: DbSession) -> dict[str, Any]:
+    service = TaskService(db)
+    if not service.task_exists(task_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+    checkpoint = TaskWorkspace.for_task(task_id).read_checkpoint()
+    return checkpoint or {}
 
 
 @router.post("/{task_id}/rollback", response_model=TaskDetail)

@@ -26,6 +26,7 @@ from app.models.task import Task
 from app.services.events import record_event, set_task_status
 from app.services.governance import bootstrap_governance_data
 from app.services.model_config import bootstrap_model_catalog
+from app.services.task_workspace import list_interrupted_workspaces, sweep_task_workspaces
 
 configure_logging()
 configure_telemetry()
@@ -194,6 +195,45 @@ def _sweep_old_sandboxes() -> None:
         )
 
 
+def _workspace_task_statuses() -> dict[str, tuple[TaskStatus, object]]:
+    with SessionLocal() as db:
+        return {
+            task.id: (task.status, task.updated_at or task.created_at)
+            for task in db.query(Task).all()
+        }
+
+
+def _log_interrupted_task_workspaces() -> None:
+    settings = get_settings()
+    interrupted = list_interrupted_workspaces(
+        settings=settings,
+        task_statuses=_workspace_task_statuses(),
+    )
+    for item in interrupted:
+        _startup_logger.warning(
+            "task_workspace_checkpoint_present_for_active_task",
+            task_id=item.get("task_id"),
+            status=item.get("status"),
+            stage_completed=item.get("stage_completed"),
+            checkpoint_updated_at=item.get("checkpoint_updated_at"),
+        )
+
+
+def _sweep_old_task_workspaces() -> None:
+    settings = get_settings()
+    counts = sweep_task_workspaces(
+        settings=settings,
+        task_statuses=_workspace_task_statuses(),
+    )
+    if counts.get("deleted") or counts.get("archived") or counts.get("failed"):
+        _startup_logger.info(
+            "task_workspace_sweep_done",
+            **counts,
+            retention_hours=settings.agent_workspace_retention_hours,
+            archive_on_complete=settings.agent_workspace_archive_on_complete,
+        )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
@@ -201,8 +241,10 @@ async def lifespan(_: FastAPI):
     bootstrap_governance_data()
     with SessionLocal() as db:
         bootstrap_model_catalog(db)
+    _log_interrupted_task_workspaces()
     _sweep_orphaned_tasks()
     _sweep_old_sandboxes()
+    _sweep_old_task_workspaces()
     init_pipeline_executor(settings.pipeline_max_workers)
     try:
         yield
