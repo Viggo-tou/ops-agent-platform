@@ -241,6 +241,86 @@ class DevelopPipelineTests(unittest.TestCase):
             self.assertEqual(kind, expected_kind, f"exc={exc} status={getattr(exc, 'http_status', None)}")
             self.assertIn(expected_substring, message, f"kind={kind} message={message!r}")
 
+    def test_probe_upgrades_404_to_auth_expired_when_token_dead(self) -> None:
+        """When issue lookup fails 404 AND /myself returns 401, surface auth_expired.
+
+        Without the probe, P69-7's real failure mode (token expired, but
+        per-issue endpoint returns 404 because Jira hides issue existence
+        from unauthenticated callers) gets misreported as
+        not_found_or_invisible — wrong remediation in the user message.
+        """
+        from app.tools.gateway import ToolInvocationError
+
+        task = SimpleNamespace(
+            id="task-probe",
+            session_id="session-probe",
+            actor_name="tester",
+            request_text="完成Jira上的P69-7",
+            scenario="jira_issue_develop",
+            status=TaskStatus.QUEUED,
+            workflow_stage=WorkflowStage.INTAKE,
+            translation_json=None,
+            plan_json=None,
+            latest_result_json=None,
+            pending_approval=False,
+            retry_count=0,
+        )
+        orchestrator = self._orchestrator()
+        orchestrator.tool_gateway.execute = Mock(
+            side_effect=ToolInvocationError("404 not found", http_status=404)
+        )
+        # Probe says token is dead.
+        orchestrator._probe_jira_auth_health = Mock(return_value=401)
+
+        with patch("app.orchestrator.service.record_event"), patch("app.orchestrator.service.set_task_status"):
+            result = orchestrator._prefetch_jira_issue_context(
+                task=task,
+                actor_name="tester",
+                issue_key="P69-7",
+            )
+
+        self.assertIsNone(result)
+        # The probe was consulted because the initial classification was 404.
+        orchestrator._probe_jira_auth_health.assert_called_once()
+        # Final error_kind upgraded to auth_expired.
+        self.assertEqual(task.latest_result_json["error_kind"], "auth_expired")
+        self.assertIn("expired or been revoked", task.latest_result_json["message"])
+
+    def test_probe_keeps_404_when_token_healthy(self) -> None:
+        """If /myself returns 200, the original 404 is genuine — don't upgrade."""
+        from app.tools.gateway import ToolInvocationError
+
+        task = SimpleNamespace(
+            id="task-probe-2",
+            session_id="session-probe-2",
+            actor_name="tester",
+            request_text="implement P69-999",
+            scenario="jira_issue_develop",
+            status=TaskStatus.QUEUED,
+            workflow_stage=WorkflowStage.INTAKE,
+            translation_json=None,
+            plan_json=None,
+            latest_result_json=None,
+            pending_approval=False,
+            retry_count=0,
+        )
+        orchestrator = self._orchestrator()
+        orchestrator.tool_gateway.execute = Mock(
+            side_effect=ToolInvocationError("404 not found", http_status=404)
+        )
+        orchestrator._probe_jira_auth_health = Mock(return_value=200)
+
+        with patch("app.orchestrator.service.record_event"), patch("app.orchestrator.service.set_task_status"):
+            orchestrator._prefetch_jira_issue_context(
+                task=task,
+                actor_name="tester",
+                issue_key="P69-999",
+            )
+
+        orchestrator._probe_jira_auth_health.assert_called_once()
+        self.assertEqual(task.latest_result_json["error_kind"], "not_found_or_invisible")
+        self.assertNotIn("expired or been revoked", task.latest_result_json["message"])
+
     def test_jira_develop_aborts_when_issue_unfetchable(self) -> None:
         """Regression for the P69-7 incident.
 

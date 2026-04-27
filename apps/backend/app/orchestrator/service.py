@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -651,6 +652,20 @@ class PrimaryOrchestrator:
             self._sync_retry_count(task)
             event_type = EventType.TOOL_TIMED_OUT if isinstance(exc, ToolInvocationError) and exc.timed_out else EventType.TOOL_FAILED
             error_kind, user_message = self._classify_jira_error(exc, issue_key)
+            # Disambiguate 404: Jira returns 404 for both "issue missing" and
+            # "token can't see project". Probe /myself to detect the
+            # token-expiry case so the user gets the right remediation.
+            if error_kind == "not_found_or_invisible":
+                probe_status = self._probe_jira_auth_health()
+                if probe_status == 401:
+                    error_kind = "auth_expired"
+                    user_message = (
+                        f"Jira authentication failed (HTTP 401 on /myself). The API token has "
+                        f"expired or been revoked, which makes issue lookups appear as 404. "
+                        f"Refresh OPS_AGENT_JIRA_API_TOKEN in apps/backend/.env from "
+                        f"https://id.atlassian.com/manage-profile/security/api-tokens and restart the backend. "
+                        f"(Original failure: {exc})"
+                    )
             record_event(
                 self.db,
                 task_id=task.id,
@@ -708,6 +723,39 @@ class PrimaryOrchestrator:
             payload=result,
         )
         return result
+
+    def _probe_jira_auth_health(self) -> int | None:
+        """Probe /rest/api/3/myself to disambiguate 404 vs 401 on issue lookups.
+
+        Returns the HTTP status code, or None if we couldn't reach Jira
+        (connection error, timeout, missing config). Caller uses 401 → token
+        expired; 200 → token healthy so the upstream 404 is genuine; anything
+        else is treated as inconclusive.
+
+        Kept narrow: short timeout (5s), no retries, swallows all errors —
+        this is a diagnostic call, not a primary code path.
+        """
+        try:
+            base_url = (self.settings.jira_base_url or "").rstrip("/")
+            if not base_url:
+                return None
+            headers = {"Accept": "application/json"}
+            auth: tuple[str, str] | None = None
+            if getattr(self.settings, "jira_bearer_token", None):
+                headers["Authorization"] = f"Bearer {self.settings.jira_bearer_token}"
+            elif self.settings.jira_email and self.settings.jira_api_token:
+                auth = (self.settings.jira_email, self.settings.jira_api_token)
+            else:
+                return None
+            with httpx.Client(timeout=5.0) as client:
+                response = client.get(
+                    f"{base_url}/rest/api/3/myself",
+                    headers=headers,
+                    auth=auth,
+                )
+            return response.status_code
+        except Exception:
+            return None
 
     @staticmethod
     def _classify_jira_error(exc: Exception, issue_key: str) -> tuple[str, str]:
