@@ -397,6 +397,72 @@ dt {
   white-space: pre-wrap;
 }
 
+.failure-diagnosis-block {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 14px;
+  margin-bottom: 14px;
+  background: #fff;
+  white-space: normal;
+}
+
+.failure-diagnosis-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.failure-diagnosis-header strong {
+  font-size: 1rem;
+  line-height: 1.45;
+}
+
+.confidence-badge {
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-size: 0.72rem;
+  font-weight: 650;
+  color: #222;
+  background: #f7f7f7;
+}
+
+.confidence-high {
+  border-color: #8bc69a;
+  background: #eef8f1;
+}
+
+.confidence-medium {
+  border-color: #d4bf72;
+  background: #fbf7e6;
+}
+
+.confidence-low {
+  border-color: #d49a72;
+  background: #fff1e8;
+}
+
+.failure-diagnosis-details {
+  margin-top: 10px;
+}
+
+.failure-diagnosis-details summary {
+  cursor: pointer;
+  font-weight: 650;
+}
+
+.failure-diagnosis-details h4 {
+  margin: 12px 0 4px;
+  font-size: 0.82rem;
+}
+
+.failure-diagnosis-details ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+
 .diff-details {
   margin-top: 14px;
   white-space: normal;

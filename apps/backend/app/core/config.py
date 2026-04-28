@@ -71,6 +71,10 @@ class Settings(BaseSettings):
     codegen_repair_files_per_round: int = 5
     codegen_repair_round_timeout_seconds: float = 180.0
     codegen_repair_cap_exceeded_to_approval: bool = True
+    failure_diagnosis_enabled: bool = True
+    failure_diagnosis_timeout_seconds: float = 30.0
+    failure_diagnosis_max_events: int = 30
+    failure_diagnosis_keyfile_head_chars: int = 500
     semantic_translator_provider: Literal["auto", "mock", "minimax"] = "auto"
     semantic_translator_model: str = "MiniMax-M2.7"
     semantic_translator_timeout_seconds: float = 30.0

@@ -1,6 +1,40 @@
 # Session Handoff
 
-Last updated: 2026-04-22
+Last updated: 2026-04-28
+
+## Session 2026-04-28: T-FAILURE-DIAGNOSIS
+
+### Session Boundary Manifest
+
+- Session-start tag attempted: `session-start/2026-04-28-0000`
+- Tag creation status: failed; sandbox user cannot write the common git dir at `D:/项目/Ops_agent_platform/.git` (`Permission denied` creating the tag lock).
+- Commit status: not committed for the same git-dir permission reason.
+- Working tree status: dirty, with this session's code changes still in the working tree.
+
+### Files touched
+
+- `apps/backend/app/core/config.py` - still in working tree
+- `apps/backend/app/core/enums.py` - still in working tree
+- `apps/backend/app/models/task.py` - still in working tree
+- `apps/backend/app/orchestrator/service.py` - still in working tree
+- `apps/backend/app/services/failure_diagnosis.py` - new, still in working tree
+- `apps/backend/app/services/failure_diagnosis_prompts.py` - new, still in working tree
+- `apps/backend/tests/services/test_failure_diagnosis.py` - new, still in working tree
+- `apps/backend/tests/orchestrator/test_failure_diagnosis_integration.py` - new, still in working tree
+- `apps/web/src/components/chat/AwaitingApprovalBlock.tsx` - new, still in working tree
+- `apps/web/src/components/chat/MessageList.tsx` - still in working tree
+- `apps/web/src/components/tasks/ApprovalPanel.tsx` - still in working tree
+- `apps/web/src/styles.css` - still in working tree
+- `SESSION_HANDOFF.md` - this manifest, still in working tree
+
+### Verification
+
+- Backend compile: passed via `C:\Users\Tomonkyo\AppData\Local\Python\bin\python.exe -m compileall apps/backend/app` using an absolute path.
+- Focused backend tests: passed, `tests.services.test_failure_diagnosis` (9 tests) and `tests.orchestrator.test_failure_diagnosis_integration` (4 tests).
+- Full backend unittest discovery: ran 160 tests; 151 passed, 8 failed, 1 errored. Failures are existing sandbox/git tests where `git init` cannot create refs under the non-ASCII `D:\项目...` path as rendered to Git (`D:/椤圭洰/...`), not in the new diagnosis tests.
+- Frontend verification: blocked. `npm --prefix ... exec` fails with `EPERM: lstat 'D:\项目'`, and `apps/web` has no local `node_modules/.bin/tsc.cmd` or `vite.cmd`; `npm run build` therefore cannot find `tsc`.
+
+---
 
 ## Session 2026-04-22: batch1 优化集成 + ship 到 main
 

@@ -1,5 +1,6 @@
 import type { Approval } from "../../types";
 import { formatDateTime, titleCase } from "../../lib/format";
+import { AwaitingApprovalBlock, readFailureDiagnosis } from "../chat/AwaitingApprovalBlock";
 
 interface ApprovalPanelProps {
   approvals: Approval[];
@@ -31,6 +32,7 @@ export function ApprovalPanel({
     <div className="stack">
       {approvals.map((approval) => {
         const isPending = approval.status === "pending";
+        const diagnosis = readFailureDiagnosis(approval.request_payload_json);
 
         return (
           <section className="detail-card" key={approval.id}>
@@ -62,6 +64,8 @@ export function ApprovalPanel({
                 <dd>{formatDateTime(approval.decided_at)}</dd>
               </div>
             </dl>
+
+            {diagnosis ? <AwaitingApprovalBlock diagnosis={diagnosis} /> : null}
 
             {approval.request_payload_json ? (
               <pre className="json-panel">{JSON.stringify(approval.request_payload_json, null, 2)}</pre>
