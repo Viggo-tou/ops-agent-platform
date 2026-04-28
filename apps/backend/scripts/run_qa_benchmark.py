@@ -45,7 +45,7 @@ from app.core.config import get_settings
 DEFAULT_DATASET_PATH = REPO_ROOT / "apps" / "backend" / "tests" / "benchmarks" / "qa_benchmark_dataset.jsonl"
 DEFAULT_OUT_DIR = REPO_ROOT / "apps" / "backend" / "tests" / "benchmarks" / "runs"
 TERMINAL_STATUSES = {"completed", "failed", "rolled_back"}
-QUESTION_TIMEOUT_SECONDS = 120.0
+QUESTION_TIMEOUT_SECONDS = 240.0
 POLL_INTERVAL_SECONDS = 1.0
 ANSWER_EXCERPT_MAX_BYTES = 2048
 ACTOR_ROLE = "employee"
@@ -782,6 +782,7 @@ def build_summary(
     records: Sequence[dict[str, Any]],
     infrastructure_failed: bool,
     running: bool,
+    question_timeout_seconds: float,
 ) -> dict[str, Any]:
     abc_records = [record for record in records if record["tier"] in {"A", "B", "C"}]
     abc_completed = sum(1 for record in abc_records if record["completed"])
@@ -798,7 +799,7 @@ def build_summary(
         "artifact_path": str(out_path),
         "backend_url": backend_url,
         "actor_name": actor_name,
-        "question_timeout_s": QUESTION_TIMEOUT_SECONDS,
+        "question_timeout_s": question_timeout_seconds,
         "requested_judge_mode": requested_judge_mode,
         "judge_model": judge.judge_model,
         "judge_modes_used": judge_modes_used,
@@ -831,6 +832,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR), help="Directory where JSONL run artifacts are written.")
     parser.add_argument("--actor-name", default="qa-benchmark", help="Actor name sent to the backend task API.")
     parser.add_argument("--limit", type=int, default=None, help="Only run the first N dataset rows.")
+    parser.add_argument(
+        "--question-timeout",
+        type=float,
+        default=QUESTION_TIMEOUT_SECONDS,
+        help=(
+            "Per-question backend polling deadline in seconds. Each question that "
+            "stays running past this is marked timed_out. Default 240s; raise if "
+            "synthesis is slow under heavy load."
+        ),
+    )
     parser.add_argument(
         "--judge-samples",
         type=int,
@@ -889,6 +900,7 @@ def main() -> int:
             records=records,
             infrastructure_failed=True,
             running=False,
+            question_timeout_seconds=args.question_timeout,
         )
         write_artifact(out_path, summary, records)
         print(str(exc), file=sys.stderr)
@@ -911,7 +923,9 @@ def main() -> int:
                 task_id = str(created_task.get("id") or "").strip() or None
                 if not task_id:
                     raise InfrastructureError(f"Task creation for {row.id} returned no task id")
-                final_task, duration_s, timed_out = client.poll_task(task_id)
+                final_task, duration_s, timed_out = client.poll_task(
+                    task_id, timeout_seconds=args.question_timeout
+                )
                 if timed_out or final_task is None:
                     task_status = "timed_out"
                     keypoint_hits = [False] * len(row.expected_answer_keypoints)
@@ -995,6 +1009,7 @@ def main() -> int:
                 records=records,
                 infrastructure_failed=infrastructure_failed,
                 running=True,
+                question_timeout_seconds=args.question_timeout,
             )
             write_artifact(out_path, running_summary, records)
             print(
@@ -1017,6 +1032,7 @@ def main() -> int:
         records=records,
         infrastructure_failed=infrastructure_failed,
         running=False,
+        question_timeout_seconds=args.question_timeout,
     )
     write_artifact(out_path, summary, records)
 
