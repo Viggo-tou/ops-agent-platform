@@ -918,6 +918,73 @@ T-QA-ACCURACY-BENCHMARK 的实现 + 首次基线已完成，**全部在 `feat/qa
 
 ---
 
+## Phase AF — 内部里程碑：CC agentic 实现 + 验证 +22.59 分（2026-04-28）✅
+
+### 做了什么
+
+**这是项目第一个用 benchmark 数字证明"方向对"的 phase**。今天一天里：
+1. dispatch codex 实现 T-KB-CC-AGENTIC-RETRIEVAL（Phase 3.0 替换原 AST chunking 方案）
+2. 同时 dispatch 实现 T-FAILURE-DIAGNOSIS（Phase 6 + 1）
+3. 把 cc-agentic + qa-benchmark 两条 feature 分支合并跑联合 baseline
+4. 第一次 baseline 跌到 17.82（vs 旧 RAG 27.06，**退步**）；instrument OpenTelemetry spans 发现 80s 卡在 `_synthesize_or_template` 不在 CC agent
+5. 应用 J（runner timeout 120→240s）+ P（synthesis snippet cap 6000→3000，纯 .env 覆盖）
+6. 重跑 baseline：**mean 49.65 / 完成 34/34 / C-tier 70.62（接近翻倍）**
+
+**也建立了项目级两条新规矩**：
+- `docs/ai/STAGE_LOG.md` 强制纪律（CLAUDE.md 写死）：每开 stage / dispatch / 完成都写一条 append-only 流水
+- `docs/ai/benchmarks/qa-baseline-2026-04-28.md` 作为 PR gate forcing function：以后任何 Phase 3+ 的优化 ticket，PR 必须 cite before/after benchmark 数字
+
+### 原理
+
+**为什么 CC agentic 比 RAG 强**：
+
+旧路径是单路 BM25 retrieval —— 给 query "Login.js 怎么处理认证"，BM25 拿命中行 ±2 行窗口。结果 imports 含 `firebase` 字面量得分高，**handleLogin 函数体却完全拿不到**（函数体里用的是 `database/ref/get/child`，不带 `firebase` 字面量）。合成 LLM 看着空 imports 写不出真答案。
+
+新路径让 LLM agent 在真实文件树上**主动 grep + read**：拿到 query → glob/grep 找候选文件 → read 关键文件 → 拼合答案。关键不在"算法更聪明"，在"agent 能看到真实代码全貌而不是 chunk 边界切碎的片段"。
+
+**为什么 P（snippet cap 3000）至关重要**：
+
+CC agent 拿 evidence 时会做 `cc_read` 整文件，单文件能到 9700 字符。4 个 citation × 9000 字符 = 36KB prompt，MiniMax 合成 80 秒。把 cap 设到 3000，单 citation 截断到 3000 字符，4×3000 = 12KB prompt，合成降到 60s。
+
+**为什么 D-tier（多跳）反而退步**：
+
+D-tier 真就需要长 snippet 来跟踪跨函数调用链。第一次 CC 跑 D max 拿 78 分（一个完美的多跳回答），加 cap 后 D max 降到 42。**这是 quality 和 latency 的真实 trade-off，数据上验证清楚**——后续要做 tier-aware cap（D=6000 ABC=3000）。
+
+**为什么不写成"portfolio milestone"**：
+
+老实说今天的进步是**内部信号**，不是外部认证。差距：
+- 只 1 个 repo（handyman dashboard 62 docs），没有跨多 repo 验证
+- claude_code 自己当 judge 评 claude_code 写的代码，**有自评偏差**
+- 没接 industry benchmark（SWE-bench / HumanEval）做横向对照
+- 只 1 个 synthesis provider（minimax），没换 model 测稳定性
+
+**Strong 内部信号 → 方向认证**，不是"外部 portfolio 级"。后面如果要往 portfolio 推，至少要补 multi-repo + 独立 judge + industry benchmark 这三条。
+
+### 怎么验证
+
+- `git log --first-parent feat/kb-cc-agentic | grep -E "(CC-AGENTIC|RUNNER-TIMEOUT|qa-baseline-2026-04-28)"` 看到 4 条 commit（`6797098` / `2576033` / `7a34c37` / `c090419`）
+- `cat docs/ai/benchmarks/qa-baseline-2026-04-28.md` 看完整数字（A 56.50 / B 37.60 / C 70.62 / D 30.33 / mean 49.65）
+- `apps/backend/tests/benchmarks/runs/qa-run-20260428T093042Z.jsonl` artifact 有 1 summary + 34 question records，`completed_questions=34, timed_out_questions=0`
+- baseline 报告 **acceptance check** 段：4 个目标里完成 2 个（completion + mean）✅，2 个未达（D-tier 30.33 vs 40 / runtime 71min vs 45min）❌
+
+### 已知遗留 + 后续 ticket
+
+| Follow-up ticket | 解决什么 |
+|---|---|
+| `T-KB-EVIDENCE-TIER-CAP` | tier-aware snippet cap（D=6000 / ABC=3000）让 D 重回 40+ |
+| `T-KB-CLI-POOL` | pre-spawn `claude` CLI 进程省 5s/call 冷启动，runtime 71→50min |
+| `T-KB-HYBRID-RAG-FAST-PATH` | A/B 走 RAG 13-18s + C/D 走 CC，runtime 71→35min |
+| `T-MERGE-CC-AGENTIC-INTO-MAIN` | 把 cc-agentic + failure-diagnosis + benchmark 三条 feature 分支整合回 checkpoint/main |
+| `T-WINDOWS-ASCII-PATH-DEBT` | 解决 `D:\项目\` 中文路径系统性 bug（git tag / mojibake / Java I/O 都受影响）|
+
+### 跟"以后所有优化必须有数字"的关联
+
+今天这一波是**第一次完整闭环**：写 spec → dispatch → 第一次跑数字（17.82 退步）→ 不慌不忙诊断 → 改 J+P → 第二次跑数字（49.65 大涨）→ 锁 baseline。
+
+**这个 working pattern 应当成为模板**：spec 必须带 acceptance criteria（数字目标），实现完跑 baseline，benchmark 数字达标才能 commit / merge。后面 Phase 3.1 / 3.3 / 3.4 / 5.4 都按这个 pattern 推。
+
+---
+
 ## 全景路线图
 
 ```
@@ -954,6 +1021,7 @@ AB = codegen.repair 多轮 + 超 cap 转审批
 AC = T-CHAT-APPROVAL-UX 前端审批块（worktree only）
 AD = T-QA-ACCURACY-BENCHMARK + 第一次诚实基线 27.06%（worktree only）
 AE = 战略 specs + STAGE_LOG 纪律 + L1 worktree audit
+AF = CC agentic 实现 + 验证 +22.59 分（49.65 vs 27.06 baseline，方向认证）★
 ```
 
 Phase H 是功能层和可观测层的衔接点。Phase M 是打通端到端 demo 的关键。Phase O 是用户体验的收尾。Phase P 让 demo 能用真正的强代码模型跑通。Phase Q-W 把流水线从"能跑"推进到"可观测、可压测、方向正确、前端友好"的阶段。
