@@ -540,13 +540,62 @@ a3f0cf4  Merge branch 'feat/repair-cap-impl' (pre-existing)
 ### Stage 11 — Dispatch T-KB-EVIDENCE-TIER-CAP (D-tier 重回 40+)
 
 **Open:** 2026-04-28 ~20:50 (UTC+10) by Claude
+**Status:** CLOSED-PARTIAL
+**Layer:** L2 (架构) → Phase 3.0 修订（部分推进）
+**Timebox:** ~100 分钟（实际：~3 小时）
+**Trigger:** D-tier 30.33 < 40 target → tier-aware cap 应回血。
+
+#### 步骤摘要
+- dispatch codex → commit `9be1ccf` on `feat/kb-evidence-tier-cap`（5 文件 +182 −18，17/17 焦点测试过）
+- benchmark `--judge-mode auto`（错误，应该 pin）→ artifact `qa-run-20260428T135735Z.jsonl`
+
+#### Close 摘要（PARTIAL）
+**Close:** 2026-04-29 ~01:30
+**结果:**
+
+| Tier | PREV(J+P) | NEW(v1) | Δ |
+|---|---|---|---|
+| A | 56.50 | 53.50 | -3.00 |
+| B | 37.60 | 38.80 | +1.20 |
+| C | **70.62** | **54.88** | **-15.75 ★** |
+| D | 30.33 | **41.00** | **+10.67 ✅** |
+| mean | 49.65 | 47.29 | -2.36 |
+
+**D 命中 40 target ✅，但 C 大幅退步，整体 mean 退步 -2.36**。
+
+**根因（多因混合）:**
+1. Keyword 分类器漏 C-tier ("which components use X" 类没匹配到 multi-hop 关键词)
+2. Judge 不一致（baseline `auto` 实际 claude_code-only；这次 `auto` fallback 到 codex/minimax，judge variance ~5-10 pt/题）
+3. 题目级 variance + synthesis evidence selection 噪音
+
+**判定:**
+- `9be1ccf` 是 **experimental，不接受为新基线**
+- 49.65 仍是 reference baseline（但需重测 with pinned judge 确认）
+- 机制本身（tier-aware cap）方向对，但**实现需 invert 默认**：default 6000，narrow 3000 only on strong locate signal
+- benchmark 必须 pin judge + pin synthesis provider
+
+**Lesson:**
+1. **一次实验只改一个变量**：这次 cap policy + judge policy 同时变，对比无意义
+2. **invert default = conservative bias**：不能信任分类器穷尽所有 query 模式
+3. **benchmark methodology 必须先文档化再执行**：判 judge auto vs pin、synthesis provider lock、模型版本 stamp 都要预先写死
+
+**没做的（→ Stage 12）:**
+- 不 merge `feat/kb-evidence-tier-cap` 到 checkpoint
+- 不更新 phase-summary（partial 不够格写 Phase 入口）
+
+---
+
+### Stage 12 — T-KB-EVIDENCE-TIER-CAP v2 (binary + invert + pinned)
+
+**Open:** 2026-04-29 ~01:35 (UTC+10) by Claude
 **Status:** OPEN
-**Layer:** L2 (架构) → 推进 **Phase 3.0 修订**：tier-aware snippet cap
-**Timebox:** ~100 分钟（codex 15-25 + benchmark verify ~80）
-**Trigger:** 用户回 "go"。Phase AF 数据显示 D-tier 30.33 < 40 target，因为 cap=3000 全局适用。Spec 已就绪在 `docs/ai/tasks/T-KB-EVIDENCE-TIER-CAP.md`，174 行 + 9 测试。
+**Layer:** L2 (架构) → Phase 3.0 完成
+**Timebox:** ~150 分钟（spec 15 + dispatch 15 + benchmark 90 + analyze 30；并行 metrics spec 写）
+**Trigger:** Stage 11 partial。机制对，policy 错（默认窄）+ judge 不锁。
 
 #### 步骤
-- 20:50 entry 写入 STAGE_LOG（本条）
+- 01:35 entry 写入 STAGE_LOG（本条）
+
 
 
 
