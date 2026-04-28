@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
 import time
@@ -25,6 +26,7 @@ from app.schemas.evidence import EvidenceItem
 from app.schemas.knowledge import KnowledgeClaim
 from app.services.events import commit_checkpoint, record_event, set_task_status
 from app.services.evidence_chain import EvidenceChainReport, check_evidence_chain
+from app.services.failure_diagnosis import FailureKind, run_diagnosis
 from app.services.sandbox import ExecutionSandbox, SandboxError
 from app.services.spec_conformance import (
     ConformanceReport,
@@ -33,6 +35,8 @@ from app.services.spec_conformance import (
 )
 from app.services.task_workspace import TaskWorkspace
 from app.tools.gateway import ToolApprovalRequired, ToolGateway, ToolInvocationError
+
+logger = logging.getLogger("orchestrator")
 
 
 class RepairRoundTimeout(Exception):
@@ -5489,6 +5493,7 @@ class PrimaryOrchestrator:
                 "residual_error_count": len(residual_errors),
             },
         )
+        self._run_failure_diagnosis(task, failure_kind="compile_repair_cap_exceeded")
         commit_checkpoint(self.db, label="awaiting_approval_compile_repair_cap")
 
     def _fail_develop_pipeline(
@@ -5541,6 +5546,21 @@ class PrimaryOrchestrator:
             "pipeline.failed",
             {"message": message, "stage": stage.value if hasattr(stage, "value") else str(stage)},
         )
+        self._run_failure_diagnosis(task, failure_kind="tool_failed_terminal")
+
+    def _run_failure_diagnosis(self, task: Task, *, failure_kind: FailureKind) -> None:
+        try:
+            run_diagnosis(
+                task=task,
+                db=self.db,
+                settings=self.tool_gateway.settings,
+                failure_kind=failure_kind,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "failure diagnosis hook failed",
+                extra={"task_id": task.id, "error": str(exc)[:300]},
+            )
 
     @staticmethod
     def _count_changed_files(codegen_result: dict[str, object]) -> int:

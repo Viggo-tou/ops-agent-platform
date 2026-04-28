@@ -1,6 +1,7 @@
 import { EventTimeline } from "./EventTimeline";
 import { ThinkingIndicator } from "./ThinkingIndicator";
 import { TypingText } from "./TypingText";
+import { AwaitingApprovalBlock, readFailureDiagnosis } from "./AwaitingApprovalBlock";
 import { countDiffFiles, DiffViewer } from "./DiffViewer";
 import { readKnowledgeSearchResult } from "../tasks/KnowledgeResultPanel";
 import { readTaskPlanDocument } from "../tasks/PlanBreakdown";
@@ -181,6 +182,7 @@ export function MessageList({ task, tasks, eventsMap }: MessageListProps) {
           messageTask.status === "completed" && Date.now() - new Date(messageTask.updated_at).getTime() < 30_000;
         const shouldAnimate = isLastTask && justCompleted;
         const agentReply = buildAgentReply(messageTask);
+        const failureDiagnosis = readFailureDiagnosis(messageTask.latest_result_json);
         const developDiff = readDevelopDiff(messageTask, agentReply);
         const replyText = developDiff ? stripDiffFences(agentReply) : agentReply;
         return (
@@ -201,6 +203,7 @@ export function MessageList({ task, tasks, eventsMap }: MessageListProps) {
               ) : (
                 <div className="message-bubble">
                   <div className="message-content">
+                    {failureDiagnosis ? <AwaitingApprovalBlock diagnosis={failureDiagnosis} /> : null}
                     {replyText ? <TypingText text={replyText} enabled={shouldAnimate} /> : null}
                     {developDiff ? (
                       <details className="diff-details" open>
