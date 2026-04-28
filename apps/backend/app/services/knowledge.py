@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import shutil
 from collections import Counter
@@ -81,6 +82,7 @@ IGNORED_FILENAMES = frozenset({
     "firebase-debug.log",
 })
 _EVIDENCE_CHUNK_KINDS = set(ChunkKind.__args__)
+logger = logging.getLogger(__name__)
 
 
 def _is_ignored_path(file_path: Path) -> bool:
@@ -292,6 +294,17 @@ class KnowledgeService:
         source_names = [spec.name for spec in selected_sources]
         documents_stmt = select(KnowledgeDocument).where(KnowledgeDocument.source_name.in_(source_names))
         documents = list(self.db.scalars(documents_stmt))
+
+        cc_result = self._try_cc_agentic_retrieval(
+            query=query,
+            top_k=top_k,
+            route=route,
+            selected_sources=selected_sources,
+            documents=documents,
+            language=language,
+        )
+        if cc_result is not None:
+            return cc_result
 
         query_tokens = _tokenize(query)
         expanded_tokens = _expand_tokens(query_tokens)
@@ -1039,6 +1052,228 @@ class KnowledgeService:
                 )
             )
         return evidence_items
+
+    def _try_cc_agentic_retrieval(
+        self,
+        *,
+        query: str,
+        top_k: int,
+        route: QueryRoute,
+        selected_sources: list[SourceSpec],
+        documents: list[KnowledgeDocument],
+        language: str | None,
+    ) -> KnowledgeSearchResult | None:
+        if not bool(getattr(self.settings, "cc_agentic_enabled", True)):
+            return None
+        if len(selected_sources) != 1:
+            return None
+
+        from app.services.cc_agent_loop import CCAgentBudget, run_cc_agent
+
+        source_spec = selected_sources[0]
+        raw_chain = str(getattr(self.settings, "cc_agent_provider_chain", "claude_code,codex,minimax") or "")
+        provider_chain = [item.strip() for item in raw_chain.split(",") if item.strip()]
+        budget = CCAgentBudget(
+            max_rounds=int(getattr(self.settings, "cc_agent_max_rounds", 3)),
+            max_tool_calls=int(getattr(self.settings, "cc_agent_max_tool_calls", 8)),
+            overall_timeout_s=float(getattr(self.settings, "cc_agent_overall_timeout_s", 30.0)),
+            per_call_timeout_s=float(getattr(self.settings, "cc_agent_per_call_timeout_s", 20.0)),
+        )
+        try:
+            result = run_cc_agent(
+                query,
+                cwd=source_spec.path,
+                budget=budget,
+                provider_chain=provider_chain,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("cc_agent crashed, falling back to RAG: %s", exc)
+            return None
+
+        if not result.evidence_items:
+            logger.warning("cc_agent fell back to RAG: %s", result.fallback_reason or "empty_evidence")
+            return None
+        if result.fallback_reason in {"all_providers_failed", "overall_timeout"}:
+            logger.warning("cc_agent fell back to RAG: %s", result.fallback_reason)
+            return None
+
+        citations = self._cc_evidence_to_citations(
+            evidence_items=result.evidence_items[:top_k],
+            source_spec=source_spec,
+        )
+        if not citations:
+            logger.warning("cc_agent fell back to RAG: evidence_not_citable")
+            return None
+
+        logger.info(
+            "cc_agent provider_used=%s rounds=%d tool_calls=%d duration=%.2fs",
+            result.decision_model,
+            result.rounds_run,
+            result.tool_calls_made,
+            result.duration_ms / 1000,
+        )
+        return self._build_result_from_citations(
+            query=query,
+            citations=citations,
+            evidence_items=result.evidence_items[:top_k],
+            route=route,
+            source_spec=source_spec,
+            selected_sources=selected_sources,
+            indexed_document_count=len(documents),
+            top_k=top_k,
+            language=language,
+            answer_provider_suffix=result.decision_model or "unknown",
+        )
+
+    def _cc_evidence_to_citations(
+        self,
+        *,
+        evidence_items: list[EvidenceItem],
+        source_spec: SourceSpec,
+    ) -> list[KnowledgeCitation]:
+        citations: list[KnowledgeCitation] = []
+        for index, item in enumerate(evidence_items):
+            path = source_spec.path / item.file_path
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                content = item.snippet or ""
+            lines = content.splitlines()
+            line_count = max(len(lines), 1)
+            line_start = item.line_start or 1
+            line_end = item.line_end or line_count
+            if line_start < 1:
+                line_start = 1
+            if line_end < line_start:
+                line_end = line_start
+
+            snippet = item.snippet
+            if not snippet and lines:
+                radius = int(getattr(self.settings, "knowledge_chunk_fallback_radius", 10))
+                start_index = max(line_start - 1 - radius, 0)
+                end_index = min(line_start + radius, len(lines))
+                snippet = "\n".join(lines[start_index:end_index])
+                line_start = start_index + 1
+                line_end = end_index
+            if not snippet:
+                snippet = content[: int(getattr(self.settings, "knowledge_synthesis_max_snippet_chars", 6000))]
+
+            citations.append(
+                KnowledgeCitation(
+                    document_id=item.id,
+                    source_name=source_spec.name,
+                    title=Path(item.file_path).name,
+                    relative_path=item.file_path,
+                    line_start=line_start,
+                    line_end=line_end,
+                    snippet=snippet,
+                    score=round(float(item.confidence) * 100.0, 2),
+                    metadata={
+                        **item.metadata,
+                        "chunk_kind": item.chunk_kind,
+                        "retrieval_channel": item.retrieval_channel,
+                        "evidence_source": item.source,
+                        "rank": index,
+                    },
+                )
+            )
+        return citations
+
+    def _build_result_from_citations(
+        self,
+        *,
+        query: str,
+        citations: list[KnowledgeCitation],
+        evidence_items: list[EvidenceItem],
+        route: QueryRoute,
+        source_spec: SourceSpec,
+        selected_sources: list[SourceSpec],
+        indexed_document_count: int,
+        top_k: int,
+        language: str | None,
+        answer_provider_suffix: str,
+    ) -> KnowledgeSearchResult:
+        query_tokens = _tokenize(query)
+        selected_paths = [citation.relative_path for citation in citations]
+        matched_tokens = sorted(
+            {
+                token
+                for token in query_tokens
+                if any(
+                    token.lower() in citation.relative_path.lower()
+                    or token.lower() in citation.snippet.lower()
+                    for citation in citations
+                )
+            }
+        )
+        token_coverage = round(len(matched_tokens) / max(len(set(query_tokens)), 1), 2) if query_tokens else 0.0
+        top_score = max((citation.score for citation in citations), default=0.0)
+        hallucination_risk, rationale = self._assess_risk(
+            citation_count=len(citations),
+            token_coverage=max(token_coverage, 0.5 if citations else 0.0),
+            top_score=top_score,
+        )
+        answer, answer_provider = self._synthesize_or_template(
+            query=query,
+            citations=citations,
+            hallucination_risk=hallucination_risk,
+            route_kind=route.kind,
+            language=language,
+        )
+        claims = []
+        ungrounded_claim_count = 0
+        if answer_provider != "template":
+            from app.services.claim_extraction import extract_claims
+
+            answer, claims, ungrounded_claim_count = extract_claims(
+                raw_synthesis=answer,
+                citation_count=len(citations),
+            )
+        packaged_context = "\n\n".join(
+            [
+                f"[{citation.source_name}:{citation.relative_path}:{citation.line_start}-{citation.line_end}]\n{citation.snippet}"
+                for citation in citations
+            ]
+        )
+        return KnowledgeSearchResult(
+            query=query,
+            answer=answer,
+            citations=citations,
+            claims=claims,
+            evidence_items=evidence_items,
+            ungrounded_claim_count=ungrounded_claim_count,
+            answer_trace=KnowledgeAnswerTrace(
+                source_name=source_spec.name,
+                source_path=str(source_spec.path),
+                selected_sources=[spec.name for spec in selected_sources],
+                strategy="cc_agentic_retrieval",
+                route_kind=route.kind,
+                route_reason=route.reason,
+                top_k=top_k,
+                indexed_document_count=indexed_document_count,
+                selected_paths=selected_paths,
+                matched_tokens=matched_tokens,
+                token_coverage=token_coverage,
+                top_score=top_score,
+                citation_count=len(citations),
+                hallucination_risk=hallucination_risk,
+                rationale=rationale,
+                answer_provider=f"{answer_provider}+cc_agent:{answer_provider_suffix}",
+                rerank_enabled=False,
+                rerank_pool_size=None,
+                query_rewrite_enabled=False,
+                query_rewrite_added_tokens=0,
+                synthesis_max_snippet_chars=(
+                    int(getattr(self.settings, "knowledge_synthesis_max_snippet_chars", 0))
+                    if answer_provider != "template" else None
+                ) or None,
+                synthesis_prompt_version=None,
+                synthesis_model=(
+                    str(getattr(self.settings, "knowledge_synthesis_model", "") or "") or None
+                ) if answer_provider != "template" else None,
+            ),
+            packaged_context=packaged_context,
+        )
 
     @staticmethod
     def _assess_risk(*, citation_count: int, token_coverage: float, top_score: float) -> tuple[str, str]:
