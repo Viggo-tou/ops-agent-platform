@@ -535,6 +535,20 @@ a3f0cf4  Merge branch 'feat/repair-cap-impl' (pre-existing)
 - Phase 4 防御矩阵 ✅
 - 其它未启
 
+---
+
+### Stage 11 — Dispatch T-KB-EVIDENCE-TIER-CAP (D-tier 重回 40+)
+
+**Open:** 2026-04-28 ~20:50 (UTC+10) by Claude
+**Status:** OPEN
+**Layer:** L2 (架构) → 推进 **Phase 3.0 修订**：tier-aware snippet cap
+**Timebox:** ~100 分钟（codex 15-25 + benchmark verify ~80）
+**Trigger:** 用户回 "go"。Phase AF 数据显示 D-tier 30.33 < 40 target，因为 cap=3000 全局适用。Spec 已就绪在 `docs/ai/tasks/T-KB-EVIDENCE-TIER-CAP.md`，174 行 + 9 测试。
+
+#### 步骤
+- 20:50 entry 写入 STAGE_LOG（本条）
+
+
 
 
 
