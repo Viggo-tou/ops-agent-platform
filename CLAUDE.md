@@ -10,6 +10,7 @@ Before changing code in a new session, read:
 4. `DECISIONS.md`
 5. `TASK_QUEUE.md`
 6. `SESSION_HANDOFF.md`
+7. **`docs/ai/STAGE_LOG.md`** — stage-级活动流水，最新进度在底部。session 启动时**必读**最后 5-10 个 entry。
 
 ## Session Boundary Discipline (MANDATORY — read before any edit)
 
@@ -18,6 +19,24 @@ See `AGENTS.md` → "Session Boundary Discipline" for the full rules. Summary:
 1. **At session start:** run `git status --short` + `git log --oneline -5`, then create `git tag session-start/YYYY-MM-DD-HHMM` on current HEAD. Announce the tag in your first response.
 2. **At session end:** either commit (preferred) OR append a manifest to `SESSION_HANDOFF.md` listing files touched + `git diff --stat <tag>..HEAD -- <file>` per file. No exceptions.
 3. **Why:** repo currently has only one commit (`940b232`). Multiple prior sessions left work uncommitted, so no git operation can separate "this session's work" from "everything prior". The tag + manifest ritual makes future sessions recoverable even without committing.
+
+## Stage Log Discipline (MANDATORY — 2026-04-28 added)
+
+`docs/ai/STAGE_LOG.md` is **append-only** and **the only reliable source-of-truth for "what's actually in flight right now"**. Session-handoff is too coarse; phase-summary is too coarse. Stage = a focused unit of work between them.
+
+**Rules**:
+
+1. **Open a stage** before starting any non-trivial unit of work. Append `Stage <N>` entry with status `OPEN`, layer (L1-L4), trigger, timestamp. Use the template at the top of `STAGE_LOG.md`.
+2. **Update the stage** every time you:
+   - dispatch a codex / minimax task
+   - finish a sub-step (commit, file written, gate ran, benchmark scored)
+   - hit a blocker
+   Append a sub-bullet under that stage's "步骤" with timestamp + fact (not plan).
+3. **Close the stage** with `CLOSED-DONE` / `CLOSED-DROPPED` / `BLOCKED` and fill the "Close 摘要" block: 结果 / 产出文件 / 没做的 / Lesson.
+4. **Never edit old entries**. If a closed stage was wrong, open a new stage with `Trigger: revisit Stage <N> because ...`.
+5. **Read on session-start**: read at least the last 5-10 entries of `STAGE_LOG.md` before announcing your session-start tag. The log tells you what's open / dispatched / blocked right now.
+
+**Why**: today's evidence — Claude (me) wrote 5 fresh specs without realizing 3 of them duplicated work already done in worktrees, because there was no flat append-only log to scan. STAGE_LOG.md fixes that. **Without this discipline, every new session re-discovers the same things and re-proposes the same tickets.**
 
 ## Current Project State
 
