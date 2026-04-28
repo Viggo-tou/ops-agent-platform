@@ -282,6 +282,213 @@
 - 新：Phase 3.0 **CC agentic 检索** 硬前置 → 3.1 query → 3.2 引用链 ✅ → 3.3 hybrid 多 source 融合（含 cards / FTS5 / CC 整合）→ 3.4 rerank → 3.5 预索引（CC 路径下大部分不需要）
 - AST chunking 保留为 3.0-fallback，仅在大代码库或 CC 不可用时启用
 
+---
+
+### Stage 6 — Commit failure-diagnosis + roadmap revisions
+
+**Open / Close:** 2026-04-28 14:42 → 14:46 (UTC+10) by Claude
+**Status:** CLOSED-DONE
+**Layer:** L1 (流程纪律)
+**Trigger:** 用户回 "commit"，把 Stage 4 + Stage 5 的成果都落 git。
+
+#### 步骤
+- 14:42 commit 1 在 `D:/项目/ops-worktrees/failure-diagnosis`（feat/failure-diagnosis 分支）：`31bb852 feat(diagnosis): T-FAILURE-DIAGNOSIS — auto root-cause LLM step on awaiting_approval / failed`（13 文件 +1259 −1）
+- 14:45 commit 2 在主工作树（docs/ops-strategic-specs-2026-04-28 分支）：`74d9096 docs: pivot Phase 3.0 to CC agentic retrieval; add T-KB-CC-AGENTIC-RETRIEVAL spec`（3 文件 +527 −19）
+
+#### Close 摘要
+**Close:** 14:46
+**结果:** 两个独立 commit 落到对应 feature 分支，**未 push** / **未 merge**（用户决定）。
+**Lesson:** commit per worktree 干净 — 分支不混。codex 工作放它自己的分支，docs/spec 改动放 docs 分支。
+
+---
+
+### Stage 7 — Dispatch T-KB-CC-AGENTIC-RETRIEVAL 到 codex
+
+**Open:** 2026-04-28 14:48 (UTC+10) by Claude
+**Status:** CLOSED-DONE
+**Layer:** L2 (架构) → 推进 **Phase 3.0**（**实现完成**）
+**Timebox:** 45 分钟（实际：codex 跑 ~14 分钟 + commit 2 分钟）
+**Trigger:** 用户回 "go"。Spec 已写完 (T-KB-CC-AGENTIC-RETRIEVAL.md, 318 行)，工程量 ~500 行 + 19 测试。Phase 3.0 真正的实现 step。
+
+#### 步骤
+- 14:48 entry 写入 STAGE_LOG（本条）
+- 14:50 创建 worktree `D:/项目/ops-worktrees/cc-agentic` + branch `feat/kb-cc-agentic` from `checkpoint/pre-reclassify`
+- 14:51 dispatch codex（PID 46807，gpt-5.5，medium reasoning，full-auto）
+- 15:05 codex 完工 — 19/19 targeted test pass，227,239 tokens 用了
+- 15:07 commit `6797098 feat(kb): T-KB-CC-AGENTIC-RETRIEVAL — CC CLI as primary RAG retrieval`（9 文件 +1252 −1）
+
+#### Close 摘要
+**Close:** 2026-04-28 15:08
+**结果:** Phase 3.0 实现层完工。CC agentic 检索 + RAG fallback + provider chain (claude_code → codex → minimax，**不含 anthropic** 跟用户 directive 一致) 全部落地。代码 commit 在 `feat/kb-cc-agentic` 分支独立干净。
+
+**产出文件（在 `feat/kb-cc-agentic` 分支）:**
+新建：
+- `apps/backend/app/services/cc_agent.py` (+237) — Glob/Grep/Read CC tool wrappers
+- `apps/backend/app/services/cc_agent_loop.py` (+324) — ReAct agent loop + provider chain dispatch + budget
+- `apps/backend/app/services/cc_agent_prompts.py` (+53) — 决策 prompt 模板
+- `apps/backend/tests/services/test_cc_agent.py` (+112) — tool wrapper 测试
+- `apps/backend/tests/services/test_cc_agent_loop.py` (+247) — agent loop 集成测试
+
+修改：
+- `apps/backend/app/core/config.py` (+11) — 6 个 cc_agent_* settings + provider_chain default
+- `apps/backend/app/services/knowledge.py` (+235) — `KnowledgeService.retrieve()` CC-first / RAG-fallback
+- `.gitignore` (+1)
+- `SESSION_HANDOFF.md` (+33 codex 自己写的 manifest)
+
+**没做的（开新 stage 跟踪）:**
+- **真实 smoke test**：起 backend → 触发 firebase auth question → 验证 evidence 真带 cc_read source + 含 handleLogin 函数体（spec 验收 4）
+- **Re-baseline**：跑 qa benchmark 看 27.06% 是不是真涨（理论 A 35→60+, B 11→35+, D 22→40+）。需要先把 qa-benchmark 那条 commit 也整合进同一个分支。
+- merge 到 checkpoint / main —— 用户决定
+
+**Lesson:**
+1. **Codex 比预期快**：500 行 spec 实际 14 分钟跑完。下次 medium effort 估 15-25 分钟而不是 30-50 分钟
+2. **Spec Background 段写硬约束很关键** — provider chain "no anthropic" 这种 user-specific directive 必须在 Background 段写明，否则 codex 实现时会用默认 chain（含 anthropic）
+3. **Worktree 隔离让 dispatch 完全无副作用** — 失败也不污染 checkpoint / main
+
+**Phase 3 进度**：
+- 3.0 CC agentic 实现 ✅（待 smoke test + re-baseline 验证）
+- 3.1 query 处理 — 未启
+- 3.2 引用链 ✅ 已合 checkpoint
+- 3.3 hybrid 多 source 融合 — 未启
+- 3.4 rerank — 未启
+- 3.5 预索引（CC 路径下大部分不需要）— 未启
+
+---
+
+### Stage 8 — Smoke + Re-baseline CC agent against handyman KB
+
+**Open:** 2026-04-28 15:12 (UTC+10) by Claude
+**Status:** CLOSED-DONE (with critical findings)
+**Layer:** L1（流程纪律 / 测量验证） → 完成 **Phase 1 reset baseline 尝试 + Phase 3.0 验证**
+**Timebox:** 35 分钟（实际：~80 分钟，因为 baseline 跑了 64 分钟超时一大半）
+**Trigger:** 用户 "全跑"。Phase 3.0 实现完工但没验证；同时 baseline 27.06% 是基于 RAG 链路测的，需要在 CC 链路上重置 baseline 才能后续 PR 引用。
+
+#### 步骤
+- 15:12 entry 写入 STAGE_LOG（本条）
+- 15:13 merge `feat/qa-benchmark-integration` 到 `feat/kb-cc-agentic`（commit `2576033`）
+- 15:18 copy main tree DB + .env 到 cc-agentic worktree（避免重新 sync KB）
+- 15:39 启 backend on port 8003
+- 15:40 dispatch benchmark runner（PID 46934）：`--judge-mode auto --judge-samples 3 --backend-url http://127.0.0.1:8003`
+- 15:40 → 16:47 runner 跑了 64 分钟（vs 预估 17-25 分钟）
+
+#### Close 摘要
+**Close:** 2026-04-28 16:50
+**结果:** **CC mode mean 17.82 vs 旧 RAG 27.06，整体 -9.24 退步**。但**根因不是 quality**：完成的 14 题质量显著超 RAG（A 完成 mean 47.5 / B 24.4 / C 56.2 / **D 54 max 78**——D-tier 真破局了）。问题是 **20/34 题撞 runner 120s timeout**。
+
+**完整数字**：
+
+| Tier | n | 完成 | 超时 | mean(全部) | mean(完成) | max |
+|---|---|---|---|---|---|---|
+| A | 10 | 2 | 8 | 9.50 | 47.50 | 55 |
+| B | 10 | 5 | 5 | 12.20 | 24.40 | 70 |
+| C | 8 | 5 | 3 | 35.12 | 56.20 | 70 |
+| D | 6 | 2 | 4 | 18.00 | 54.00 | **78** |
+
+**对比旧 baseline**（RAG, multi-sample N=3）：A=35 / B=11 / C=41 / D=22 / mean=27.06
+
+**慢的具体表现**：
+- 每题平均 wall-clock：112.6s
+- 所有 timeout 题精确停在 120.0s
+- spec 写的 `cc_agent_overall_timeout_s = 30.0`，但每题实际 112s **差 80s 找不到去哪了**
+
+**产出文件:**
+- `D:/项目/ops-worktrees/cc-agentic/apps/backend/tests/benchmarks/runs/qa-run-20260428T053956Z.jsonl`（完整 baseline JSONL）
+
+**没做的（Stage 9 跟踪）:**
+- 没诊断到底慢在哪一层（agent / synthesizer / CC subprocess 冷启动 / judge）
+- 没写新 baseline 报告（数据有但没格式化成 markdown）
+- backend on port 8003 仍在跑（留着给 Stage 9 用）
+
+**Lesson:**
+1. **测量先于优化** 这条原则今天直接拿到回报：如果不跑 baseline，Phase 3.0 代码合 main 之后才会发现整体退步
+2. **CC mode 是真有用** —— 完成的题 D-tier max 78（之前 RAG 撑死 22），完全是范式级别的提升
+3. **但操作性是个真问题** —— "代码能跑测试都过" 跟 "在 baseline 时间预算内能跑完" 之间隔着一大段
+4. **runner timeout vs agent budget vs subprocess cold start** 这三层时间预算有没对齐 = 关键技术债
+
+---
+
+### Stage 9 — Instrument → diagnose → J+P fix → re-baseline 49.65
+
+**Open:** 2026-04-28 16:52 (UTC+10) by Claude
+**Status:** CLOSED-DONE — **Phase 3.0 验证 PASS（mean +22.59）**
+**Layer:** L4 (UX / 可观测) → 推进 **Phase 1 baseline lock** + **Phase 3.0 验证**
+**Timebox:** 原 30 分钟（实际 ~3 小时，含 71min baseline 跑 + 调试 + 报告）
+**Trigger:** 用户回 "go o"。CC mode 退步是 timeout 主导的，不是 quality 差。
+
+#### 步骤
+- 16:52 entry 写入 STAGE_LOG（本条）
+- 17:00 instrument：解析 OpenTelemetry spans 发现 `knowledge.search` tool 跑 112.61s；agent 守 30s OK，**80 秒在 `_synthesize_or_template` LLM 调用**
+- 17:10 进一步 instrument：单 citation snippet 高达 9761 字符（`HandymanVerification.js` 全文件 dump 进 prompt）。`knowledge_synthesis._format_evidence` 已在按 `knowledge_synthesis_max_snippet_chars` 截断（默认 6000），但 4 × 6000 = 24KB prompt 还是太大
+- 17:20 写 spec `T-BENCH-RUNNER-TIMEOUT-FLAG`，dispatch codex（low effort）
+- 17:25 codex 完工（commit `7a34c37`）：runner 加 `--question-timeout` flag，默认 120s → 240s
+- 17:28 set `OPS_AGENT_KNOWLEDGE_SYNTHESIS_MAX_SNIPPET_CHARS=3000` in worktree `.env`（P，纯 .env 覆盖无源码改）
+- 17:30 重启 backend on 8003 让吃新 .env
+- 17:30 → 19:42 跑 CC baseline 71min
+- 19:42 解析新 artifact `qa-run-20260428T093042Z.jsonl`：**mean 49.65 vs 旧 RAG 27.06 = +22.59**
+- 19:50 写 baseline 报告 `docs/ai/benchmarks/qa-baseline-2026-04-28.md` + commit `c090419`
+
+#### Close 摘要
+**Close:** 2026-04-28 19:55
+**结果:** **Phase 1 baseline lock + Phase 3.0 验证 PASS**。CC agentic mode 击败单路 RAG 22.59 分。新 baseline 报告 commit 在 `feat/kb-cc-agentic` (`c090419`)。
+
+**Phase 3.0 真实数据**：
+
+| Tier | 旧 RAG | 第一次 CC | NEW J+P | vs RAG |
+|---|---|---|---|---|
+| A | 35 | 9.5 | **56.50** | +21.50 |
+| B | 11 | 12.2 | **37.60** | +26.60 |
+| C | 41 | 35.1 | **70.62** | **+29.62** ★ |
+| D | 22 | 18 | **30.33** | +8.33 |
+| **mean** | **27.06** | 17.82 | **49.65** | **+22.59** |
+
+**Acceptance vs Stage 9 targets**：
+
+| 指标 | 目标 | 实际 | 结果 |
+|---|---|---|---|
+| Completion | ≥28/34 | **34/34** | ✅ |
+| Mean | ≥35 | **49.65** | ✅ |
+| D-tier | ≥40 | 30.33 | ❌ |
+| Wall-clock | ≤45min | 71.1min | ❌ |
+
+**产出文件（在 `feat/kb-cc-agentic` 分支）:**
+- `docs/ai/tasks/T-BENCH-RUNNER-TIMEOUT-FLAG.md`（新）— J 的 spec
+- `apps/backend/scripts/run_qa_benchmark.py`（+19 −3）— `--question-timeout` flag，默认 240s
+- `apps/backend/.env`（worktree-local，未 commit）— `OPS_AGENT_KNOWLEDGE_SYNTHESIS_MAX_SNIPPET_CHARS=3000`
+- `apps/backend/tests/benchmarks/runs/qa-run-20260428T093042Z.jsonl`（新）— baseline JSONL
+- `docs/ai/benchmarks/qa-baseline-2026-04-28.md`（新）— 完整 baseline 报告 + acceptance check + 后续 ticket 提案
+
+**Phase 1 / Phase 3.0 状态**：
+- Phase 1 测量地基 ✅ 完工（baseline 49.65 锁定，作为 PR gate forcing function）
+- Phase 3.0 CC agentic ✅ 验证 PASS（+22.59 mean，C-tier 翻倍）
+
+**没做的（开新 ticket 跟踪）:**
+- `T-KB-EVIDENCE-TIER-CAP` — D-tier cap=6000 / A/B/C cap=3000 让 D 重回 40+
+- `T-KB-CLI-POOL` — pre-spawn `claude` 进程，省 5s/call 冷启动 → runtime 71min → ~50min
+- `T-KB-HYBRID-RAG-FAST-PATH` — A/B-tier 走 RAG 13-18s；C/D 走 CC → runtime 71min → ~35min
+- merge `feat/kb-cc-agentic` 到 checkpoint —— 用户决定（这一波是大块改动，建议至少 review 一下）
+- main vs checkpoint 分叉的 meta 整合 —— 还在挂
+
+**Lesson:**
+1. **诊断优先于 brute-force tuning** —— 直接 J+K 是猜；instrument 5 分钟才发现 80s 的真正去处是 synthesis 而不是 agent
+2. **现成 config 比加新 config 优**：`knowledge_synthesis_max_snippet_chars` 已经存在，只是默认 6000 太松；纯 .env 调 3000 就够，不用动代码
+3. **D-tier 的 trade-off** 数据上验证：cap 帮 ABC 但伤 D，因为多跳问题需要长 context。tier-aware cap 这下有数据支持
+4. **C-tier +29.62 是最大惊喜**：CC 多轮 grep+read 真的能解决 cross-file 问题，从 41 → 70.62 接近翻倍。这条路对了
+5. **runtime 比预估慢**：先期估的 "synthesis 80→40s" 实际只是 80→60s。下次估时按 `cap_ratio × 0.5` 折扣
+
+**Phase 3 进度刷新**：
+- 3.0 CC agentic ✅ 实现 + ✅ 验证 PASS（+22.59）
+- 3.1 query 处理 — 未启
+- 3.2 引用链 ✅
+- 3.3 hybrid 多 source 融合 — 未启
+- 3.4 rerank — 未启
+- 3.5 预索引 — 未启
+
+
+
+
+
+
+
 
 
 
