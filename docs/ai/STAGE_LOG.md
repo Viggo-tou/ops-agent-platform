@@ -483,6 +483,20 @@
 - 3.4 rerank — 未启
 - 3.5 预索引 — 未启
 
+---
+
+### Stage 10 — Execute T-MERGE-CC-AGENTIC-INTO-MAIN
+
+**Open:** 2026-04-28 ~20:30 (UTC+10) by Claude
+**Status:** OPEN
+**Layer:** L1 (流程纪律) → 把 Phase AF 成果合到 checkpoint 主线
+**Timebox:** 30 分钟（按 spec 3-step 顺序）
+**Trigger:** 用户回 "j继续 / 直接全程"。Phase AF 的 49.65 baseline 还在 worktree，必须合到 checkpoint 否则下个 ticket 拿不到这个起点。
+
+#### 步骤
+- 20:30 entry 写入 STAGE_LOG（本条）
+
+
 
 
 
