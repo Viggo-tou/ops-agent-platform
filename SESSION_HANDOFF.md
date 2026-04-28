@@ -1,6 +1,37 @@
 # Session Handoff
 
-Last updated: 2026-04-22
+Last updated: 2026-04-28
+
+## Session 2026-04-28: T-KB-CC-AGENTIC-RETRIEVAL
+
+Session-start tag requested: `session-start/2026-04-28-1347`
+
+Tag status: not created. `git tag` failed because this worktree's common git directory resolves to `D:/项目/Ops_agent_platform/.git`, which is outside the writable sandbox for the current Codex user. The same permission issue blocked the end-of-session commit (`index.lock` permission denied). Baseline HEAD at start was `a3f0cf4`.
+
+Files touched:
+
+- `.gitignore`
+- `apps/backend/app/core/config.py`
+- `apps/backend/app/services/knowledge.py`
+- `apps/backend/app/services/cc_agent.py` (new)
+- `apps/backend/app/services/cc_agent_loop.py` (new)
+- `apps/backend/app/services/cc_agent_prompts.py` (new)
+- `apps/backend/tests/services/test_cc_agent.py` (new)
+- `apps/backend/tests/services/test_cc_agent_loop.py` (new)
+- `SESSION_HANDOFF.md`
+
+Diff/stat notes:
+
+- Tracked-file stat from `git diff --stat HEAD -- .gitignore apps/backend/app/core/config.py apps/backend/app/services/knowledge.py`: `.gitignore | 1 +`, `apps/backend/app/core/config.py | 11 ++`, `apps/backend/app/services/knowledge.py | 235 +++++++++++++++++++++++++++++++++`.
+- New files are still untracked because `git add` is blocked by the same `.git/worktrees/cc-agentic/index.lock` permission error.
+
+Verification:
+
+- `python -m compileall D:\项目\ops-worktrees\cc-agentic\apps\backend\app` passed.
+- Targeted mocked tests passed: `pytest tests/services/test_cc_agent.py tests/services/test_cc_agent_loop.py -q -p no:cacheprovider` -> 19 passed.
+- Full `python -m unittest discover -s tests -v` ran 147 tests and failed only in existing sandbox/git-init tests where Git cannot create refs under the mojibake `D:/椤圭洰/...` path: 8 failures, 1 error.
+
+Code changes are still dirty/uncommitted because Git metadata writes are blocked by sandbox permissions.
 
 ## Session 2026-04-22: batch1 优化集成 + ship 到 main
 

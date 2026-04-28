@@ -92,6 +92,7 @@ apps/backend/.pytest_tmp/
 apps/backend/.tmp-test/
 apps/backend/manual-pytest-temp/
 pytest-cache-files-*/
+/.tmp/
 
 # MCP config (machine-local)
 .mcp.json
