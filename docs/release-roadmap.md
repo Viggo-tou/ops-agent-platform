@@ -10,9 +10,9 @@
 通过前端"现在 firebase 的认证逻辑是啥"实测，拿到 answer_trace，发现四个并发失败：
 
 1. **翻译压瘪原问题**：`现在firebase的认证逻辑是啥` → `firebase auth`，丢掉"逻辑/是啥"的 explain 意图。token_coverage 0.5。→ Phase 3.1 调整方向：query 处理必须**保留原文 + 加扩展**，不允许替换。
-2. **chunk 切碎**：Login.js 真正认证逻辑在 L35-82（`handleLogin`），但 retrieval 拿到的是 L1-5（imports）—— 因为按命中切窗，imports 含 `firebase` 字面量得分高，函数体含 `database/ref/get/child` 没 `firebase` 字面量被丢。→ **新增 Phase 3.0 AST-aware chunking**，作为整个 Phase 3 的硬前置。
+2. **chunk 切碎**：Login.js 真正认证逻辑在 L35-82（`handleLogin`），但 retrieval 拿到的是 L1-5（imports）—— 因为按命中切窗，imports 含 `firebase` 字面量得分高，函数体含 `database/ref/get/child` 没 `firebase` 字面量被丢。→ **2026-04-28 修正方向**：原计划做 AST chunking 解决；改为优先 **Phase 3.0 CC agentic 检索**（CC 直接 grep + read 整个函数），AST chunking 降级为 fallback。
 3. **router 写死 Android**：`_route_query` 的所有分支都为 Kotlin/Java/XML/Gradle/AndroidManifest 写死，JS 项目走默认分支拿到 `preferred_extensions=(".kt",".java",".xml")` 和 "Kotlin and Java" 的 rationale。→ **T-KB-ROUTE-LANG-AGNOSTIC** 小卡（Phase 2.x，30 行 + 1 测试）。
-4. **CSS 文件混入 top-K**：Login.css 占了 1/4 证据预算。→ Phase 3.0 顺手做扩展名加权。
+4. **CSS 文件混入 top-K**：Login.css 占了 1/4 证据预算。→ Phase 3.0 顺手做扩展名加权（CC grep 用 `--include` / `--exclude` 过滤 + 索引层加扩展名黑名单）。
 
 另外 multi-sample N=3 的"诚实税"把 single-sample 30.04 拉到 27.06。→ benchmark 基线必须用 multi-sample 数字，不再引用 single-sample。
 
@@ -87,26 +87,78 @@
 
 按依赖顺序，不跳步。每一步跑 Phase 1 benchmark 验证"有没有真的涨"。
 
-### 3.0 AST-aware chunking（NEW，2026-04-26 加，硬前置）
+### 3.0 CC agentic 检索（NEW priority，2026-04-28 重排）
 
-**为什么放最前**
-- 当前按"命中位置"切 chunk，函数体经常被切碎或丢失（实测：Login.js 的 `handleLogin` 在 L35-82，但 retrieval 拿到 L1-5 imports）
-- 任何 query rewrite / 多路召回 / rerank 都建在 chunk 之上。chunk 不靠谱，后面所有优化都打折
-- 改 chunking 会让所有 benchmark 分数失效，必须**先做这一步、立新基线、再做后面**
+**为什么放最前**（替换原 AST chunking 优先位）
+
+实测 KB（`D:/项目/HostedDashboard/handyman-admin-dashboard`）规模约几十文件。在这种规模下：
+
+- CC 全库 ripgrep ~100ms；单文件 Read ~200-500ms；3 轮 agent ≈ 6-10s（**比当前单路 RAG 13-18s 还快**）
+- 直接让 LLM agent 在真实文件树上 grep + read，**不需要任何离线索引**，不需要 chunk 边界，不需要 embedding
+- 解决 baseline 大半失败题：A-05 (`grep -r 'ExportReportButton' --include='*.js'` 一条命令出结果)、D-01 / D-04 (多轮探查)、Login.js handleLogin 定位（直接 Read 整个文件）
+- 跟 EvidenceItem schema 的 `cc_glob` / `cc_grep` / `cc_read` 三个 source 完美匹配，schema 已经在等这一刀
+
+**为什么不再优先 AST chunking**
+- AST 只解 A/B 档部分（chunker 切碎问题），完全不沾 C/D 档（多跳）
+- 小代码库下，AST chunking 的"预先切片 + 索引"成本对比 CC "直接 grep" 没优势
+- AST 留作 fallback：CC agent 若不可用 / 速率超限 → 退回 AST + RAG
 
 **做什么**
+
+1. **CC tool wrapper**（新建 `apps/backend/app/services/cc_agent.py`）：
+   - `cc_glob(pattern, *, cwd, timeout=10s) -> list[FileMatch]` — 调 `claude` CLI 的 `Glob` 工具
+   - `cc_grep(pattern, *, cwd, file_glob=None, timeout=20s) -> list[GrepHit]` — 调 `Grep`
+   - `cc_read(path, *, cwd, line_range=None, timeout=15s) -> str` — 调 `Read`
+   - 每次调用结果**直接转 EvidenceItem** 塞进证据池
+
+2. **Agent loop**（新建 `apps/backend/app/services/cc_agent_loop.py`）：
+   - 输入：query + cwd
+   - 第一轮：LLM 看 query → 决定 `cc_glob` 或 `cc_grep` → 拿到 3-10 个候选文件
+   - 第二轮：LLM 看候选 + query → 决定 `cc_read` 哪些文件的哪些范围
+   - 第三轮（可选）：LLM 看 read 结果 → 决定要不要再 grep / read 别的
+   - 预算：`max_rounds=3` / `max_tool_calls=8` / 整体超时 `30s`
+   - LLM 输出结构化 ReAct（`thought` + `action` + `observation`），不允许自由文本调用工具
+
+3. **LLM provider chain（agent 自己用的决策模型）**：
+   - 顺序：**`claude_code` CLI → `codex` CLI → `minimax`**（按用户 2026-04-28 明示）
+   - **不在链里**：`anthropic` API（用户不烧 API 余额）；如果 `_resolve_provider_chain` 默认包含 anthropic，CC agent 这条路要单独配 chain
+   - 配置：`cc_agent_provider_chain: list[str] = ["claude_code", "codex", "minimax"]`
+   - 任一 provider 失败 → 走下一个；全失败 → fallback 到纯 RAG（保留旧路径）
+
+4. **资源文件过滤**（顺手做，从原 AST 方案搬过来的子任务）：
+   - 索引时排除 `.css / .scss / .svg / .png / .lock / .min.*` 等
+   - CC grep 的 `file_glob` 也加默认 exclude 列表
+
+**质量门槛**
+- 单 query 端到端 ≤ 30s（CC 多轮 + 合成），平均 ≤ 18s
+- A 档 35 → 60+（A-05 这种"找文件"题应该接近满分）
+- B 档 11 → 35+
+- D 档 22 → 40+（多跳能跑通才有用）
+- CC 任一调用失败 → 自动 fallback，整体 query 不挂
+- agent 跑超 max_rounds → 用已收集的证据走合成，不空手回（"degraded mode"）
+
+**实施依赖**
+- T-WS-FS-WORKSPACE schema 已合 ✅（cc_glob / cc_grep / cc_read 三个 source 已定义）
+- claude_code CLI 已在 PATH（`npx @anthropic-ai/claude-code`）
+- codex CLI 已在 PATH（`codex-cli 0.125.0`）
+- minimax API key 在 `.env`
+
+**spec**：待写 `docs/ai/tasks/T-KB-CC-AGENTIC-RETRIEVAL.md`（取代原 AST 优先方案）
+
+### 3.0-fallback AST-aware chunking（降级为可选 fallback，2026-04-28 修订）
+
+**何时做**
+- 仅当 3.0 CC agentic 路径不稳定 / 速率限制频发 / 或新接入的大代码库（>5000 文件）让 CC 走全库变慢时，才做这一步
+- 对当前几十文件 KB，AST chunking 的 ROI 已经被 CC 模式覆盖
+
+**做什么**（保留原方案，仅作 fallback）
 - 引入 TreeSitter（或更轻的 ast 库针对 JS/Py/Java），按"函数/类/顶层声明"切 chunk
 - 每个 chunk 包含完整 body 和 docstring，附带 `enclosing_symbol` 元数据
 - 文件级粗粒度索引保留作为 fallback（小文件、纯 config）
 - 扩展名加权 / 排除：`.css`/`.svg`/`.png` 等纯资源文件不进 retrieval 池或权重 -50%
-- 顶层文件级 chunk 跟函数级 chunk 共存，retrieval 时按 query 性质偏向某一种
+- 顶层文件级 chunk 跟函数级 chunk 共存
 
-**质量门槛**
-- 相同 query 命中函数体所在文件时，证据 snippet 必须含函数完整 body（不再只给 imports）
-- benchmark 重跑全集，A 档不降、B 档 +5、C 档 +3、D 档 +5
-- 索引重建 ≤ 当前 1.5 倍时间
-
-**spec**：未写，加进 P1 待办（`docs/ai/specs/ast-chunking.md` TBD）
+**spec**：原 `docs/ai/tasks/T-KB-AST-CHUNKING.md` 保留但状态改为 P2（fallback 方案）
 
 ### 3.1 Query 处理（修订 2026-04-26：从"rewrite 替换"改为"additive 扩展"）
 
@@ -190,7 +242,7 @@
 - 单仓库扫描总耗时 ≤ 当前 12-18s 的 1.5x（混合比纯 RAG 慢，但要有顶）
 
 **实施依赖**
-- Phase 3.0 AST chunking 完成（card 摘要要按函数/类粒度生成）
+- Phase 3.0 CC agentic 检索完成（agent 已在跑，cards 是优化层）；如降级用 AST，则 AST chunking 完成（card 摘要要按函数/类粒度生成）
 - Phase 3.5 PreIndex 同步升级，把 FTS5 表 + 卡片表都建出来（预索引方案见 3.5 修订）
 - T-WS-FS-WORKSPACE schema 已合并 ✅
 
@@ -215,7 +267,7 @@
 - 3.3 升级后多了两类新索引（FTS5 + 文件卡片），尤其卡片要 LLM 离线生成（每文件一次），不预跑就每次查询都点钱。
 
 **做什么**
-- `apps/backend/scripts/build_knowledge_index.py`：扫描 → AST 分块（Phase 3.0）→ 多种索引并行建 → 持久化到 `data/kb_index/`
+- `apps/backend/scripts/build_knowledge_index.py`：扫描 → AST 分块（Phase 3.0-fallback；CC 路径不需要预 chunk）→ 多种索引并行建 → 持久化到 `data/kb_index/`
 - 索引产物：
   - **embedding** 表（Phase 3.3 之前已有）
   - **FTS5 BM25** 表（替换原 rank_bm25 倒排，对应 `rag_fts5`）
@@ -429,7 +481,8 @@
 ```
 Phase 1 (测量 + multi-run baseline)
    └── Phase 2 (清债 + T-KB-ROUTE)
-          └── Phase 3.0 AST chunking ★ 硬前置
+          └── Phase 3.0 CC agentic 检索 ★ 硬前置（2026-04-28 替换原 AST 优先）
+                 │   (AST chunking 降级为 fallback，仅大代码库或 CC 不可用时启用)
                  └── Phase 3.1 Query 处理（additive）
                         └── Phase 3.2 CitationChain
                                ├── Phase 3.3 MultiPath
