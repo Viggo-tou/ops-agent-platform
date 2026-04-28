@@ -488,13 +488,52 @@
 ### Stage 10 — Execute T-MERGE-CC-AGENTIC-INTO-MAIN
 
 **Open:** 2026-04-28 ~20:30 (UTC+10) by Claude
-**Status:** OPEN
-**Layer:** L1 (流程纪律) → 把 Phase AF 成果合到 checkpoint 主线
-**Timebox:** 30 分钟（按 spec 3-step 顺序）
-**Trigger:** 用户回 "j继续 / 直接全程"。Phase AF 的 49.65 baseline 还在 worktree，必须合到 checkpoint 否则下个 ticket 拿不到这个起点。
+**Status:** CLOSED-DONE
+**Layer:** L1 (流程纪律) → Phase AF 成果合并到 checkpoint 主线 ✅
+**Timebox:** 30 分钟（实际：~15 分钟）
+**Trigger:** 用户回 "继续 / 直接全程"。Phase AF 的 49.65 baseline 还在 worktree，必须合到 checkpoint 否则下个 ticket 拿不到这个起点。
 
 #### 步骤
 - 20:30 entry 写入 STAGE_LOG（本条）
+- 20:31 创建 4 个 safety tag：`pre-merge/T-MERGE-CC-AGENTIC-2026-04-28-2030-{docs,failure-diagnosis,cc-agentic,checkpoint}`
+- 20:33 `git checkout checkpoint/pre-reclassify`
+- 20:34 **Step 1**: merge `docs/ops-strategic-specs-2026-04-28` → clean，17 文件 +3685 −2，merge `b6830c5`
+- 20:35 **Step 2**: merge `feat/failure-diagnosis` → 1 conflict (SESSION_HANDOFF.md), keep ours, merge `c28b868`
+- 20:38 **Step 3**: merge `feat/kb-cc-agentic` → 2 conflicts (SESSION_HANDOFF + T-QA-ACCURACY-BENCHMARK add/add), keep ours, merge `9cffe4b`
+- 20:40 verify: `compileall` clean ✅ / **28/28 focused test pass** (cc_agent 7 + cc_agent_loop 12 + failure_diagnosis 9) ✅
+- 20:42 cleanup: 删 3 已合并 branch + 1 worktree；保留 `feat/kb-cc-agentic` worktree (含 `.env` override = baseline reproducibility 锚点)
+
+#### Close 摘要
+**Close:** 2026-04-28 20:45
+**结果:** **3 步 merge 全成功**。`checkpoint/pre-reclassify` HEAD 现在 `9cffe4b`，包含 Phase AF 全部成果（CC agentic + benchmark + diagnosis + STAGE_LOG + Phase AA-AF + 8 ticket specs）。
+
+**Merge 链路（在 checkpoint）:**
+```
+9cffe4b  merge: feat/kb-cc-agentic — Phase 3.0 CC + qa-benchmark + 49.65 baseline
+c28b868  merge: feat/failure-diagnosis — Phase 6 +1
+b6830c5  merge: docs/ops-strategic-specs-2026-04-28 — Phase AF + STAGE_LOG + specs
+a3f0cf4  Merge branch 'feat/repair-cap-impl' (pre-existing)
+```
+
+**Safety net**: 4 个 `pre-merge/...` tag 留着，任何时候 `git reset --hard <tag>` 可回滚。
+
+**没做的:**
+- merge `checkpoint/pre-reclassify` → `main` (单独决策)
+- 清理另 9 个 stale worktree (Stage 1 deferred)
+- backend smoke test 验证 49.65 在 checkpoint 上复现 (可选)
+
+**Lesson:**
+1. Cherry-pick + 多次 merge 比想象中干净（evidence schema 模块化好，无耦合）
+2. 3 conflicts 全在 SESSION_HANDOFF / 旧版 spec — `git checkout --ours` 一招通关
+3. Safety tags 批量创建是好习惯，5 秒成本，但回滚自由度极大
+4. Worktree 删除卡时直接 `rm -rf` + `git worktree prune`
+
+**Phase 总览（merge 后）**：
+- Phase 1 测量地基 ✅ **on checkpoint**
+- Phase 3.0 CC agentic ✅ **on checkpoint**
+- Phase 6 治理 UX 🟡 2/6（diagnosis + repair-cap on checkpoint）
+- Phase 4 防御矩阵 ✅
+- 其它未启
 
 
 
