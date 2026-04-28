@@ -1,6 +1,67 @@
 # Session Handoff
 
-Last updated: 2026-04-22
+Last updated: 2026-04-28
+
+## Session 2026-04-28: Phase 3.0 verified ✅ — CC agentic mean 27.06 → 49.65 (+22.59)
+
+**Headline**: First time the project shipped a benchmark-validated optimization. CC agentic search beats single-path RAG by +22.59 mean on the 34-question dataset; completion 14/34 → 34/34; C-tier nearly doubled (41 → 70.62). Phase 1 (measurement baseline) and Phase 3.0 (CC retrieval) both complete.
+
+### Branches landed today (NOT yet merged to main / checkpoint)
+
+| Branch | Worktree | Commits |
+|---|---|---|
+| `feat/kb-cc-agentic` | `D:/项目/ops-worktrees/cc-agentic` | `6797098` (CC impl) → `2576033` (merge qa-bench) → `7a34c37` (--question-timeout 240s) → `c090419` (baseline 49.65 lock) |
+| `feat/failure-diagnosis` | `D:/项目/ops-worktrees/failure-diagnosis` | `31bb852` (T-FAILURE-DIAGNOSIS impl) |
+| `docs/ops-strategic-specs-2026-04-28` | main worktree | `f416249` → `c3af1a0` → `74d9096` → `a69d134` → `c8c238d` (5 commits: 5 strategic specs + STAGE_LOG discipline + Phase AA-AF entries + Phase 3 pivot to CC + Stage 9 close + 5 follow-up specs) |
+
+### Where to find the artifacts
+
+- Baseline report: `docs/ai/benchmarks/qa-baseline-2026-04-28.md` (on `feat/kb-cc-agentic`)
+- Stage log: `docs/ai/STAGE_LOG.md` Stages 1-9 (on `docs/ops-strategic-specs-2026-04-28`)
+- Phase summary: `docs/ai/phase-summary-zh.md` Phases AA-AF (on `docs/ops-strategic-specs-2026-04-28`)
+
+### Next session: read these first
+
+1. `docs/ai/STAGE_LOG.md` — last 5 entries (Stages 5-9)
+2. `docs/ai/phase-summary-zh.md` — Phase AF section
+3. `docs/ai/benchmarks/qa-baseline-2026-04-28.md` — the new reference number 49.65
+
+### Next session: 5 ready-to-dispatch tickets (priority order)
+
+| Priority | Ticket | What |
+|---|---|---|
+| P0 | T-MERGE-CC-AGENTIC-INTO-MAIN | Integrate today's 3 feature branches into checkpoint/pre-reclassify |
+| P1 | T-KB-EVIDENCE-TIER-CAP | tier-aware snippet cap (D=6000 / ABC=3000) → recover D-tier ceiling |
+| P2 | T-KB-CLI-POOL | warm `claude` CLI pool → runtime 71 → 50min |
+| P2 | T-KB-HYBRID-RAG-FAST-PATH | route simple queries to RAG fast-path → runtime 71 → ~40min |
+| P2 | T-WINDOWS-ASCII-PATH-DEBT | decide on path A/B/C for `D:\项目\` mojibake debt |
+
+All 5 specs are at `docs/ai/tasks/T-*.md` on `docs/ops-strategic-specs-2026-04-28`.
+
+### Two acceptance targets that did NOT meet, with mitigation paths
+
+- **D-tier 30.33** (vs target 40): snippet cap=3000 hurt multi-hop. Fix in T-KB-EVIDENCE-TIER-CAP.
+- **Wall-clock 71min** (vs target 45min): cap helped synthesis 80→60s, not enough. Fix in T-KB-CLI-POOL + T-KB-HYBRID-RAG-FAST-PATH.
+
+### Files NOT committed (intentional)
+
+- `D:/项目/ops-worktrees/cc-agentic/apps/backend/.env` — has local override `OPS_AGENT_KNOWLEDGE_SYNTHESIS_MAX_SNIPPET_CHARS=3000` to reproduce baseline 49.65. .env is gitignored. Documented in `qa-baseline-2026-04-28.md` "Required env to reproduce" section.
+
+### Worktrees still alive (not cleaned up — Stage 4 deferred)
+
+29 worktrees per Stage 1 audit. 10 stale (already merged), 12 active, 3 temp Claude. Cleanup is a separate stage; not blocking.
+
+---
+
+## Session 2026-04-27: docs analysis / no code changes
+
+- Session-start tag: `session-start/2026-04-27-1558`
+- Purpose: read recovery docs, roadmap docs, and active task specs to rebuild project context.
+- Files touched: `SESSION_HANDOFF.md` only, for this required session manifest.
+- Code changes: none.
+- Git diff stat: this manifest is still in the working tree; no product/source files were modified.
+
+---
 
 ## Session 2026-04-22: batch1 优化集成 + ship 到 main
 
