@@ -741,6 +741,183 @@ Phase W 的 `DESTRUCTIVE_WORK_TYPES` 包含 `{"refactor", "bugfix", "fix", "chor
 
 ---
 
+## Phase AA — Evidence 证据链全套：schema + claim binding + must-touch + chain closure（2026-04-23 → 2026-04-27）✅
+
+### 做了什么
+
+四个 ticket 围绕"证据"这条数据线打了一波组合拳，把 evidence 从"散落的几个 dict"升级成"统一 schema + 闭环审批 gate + LLM 合成必须挂引用"。**全部已合到 `checkpoint/pre-reclassify`**。
+
+- **T-WS-FS-WORKSPACE 落地 evidence 统一 schema**（commits `015d256` + `f646cb6`）：新增 `apps/backend/app/schemas/evidence.py`，定义 `EvidenceItem` + `EvidenceSource` 枚举（8 种来源：rag_lexical / rag_fts5 / rag_card / cc_glob / cc_grep / cc_read / user_provided / spec_anchor）。这一步只建管子，CC 工具 / FTS5 / cards 三个 source 的实际填充逻辑还未实现（后续 Phase 3.3 做）。同时给每个 task 落地一个 per-task FS workspace，给 reviewer / 长期记忆 / resume 协议铺地基。
+- **T-KB-CLAIM-BINDING**（commit `2d9ec5e`）：MiniMax 合成出来的每条论断（claim）现在必须挂上对应的 `KnowledgeCitation { claim, file_path, line_range, source_channel, confidence }`，前端 chat 可点跳转到 KB 文件。
+- **T-EVIDENCE-MUST-TOUCH-FILTER**（commit `b618681`）：spec_conformance 抽出的 `must_touch` 列表过滤掉非源文件目标（构建产物 / 锁文件 / 资源），避免 LLM 被引导去改不该动的文件。
+- **T-041-04 EVIDENCE CHAIN CLOSURE**（commits `694a1fe` + `e64a672`）：审批入口强制校验"证据包 + diff + goal attestation"三者闭合，缺任意一项审批按钮不可用，前端明示原因。`e64a672` 是上线后修的一个边角 bug：path 前缀不匹配时（如 `hosteddashboard/...` vs `handyman-admin-dashboard/...`），改成 suffix-tolerant 匹配，避免误报"证据指向的文件不存在"。
+
+### 原理
+
+**为什么这四件事捆成一个 phase**：它们是一根线上的不同断面。`EvidenceItem` 是数据契约；`KBClaim binding` 把合成结果跟证据系起来；`must-touch filter` 让证据不污染 codegen 目标；`chain closure` 把证据塞进审批 UI，让审批人能验。**任一缺失，证据链都不闭合**——单独看每一个像小改进，合起来才让"governance-first"这个定位真站住。
+
+**为什么 schema 没把 cc_glob/cc_grep/cc_read/rag_card 的 source 实现一起做**：这是有意的"留扩展点"。CC 工具结果接入需要等 Phase 3.3 混合证据召回那个大块（roadmap 已升级反映这一点）；rag_card / rag_fts5 需要 Phase 3.5 预索引。先把 schema 放好，让后续 ticket 直接往里塞，不用改全链路。
+
+**suffix-tolerant path matching 的痛点**：原来的 evidence_chain 用 exact path equality 判断"diff 改的文件 ⊆ 证据声明的文件"。但实际项目里 KB 索引的路径根（如 `hosteddashboard/`）和 backend serialize 的路径根（如 `handyman-admin-dashboard/`）经常不一致。改成"suffix 末段匹配"既保留拦截能力，又容忍这种命名漂移。
+
+### 怎么验证
+
+- `git log --first-parent checkpoint/pre-reclassify | grep -E "(EVIDENCE|FS-WORKSPACE|CLAIM-BINDING)"` 能看到 4 条 commit
+- `apps/backend/app/schemas/evidence.py` 存在且包含 `EvidenceSource = Literal[...]` 8 种 source
+- 跑一次 `process_question`：返回的 `latest_result_json.result.citations` 数组里每条 claim 都有非空 `file_path` + `line_range`
+- 跑一次 `jira_issue_develop`：审批 UI 缺证据时按钮灰掉，附文字"缺少证据包/diff/goal attestation"
+- spec_conformance must_touch 列表里不再出现 `package-lock.json` / `dist/*.js` / `*.png` 之类
+
+---
+
+## Phase AB — codegen.repair 多轮 + 超 cap 转审批（T-PIPELINE-REPAIR-CAP-IMPL，2026-04-27）✅
+
+### 做了什么
+
+把原来"compile_gate 失败 → 单轮 repair → 还失败就整个 task FAILED"的死板流程，改成"最多 N 轮 repair（默认 3）+ 每轮独立超时（默认 180s）+ 超 cap 转 awaiting_approval 带 `repair_summary`"。**已合到 `checkpoint/pre-reclassify`**（commits `75adc6d` + `a3f0cf4`）。
+
+- 新增 settings：`OPS_AGENT_CODEGEN_MAX_REPAIR_ATTEMPTS=3` / `OPS_AGENT_CODEGEN_REPAIR_TIMEOUT_S=180`
+- 新增 orchestrator method `_run_compile_repair_loop`，循环最多 N 轮，每轮：dispatch `codegen.repair` → 重跑 compile_gate → pass 则 break
+- 超 cap 时：task 转 `AWAITING_APPROVAL`，pipeline_state 落 `pending_compile_repair_approval_id` + `compile_repair_cap_exceeded=True` + `repair_summary`（每轮 attempted/repaired/duration/timed_out）
+- 审批人 grant 时清掉这两个 key，pipeline 继续；reject 则 task FAILED
+- 3 个 unit test 覆盖：超 cap / 中途成功 / 单轮超时
+
+### 原理
+
+**之前问题**：P69-7 实测两次都因为 compile_gate 反复失败被卡死。codegen 一次写 6 个文件，每个都有点小毛病；单轮 repair 只能修 5 个（因为 fan-out batch 上限），第 6 个永远修不到。整个 task 死在最后一个文件上，没办法把"先把能修的修完，剩下的让人审批"这种自然策略走通。
+
+**为什么 cap=3 不是 cap=10**：每轮 repair 调一次 LLM ≈ 60-120s。3 轮已经基本能覆盖"批次太大装不下"的场景。无脑加大 cap 只是让 token 烧得更多，不解决"codegen 输出质量本身差"这个根因——根因要靠 codegen provider 切换 / prompt 调优来解，不是靠 repair 抹屁股。
+
+**`compile_repair.cap_exceeded` 这条事件 + payload 里塞 `rounds_summary`**：让 reviewer 在 awaiting_approval 状态打开任务时能看见"系统已经尝试了 3 轮，分别动了哪些文件，每轮多少秒，超时没"——比啥都没有强一万倍。但这个信息现在还是 raw JSON，**前端没专门 UI 展示**（待 Phase AD 的 Stage Log 后续 dispatch T-FAILURE-DIAGNOSIS 解决）。
+
+### 怎么验证
+
+- `git log --first-parent checkpoint/pre-reclassify | grep "PIPELINE-REPAIR-CAP"` 能看到 `75adc6d` + `a3f0cf4`
+- `apps/backend/app/orchestrator/service.py` 含 `_run_compile_repair_loop` 方法
+- 触发 P69-7 同款 task：超 cap 后任务在 `AWAITING_APPROVAL`，`latest_result_json.result.decision == "compile_repair_cap_exceeded"`，`rounds_summary` 数组有 3 条
+- 跑 `pytest apps/backend/tests/orchestrator/test_repair_cap.py`：3 测试过
+
+### 已知遗留
+
+**runtime_validation 仍是单轮 repair**（orchestrator/service.py:2727 `_rv_max_passes = 2  # initial + 1 repair attempt`）。同样的"单轮不够"问题在 runtime_validation 那条线上还在，待后续 ticket。
+
+---
+
+## Phase AC — T-CHAT-APPROVAL-UX：前端审批块 + 自动滚动（2026-04-23 → 2026-04-24）⚠️ 在 worktree，未合并
+
+### 做了什么
+
+把 chat 页面里 `awaiting_approval` 状态从"小圆点+处理中…"换成独立的 `<AwaitingApprovalBlock>`，并自动滚到审批按钮，解决用户判断"前端卡死"的体感 bug。**只在 `feat/chat-approval-ux` worktree 落地（commits 包括 `83aa152` / `5dc73f7` / `89498b6`），尚未合到 checkpoint/main**。同时也存在于 `feat/qa-accuracy-benchmark` 这个 worktree（两个分支有重叠）。
+
+- 新组件 `apps/web/src/components/chat/AwaitingApprovalBlock.tsx`
+- `MessageList.tsx` 在 `awaiting_approval` 分支挂载新组件 + 切到该 task 时 `scrollIntoView()` 到审批块
+- 测试 `apps/web/src/components/chat/__tests__/AwaitingApprovalBlock.test.tsx` 覆盖：渲染、按钮 enabled/disabled 状态、grant/reject 触发的 API 调用
+
+### 原理
+
+**根因是 UI 同质化**：`MessageList.tsx` 里 `TERMINAL_STATUSES` 只含 `completed/failed/rolled_back`，所有非终态都渲染成 `<ThinkingIndicator>`（小圆点+"处理中…"）。`awaiting_approval` 套这个模板视觉上跟"正在跑"几乎一样，加上审批按钮埋在 timeline 末尾，用户不滚到底就看不到 → 误判"前端卡死"。**这不是后端问题，是状态可见性问题**。
+
+**为什么单独做新组件而不是改 ThinkingIndicator**：状态语义不一样（一个是"机器在跑别打扰"，一个是"等你拍板"），用户的反应也不一样（前者干等，后者要操作）。强行复用同一个组件等于继续骗用户。
+
+### 怎么验证
+
+- 切到 `feat/chat-approval-ux` worktree（`D:/项目/ops-worktrees/chat-approval-ux`）→ 起前端 → 触发一个 develop task → task 跑到 `awaiting_approval` 时 chat 页面应显示**独立色块** + 大按钮，并自动滚到位
+- 单元测试：`apps/web/src/components/chat/__tests__/AwaitingApprovalBlock.test.tsx` 通过
+- 截图证据：仓库根的 `bug-p69-8-bottom.png`（修前）、`p69-8-approval-block-verified.png`（修后）
+
+### 状态待办
+
+未合并到 checkpoint。Stage 1 audit 标记需要决策：合 / 改造 / 重做。建议合（已经有测试覆盖、screenshots 验证过）。
+
+---
+
+## Phase AD — T-QA-ACCURACY-BENCHMARK + 第一次诚实基线 27.06%（2026-04-23 → 2026-04-26）⚠️ 在 worktree，未合并
+
+### 做了什么
+
+T-QA-ACCURACY-BENCHMARK 的实现 + 首次基线已完成，**全部在 `feat/qa-accuracy-benchmark` worktree**（39 commit 超前 checkpoint，29 个 dirty 文件）。**未合到 main / checkpoint**。是当前**唯一可量化"系统真实准确率"的来源**。
+
+- `apps/backend/tests/benchmarks/qa_benchmark_dataset.jsonl` — 34 题（A:10 简单定位 / B:10 单文件说明 / C:8 跨文件引用 / D:6 多跳分析），每题带 `expected_keypoints` + `expected_citations`
+- `apps/backend/scripts/run_qa_benchmark.py` — runner CLI，支持 `--dataset` / `--judge-mode {auto,minimax,rule}` / `--judge-samples N` / `--limit N`
+- `apps/backend/scripts/qa_benchmark_judge.py` — judge module，支持 **claude_code CLI + codex CLI（cross-family 双 judge，零 API 余额消耗）**+ `--judge-samples N` 多样本 per-keypoint 多数投票
+- `docs/ai/benchmarks/qa-baseline-2026-04-23.md` — 第一次 baseline：A=5.50 / B=8.00 / C=29.62 / D=10.00，**A+B+C aggregate = 13.29%**（rule judge，单样本，远低于 spec 设的 85% 目标）
+- `docs/ai/benchmarks/qa-complex-failure-analysis.md` — D 档失败分类：2 retrieval-miss / 2 planner-would-help / 1 synthesis-miss / 1 other。建议下一步 `Phase 3.X — source-only retrieval + planner-assisted multi-hop QA`
+- `apps/backend/tests/benchmarks/runs/multi-run-log.md` — 噪声基线 + 多次跑：claude_code judge + N=3 multi-sample → mean **27.06**（"诚实税"将 single-sample 30.04 拉到 27.06）
+
+### 原理
+
+**为什么先做 benchmark 不做优化**：STRATEGY R-1 + roadmap Phase 1 都钉死"不做这一步后面所有'优化'都是拍脑袋"。没有可复现的数字 baseline，任何"+5 分"的优化 claim 都是凭直觉，无法验真。
+
+**为什么用 CLI 当 judge 不用 MiniMax / Anthropic API**：用户暂时不烧 API 余额。CLI judge 走 OAuth / 本地，零成本。代价是 judge 不稳定一些（同一答案不同时间可能给不同分），所以才需要 `--judge-samples N` 取每个 keypoint 多数投票。
+
+**为什么 baseline 这么低（27.06%）**：top-3 lowest 题分别揭示了三个独立 bug——
+- A-08 (`0.00`)：support 类问题被路由出 Q&A 流跑去建 Jira 单（**scenario 路由对 "support/ticket" 词汇过敏**）
+- B-03 (`0.00`)：JobManagement.js 真存在，anchor gate 太字面 reject 了（**anchor gate over-literal**）
+- A-05 (`0.00`)：retrieval 返回 license + bundle 输出，不是源文件（**retrieval 没排除 build artifacts**）
+
+**为什么 anthropic synthesis 跑 Run A3/A4 都 0 分**：副线发现的独立 bug，`synthesis_provider=anthropic` 这条路径在某个点完全坏掉了。需要单独 ticket 调查，未列入主线。
+
+**关键 caveat**：dataset 用 `handyman-admin-dashboard/...` 路径，backend 报 `hosteddashboard/...`。citation precision 全表偏低，但 A/B/C/D 平摊不影响 delta。修这个能让全表分数涨。
+
+### 怎么验证
+
+- 切到 `D:/项目/ops-worktrees/qa-benchmark` 看 commit history：`6e94238` / `d5d457e` / `46c0e61` / `1e271e8` / `2eda909` / `704dbf1` / `0cea861`
+- `apps/backend/scripts/run_qa_benchmark.py --dataset apps/backend/tests/benchmarks/qa_benchmark_dataset.jsonl --judge-mode rule --limit 3` 应能跑通（不烧 LLM）
+- `cat docs/ai/benchmarks/qa-baseline-2026-04-23.md` 看完整 per-tier 数字
+- 噪声基线复现：multi-run-log.md 里 Run A 的 mean=27.06 / median=22.50 是当前公认基线
+
+### 状态待办
+
+未合并到 checkpoint。是 **Stage 1 audit 标识的 P0 待整合工作**——所有"优化是否真涨分"的判断都要靠这个 runner，必须 merge 出来作为公共基础设施。
+
+---
+
+## Phase AE — 战略 specs + STAGE_LOG 纪律 + L1 worktree audit（2026-04-28，今天）✅
+
+### 做了什么
+
+诊断了项目当前状态后，写了 5 个新 spec + 升级了 roadmap + 立了一条新的开发纪律 + 做了第一次 L1 audit。**全部 commit 到 `docs/ops-strategic-specs-2026-04-28` 分支**（`f416249`），**未合主干**（用户决定本地继续不 push）。
+
+- **5 个新 spec**（`docs/ai/tasks/`）：
+  - `T-QA-ACCURACY-BENCHMARK.md`（重写为 P0 baseline + PR gate 制度。注：实现已完工，见 Phase AD）
+  - `T-FAILURE-DIAGNOSIS.md`（P0：task 进 awaiting_approval/failed 时自动跑诊断 LLM，输出中文白话根因 + 建议修复路径）
+  - `T-CODEGEN-PROVIDER-OBSERVABILITY.md`（P0：每次 codegen.generate_patch 事件加 provider_used / chain / fallback_count / duration / model_name）
+  - `T-COMPILE-GATE-ERROR-CLASSIFICATION.md`（P1：把 `Invalid package config` 这种外部错跟"目标文件语法错"分开，外部错不进 repair loop）
+  - `T-SANDBOX-PREFLIGHT.md`（P2：sandbox clone 后立刻验证 package.json/tsconfig.json/pyproject.toml 是否合法）
+- **`docs/release-roadmap.md` Phase 3.3 升级**：从"4 条 RAG 通道多路召回"扩为"**混合证据召回**" — 把 EvidenceItem 8 种 source 全列出，加入 CC Glob/Grep/Read 主动 agentic 通道 + rag_card 文件级 markdown 卡片粗筛通道。Phase 3.5 PreIndex 同步升级，加 FTS5 表 + 卡片表的离线构建 + 增量重建策略
+- **新建 `docs/ai/STAGE_LOG.md`**：append-only stage 流水簿，每开 stage / dispatch / 完成都必须写。`CLAUDE.md` 加 "Stage Log Discipline" 段，下一次 session 启动必读 STAGE_LOG 最后 5-10 条。
+- **Stage 1 = L1 worktree audit 完成**：发现 29 worktree + 33 branch 的真实状态——10 个已合可删，3 个临时 agent worktree，剩下 12 个有 unique 工作未合。**最大风险是 `qa-benchmark` worktree（39 commit 超前 + 29 dirty 文件）**，benchmark 所有产物只活在那。详见 STAGE_LOG.md Stage 1 entry。
+
+### 原理
+
+**为什么写完 5 个 spec 才发现问题**：今天 dispatch 第一个 ticket 时才看到 `feat/qa-accuracy-benchmark` worktree 已经把 benchmark 做完了。这暴露了一个流程缺陷——**spec、worktree、commit 三者没有同步映射**。如果有 STAGE_LOG，每次 dispatch 之前先看一眼"哪些 stage 已开/已闭"就能避免。
+
+**STAGE_LOG vs SESSION_HANDOFF vs phase-summary-zh.md 的分工**：粒度从粗到细 = phase（一个 P-字母段，几周大故事）→ session（一次会话，半天到一天）→ stage（一个聚焦单元，一两小时）。三个并存，因为不同时间尺度的问题需要不同密度的记录。**Stage 这层是之前没有的，是今天才加的纪律**。
+
+**为什么 Phase 3.3 必须升级**：T-WS-FS-WORKSPACE schema 已经把 EvidenceItem 扩到 8 种 source（rag_lexical / rag_fts5 / rag_card / cc_glob / cc_grep / cc_read / user_provided / spec_anchor），但原 roadmap 里 Phase 3.3 还在写"4 条 RAG 通道"——roadmap 落后于代码。继续按旧 roadmap 拆 ticket 会漏 CC 工具 / 卡片这两条主动 agentic 通道，等于把 Phase 5.4 的部分能力提前耗在 3.3 阶段。
+
+**5 个 spec 的优先级排序**：
+1. T-QA-ACCURACY-BENCHMARK（虽然实现已完，但要"lock baseline + 钉死 PR gate 制度"）
+2. T-FAILURE-DIAGNOSIS（直接解决用户体感问题——失败时不用来问我）
+3. T-CODEGEN-PROVIDER-OBSERVABILITY（让 diagnosis 有数据可读）
+4. T-COMPILE-GATE-ERROR-CLASSIFICATION（修今天 P69-7 暴露的具体 bug）
+5. T-SANDBOX-PREFLIGHT（defense-in-depth）
+
+### 怎么验证
+
+- `git log --oneline docs/ops-strategic-specs-2026-04-28 -2`：能看到 `f416249 docs: 5 strategic specs + roadmap Phase 3.3/3.5 update`
+- 5 个 spec 文件存在 + 每个开头都是 SPEC TEMPLATE v2 标头
+- `cat docs/ai/STAGE_LOG.md` 最末 entry = Stage 1 CLOSED-DONE
+- `grep -A5 "Stage Log Discipline" CLAUDE.md` 应显示新加的强制纪律段
+
+### 状态待办
+
+- 4 个待 dispatch 的 spec（除 BENCHMARK 已实现外）尚未派给 codex
+- L2-L4 后续 stage 都未开始
+- worktree 真正动手清理 + 整合 qa-benchmark 回主干 = Stage 2/3 待开
+
+---
+
 ## 全景路线图
 
 ```
@@ -769,9 +946,19 @@ V = 压力测试框架（延迟/确定性/资源漂移）
 W = 方向感知 spec_conformance + goal attestation
 X = Planner 过滤构建产物 + 共享路径分类器
 Y = 默认工作类型不再是破坏性 + fixture 文本修正
+Z = batch1 优化集成 + 基线校准
+
+证据 / 流水线 / 测量 / 纪律层（2026-04-23 起）：
+AA = Evidence 证据链全套（schema + claim binding + must-touch + chain closure）
+AB = codegen.repair 多轮 + 超 cap 转审批
+AC = T-CHAT-APPROVAL-UX 前端审批块（worktree only）
+AD = T-QA-ACCURACY-BENCHMARK + 第一次诚实基线 27.06%（worktree only）
+AE = 战略 specs + STAGE_LOG 纪律 + L1 worktree audit
 ```
 
 Phase H 是功能层和可观测层的衔接点。Phase M 是打通端到端 demo 的关键。Phase O 是用户体验的收尾。Phase P 让 demo 能用真正的强代码模型跑通。Phase Q-W 把流水线从"能跑"推进到"可观测、可压测、方向正确、前端友好"的阶段。
+
+**Phase AA-AE 是 2026-04-22 之后的新进度**：从"流水线能跑"推进到"流水线有数字、有证据闭环、有审批 UX、有失败诊断蓝图、有 stage 流水簿这种工程纪律"。其中 **AC 和 AD 还在各自的 worktree 没合主干**——是 Stage 1 audit 标识的 P0 待整合工作。
 
 ---
 
@@ -805,4 +992,11 @@ Phase H 是功能层和可观测层的衔接点。Phase M 是打通端到端 dem
 - 如果是 codex 写，在 prompt 里明确要求"中文白话 + 三段式 + 详细"
 - 写完后 Claude 或人做一次 review，确保"原理"段真的讲清楚了为什么
 
-**Phase 命名：** 按字母顺序延续（当前最新是 W，下一个是 X、Y、Z，然后 AA、AB…）。一个 Phase 对应一次"有故事可讲"的开发闭环，不是一个 commit。
+**Phase 命名：** 按字母顺序延续（当前最新是 AE，下一个是 AF、AG…）。一个 Phase 对应一次"有故事可讲"的开发闭环，不是一个 commit。
+
+**跟 STAGE_LOG.md 的分工**（2026-04-28 加）：
+
+- **`docs/ai/STAGE_LOG.md`** = stage 级（一个聚焦工作单元，几小时到一两天）。**append-only**。每开 stage / dispatch / 完成都记。粒度细，更新频繁。
+- **本文件 phase-summary-zh.md** = phase 级（一个有故事可讲的开发闭环，几天到几周）。三段式详写。粒度粗，更新慢。
+- 一个 Phase 通常包含若干个 Stage 的成果。Stage 是流水账，Phase 是回头看的总结。
+- **写本文件之前**：先看一眼 STAGE_LOG.md 最近 N 条 stage，确保 Phase 总结是基于 stage 流水实证的，不是凭印象。
