@@ -76,10 +76,14 @@ class KnowledgeSynthesizer:
             snippet = citation.snippet or ""
             if len(snippet) > limit:
                 snippet = snippet[:limit] + "\n(truncated)"
+            card_block = ""
+            if citation.card_text:
+                card = citation.card_text.strip()
+                card_block = f"[CARD]\n{card}\n"
             parts.append(
                 f"[{index}] {citation.source_name}:{citation.relative_path} "
                 f"(lines {citation.line_start}-{citation.line_end}, score={citation.score})\n"
-                f"{snippet}"
+                f"{card_block}[CONTENT]\n{snippet}"
             )
         return "\n\n".join(parts)
 

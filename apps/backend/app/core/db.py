@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 from app.models.base import Base
+from app.models.knowledge_card import KnowledgeCard
 from app.models.knowledge_document import KnowledgeDocument
 
 settings = get_settings()
@@ -47,6 +48,18 @@ def get_db() -> Generator[Session, None, None]:
 def create_knowledge_fts_table(db: Session) -> None:
     if not is_sqlite:
         return
+    if not hasattr(db, "execute"):
+        return
+    existing = db.execute(
+        text("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_document_fts'")
+    ).scalar_one_or_none()
+    if existing == "knowledge_document_fts":
+        columns = {
+            row[1]
+            for row in db.execute(text("PRAGMA table_info(knowledge_document_fts)")).all()
+        }
+        if "card_text" not in columns:
+            db.execute(text("DROP TABLE IF EXISTS knowledge_document_fts"))
     db.execute(
         text(
             """
@@ -56,6 +69,7 @@ def create_knowledge_fts_table(db: Session) -> None:
                 relative_path,
                 title,
                 content,
+                card_text,
                 tokenize = 'porter unicode61 remove_diacritics 2'
             )
             """
@@ -71,6 +85,7 @@ def upsert_knowledge_fts(
     relative_path: str,
     title: str,
     content: str,
+    card_text: str | None = None,
 ) -> None:
     if not is_sqlite:
         return
@@ -82,9 +97,9 @@ def upsert_knowledge_fts(
         text(
             """
             INSERT INTO knowledge_document_fts (
-                document_id, source_name, relative_path, title, content
+                document_id, source_name, relative_path, title, content, card_text
             ) VALUES (
-                :id, :src, :rp, :title, :content
+                :id, :src, :rp, :title, :content, :card_text
             )
             """
         ),
@@ -94,6 +109,7 @@ def upsert_knowledge_fts(
             "rp": relative_path,
             "title": title,
             "content": content,
+            "card_text": card_text or "",
         },
     )
 
@@ -101,13 +117,21 @@ def upsert_knowledge_fts(
 def backfill_knowledge_fts_if_empty(db: Session) -> int:
     if not is_sqlite:
         return 0
+    if not hasattr(db, "execute"):
+        return 0
     create_knowledge_fts_table(db)
-    count = int(db.execute(text("SELECT COUNT(*) FROM knowledge_document_fts")).scalar() or 0)
+    raw_count = db.execute(text("SELECT COUNT(*) FROM knowledge_document_fts")).scalar()
+    if not isinstance(raw_count, int):
+        return 0
+    count = int(raw_count or 0)
     if count > 0:
         return 0
 
     inserted = 0
     for document in db.execute(select(KnowledgeDocument)).scalars():
+        card = db.execute(
+            select(KnowledgeCard).where(KnowledgeCard.document_id == document.id)
+        ).scalar_one_or_none()
         upsert_knowledge_fts(
             db,
             document_id=document.id,
@@ -115,6 +139,7 @@ def backfill_knowledge_fts_if_empty(db: Session) -> int:
             relative_path=document.relative_path,
             title=document.title,
             content=document.content,
+            card_text=card.card_text if card is not None else "",
         )
         inserted += 1
     db.commit()

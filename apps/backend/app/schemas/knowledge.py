@@ -30,6 +30,7 @@ class KnowledgeCitation(BaseModel):
     line_start: int = Field(..., description="Starting line number of the citation in the document")
     line_end: int = Field(..., description="Ending line number of the citation in the document")
     snippet: str = Field(..., description="Text snippet of the citation")
+    card_text: str | None = Field(default=None, description="LLM-generated card summary")
     score: float = Field(..., description="Relevance score of the citation")
     metadata: dict[str, Any] = Field(default_factory=dict, description="Additional metadata for the citation")
 
@@ -82,6 +83,8 @@ class KnowledgeAnswerTrace(BaseModel):
     synthesis_max_snippet_chars: int | None = Field(default=None, description="Per-citation snippet cap fed to synthesiser")
     synthesis_prompt_version: str | None = Field(default=None, description="Identifier of the synthesis system-prompt version")
     synthesis_model: str | None = Field(default=None, description="Model identifier used for synthesis (None when answer_provider=='template')")
+    cards_available_count: int | None = Field(default=None, description="How many selected citations had generated cards")
+    cards_used_count: int | None = Field(default=None, description="How many cards were included in the synthesis prompt")
 
 
 class KnowledgeSearchResult(BaseModel):

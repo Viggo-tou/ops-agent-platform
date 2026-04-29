@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     # now returns whole function bodies, so keep enough context for later
     # control-flow and validation logic inside a cited function.
     knowledge_synthesis_max_snippet_chars: int = 6000
+    knowledge_cards_enabled: bool = True
+    knowledge_cards_provider: str = "minimax"
+    knowledge_cards_model: str = "MiniMax-M2.7"
+    knowledge_cards_max_chars: int = 400 * 6
+    knowledge_cards_concurrency: int = 5
     llm_retry_on_rate_limit: bool = True
     llm_retry_max_attempts: int = 3
     llm_retry_base_delay_sec: float = 2.0

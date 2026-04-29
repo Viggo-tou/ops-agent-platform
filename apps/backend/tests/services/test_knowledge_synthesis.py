@@ -148,6 +148,14 @@ def test_synthesize_respects_max_snippet_chars() -> None:
     assert "(truncated)" in evidence
 
 
+def test_format_evidence_includes_card_before_content() -> None:
+    citation = _citation(snippet="raw login code")
+    citation.card_text = "**Purpose**: Explains login."
+    evidence = KnowledgeSynthesizer(_settings())._format_evidence([citation])
+
+    assert "[CARD]\n**Purpose**: Explains login.\n[CONTENT]\nraw login code" in evidence
+
+
 @pytest.fixture()
 def db_session():
     engine = create_engine(

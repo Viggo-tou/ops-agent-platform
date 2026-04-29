@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.db import backfill_knowledge_fts_if_empty, create_knowledge_fts_table, upsert_knowledge_fts
+from app.models.knowledge_card import KnowledgeCard
 from app.models.knowledge_document import KnowledgeDocument
 from app.schemas.evidence import ChunkKind, EvidenceItem
 from app.schemas.knowledge import (
@@ -219,7 +220,7 @@ def _build_fts5_query(query_tokens: list[str], expanded_tokens: set[str]) -> str
         return '"unlikelytoken12345"'
 
     or_expr = " OR ".join(safe_tokens)
-    return f"(relative_path:({or_expr}) OR title:({or_expr}) OR content:({or_expr}))"
+    return f"(relative_path:({or_expr}) OR title:({or_expr}) OR content:({or_expr}) OR card_text:({or_expr}))"
 
 
 def _upsert_fts(
@@ -230,6 +231,7 @@ def _upsert_fts(
     relative_path: str,
     title: str,
     content: str,
+    card_text: str | None = None,
 ) -> None:
     upsert_knowledge_fts(
         db,
@@ -238,6 +240,7 @@ def _upsert_fts(
         relative_path=relative_path,
         title=title,
         content=content,
+        card_text=card_text,
     )
 
 
@@ -450,6 +453,9 @@ class KnowledgeService:
             self._build_citation(scored=scored, query_tokens=query_tokens, settings=self.settings)
             for scored in selected
         ]
+        for citation in citations:
+            citation.card_text = self._card_text_for_document_id(citation.document_id)
+        cards_available_count = sum(1 for citation in citations if citation.card_text)
         evidence_items = self._citations_to_evidence_items(citations)
 
         matched_tokens = sorted({token for scored in selected for token in scored.matched_tokens})
@@ -549,6 +555,8 @@ class KnowledgeService:
                 synthesis_max_snippet_chars=synthesis_max_snippet,
                 synthesis_prompt_version=synthesis_prompt_v,
                 synthesis_model=synthesis_model_used,
+                cards_available_count=cards_available_count,
+                cards_used_count=cards_available_count if synth_was_used else 0,
             ),
             packaged_context=packaged_context,
         )
@@ -626,11 +634,16 @@ class KnowledgeService:
                     relative_path=document.relative_path,
                     title=document.title,
                     content=document.content,
+                    card_text="",
                 )
                 indexed_documents += 1
                 continue
 
             if existing.content_hash != content_hash:
+                self.db.execute(
+                    text("DELETE FROM knowledge_card WHERE document_id = :id"),
+                    {"id": existing.id},
+                )
                 existing.title = file_path.name
                 existing.extension = extension
                 existing.language = metadata["language"]
@@ -646,6 +659,7 @@ class KnowledgeService:
                     relative_path=existing.relative_path,
                     title=existing.title,
                     content=existing.content,
+                    card_text="",
                 )
                 updated_documents += 1
 
@@ -656,6 +670,10 @@ class KnowledgeService:
             for stale_path in stale_paths:
                 stale_document = existing_documents.get(stale_path)
                 if stale_document is not None:
+                    self.db.execute(
+                        text("DELETE FROM knowledge_card WHERE document_id = :id"),
+                        {"id": stale_document.id},
+                    )
                     self.db.execute(
                         text("DELETE FROM knowledge_document_fts WHERE document_id = :id"),
                         {"id": stale_document.id},
@@ -815,6 +833,11 @@ class KnowledgeService:
                 )
                 self.db.add(document)
             else:
+                if existing.content_hash != content_hash:
+                    self.db.execute(
+                        text("DELETE FROM knowledge_card WHERE document_id = :id"),
+                        {"id": existing.id},
+                    )
                 existing.title = safe_name
                 existing.extension = extension
                 existing.language = metadata["language"]
@@ -835,6 +858,7 @@ class KnowledgeService:
                 relative_path=document.relative_path,
                 title=document.title,
                 content=document.content,
+                card_text=self._card_text_for_document_id(document.id),
             )
         self.db.commit()
 
@@ -860,6 +884,10 @@ class KnowledgeService:
                 removed_from_disk = True
 
         self.db.execute(
+            text("DELETE FROM knowledge_card WHERE document_id = :id"),
+            {"id": document.id},
+        )
+        self.db.execute(
             text("DELETE FROM knowledge_document_fts WHERE document_id = :id"),
             {"id": document.id},
         )
@@ -882,6 +910,10 @@ class KnowledgeService:
         )
         removed_count = int(self.db.execute(count_stmt).scalar_one() or 0)
 
+        self.db.execute(
+            text("DELETE FROM knowledge_card WHERE source_name = :source_name"),
+            {"source_name": normalized},
+        )
         self.db.execute(
             text("DELETE FROM knowledge_document_fts WHERE source_name = :source_name"),
             {"source_name": normalized},
@@ -1028,7 +1060,7 @@ class KnowledgeService:
             FROM knowledge_document_fts
             WHERE knowledge_document_fts MATCH :query
               AND source_name IN ({placeholders})
-            ORDER BY bm25(knowledge_document_fts, 0.0, 0.0, 3.0, 2.0, 1.0)
+            ORDER BY bm25(knowledge_document_fts, 0.0, 0.0, 3.0, 2.0, 1.0, 4.0)
             LIMIT :limit
             """
         )
@@ -1081,8 +1113,8 @@ class KnowledgeService:
         ]
         return tuple(dominant[:4])
 
-    @staticmethod
     def _score_document(
+        self,
         *,
         document: KnowledgeDocument,
         query: str,
@@ -1095,11 +1127,17 @@ class KnowledgeService:
 
         path_text = f"{document.relative_path} {document.title}".lower()
         content_sample = document.content[:40_000]
-        content_tokens = Counter(_tokenize(content_sample))
-        matched_tokens = {token for token in set(query_tokens) if token in path_text or content_tokens.get(token, 0) > 0}
+        card_text = self._card_text_for_document_id(document.id) or ""
+        searchable_text = f"{content_sample}\n{card_text}"
+        content_tokens = Counter(_tokenize(searchable_text))
+        matched_tokens = {
+            token
+            for token in set(query_tokens)
+            if token in path_text or content_tokens.get(token, 0) > 0
+        }
         semantic_hits = sum(min(content_tokens.get(token, 0), 4) for token in expanded_tokens)
         path_hits = sum(1 for token in expanded_tokens if token in path_text)
-        phrase_bonus = 8 if query.lower() in content_sample.lower() else 0
+        phrase_bonus = 8 if query.lower() in searchable_text.lower() else 0
         extension_bonus = 4 if document.extension in route.preferred_extensions else 0
         path_term_bonus = sum(3 for term in route.preferred_path_terms if term.lower() in path_text)
 
@@ -1155,6 +1193,21 @@ class KnowledgeService:
                 "truncated": chunk.truncated,
             },
         )
+
+    def _card_text_for_document_id(self, document_id: str) -> str | None:
+        card_text = self.db.execute(
+            select(KnowledgeCard.card_text).where(KnowledgeCard.document_id == document_id)
+        ).scalar_one_or_none()
+        return str(card_text) if card_text else None
+
+    def _card_text_for_source_path(self, *, source_name: str, relative_path: str) -> str | None:
+        card_text = self.db.execute(
+            select(KnowledgeCard.card_text).where(
+                KnowledgeCard.source_name == source_name,
+                KnowledgeCard.relative_path == relative_path,
+            )
+        ).scalar_one_or_none()
+        return str(card_text) if card_text else None
 
     @staticmethod
     def _citations_to_evidence_items(citations: list[KnowledgeCitation]) -> list[EvidenceItem]:
@@ -1304,6 +1357,10 @@ class KnowledgeService:
                     line_start=line_start,
                     line_end=line_end,
                     snippet=snippet,
+                    card_text=self._card_text_for_source_path(
+                        source_name=source_spec.name,
+                        relative_path=item.file_path,
+                    ),
                     score=round(float(item.confidence) * 100.0, 2),
                     metadata={
                         **item.metadata,
@@ -1357,6 +1414,7 @@ class KnowledgeService:
             route_kind=route.kind,
             language=language,
         )
+        cards_available_count = sum(1 for citation in citations if citation.card_text)
         claims = []
         ungrounded_claim_count = 0
         if answer_provider != "template":
@@ -1408,6 +1466,8 @@ class KnowledgeService:
                 synthesis_model=(
                     str(getattr(self.settings, "knowledge_synthesis_model", "") or "") or None
                 ) if answer_provider != "template" else None,
+                cards_available_count=cards_available_count,
+                cards_used_count=cards_available_count if answer_provider != "template" else 0,
             ),
             packaged_context=packaged_context,
         )
