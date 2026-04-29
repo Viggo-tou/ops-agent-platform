@@ -121,7 +121,7 @@ def main() -> int:
             answer, citations, display_citations, error, judge_error = "", [], [], None, None
             hits, judge_mode = [False] * len(points), "skipped"
             task_status, completed, question = "fetch_error", False, str(record.get("question") or "")
-            synthesis_status, judge_status = "fail", "skipped"
+            synthesis_status, judge_status = "task_error", "skipped"
             try:
                 response = client.get(f"{args.backend_url.rstrip('/')}/api/tasks/{task_id}")
                 response.raise_for_status()
@@ -132,7 +132,9 @@ def main() -> int:
                 task_status = str(task.get("status") or record.get("task_status") or "")
                 completed = task_status.lower() in TERMINAL_STATUSES
                 answer, display_citations, citations = task_answer(task)
-                synthesis_status = "pass" if answer.strip() else "fail"
+                synthesis_status = "pass" if answer.strip() else (
+                    "empty" if task_status.lower() == "completed" else "task_error"
+                )
             except Exception as exc:  # noqa: BLE001
                 error = f"{type(exc).__name__}: {exc}"
             if answer.strip():
@@ -182,7 +184,26 @@ def main() -> int:
         backend_url=args.backend_url,
         requested_judge_mode=args.judge_mode,
         judge_model=judge.judge_model,
-        judge_modes_used=sorted({str(record.get("judge_mode")) for record in records if record.get("judge_mode")}),
+        judge_modes_used=list(
+            dict.fromkeys(
+                str(record.get("judge_mode"))
+                for record in records
+                if record.get("judge_mode") and str(record.get("judge_mode")) != "skipped"
+            )
+        ),
+        pinned_judge_failure_count=(
+            sum(1 for record in records if record.get("judge_status") == "fail")
+            if args.judge_mode != "auto"
+            else 0
+        ),
+        pinned_judge_run_intact=(
+            args.judge_mode == "auto"
+            or not any(record.get("judge_status") == "fail" for record in records)
+        ),
+        score_averaging_note=(
+            "Records with score_status='invalid' are infrastructure/judge/synthesis failures "
+            "and must not be averaged as model-quality scores."
+        ),
         synthesis_status=overall_status(syn_counts, "pass"),
         judge_status=overall_status(judge_counts, "pass", "skipped"),
         score_status=overall_status(score_counts, "valid"),
