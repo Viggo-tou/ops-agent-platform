@@ -1,5 +1,6 @@
 from app.models.approval import Approval
 from app.models.event import Event
+from app.models.knowledge_card import KnowledgeCard
 from app.models.knowledge_document import KnowledgeDocument
 from app.models.llm_usage import LlmUsage
 from app.models.memory import MemoryItem, MemorySettings
@@ -13,6 +14,7 @@ __all__ = [
     "Task",
     "Event",
     "Approval",
+    "KnowledgeCard",
     "KnowledgeDocument",
     "LlmUsage",
     "MemoryItem",
