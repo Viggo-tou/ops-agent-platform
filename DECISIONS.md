@@ -100,3 +100,21 @@ Constraint:
 
 - Delete must remain gated by the `knowledge:delete` permission (admin only in current `PERMISSION_MAP`).
 - If compliance or legal later require retention/recall, switch to soft-delete by adding a `deleted_at` column and filtering in `KnowledgeService.list_documents` / `list_sources` — don't retrofit half the codebase.
+
+## D-009 Scored Tickets Land In Two Commits (feat + bench evidence)
+
+Any ticket whose acceptance criteria reference benchmark scores must land in two commits, not one:
+
+1. `feat(<area>): <change description>` — the implementation only. No measurement artifacts. No bench numbers in the message.
+2. `bench(<area>): record <ticket-id> results and decision` — the artifact files (`apps/backend/tests/benchmarks/runs/qa-run-*.jsonl`) plus a stage-log entry recording per-tier deltas and the accept/revert decision.
+
+Reason:
+
+- The implementation and the empirical evaluation have different revert semantics. If the bench fails to meet acceptance, only commit 2 needs to revert; commit 1 may still be useful as an experimental checkpoint or starting point for v2.
+- Bundling them means a "didn't meet bar" outcome forces a two-thing revert, more churn, and pollutes the implementation's commit message with numbers that may be re-measured later.
+- Codex's Stage 12 critique D6 surfaced this — bundled commits are bad history.
+
+Constraint:
+
+- Do not commit either half until the bench has been run with a strict-pinned judge (per T-BENCH-HARNESS-RESILIENCE) and `score_status="valid"` for all 34 questions in the artifact.
+- The stage-log entry in commit 2 must explicitly record the accept/revert decision. If revert: commit 2 is `revert(<area>): drop <ticket-id> per bench` and commit 1's hash is recorded in the stage-log close summary.
