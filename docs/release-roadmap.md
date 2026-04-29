@@ -196,7 +196,26 @@
 - benchmark 的 citation precision 口径从"文件级"升到"行级"，基线重跑一次存档
 - 无引用或引用残缺时 UI 明确提示（不造假）
 
-### 3.3 混合证据召回（升级自原 "多路召回"，2026-04-28 update）
+### 3.3 混合证据召回（升级自原 "多路召回"，2026-04-28 update + 2026-04-29 校准）
+
+**2026-04-29 校准（Stage 11/12/13 复盘 final）**
+
+Stage 11 v1（关键字分类器 → tier-aware cap）部分失败：D +10.67 ✅，但 C -15.75 ❌。Stage 12 v2 inverted-default 政策跑了 rejudge：A=55(-1.5)、B=44.8(+7.2)、C=58.1(-12.5)、D=39.7(-0.3)、**mean=50.03（vs 49.65, +0.38 — 统计噪声）**。
+
+诊断：trace 显示 34/34 题都 `locate_detected=False, cap_used=6000`，policy 实际等于"全局 cap=6000"。后做 5 分钟 unit test，把 raw dataset 34 题喂 `_detect_locate_signal`，只 **2/34** match。差异原因：planner 给 synthesis 的 `query` 不是用户原 `request_text`（query_rewrite +12 tokens），detector 的 `len > 60: return False` 把这些都筛掉。
+
+**结论：tier-aware via regex/keyword classifier 不是有用的杠杆。** Drop 这个 workstream，v2 不 commit，回 baseline cap=3000 (.env override)。
+
+落到 Phase 3.3 的具体校准：
+
+落到 Phase 3.3 的具体校准：
+
+1. **任何"按 query shape / channel 选权重"的逻辑，先做 binary（开/关 / 宽/窄），不要做 3+ 档**。v1 想 single/multi 双档已经吃了苦头，跳到 single/medium/wide 三档只会失败更多次。证明二元不够再加。
+2. **channel_weights 不能拍脑袋**。所有 RRF 权重必须先有 T-LLM-METRICS 的数据（每个通道的命中率 / p95 延迟 / cost），再用一份 baseline 数据集做小范围 sweep 决定。**不允许在没数据的情况下硬编码 0.4 / 0.3 / 0.2**。前置票：`docs/ai/specs/llm-metrics-instrumentation.md`。
+3. **接受标准 "C 档 +10 / D 档 +8" 的基线对照对象更新**：原来对 Phase 3.0 出口（49.65 + D 30.33），v2 落地后改用 v2 PINNED judge baseline 作为新基线（数字待 Stage 12 出）。比较时 judge / synthesis provider 必须 pin 死。
+4. **CC 工具混入 EvidenceItem 池的优先级降低**：v2 已经验证 CC 单路就能拿 49.65 mean。3.3 的 "agentic 通道" 重要性从 P0 降为 P1 —— 先把 fts5 + card 这两个**离线索引**通道做掉（CC 慢的根源是 runtime 调用，离线索引不抢 30s 预算），benchmark 涨多少看，再决定要不要把 cc_glob/cc_grep 也并进 RRF。
+5. **T-KB-HYBRID-RAG-FAST-PATH 重新定位**（codex 反对推迟到 3.5）：176s/Q 不是"latency-only"，是"产品根本不能交互"。Hybrid fast-path 留 **P0**，但 scope 窄：simple locate/definition/factual repo 问题走 fast-path（RAG 13-18s），ambiguity / 低置信才升 agentic。这是 codex 在 Stage 12 critique D5 修正我的判断后的版本。
+6. **classifier 的输入要和测试输入一致**（Stage 13 lesson）：v2 unit test 用 raw question，runtime detector 看的是 planner 改写的 query。任何未来 query-shape 分类（fast-path 路由、cap 选择、re-rank trigger）必须明确到底用哪个 query 字符串，并在 trace 里两个都记。
 
 **为什么改名 + 改方向**
 

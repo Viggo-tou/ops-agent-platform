@@ -595,6 +595,76 @@ a3f0cf4  Merge branch 'feat/repair-cap-impl' (pre-existing)
 
 #### 步骤
 - 01:35 entry 写入 STAGE_LOG（本条）
+- ~03:00 codex 实施 v2 完成（5 文件：config / schemas/knowledge / services/knowledge / services/knowledge_synthesis / tests/services/test_knowledge_synthesis）。第 6 文件 baseline-doc 被 codex 误改（把 cap=3000 改成 0，会污染 49.65 历史复现），手动 revert。
+- ~03:05 sanity：`compileall app` clean，`pytest tests/services/test_knowledge_synthesis.py` 17/17 pass（696s，~12 min）。
+- ~03:10 老 8004 backend (PID 29080, v1 commit) kill，从 v2 worktree 重启 backend on 8004 (PID 48209)。`/health` 返回 db_connected=true。
+- ~03:15 写 `T-RUN-BENCH-V2.md` 派 codex 跑 benchmark（PID 48221，`--judge-mode claude_code` PINNED，`--judge-samples 3`，`--question-timeout 240`）。预计 ~80-100 分钟。
+- 并行：写 `docs/ai/specs/llm-metrics-instrumentation.md`（T-LLM-METRICS，P2，event.payload_json + 现有 LlmUsage，无新表），写 release-roadmap.md Phase 3.3 校准（v1/v2 经验教训：先 binary 再多档；channel weights 必须有 metrics 数据再定；CC 单路已够好，hybrid fast-path 推迟到 3.5）。
+- 等 benchmark 出数据 → 决策 commit / merge / 是否更新 baseline。
+
+#### Close 摘要
+
+- **Status:** CLOSED-DROPPED
+- **结果:** v2 政策没赢，且实际上没真正运行。
+- **bench 灾难 + 抢救:** 第一次 v2 bench 在 codex sandbox 跑（PID 48221），结果 0/34 全 0 分，`task_status=runner_error`。Root cause: `CodexSandboxUsers` Windows 用户对 `%LOCALAPPDATA%\npm-cache` 没写权限 → judge 调 `npx claude` 时 npm EPERM → script `except Exception` 把 judge 故障误标成 task 故障 → answer 被丢、judge 回退 "rule"、rule 对空答案打 0。Backend synthesis 实际上是成功的（DB 里有 34 个真实 answer + citations）。
+- **抢救方案:** 派 codex 写 `apps/backend/scripts/rejudge_run.py`（offline rejudge：从 backend `GET /api/tasks/{id}` 拉 `latest_result_json.result.answer` + citations，用 `KeypointJudge(claude_code, samples=3)` 重新打分），从 Tomonkyo shell 跑（绕开 sandbox EPERM）。修了 codex 写的脚本里一处 canonical-citation reuse bug（`task_answer` 之前没用 bench 的 `extract_answer_and_citations` 3-tuple）。耗时 ~9 分钟，34/34 valid。
+- **真实 v2 数字（rejudge claude_code, samples=3）:**
+  - A=55.00（vs baseline 56.50, **-1.50**, 平）
+  - B=44.80（vs 37.60, **+7.20** ✓）
+  - C=58.12（vs 70.62, **-12.50** ✗ 距 target 65 短 6.88）
+  - D=39.67（vs 30.33, **+9.34** ✓ 距 target 40 短 0.33，基本平）
+  - **Mean=50.03（vs 49.65, +0.38 — 统计噪声）**
+- **Smoking gun:** 跑 5 分钟 unit test 单独喂 34 题给 `_detect_locate_signal()`，只有 **2/34** match（A-01, A-07）。但 trace 里 34/34 都是 `locate_detected=False, cap_used=6000`。差异原因：planner 给 synthesis 的 `query` 不是用户原 `request_text`，是 planner 改写后的字符串（且 query_rewrite 还会 +12 tokens），detector 的 `len > 60: return False` 把这些都筛掉。
+- **结论:**
+  1. v2 政策实际上等于"全局 cap=6000"，从未触发 narrow。
+  2. 即使修了 upstream-query 让 detector 看到原问题，也只 2/34 命中 narrow，对整体 mean 影响极小。
+  3. cap=6000 vs cap=3000 是 per-tier trade-off（B/D 涨 7-9，C 跌 12），mean 持平，没赢家。
+  4. **tier-aware via regex/keyword classifier 不是有用的杠杆**，drop 这个 workstream。
+- **没做的:**
+  - 不 commit v2，不 merge `feat/kb-evidence-tier-cap` 到 checkpoint（branch 留作 history reference）。
+  - 不动 `qa-baseline-2026-04-28.md`（49.65 reference 保持）。
+- **产出文件（已 copy 到 checkpoint）:**
+  - `apps/backend/scripts/rejudge_run.py` — offline rejudge 工具
+  - `apps/backend/tests/benchmarks/runs/qa-run-20260429T011959Z.jsonl` — v2 原 bench artifact（judge 灾难版）
+  - `apps/backend/tests/benchmarks/runs/qa-run-20260429T011959Z-rejudged.jsonl` — v2 真实 rejudge 数据
+  - `apps/backend/tests/benchmarks/runs/qa-run-20260428T135735Z.jsonl` — v1 (Stage 11) 原 bench
+  - `docs/ai/tasks/T-REJUDGE-RUN.md` — rejudge 工具 spec
+- **Lesson:**
+  1. **harness 设计 bug 比策略 bug 危险**：`except Exception` 把 infra 故障翻译成模型故障；harness 必须先持久化 answer 再 judge，且区分 `synthesis_status` / `judge_status` / `score_status`（codex 的洞察）。→ T-BENCH-HARNESS-RESILIENCE 记录待办。
+  2. **classifier 的输入要和你测试的输入一致**：v2 unit test 用 raw question，但 runtime detector 看的是 planner 改写后的 query。这俩不一致就别假装是同一个分类器。
+  3. **codex sandbox 用户隔离会破 npm/pip cache 等用户级状态**：bench/CLI 编排不要在 codex 沙箱跑，应在 Tomonkyo shell；codex 沙箱专门用于 codegen 和 risky edits（memory rule 待更新）。
+  4. **measurement 投资回报递减时及时退出**：v1+v2 两个 stage 投了 ~5 小时换一个"mean +0.38"，还是统计噪声。再迭代第三次去修 1-line classifier bug 不会改变 mean 不动的事实。
+
+---
+
+### Stage 13 — Bench infra triage + offline rejudge + Stage 12 closure
+
+**Open:** 2026-04-29 ~03:30 (UTC+10) by Claude
+**Status:** CLOSED-DONE
+**Layer:** L1 (调试)
+**Timebox:** ~120 分钟实际
+**Trigger:** Stage 12 v2 bench 0/34 灾难需要 root-cause + 抢救数据。
+
+#### 步骤
+- 03:30 root-cause: `task_status=runner_error` + `npm error EPERM` 全部 34 题；ACL 检查发现 `CodexSandboxUsers` 对 `%LOCALAPPDATA%\npm-cache\_cacache\tmp` 只读。从 Tomonkyo shell `npx --no-install -y @anthropic-ai/claude-code --version` 返 2.1.122 OK，证明问题在 sandbox 用户。
+- 03:35 verify: backend 实际 synthesis 成功，curl A-01 task 拿到完整 answer + 4 个 citations + reviewer approved。bench 失败 100% 在 script 端 judge 步骤。
+- 03:40 与 codex pivot 讨论（PID 48418）：4 问 → codex 给出 4 答，最关键的 d 点："这是 harness 设计 bug，不是 npm 问题；harness 应在 judge 前持久化 answer，artifact 应区分 3 个 status 字段"。我无实质反驳，采纳。
+- 03:45 写 `T-REJUDGE-RUN.md` 派 codex（PID 48455）写 `rejudge_run.py`（low effort）。codex sandbox 跑不了 `python` 所以做不了 dry-run，由 Tomonkyo shell 接手。
+- 04:00 dry-run 暴露 1 bug：rejudge 用了自己的 `task_answer` 而没复用 bench 的 `extract_answer_and_citations`，导致 citation 是 display-form 不是 canonical → cp 全 0。手动 patch（3 行 edit），rule dry-run 复跑，cp 正确。
+- 04:05 启 claude_code rejudge（PID 48592, samples=3, 真 PINNED 因为 Tomonkyo 用户能用 npm cache），9 分钟跑完 34 题。
+- 04:14 数字到位（见 Stage 12 close 摘要）。
+- 04:20 与 codex 讨论结果（PID 48604, 4 问 4 答），收敛到 Option A（revert v2，drop tier-cap workstream，pivot FTS5/cards）。
+- 04:30 5 分钟 unit test：把 dataset 34 题喂 `_detect_locate_signal`，只有 2 题（A-01/A-07）match。结合 trace 全 False，证实 detector 看到的不是 raw question。
+- 04:40 用户拍板 Option B（revert 到 pre-v1 baseline，不留 v1 keyword classifier）。
+- 04:45 worktree `git checkout HEAD --` 5 个 v2 文件 → 回到 v1 commit `9be1ccf`。checkpoint/pre-reclassify 本来就没 v1（feat 分支独立），所以源代码已是 baseline 状态。
+- 04:50 把 rejudge 工具 + 3 个 measurement 工艺品 + spec 复制到 checkpoint 准备 docs commit。
+
+#### Close 摘要
+- **Status:** CLOSED-DONE
+- **结果:** Stage 12 灾难抢救成功，v2 政策被诚实评估并 drop。
+- **产出:** `rejudge_run.py` 落盘 checkpoint（未来 bench infra 故障可复用）；3 个 measurement artifact 留 history；Stage 12 close 摘要 + 4 条 lesson。
+- **没做的:** memory rule 拆分、T-BENCH-HARNESS-RESILIENCE spec、Plan B doc updates（D2/D4/D5/D6）、roadmap Phase 3.3 calibration 收尾——都列入 Stage 14 待办。
+- **Lesson:** harness resilience 比 policy 优化优先级高。一个 0/34 的 bench 比 100 个 baseline 偏移更难诊断。
 
 
 
