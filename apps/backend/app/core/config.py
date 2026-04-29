@@ -121,6 +121,8 @@ class Settings(BaseSettings):
     knowledge_rerank_pool_size: int = 15
     knowledge_rerank_timeout_seconds: float = 20.0
     knowledge_rerank_snippet_chars: int = 600
+    knowledge_fts5_enabled: bool = True
+    knowledge_fts5_pool_multiplier: int = 5
     # Query expansion: ask an LLM for additional likely-source tokens to
     # add to the retrieval token set, addressing the recall gap where
     # natural-language phrases don't share surface tokens with actual

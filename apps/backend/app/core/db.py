@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Generator
 
-from sqlalchemy import create_engine, event as sa_event, inspect, text
+from sqlalchemy import create_engine, event as sa_event, inspect, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 from app.models.base import Base
+from app.models.knowledge_document import KnowledgeDocument
 
 settings = get_settings()
 is_sqlite = settings.database_url.startswith("sqlite")
@@ -41,6 +42,83 @@ def get_db() -> Generator[Session, None, None]:
         yield db
     finally:
         db.close()
+
+
+def create_knowledge_fts_table(db: Session) -> None:
+    if not is_sqlite:
+        return
+    db.execute(
+        text(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_document_fts USING fts5(
+                document_id UNINDEXED,
+                source_name UNINDEXED,
+                relative_path,
+                title,
+                content,
+                tokenize = 'porter unicode61 remove_diacritics 2'
+            )
+            """
+        )
+    )
+
+
+def upsert_knowledge_fts(
+    db: Session,
+    *,
+    document_id: str,
+    source_name: str,
+    relative_path: str,
+    title: str,
+    content: str,
+) -> None:
+    if not is_sqlite:
+        return
+    db.execute(
+        text("DELETE FROM knowledge_document_fts WHERE document_id = :id"),
+        {"id": document_id},
+    )
+    db.execute(
+        text(
+            """
+            INSERT INTO knowledge_document_fts (
+                document_id, source_name, relative_path, title, content
+            ) VALUES (
+                :id, :src, :rp, :title, :content
+            )
+            """
+        ),
+        {
+            "id": document_id,
+            "src": source_name,
+            "rp": relative_path,
+            "title": title,
+            "content": content,
+        },
+    )
+
+
+def backfill_knowledge_fts_if_empty(db: Session) -> int:
+    if not is_sqlite:
+        return 0
+    create_knowledge_fts_table(db)
+    count = int(db.execute(text("SELECT COUNT(*) FROM knowledge_document_fts")).scalar() or 0)
+    if count > 0:
+        return 0
+
+    inserted = 0
+    for document in db.execute(select(KnowledgeDocument)).scalars():
+        upsert_knowledge_fts(
+            db,
+            document_id=document.id,
+            source_name=document.source_name,
+            relative_path=document.relative_path,
+            title=document.title,
+            content=document.content,
+        )
+        inserted += 1
+    db.commit()
+    return inserted
 
 
 def ensure_local_schema() -> None:
@@ -135,3 +213,6 @@ def ensure_local_schema() -> None:
             tool_execution_columns = {column["name"] for column in inspector.get_columns("tool_execution")}
             if "inverse_action_json" not in tool_execution_columns:
                 connection.execute(text("ALTER TABLE tool_execution ADD COLUMN inverse_action_json JSON"))
+
+    with SessionLocal() as db:
+        backfill_knowledge_fts_if_empty(db)

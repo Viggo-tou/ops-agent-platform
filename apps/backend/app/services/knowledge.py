@@ -9,10 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.core.db import backfill_knowledge_fts_if_empty, create_knowledge_fts_table, upsert_knowledge_fts
 from app.models.knowledge_document import KnowledgeDocument
 from app.schemas.evidence import ChunkKind, EvidenceItem
 from app.schemas.knowledge import (
@@ -203,6 +204,43 @@ def _expand_tokens(tokens: list[str]) -> set[str]:
     return expanded
 
 
+def _escape_fts_token(token: str) -> str:
+    safe = token.replace('"', '""')
+    return f'"{safe}"'
+
+
+def _build_fts5_query(query_tokens: list[str], expanded_tokens: set[str]) -> str:
+    safe_tokens = [
+        _escape_fts_token(token)
+        for token in sorted({*query_tokens, *expanded_tokens})
+        if token and len(token) >= 2
+    ]
+    if not safe_tokens:
+        return '"unlikelytoken12345"'
+
+    or_expr = " OR ".join(safe_tokens)
+    return f"(relative_path:({or_expr}) OR title:({or_expr}) OR content:({or_expr}))"
+
+
+def _upsert_fts(
+    db: Session,
+    *,
+    document_id: str,
+    source_name: str,
+    relative_path: str,
+    title: str,
+    content: str,
+) -> None:
+    upsert_knowledge_fts(
+        db,
+        document_id=document_id,
+        source_name=source_name,
+        relative_path=relative_path,
+        title=title,
+        content=content,
+    )
+
+
 @dataclass(frozen=True)
 class SourceSpec:
     name: str
@@ -229,6 +267,8 @@ class KnowledgeService:
     def __init__(self, db: Session):
         self.db = db
         self.settings = get_settings()
+        create_knowledge_fts_table(self.db)
+        backfill_knowledge_fts_if_empty(self.db)
 
     def sync_repositories(self, *, source_name: str | None = None) -> KnowledgeSyncResponse:
         source_specs = self._resolve_source_specs()
@@ -318,6 +358,9 @@ class KnowledgeService:
         )
         query_rewrite_added_tokens_count: int | None = None
         actual_rerank_pool_size: int | None = None
+        fts5_pool_size: int | None = None
+        fts5_match_count: int | None = None
+        fts5_query: str | None = None
 
         # Query rewrite: ask LLM for additional likely-source tokens (e.g.
         # CamelCase identifiers, synonyms, adjacent concepts) to lift recall
@@ -333,8 +376,21 @@ class KnowledgeService:
             if llm_tokens:
                 expanded_tokens = expanded_tokens | llm_tokens
 
+        scoring_candidates = documents
+        fts5_enabled = bool(getattr(self.settings, "knowledge_fts5_enabled", True))
+        if fts5_enabled:
+            multiplier = max(1, int(getattr(self.settings, "knowledge_fts5_pool_multiplier", 5)))
+            fts5_pool_size = max(top_k * multiplier, 20)
+            fts5_query = _build_fts5_query(query_tokens, expanded_tokens)
+            scoring_candidates = self._fts5_topk(
+                source_names=source_names,
+                fts_query=fts5_query,
+                pool_size=fts5_pool_size,
+            )
+            fts5_match_count = len(scoring_candidates)
+
         scored_documents: list[ScoredDocument] = []
-        for document in documents:
+        for document in scoring_candidates:
             scored = self._score_document(
                 document=document,
                 query=query,
@@ -485,6 +541,9 @@ class KnowledgeService:
                 answer_provider=answer_provider,
                 rerank_enabled=rerank_enabled,
                 rerank_pool_size=actual_rerank_pool_size,
+                fts5_pool_size=fts5_pool_size,
+                fts5_match_count=fts5_match_count,
+                fts5_query=fts5_query,
                 query_rewrite_enabled=query_rewrite_enabled_setting,
                 query_rewrite_added_tokens=query_rewrite_added_tokens_count,
                 synthesis_max_snippet_chars=synthesis_max_snippet,
@@ -546,19 +605,27 @@ class KnowledgeService:
 
             existing = existing_documents.get(relative_path)
             if existing is None:
-                self.db.add(
-                    KnowledgeDocument(
-                        source_name=spec.name,
-                        relative_path=relative_path,
-                        title=file_path.name,
-                        extension=extension,
-                        language=metadata["language"],
-                        size_bytes=len(raw_bytes),
-                        line_count=line_count,
-                        content_hash=content_hash,
-                        metadata_json=metadata,
-                        content=content,
-                    )
+                document = KnowledgeDocument(
+                    source_name=spec.name,
+                    relative_path=relative_path,
+                    title=file_path.name,
+                    extension=extension,
+                    language=metadata["language"],
+                    size_bytes=len(raw_bytes),
+                    line_count=line_count,
+                    content_hash=content_hash,
+                    metadata_json=metadata,
+                    content=content,
+                )
+                self.db.add(document)
+                self.db.flush()
+                _upsert_fts(
+                    self.db,
+                    document_id=document.id,
+                    source_name=document.source_name,
+                    relative_path=document.relative_path,
+                    title=document.title,
+                    content=document.content,
                 )
                 indexed_documents += 1
                 continue
@@ -572,12 +639,27 @@ class KnowledgeService:
                 existing.content_hash = content_hash
                 existing.metadata_json = metadata
                 existing.content = content
+                _upsert_fts(
+                    self.db,
+                    document_id=existing.id,
+                    source_name=existing.source_name,
+                    relative_path=existing.relative_path,
+                    title=existing.title,
+                    content=existing.content,
+                )
                 updated_documents += 1
 
         stale_paths = set(existing_documents) - seen_paths
         removed_documents = 0
         if stale_paths:
             removed_documents = len(stale_paths)
+            for stale_path in stale_paths:
+                stale_document = existing_documents.get(stale_path)
+                if stale_document is not None:
+                    self.db.execute(
+                        text("DELETE FROM knowledge_document_fts WHERE document_id = :id"),
+                        {"id": stale_document.id},
+                    )
             self.db.execute(
                 delete(KnowledgeDocument).where(
                     KnowledgeDocument.source_name == spec.name,
@@ -745,6 +827,15 @@ class KnowledgeService:
             indexed.append(document)
 
         self.db.flush()
+        for document in indexed:
+            _upsert_fts(
+                self.db,
+                document_id=document.id,
+                source_name=document.source_name,
+                relative_path=document.relative_path,
+                title=document.title,
+                content=document.content,
+            )
         self.db.commit()
 
         summaries = [KnowledgeDocumentSummary.model_validate(document) for document in indexed]
@@ -768,6 +859,10 @@ class KnowledgeService:
                 disk_path.unlink()
                 removed_from_disk = True
 
+        self.db.execute(
+            text("DELETE FROM knowledge_document_fts WHERE document_id = :id"),
+            {"id": document.id},
+        )
         self.db.delete(document)
         self.db.commit()
         return KnowledgeDeleteResponse(
@@ -787,6 +882,10 @@ class KnowledgeService:
         )
         removed_count = int(self.db.execute(count_stmt).scalar_one() or 0)
 
+        self.db.execute(
+            text("DELETE FROM knowledge_document_fts WHERE source_name = :source_name"),
+            {"source_name": normalized},
+        )
         self.db.execute(
             delete(KnowledgeDocument).where(KnowledgeDocument.source_name == normalized)
         )
@@ -911,6 +1010,44 @@ class KnowledgeService:
             preferred_path_terms=("src/main", "viewmodel", "activity", "fragment", "login", "chat"),
             source_candidates=source_candidates,
         )
+
+    def _fts5_topk(
+        self,
+        *,
+        source_names: list[str],
+        fts_query: str,
+        pool_size: int,
+    ) -> list[KnowledgeDocument]:
+        if not source_names:
+            return []
+
+        placeholders = ", ".join(f":s{i}" for i in range(len(source_names)))
+        sql = text(
+            f"""
+            SELECT document_id
+            FROM knowledge_document_fts
+            WHERE knowledge_document_fts MATCH :query
+              AND source_name IN ({placeholders})
+            ORDER BY bm25(knowledge_document_fts, 0.0, 0.0, 3.0, 2.0, 1.0)
+            LIMIT :limit
+            """
+        )
+        params: dict[str, object] = {"query": fts_query, "limit": pool_size}
+        for index, source_name in enumerate(source_names):
+            params[f"s{index}"] = source_name
+
+        rows = self.db.execute(sql, params).all()
+        ids = [row[0] for row in rows]
+        if not ids:
+            return []
+
+        documents = list(
+            self.db.execute(
+                select(KnowledgeDocument).where(KnowledgeDocument.id.in_(ids))
+            ).scalars()
+        )
+        by_id = {document.id: document for document in documents}
+        return [by_id[document_id] for document_id in ids if document_id in by_id]
 
     def _extension_counts(self, source_specs: list[SourceSpec]) -> Counter[str]:
         source_names = [spec.name for spec in source_specs]

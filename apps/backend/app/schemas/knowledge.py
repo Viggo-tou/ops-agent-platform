@@ -74,6 +74,9 @@ class KnowledgeAnswerTrace(BaseModel):
     # synthesis_prompt_version when answer_provider == "template").
     rerank_enabled: bool | None = Field(default=None, description="Whether the LLM reranker ran on the keyword-top pool")
     rerank_pool_size: int | None = Field(default=None, description="Pool size fed to the reranker before top_k slice")
+    fts5_pool_size: int | None = Field(default=None, description="FTS5 candidate pool size before rerank")
+    fts5_match_count: int | None = Field(default=None, description="FTS5 actual match count returned")
+    fts5_query: str | None = Field(default=None, description="FTS5 MATCH expression used")
     query_rewrite_enabled: bool | None = Field(default=None, description="Whether LLM query-token expansion ran")
     query_rewrite_added_tokens: int | None = Field(default=None, description="Number of LLM-suggested tokens unioned into retrieval set")
     synthesis_max_snippet_chars: int | None = Field(default=None, description="Per-citation snippet cap fed to synthesiser")
