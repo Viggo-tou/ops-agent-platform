@@ -253,6 +253,15 @@ class KeypointJudge:
         # benchmark variants. samples=1 preserves the original behaviour.
         self.samples = max(1, int(samples))
 
+    @property
+    def pinned(self) -> bool:
+        return self.requested_mode != "auto"
+
+    def _append_auto_reason(self, reason: str) -> None:
+        if self.auto_rule_reason and reason in self.auto_rule_reason:
+            return
+        self.auto_rule_reason = f"{self.auto_rule_reason} {reason}".strip() if self.auto_rule_reason else reason
+
     def judge(self, *, question: str, answer: str, keypoints: Sequence[str]) -> tuple[list[bool], str]:
         if not answer.strip():
             return [False] * len(keypoints), "rule"
@@ -323,35 +332,38 @@ class KeypointJudge:
             try:
                 return self._judge_with_claude_code(question=question, answer=answer, keypoints=keypoints), "claude_code"
             except Exception as exc:  # noqa: BLE001
-                self.auto_rule_reason = f"Claude Code CLI judge failed: {exc}; trying next."
+                self._append_auto_reason(f"Claude Code CLI judge failed: {exc}; trying next.")
+        else:
+            self._append_auto_reason(f"Claude Code CLI judge not found: {self.settings.claude_code_command}; trying next.")
 
         # Codex CLI: also cross-family vs MiniMax, uses ChatGPT auth.
         if shutil.which(self.settings.codex_command):
             try:
                 return self._judge_with_codex(question=question, answer=answer, keypoints=keypoints), "codex"
             except Exception as exc:  # noqa: BLE001
-                self.auto_rule_reason = (self.auto_rule_reason or "") + f" Codex CLI judge failed: {exc};"
+                self._append_auto_reason(f"Codex CLI judge failed: {exc}; trying next.")
+        else:
+            self._append_auto_reason(f"Codex CLI judge not found: {self.settings.codex_command}; trying next.")
 
         if self.settings.anthropic_api_key:
             try:
                 return self._judge_with_anthropic(question=question, answer=answer, keypoints=keypoints), "anthropic"
             except (httpx.HTTPError, json.JSONDecodeError, RuntimeError) as exc:
                 # Don't force-rule yet — fall through to MiniMax before giving up.
-                self.auto_rule_reason = (self.auto_rule_reason or "") + f" Anthropic judge failed: {exc};"
+                self._append_auto_reason(f"Anthropic judge failed: {exc}; trying next.")
+        else:
+            self._append_auto_reason("OPS_AGENT_ANTHROPIC_API_KEY not configured; trying next.")
 
         if not self.settings.minimax_api_key:
             self._auto_force_rule = True
-            self.auto_rule_reason = (
-                self.auto_rule_reason
-                or "Neither OPS_AGENT_ANTHROPIC_API_KEY nor OPS_AGENT_MINIMAX_API_KEY configured"
-            )
+            self._append_auto_reason("OPS_AGENT_MINIMAX_API_KEY not configured; falling back to rule.")
             return self._judge_with_rule(answer=answer, keypoints=keypoints), "rule"
 
         try:
             return self._judge_with_minimax(question=question, answer=answer, keypoints=keypoints), "minimax"
         except (httpx.HTTPError, json.JSONDecodeError, RuntimeError) as exc:
             self._auto_force_rule = True
-            self.auto_rule_reason = f"MiniMax judge unavailable: {exc}"
+            self._append_auto_reason(f"MiniMax judge unavailable: {exc}; falling back to rule.")
             return self._judge_with_rule(answer=answer, keypoints=keypoints), "rule"
 
     def _judge_with_rule(self, *, answer: str, keypoints: Sequence[str]) -> list[bool]:
@@ -736,9 +748,14 @@ def tier_summary(records: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]
     summary: dict[str, dict[str, Any]] = {}
     for tier in ("A", "B", "C", "D"):
         tier_records = [record for record in records if record["tier"] == tier]
-        scores = [float(record["score"]) for record in tier_records]
+        valid_records = [
+            record for record in tier_records if str(record.get("score_status", "valid")) == "valid"
+        ]
+        scores = [float(record["score"]) for record in valid_records]
         summary[tier] = {
             "count": len(tier_records),
+            "valid_score_count": len(valid_records),
+            "invalid_score_count": len(tier_records) - len(valid_records),
             "completed": sum(1 for record in tier_records if record["completed"]),
             "timed_out": sum(1 for record in tier_records if record["timed_out"]),
             "mean_score": round(mean(scores), 2) if scores else 0.0,
@@ -783,12 +800,26 @@ def build_summary(
     infrastructure_failed: bool,
     running: bool,
     question_timeout_seconds: float,
+    preflight_judge_status: str,
+    preflight_judge_error: str | None,
 ) -> dict[str, Any]:
     abc_records = [record for record in records if record["tier"] in {"A", "B", "C"}]
     abc_completed = sum(1 for record in abc_records if record["completed"])
     abc_total = len(abc_records)
     completion_ratio = abc_completed / abc_total if abc_total else 0.0
-    judge_modes_used = sorted({str(record["judge_mode"]) for record in records if record.get("judge_mode")})
+    judge_modes_used: list[str] = []
+    for record in records:
+        mode = str(record.get("judge_mode") or "").strip()
+        if mode and mode != "skipped" and mode not in judge_modes_used:
+            judge_modes_used.append(mode)
+    synthesis_counts = Counter(str(record.get("synthesis_status", "unknown")) for record in records)
+    judge_counts = Counter(str(record.get("judge_status", "unknown")) for record in records)
+    score_counts = Counter(str(record.get("score_status", "unknown")) for record in records)
+    pinned_judge_failure_count = (
+        sum(1 for record in records if record.get("judge_status") == "fail")
+        if requested_judge_mode != "auto"
+        else 0
+    )
     summary = {
         "type": "summary",
         "status": "running" if running else "completed",
@@ -804,11 +835,22 @@ def build_summary(
         "judge_model": judge.judge_model,
         "judge_modes_used": judge_modes_used,
         "judge_auto_fallback_reason": judge.auto_rule_reason,
+        "preflight_judge_status": preflight_judge_status,
+        "preflight_judge_error": preflight_judge_error,
+        "pinned_judge_failure_count": pinned_judge_failure_count,
+        "pinned_judge_run_intact": requested_judge_mode == "auto" or pinned_judge_failure_count == 0,
+        "score_averaging_note": (
+            "Records with score_status='invalid' are infrastructure/judge/synthesis failures "
+            "and must not be averaged as model-quality scores."
+        ),
         "backend_commit_sha": try_git_head(),
         "total_questions": len(records),
         "completed_questions": sum(1 for record in records if record["completed"]),
         "timed_out_questions": sum(1 for record in records if record["timed_out"]),
         "infrastructure_failed": infrastructure_failed,
+        "synthesis_status_counts": dict(sorted(synthesis_counts.items())),
+        "judge_status_counts": dict(sorted(judge_counts.items())),
+        "score_status_counts": dict(sorted(score_counts.items())),
         "abc_completed": abc_completed,
         "abc_total": abc_total,
         "abc_completion_ratio": round(completion_ratio, 4),
@@ -823,6 +865,23 @@ def write_artifact(out_path: Path, summary: dict[str, Any], records: Sequence[di
         handle.write(json.dumps(summary, ensure_ascii=False) + "\n")
         for record in records:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def preflight_judge(judge: KeypointJudge) -> tuple[str, str | None]:
+    try:
+        _hits, mode = judge.judge(question="ping", answer="ping", keypoints=["ping"])
+        if judge.requested_mode == "auto" and mode == "rule" and not judge.auto_rule_reason:
+            judge.auto_rule_reason = "Auto judge preflight fell back to rule judge"
+        return "pass", None
+    except Exception as exc:  # noqa: BLE001
+        error = f"{type(exc).__name__}: {exc}"
+        if judge.requested_mode == "auto":
+            judge.auto_rule_reason = (
+                (judge.auto_rule_reason + " ") if judge.auto_rule_reason else ""
+            ) + f"Auto judge preflight failed: {error}; continuing with per-question fallback."
+            print(f"WARNING: Preflight judge call failed: {error}; continuing in auto mode.", file=sys.stderr)
+            return "fail", error
+        raise RuntimeError(error) from exc
 
 
 def parse_args() -> argparse.Namespace:
@@ -884,6 +943,38 @@ def main() -> int:
     client = BenchmarkClient(backend_url=args.backend_url, actor_name=args.actor_name)
     records: list[dict[str, Any]] = []
     infrastructure_failed = False
+    preflight_judge_status = "not_run"
+    preflight_judge_error: str | None = None
+
+    try:
+        preflight_judge_status, preflight_judge_error = preflight_judge(judge)
+    except RuntimeError as exc:
+        preflight_judge_status = "fail"
+        preflight_judge_error = str(exc)
+        summary = build_summary(
+            dataset_path=dataset_path,
+            out_path=out_path,
+            backend_url=args.backend_url,
+            actor_name=args.actor_name,
+            requested_judge_mode=args.judge_mode,
+            judge=judge,
+            started_at=started_at,
+            finished_at=utc_now(),
+            records=records,
+            infrastructure_failed=True,
+            running=False,
+            question_timeout_seconds=args.question_timeout,
+            preflight_judge_status=preflight_judge_status,
+            preflight_judge_error=preflight_judge_error,
+        )
+        write_artifact(out_path, summary, records)
+        print(
+            f"Preflight judge call failed: {preflight_judge_error}; "
+            "aborting before consuming synthesis budget",
+            file=sys.stderr,
+        )
+        client.close()
+        return 2
 
     try:
         client.ensure_backend_reachable()
@@ -901,6 +992,8 @@ def main() -> int:
             infrastructure_failed=True,
             running=False,
             question_timeout_seconds=args.question_timeout,
+            preflight_judge_status=preflight_judge_status,
+            preflight_judge_error=preflight_judge_error,
         )
         write_artifact(out_path, summary, records)
         print(str(exc), file=sys.stderr)
@@ -913,10 +1006,20 @@ def main() -> int:
             timed_out = False
             completed = False
             task_status = "unknown"
+            synthesis_status = "task_error"
+            judge_status = "skipped"
+            score_status = "invalid"
             answer = ""
             citations_found_display: list[str] = []
             citations_found_canonical: list[str] = []
+            answer_excerpt = ""
             error_text: str | None = None
+            judge_error: str | None = None
+            keypoint_hits = [False] * len(row.expected_answer_keypoints)
+            judge_mode_used = "skipped"
+            citation_precision = 0.0
+            keypoint_coverage = 0.0
+            score = 0.0
 
             try:
                 created_task = client.submit_question(row)
@@ -928,50 +1031,50 @@ def main() -> int:
                 )
                 if timed_out or final_task is None:
                     task_status = "timed_out"
-                    keypoint_hits = [False] * len(row.expected_answer_keypoints)
-                    judge_mode_used = "rule"
-                    citation_precision = 0.0
-                    keypoint_coverage = 0.0
-                    score = 0.0
-                    answer_excerpt = ""
+                    synthesis_status = "timeout"
                 else:
                     task_status = str(final_task.get("status") or "").strip().lower()
                     completed = task_status in TERMINAL_STATUSES
                     answer, citations_found_display, citations_found_canonical = extract_answer_and_citations(final_task)
-                    keypoint_hits, judge_mode_used = judge.judge(
-                        question=row.question,
-                        answer=answer,
-                        keypoints=row.expected_answer_keypoints,
-                    )
-                    keypoint_coverage = sum(1 for hit in keypoint_hits if hit) / max(len(keypoint_hits), 1)
-                    citation_precision = compute_citation_precision(row.expected_citations, citations_found_canonical)
-                    score = (keypoint_coverage * 60.0) + (citation_precision * 40.0)
                     answer_excerpt = truncate_utf8(answer, ANSWER_EXCERPT_MAX_BYTES)
+                    citation_precision = compute_citation_precision(row.expected_citations, citations_found_canonical)
+                    if answer.strip():
+                        synthesis_status = "pass"
+                        try:
+                            keypoint_hits, judge_mode_used = judge.judge(
+                                question=row.question,
+                                answer=answer,
+                                keypoints=row.expected_answer_keypoints,
+                            )
+                            judge_status = "pass"
+                        except Exception as exc:  # noqa: BLE001
+                            judge_status = "fail"
+                            judge_mode_used = args.judge_mode
+                            judge_error = f"{type(exc).__name__}: {exc}"
+                    else:
+                        synthesis_status = "empty" if task_status == "completed" else "task_error"
+                        judge_status = "skipped"
             except InfrastructureError as exc:
                 infrastructure_failed = True
                 duration_s = time.monotonic() - question_started
                 task_status = "infrastructure_error"
+                synthesis_status = "task_error"
                 error_text = str(exc)
-                keypoint_hits = [False] * len(row.expected_answer_keypoints)
-                judge_mode_used = "rule"
-                citation_precision = 0.0
-                keypoint_coverage = 0.0
-                score = 0.0
-                answer_excerpt = ""
             except Exception as exc:  # pragma: no cover - defensive failure capture
                 infrastructure_failed = True
                 duration_s = time.monotonic() - question_started
                 task_status = "runner_error"
+                synthesis_status = "task_error"
                 error_text = f"{type(exc).__name__}: {exc}"
-                keypoint_hits = [False] * len(row.expected_answer_keypoints)
-                judge_mode_used = "rule"
-                citation_precision = 0.0
-                keypoint_coverage = 0.0
-                score = 0.0
-                answer_excerpt = ""
 
             if task_status in TERMINAL_STATUSES:
                 completed = True
+            if synthesis_status == "pass" and judge_status == "pass":
+                keypoint_coverage = sum(1 for hit in keypoint_hits if hit) / max(len(keypoint_hits), 1)
+                score_status = "valid"
+                score = (keypoint_coverage * 60.0) + (citation_precision * 40.0)
+            else:
+                score_status = "invalid"
 
             record = {
                 "type": "question",
@@ -979,6 +1082,9 @@ def main() -> int:
                 "tier": row.tier,
                 "task_id": task_id,
                 "task_status": task_status,
+                "synthesis_status": synthesis_status,
+                "judge_status": judge_status,
+                "score_status": score_status,
                 "completed": completed,
                 "timed_out": timed_out,
                 "score": round(score, 2),
@@ -994,6 +1100,7 @@ def main() -> int:
                 "duration_s": round(duration_s, 3),
                 "answer_excerpt": answer_excerpt,
                 "error": error_text,
+                "judge_error": judge_error,
             }
             records.append(record)
 
@@ -1010,6 +1117,8 @@ def main() -> int:
                 infrastructure_failed=infrastructure_failed,
                 running=True,
                 question_timeout_seconds=args.question_timeout,
+                preflight_judge_status=preflight_judge_status,
+                preflight_judge_error=preflight_judge_error,
             )
             write_artifact(out_path, running_summary, records)
             print(
@@ -1033,6 +1142,8 @@ def main() -> int:
         infrastructure_failed=infrastructure_failed,
         running=False,
         question_timeout_seconds=args.question_timeout,
+        preflight_judge_status=preflight_judge_status,
+        preflight_judge_error=preflight_judge_error,
     )
     write_artifact(out_path, summary, records)
 
@@ -1044,7 +1155,8 @@ def main() -> int:
         f"abc_completion_ratio={abc_ratio:.4f} infrastructure_failed={infrastructure_failed}"
     )
 
-    if infrastructure_failed or abc_ratio < 0.9:
+    invalid_score_count = summary["score_status_counts"].get("invalid", 0)
+    if infrastructure_failed or invalid_score_count or abc_ratio < 0.9:
         return 2
     return 0
 
