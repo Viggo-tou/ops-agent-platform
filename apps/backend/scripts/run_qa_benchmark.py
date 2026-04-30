@@ -50,6 +50,9 @@ POLL_INTERVAL_SECONDS = 1.0
 ANSWER_EXCERPT_MAX_BYTES = 2048
 ACTOR_ROLE = "employee"
 ACTOR_APP_ROLE = "member"
+INFRA_INVALID_SYNTH_STATUSES = {"task_error", "timeout"}
+INFRA_BURST_THRESHOLD = 3
+INFRA_BURST_BACKOFF_S = [30.0, 60.0]
 STOPWORDS = {
     "a",
     "an",
@@ -765,6 +768,48 @@ def tier_summary(records: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]
     return summary
 
 
+def parse_infra_burst_backoff(value: str) -> list[float]:
+    backoffs: list[float] = []
+    for raw_part in value.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        backoff = float(part)
+        if backoff < 0:
+            raise argparse.ArgumentTypeError("--infra-burst-backoff values must be non-negative")
+        backoffs.append(backoff)
+    return backoffs
+
+
+def classify_failure_bucket(record: dict[str, Any]) -> str | None:
+    """Return a failure bucket name for invalid records, or None for valid ones."""
+    if record.get("score_status") == "valid":
+        return None
+    synthesis_status = record.get("synthesis_status")
+    judge_status = record.get("judge_status")
+    duration_s = float(record.get("duration_s") or 0)
+    error = " ".join(
+        str(record.get(field) or "").lower()
+        for field in ("error", "judge_error", "answer_excerpt")
+    )
+
+    if synthesis_status == "timeout":
+        return "infra_timeout"
+    if synthesis_status == "task_error":
+        if 25 <= duration_s <= 35:
+            return "cc_failure"
+        if "cc_agent" in error or "claude_code" in error or "cc decision" in error:
+            return "cc_failure"
+        return "infra_task_error"
+    if synthesis_status == "empty":
+        return "synthesis_empty"
+    if synthesis_status == "pass" and judge_status == "fail":
+        return "judge_failure"
+    if "cc_agent" in error or "claude_code" in error or "cc decision" in error:
+        return "cc_failure"
+    return "other"
+
+
 def try_git_head() -> str | None:
     try:
         result = subprocess.run(
@@ -802,6 +847,8 @@ def build_summary(
     question_timeout_seconds: float,
     preflight_judge_status: str,
     preflight_judge_error: str | None,
+    infra_burst_count: int = 0,
+    abort_reason: str | None = None,
 ) -> dict[str, Any]:
     abc_records = [record for record in records if record["tier"] in {"A", "B", "C"}]
     abc_completed = sum(1 for record in abc_records if record["completed"])
@@ -815,6 +862,11 @@ def build_summary(
     synthesis_counts = Counter(str(record.get("synthesis_status", "unknown")) for record in records)
     judge_counts = Counter(str(record.get("judge_status", "unknown")) for record in records)
     score_counts = Counter(str(record.get("score_status", "unknown")) for record in records)
+    failure_buckets = Counter()
+    for record in records:
+        bucket = classify_failure_bucket(record)
+        if bucket:
+            failure_buckets[bucket] += 1
     pinned_judge_failure_count = (
         sum(1 for record in records if record.get("judge_status") == "fail")
         if requested_judge_mode != "auto"
@@ -838,7 +890,10 @@ def build_summary(
         "preflight_judge_status": preflight_judge_status,
         "preflight_judge_error": preflight_judge_error,
         "pinned_judge_failure_count": pinned_judge_failure_count,
-        "pinned_judge_run_intact": requested_judge_mode == "auto" or pinned_judge_failure_count == 0,
+        "pinned_judge_run_intact": (
+            abort_reason is None
+            and (requested_judge_mode == "auto" or pinned_judge_failure_count == 0)
+        ),
         "score_averaging_note": (
             "Records with score_status='invalid' are infrastructure/judge/synthesis failures "
             "and must not be averaged as model-quality scores."
@@ -848,9 +903,12 @@ def build_summary(
         "completed_questions": sum(1 for record in records if record["completed"]),
         "timed_out_questions": sum(1 for record in records if record["timed_out"]),
         "infrastructure_failed": infrastructure_failed,
+        "infra_burst_count": infra_burst_count,
+        "abort_reason": abort_reason,
         "synthesis_status_counts": dict(sorted(synthesis_counts.items())),
         "judge_status_counts": dict(sorted(judge_counts.items())),
         "score_status_counts": dict(sorted(score_counts.items())),
+        "failure_bucket_counts": dict(sorted(failure_buckets.items())),
         "abc_completed": abc_completed,
         "abc_total": abc_total,
         "abc_completion_ratio": round(completion_ratio, 4),
@@ -923,6 +981,23 @@ def parse_args() -> argparse.Namespace:
             "rule. Explicit modes pin the choice."
         ),
     )
+    parser.add_argument(
+        "--infra-burst-threshold",
+        type=int,
+        default=INFRA_BURST_THRESHOLD,
+        help="Pause when N consecutive infra-invalid records appear.",
+    )
+    parser.add_argument(
+        "--infra-burst-backoff",
+        type=str,
+        default=",".join(str(int(item)) for item in INFRA_BURST_BACKOFF_S),
+        help="Comma-separated backoff seconds; bursts beyond list count abort the bench.",
+    )
+    parser.add_argument(
+        "--no-pause-on-burst",
+        action="store_true",
+        help="Disable burst pause; emit warnings only.",
+    )
     return parser.parse_args()
 
 
@@ -943,8 +1018,13 @@ def main() -> int:
     client = BenchmarkClient(backend_url=args.backend_url, actor_name=args.actor_name)
     records: list[dict[str, Any]] = []
     infrastructure_failed = False
+    consecutive_infra_invalid = 0
+    infra_burst_count = 0
+    abort_reason: str | None = None
     preflight_judge_status = "not_run"
     preflight_judge_error: str | None = None
+    infra_burst_backoff = parse_infra_burst_backoff(args.infra_burst_backoff)
+    infra_burst_threshold = max(1, int(args.infra_burst_threshold))
 
     try:
         preflight_judge_status, preflight_judge_error = preflight_judge(judge)
@@ -966,6 +1046,8 @@ def main() -> int:
             question_timeout_seconds=args.question_timeout,
             preflight_judge_status=preflight_judge_status,
             preflight_judge_error=preflight_judge_error,
+            infra_burst_count=infra_burst_count,
+            abort_reason=abort_reason,
         )
         write_artifact(out_path, summary, records)
         print(
@@ -994,6 +1076,8 @@ def main() -> int:
             question_timeout_seconds=args.question_timeout,
             preflight_judge_status=preflight_judge_status,
             preflight_judge_error=preflight_judge_error,
+            infra_burst_count=infra_burst_count,
+            abort_reason=abort_reason,
         )
         write_artifact(out_path, summary, records)
         print(str(exc), file=sys.stderr)
@@ -1104,6 +1188,46 @@ def main() -> int:
             }
             records.append(record)
 
+            if score_status == "invalid" and synthesis_status in INFRA_INVALID_SYNTH_STATUSES:
+                consecutive_infra_invalid += 1
+                if consecutive_infra_invalid >= infra_burst_threshold:
+                    infra_burst_count += 1
+                    if args.no_pause_on_burst:
+                        print(
+                            f"BENCH WARNING: {consecutive_infra_invalid} consecutive "
+                            "infra-invalid records; pause-on-burst disabled",
+                            file=sys.stderr,
+                        )
+                        consecutive_infra_invalid = 0
+                    elif infra_burst_count > len(infra_burst_backoff):
+                        abort_reason = "infra_burst_exceeded"
+                        print(
+                            f"BENCH ABORT: {infra_burst_count} infra bursts; aborting "
+                            "bench to avoid contaminated signal",
+                            file=sys.stderr,
+                        )
+                    else:
+                        backoff = infra_burst_backoff[infra_burst_count - 1]
+                        print(
+                            f"BENCH PAUSE: {consecutive_infra_invalid} consecutive "
+                            f"infra-invalid records; sleeping {backoff:g}s, then "
+                            "probing backend health",
+                            file=sys.stderr,
+                        )
+                        time.sleep(backoff)
+                        try:
+                            client.ensure_backend_reachable()
+                        except Exception as exc:  # noqa: BLE001
+                            abort_reason = "backend_unreachable_after_pause"
+                            infrastructure_failed = True
+                            print(
+                                f"BENCH ABORT: backend unreachable after pause: {exc}",
+                                file=sys.stderr,
+                            )
+                        consecutive_infra_invalid = 0
+            else:
+                consecutive_infra_invalid = 0
+
             running_summary = build_summary(
                 dataset_path=dataset_path,
                 out_path=out_path,
@@ -1119,12 +1243,16 @@ def main() -> int:
                 question_timeout_seconds=args.question_timeout,
                 preflight_judge_status=preflight_judge_status,
                 preflight_judge_error=preflight_judge_error,
+                infra_burst_count=infra_burst_count,
+                abort_reason=abort_reason,
             )
             write_artifact(out_path, running_summary, records)
             print(
                 f"{row.id} status={task_status} score={record['score']:.2f} "
                 f"judge={judge_mode_used} duration={record['duration_s']:.3f}s"
             )
+            if abort_reason:
+                break
     finally:
         client.close()
 
@@ -1144,6 +1272,8 @@ def main() -> int:
         question_timeout_seconds=args.question_timeout,
         preflight_judge_status=preflight_judge_status,
         preflight_judge_error=preflight_judge_error,
+        infra_burst_count=infra_burst_count,
+        abort_reason=abort_reason,
     )
     write_artifact(out_path, summary, records)
 
@@ -1156,7 +1286,7 @@ def main() -> int:
     )
 
     invalid_score_count = summary["score_status_counts"].get("invalid", 0)
-    if infrastructure_failed or invalid_score_count or abc_ratio < 0.9:
+    if abort_reason or infrastructure_failed or invalid_score_count or abc_ratio < 0.9:
         return 2
     return 0
 
