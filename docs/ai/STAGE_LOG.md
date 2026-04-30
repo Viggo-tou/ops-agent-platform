@@ -678,3 +678,130 @@ a3f0cf4  Merge branch 'feat/repair-cap-impl' (pre-existing)
 
 
 
+
+---
+
+### Stage 14 — Bench harness hardening + Plan B from Stage 12 critique
+
+**Open:** 2026-04-29 ~14:00 (UTC+10)
+**Status:** CLOSED-DONE
+**Commits:** `4783e20` (docs+spec) + `fe879ed` (impl) + `84035a8` (merge)
+
+#### Close 摘要
+- **Status:** CLOSED-DONE
+- **结果:** 4 件全收。
+  - B (memory rule split): codex sandbox vs Tomonkyo bash 写到 auto-memory
+  - A (T-BENCH-HARNESS-RESILIENCE): strict pin / preflight / persist-before-judge / 3 status fields, 8 tests
+  - C (Plan B docs): D-009 in DECISIONS.md, D2 conditional in roadmap, D4 visible-error pattern in T-LLM-METRICS spec
+  - D (archive tag): `archive/kb-evidence-tier-cap-v1` at `9be1ccf`
+- **产出:** harness 现在不撒谎；下次 bench 故障 30 min 内可定位（vs Stage 12 用了 3+ hr）。
+
+---
+
+### Stage 15 — T-KB-FTS5-INDEX (lexical retrieval substrate)
+
+**Open:** 2026-04-29 ~15:00
+**Status:** CLOSED-DONE (substrate verification, not quality lever)
+**Commits:** `2561f13` feat + `1494743` bench + `0316e86` merge
+
+#### Close 摘要
+- **结果 (PINNED claude_code, 34/34 valid, 72.5 min):**
+  - A=47.50 (-9.00 vs baseline 56.50) ← noisy CSS/build files no longer help
+  - B=44.80 (+7.20)
+  - C=59.71 (-10.91) ← same dataset coupling as A
+  - D=42.78 (+12.45) ← first time D crossed historical 40 target
+  - **Mean=48.75 (-0.90 vs 49.65 = noise)**
+- **意图:** substrate work, not quality lever. Spec said "expected mean delta small". Verified.
+- **诊断:** A/C 损失是 dataset 耦合（baseline 老 sync 留的 .css/build 文件意外帮 synthesis 命中 literal keypoint）；FTS5 候选更干净，synthesis 答案更聚焦反而漏字面 keypoint。Stage 16 cards 应能补回。
+- **三个数共存:** 49.65 baseline (reference) / 48.75 FTS5 substrate / pending cards as new best.
+
+---
+
+### Stage 16 — T-KB-RAG-CARDS-OFFLINE (real quality breakthrough)
+
+**Open:** 2026-04-29 ~16:00
+**Status:** CLOSED-DONE (NEW BEST QUALITY CHECKPOINT)
+**Commits:** `ffec317` feat + `f1b8418` bench + `c7ecfc8` merge
+
+#### Close 摘要
+- **结果 (PINNED claude_code, 34/34 valid, 73.6 min):**
+  - A=60.00 (+3.50 vs baseline) ← recovered FTS5 dip
+  - B=**56.40 (+18.80)** ← first time B-tier broke 50; cards directly addresses "how does X work"
+  - C=70.25 (-0.37 = flat)
+  - D=**45.67 (+15.34)** ← well past 40 target
+  - **Mean=58.82 (+9.17 vs 49.65)** ← biggest single-stage lift since CC agentic +22.59
+- **Card metadata** (commit `f1b8418` records for reproducibility):
+  - 37 cards generated for hosteddashboard via MiniMax-M2.7
+  - card_version: v1-card
+  - dashboard repo HEAD at gen: `b60d6d8`
+- **三个数共存 (locked into bench commit):**
+  - 49.65 = historical reference baseline (Phase 3.0 CC agentic, 2026-04-28) — NOT replaced
+  - 48.75 = FTS5 substrate verification (Stage 15)
+  - **58.82 = current best quality checkpoint** (Stage 16 cards)
+- **战略验证:** "B+D 是真杠杆，A 已近 dataset 上限，cards 是 lever" — 数据匹配预测。
+- **Lesson:** structural changes (every-file LLM summary) > runtime tweaks (cap / prompt). 验证投资方向。
+
+---
+
+### Stage 17 — T-LLM-METRICS (observability)
+
+**Open:** 2026-04-29 ~22:00
+**Status:** CLOSED-DONE
+**Commits:** `d6dabb3` feat + `58eb0d2` merge
+
+#### 步骤
+- spec 已存盘（Stage 14 写的），加 cards 作为第 6 个 call site
+- codex impl: 6 call sites instrumented (synthesis, semantic_translator, planner, codegen, cc_agent, cards)
+- smoke 暴露 2 bug：
+  1. `event.task_id` NOT NULL 在老 DB 上 → LLM_CALL writes 失败
+  2. record_llm_call 用 caller's session 但 FastAPI `get_db()` yield-then-close 不 commit → events 全丢
+- T-LLM-METRICS-FIX-1 spec 写好派 codex 但 codex sandbox 在 worktree 路径上突然 PermissionDenied，0 changes
+- 2 bug 我手 patch：(a) db.py 加幂等 SQLite rebuild migration（drop indexes / rename / metadata.create / copy / drop tmp）；(b) llm_telemetry 改 sibling-session pattern（`sessionmaker(bind=db.get_bind())`，自己 commit + close）
+- 10/10 telemetry tests + 49/49 regression pass
+- Live smoke: 1 search → metrics endpoint shows synthesis (n=1, p50=17s) + cc_agent (n=1, p50=5.8s), telemetry_failure_count=0, fallback_step_distribution{0:2}
+
+#### Close 摘要
+- **结果:** 6 call sites instrumented. `/api/metrics/llm-calls` 返回 by_purpose (n, p50_ms, p95_ms, success_rate, cache_hit_pct) + fallback_step_distribution + error_type_distribution + telemetry_failure_count.
+- **Visible-error pattern 完整覆盖** (codex 之前 D4 critique 收纳)：counter + WARN log，没有 silent except-pass。
+- **Sibling session 设计** 解决了双重问题：telemetry 写不依赖 caller commit + telemetry 失败不 poison caller transaction。
+- **Lesson:** FastAPI `get_db()` 不 commit 是个常见 footgun；fire-and-forget telemetry 必须自带 session 或调用方明确 commit。
+
+---
+
+### Stage 18 — T-KB-HYBRID-FAST-PATH (DROPPED — Stage 13 wiring bug + CC infra noise)
+
+**Open:** 2026-04-30 ~12:30
+**Status:** CLOSED-DROPPED
+**Commits:** 无 (per D-009: 不达验收不 commit)
+**Branch:** `feat/kb-hybrid-fast-path` (uncommitted, worktree removed; branch label still at `58eb0d2`)
+
+#### 步骤
+- spec 写完（11+ tests, quality-preservation acceptance: mean ≥57, D≥43, runtime <60min）
+- codex impl: 16/16 hybrid tests + 59/59 regression all pass
+- Pre-bench smoke 3 queries：fast/full 路由都看着对（`disqualified:validated` 也触发了），但 cc_agent 已经 n=7 success_rate=0.5714 (3 errors / 1 timeout) — **infra warning 出现但忽略了**
+- Full 34Q bench (PINNED claude_code, samples=3) 跑了 **109.9 min** (+36 vs cards 73.6) → 26/34 valid, 8 task_error/timeout (7 连续 B-tier + 1 A)
+- Per-tier (valid only): A=53.33 / B=**34.00** / C=56.79 / D=43.33 / **mean=49.86**
+- **未达 acceptance: mean -7, B -18, runtime +50 min**
+- 与 codex 复盘 5 问 5 答，收敛到 "A 先短调查 → 大概率 C revert"
+- 10 分钟分类发现 root cause: **`routing_query` 不是 user question, 是 planner-rewritten token list**
+  - A-01 user: "Which file defines the admin login screen?" → routing_query: "admin login component"
+  - B-01 user: "How does the login page validate credentials..." → routing_query: "login credential validation authentication"
+  - regex 要 "Which file (defines|...)" 这种自然句，token list 全部 miss
+  - **0/34 题 fast-path 实际触发**——hybrid 在 bench 期间根本没生效
+
+#### Close 摘要
+- **Status:** CLOSED-DROPPED
+- **结果:** Hybrid 实现有 wiring bug（detector 看 rewritten query），bench 期间 0/34 真触发 fast-path。所谓"hybrid 让 bench 变慢"其实是 full-path + CC infra 不稳定的合力。
+- **Stage 13 重演:** v2 tier-cap 死于同样 bug——detector 看的不是 user query。spec 里**明文写了** "must see request_text" + "Stage 13 lesson" warning，codex 还是接成了改写后的 query。**这条 lesson 必须升级**——下次 routing/classifier 类 spec 必须强制要求"集成测试断言 routing_query == request_text 字面字符串"。
+- **CC infra 不稳:** smoke 已显示 cc_agent 43% 失败率（3 calls 中 2 CCDecisionError + 1 ReadTimeout），bench 把它放大成 8 task_error。这跟 hybrid 无关。
+- **没做的:** 不 commit hybrid，不修 wiring 重跑（CC 不稳风险，且预期收益低）。
+- **产出归档:**
+  - `apps/backend/tests/benchmarks/runs/qa-run-20260430T032048Z-hybrid-DROPPED.jsonl` (失败 bench artifact, history)
+  - `docs/ai/tasks/T-KB-HYBRID-FAST-PATH-DROPPED.md` (spec 留作 negative result reference)
+  - branch `feat/kb-hybrid-fast-path` 留着（只是 label，没 commit），用 reflog 找路由实现的话能找回
+- **Lessons:**
+  1. **Routing/classifier 必有"看的是 user query"的集成测试断言**——unit test helper 工作 ≠ wiring 正确，Stage 13 已经验证了一次，今天又验证了一次
+  2. **CC infra 失败率早期信号必须刹车**——smoke 时 cc_agent 43% 失败已经是危险信号，不应直接进 bench
+  3. **Wall-clock 反向是核心反证**——一个"fast-path"让总 wall-clock 变长，前提已破，后续诊断只是确认而非翻案
+  4. **Hybrid is higher-risk class than substrate/quality**——hybrid 改了执行政策（routing decision），cards/FTS5 只改了 retrieval substrate；前者一行 wiring bug 就能让所有 bench 走错路，后者最坏也只是某档掉分
+- **下一步:** Stage 19 (扩 benchmark 34→60 验证 cards 泛化) — 与 hybrid 正交，不依赖 CC infra 稳定。
