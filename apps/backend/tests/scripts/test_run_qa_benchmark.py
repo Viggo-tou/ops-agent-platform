@@ -14,29 +14,49 @@ if str(BACKEND_ROOT) not in sys.path:
 from scripts import run_qa_benchmark as bench
 
 
-def _write_dataset(path: Path, count: int = 1) -> None:
+def _write_dataset(
+    path: Path,
+    count: int = 1,
+    *,
+    source_names: list[str | None] | None = None,
+) -> None:
     rows = []
     for index in range(count):
-        rows.append(
-            {
-                "id": f"Q{index + 1:02d}",
-                "tier": "A",
-                "question": f"Question {index + 1}?",
-                "expected_answer_keypoints": ["ping"],
-                "expected_citations": ["src/a.py"],
-            }
-        )
+        row = {
+            "id": f"Q{index + 1:02d}",
+            "tier": "A",
+            "question": f"Question {index + 1}?",
+            "expected_answer_keypoints": ["ping"],
+            "expected_citations": ["src/a.py"],
+        }
+        if source_names is not None and index < len(source_names) and source_names[index] is not None:
+            row["source_name"] = source_names[index]
+        rows.append(row)
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
 
 
-def _task(answer: str, *, status: str = "completed") -> dict[str, object]:
-    citations = [{"relative_path": "src/a.py", "source_name": "repo"}] if answer else []
+def _task(
+    answer: str,
+    *,
+    status: str = "completed",
+    source_name: str = "repo",
+    relative_path: str = "src/a.py",
+    card_text: str | None = None,
+) -> dict[str, object]:
+    citations = [
+        {
+            "relative_path": relative_path,
+            "source_name": source_name,
+            "card_text": card_text,
+        }
+    ] if answer else []
     return {
         "status": status,
         "latest_result_json": {
             "result": {
                 "answer": answer,
                 "citations": citations,
+                "answer_trace": {"selected_sources": [source_name]} if source_name else {},
             }
         },
     }
@@ -113,8 +133,9 @@ def bench_run(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
         judge_cls: type[object] = PassingJudge,
         count: int = 1,
         extra_args: list[str] | None = None,
+        source_names: list[str | None] | None = None,
     ) -> int:
-        _write_dataset(dataset, count=count)
+        _write_dataset(dataset, count=count, source_names=source_names)
         if out_dir.exists():
             for artifact in out_dir.glob("qa-run-*.jsonl"):
                 artifact.unlink()
@@ -355,3 +376,155 @@ def test_no_pause_on_burst_flag_disables_pause(
     assert summary["infra_burst_count"] == 1
     assert summary["abort_reason"] is None
     assert "pause-on-burst disabled" in capsys.readouterr().err
+
+
+def test_multi_source_dataset_requires_source_name_field(
+    bench_run, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run, out_dir = bench_run
+
+    assert run(judge_mode="rule", count=3, source_names=["repo", None, "other"]) == 2
+
+    assert FakeClient.submitted == 0
+    assert not list(out_dir.glob("qa-run-*.jsonl"))
+    assert "requires source_name on every row" in capsys.readouterr().err
+
+
+def test_search_passes_source_name_to_backend() -> None:
+    captured: dict[str, object] = {}
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"id": "task-1"}
+
+    class DummyHttpClient:
+        def post(self, url: str, json: dict[str, object]) -> Response:
+            captured["url"] = url
+            captured["json"] = json
+            return Response()
+
+        def close(self) -> None:
+            return None
+
+    client = bench.BenchmarkClient(backend_url="http://backend.test", actor_name="qa")
+    client.client = DummyHttpClient()  # type: ignore[assignment]
+    row = bench.DatasetRow(
+        id="Q01",
+        tier="A",
+        question="Question?",
+        expected_answer_keypoints=["ping"],
+        expected_citations=["src/a.py"],
+        source_name="hosteddashboard",
+    )
+
+    assert client.submit_question(row) == {"id": "task-1"}
+    assert captured["json"]["source_name"] == "hosteddashboard"  # type: ignore[index]
+
+
+def test_diagnostics_compute_expected_citation_rank() -> None:
+    row = bench.DatasetRow(
+        id="Q01",
+        tier="A",
+        question="Question?",
+        expected_answer_keypoints=["login"],
+        expected_citations=["handyman-admin-dashboard/src/pages/Login.js"],
+        source_name="hosteddashboard",
+    )
+    citations = [
+        {"source_name": "hosteddashboard", "relative_path": "src/pages/Home.js"},
+        {"source_name": "hosteddashboard", "relative_path": "src/pages/Login.js", "card_text": "login form"},
+    ]
+
+    diagnostics = bench.compute_retrieval_diagnostics(row, {}, citations)
+
+    assert diagnostics["expected_citation_top_rank"] == 2
+    assert diagnostics["expected_fact_in_card"] is True
+
+
+def test_diagnostics_count_wrong_source_citations() -> None:
+    row = bench.DatasetRow(
+        id="Q01",
+        tier="A",
+        question="Question?",
+        expected_answer_keypoints=["ping"],
+        expected_citations=["src/a.py"],
+        source_name="repo",
+    )
+    citations = [
+        {"source_name": "repo", "relative_path": "src/a.py"},
+        {"source_name": "other", "relative_path": "src/b.py"},
+        {"source_name": "other", "relative_path": "src/c.py"},
+    ]
+
+    diagnostics = bench.compute_retrieval_diagnostics(row, {}, citations)
+
+    assert diagnostics["top_k_source_distribution"] == {"repo": 1, "other": 2}
+    assert diagnostics["wrong_source_in_top_k"] == 2
+
+
+def test_buckets_assign_retrieval_wrong_source() -> None:
+    record = {
+        "tier": "A",
+        "keypoint_coverage": 1.0,
+        "expected_answer_keypoints": ["ping"],
+        "answer_excerpt": "ping",
+    }
+    diagnostics = {
+        "expected_citation_top_rank": None,
+        "wrong_source_in_top_k": 1,
+        "expected_fact_in_card": None,
+    }
+
+    assert "retrieval_wrong_source" in bench.assign_stage19_buckets(record, diagnostics)
+
+
+def test_buckets_assign_card_missing_keypoint_facts() -> None:
+    record = {
+        "tier": "A",
+        "keypoint_coverage": 1.0,
+        "expected_answer_keypoints": ["login validates password"],
+        "answer_excerpt": "login validates password",
+    }
+    diagnostics = {
+        "expected_citation_top_rank": 1,
+        "wrong_source_in_top_k": 0,
+        "expected_fact_in_card": False,
+    }
+
+    assert bench.assign_stage19_buckets(record, diagnostics) == ["card_missing_keypoint_facts"]
+
+
+def test_summary_emits_per_source_means(bench_run) -> None:
+    FakeClient.tasks = [
+        _task("answer ping", source_name="hosteddashboard"),
+        _task("answer ping", source_name="handymanapp"),
+    ]
+
+    run, out_dir = bench_run
+    assert run(
+        judge_mode="rule",
+        count=2,
+        source_names=["hosteddashboard", "handymanapp"],
+    ) == 0
+
+    summary, records = _read_artifact(out_dir)
+    assert summary["source_summary"] == {
+        "handymanapp": {
+            "count": 1,
+            "valid_score_count": 1,
+            "invalid_score_count": 0,
+            "mean_score": 100.0,
+        },
+        "hosteddashboard": {
+            "count": 1,
+            "valid_score_count": 1,
+            "invalid_score_count": 0,
+            "mean_score": 100.0,
+        },
+    }
+    assert summary["retrieval_top_rank_distribution"] == {"top1": 2}
+    assert summary["stage19_bucket_counts"] == {}
+    assert records[0]["source_name"] == "hosteddashboard"
