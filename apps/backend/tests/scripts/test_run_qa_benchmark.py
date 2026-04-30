@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -52,13 +53,16 @@ def _read_artifact(out_dir: Path) -> tuple[dict[str, object], list[dict[str, obj
 
 class FakeClient:
     submitted = 0
+    health_checks = 0
     tasks: list[dict[str, object] | None] = [_task("answer ping")]
+    durations: list[float] = []
 
     def __init__(self, backend_url: str, actor_name: str) -> None:
         self.backend_url = backend_url
         self.actor_name = actor_name
 
     def ensure_backend_reachable(self) -> None:
+        type(self).health_checks += 1
         return None
 
     def submit_question(self, row: bench.DatasetRow) -> dict[str, object]:
@@ -70,7 +74,8 @@ class FakeClient:
     ) -> tuple[dict[str, object] | None, float, bool]:
         index = type(self).submitted - 1
         task = type(self).tasks[index]
-        return task, 0.01, task is None
+        duration = type(self).durations[index] if index < len(type(self).durations) else 0.01
+        return task, duration, task is None
 
     def close(self) -> None:
         return None
@@ -88,20 +93,33 @@ class PassingJudge:
 
 
 @pytest.fixture()
-def bench_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def bench_run(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
+    tmp_path = BACKEND_ROOT / "tmp-pytest" / request.node.name
+    if tmp_path.exists():
+        shutil.rmtree(tmp_path)
+    tmp_path.mkdir(parents=True)
     dataset = tmp_path / "dataset.jsonl"
     out_dir = tmp_path / "runs"
     _write_dataset(dataset)
     FakeClient.submitted = 0
+    FakeClient.health_checks = 0
     FakeClient.tasks = [_task("answer ping")]
+    FakeClient.durations = []
     monkeypatch.setattr(bench, "BenchmarkClient", FakeClient)
 
-    def run(*, judge_mode: str = "rule", judge_cls: type[object] = PassingJudge, count: int = 1) -> int:
+    def run(
+        *,
+        judge_mode: str = "rule",
+        judge_cls: type[object] = PassingJudge,
+        count: int = 1,
+        extra_args: list[str] | None = None,
+    ) -> int:
         _write_dataset(dataset, count=count)
+        if out_dir.exists():
+            for artifact in out_dir.glob("qa-run-*.jsonl"):
+                artifact.unlink()
         monkeypatch.setattr(bench, "KeypointJudge", judge_cls)
-        monkeypatch.setattr(
-            "sys.argv",
-            [
+        argv = [
                 "run_qa_benchmark.py",
                 "--dataset",
                 str(dataset),
@@ -111,8 +129,10 @@ def bench_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
                 "http://backend.test",
                 "--judge-mode",
                 judge_mode,
-            ],
-        )
+        ]
+        if extra_args:
+            argv.extend(extra_args)
+        monkeypatch.setattr("sys.argv", argv)
         return bench.main()
 
     return run, out_dir
@@ -221,3 +241,117 @@ def test_preflight_records_status_in_summary(bench_run) -> None:
     summary, _records = _read_artifact(out_dir)
     assert summary["preflight_judge_status"] == "pass"
     assert summary["preflight_judge_error"] is None
+
+
+def test_burst_pause_after_3_consecutive_infra_invalid(
+    bench_run, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(bench.time, "sleep", lambda seconds: sleeps.append(seconds))
+    FakeClient.tasks = [None, None, None, _task("answer ping")]
+
+    run, out_dir = bench_run
+    assert run(judge_mode="rule", count=4, extra_args=["--infra-burst-backoff", "0.5,1"]) == 2
+
+    summary, records = _read_artifact(out_dir)
+    assert len(records) == 4
+    assert sleeps == [0.5]
+    assert FakeClient.health_checks == 2
+    assert summary["infra_burst_count"] == 1
+    assert summary["abort_reason"] is None
+    assert "BENCH PAUSE" in capsys.readouterr().err
+
+
+def test_burst_pause_resets_counter_on_valid_record(
+    bench_run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(bench.time, "sleep", lambda seconds: sleeps.append(seconds))
+    FakeClient.tasks = [None, None, _task("answer ping"), None, None]
+
+    run, out_dir = bench_run
+    assert run(judge_mode="rule", count=5, extra_args=["--infra-burst-backoff", "0.5"]) == 2
+
+    summary, records = _read_artifact(out_dir)
+    assert len(records) == 5
+    assert sleeps == []
+    assert summary["infra_burst_count"] == 0
+
+
+def test_burst_abort_after_max_bursts(
+    bench_run, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(bench.time, "sleep", lambda seconds: sleeps.append(seconds))
+    FakeClient.tasks = [None, None, None, None, None, None]
+
+    run, out_dir = bench_run
+    assert run(judge_mode="rule", count=6, extra_args=["--infra-burst-backoff", "0"]) == 2
+
+    summary, records = _read_artifact(out_dir)
+    assert len(records) == 6
+    assert sleeps == [0.0]
+    assert summary["infra_burst_count"] == 2
+    assert summary["abort_reason"] == "infra_burst_exceeded"
+    assert summary["pinned_judge_run_intact"] is False
+    assert "BENCH ABORT" in capsys.readouterr().err
+
+
+def test_failure_bucket_classifies_30s_task_error_as_cc_failure() -> None:
+    record = {
+        "score_status": "invalid",
+        "synthesis_status": "task_error",
+        "judge_status": "skipped",
+        "duration_s": 30.001,
+        "error": None,
+    }
+
+    assert bench.classify_failure_bucket(record) == "cc_failure"
+
+
+def test_failure_bucket_classifies_other_task_error_as_infra() -> None:
+    record = {
+        "score_status": "invalid",
+        "synthesis_status": "task_error",
+        "judge_status": "skipped",
+        "duration_s": 2.0,
+        "error": "backend task crashed",
+    }
+
+    assert bench.classify_failure_bucket(record) == "infra_task_error"
+
+
+def test_summary_emits_failure_bucket_counts_and_burst_count(bench_run) -> None:
+    FakeClient.tasks = [None, _task(""), _task("answer ping")]
+
+    run, out_dir = bench_run
+    assert run(judge_mode="rule", count=3) == 2
+
+    summary, _records = _read_artifact(out_dir)
+    assert summary["failure_bucket_counts"] == {
+        "infra_timeout": 1,
+        "synthesis_empty": 1,
+    }
+    assert summary["infra_burst_count"] == 0
+
+
+def test_no_pause_on_burst_flag_disables_pause(
+    bench_run, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(bench.time, "sleep", lambda seconds: sleeps.append(seconds))
+    FakeClient.tasks = [None, None, None, None]
+
+    run, out_dir = bench_run
+    assert run(
+        judge_mode="rule",
+        count=4,
+        extra_args=["--infra-burst-backoff", "0", "--no-pause-on-burst"],
+    ) == 2
+
+    summary, records = _read_artifact(out_dir)
+    assert len(records) == 4
+    assert sleeps == []
+    assert summary["infra_burst_count"] == 1
+    assert summary["abort_reason"] is None
+    assert "pause-on-burst disabled" in capsys.readouterr().err
