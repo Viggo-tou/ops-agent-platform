@@ -1275,6 +1275,7 @@ class KnowledgeService:
                 cwd=source_spec.path,
                 budget=budget,
                 provider_chain=provider_chain,
+                db=self.db,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("cc_agent crashed, falling back to RAG: %s", exc)
@@ -1662,7 +1663,7 @@ class KnowledgeService:
         )
 
         if citations and self.settings.knowledge_synthesis_enabled:
-            synthesizer = KnowledgeSynthesizer(self.settings)
+            synthesizer = KnowledgeSynthesizer(self.settings, db=self.db)
             try:
                 answer = synthesizer.synthesize(
                     query=query,

@@ -28,7 +28,6 @@ from app.models.tool_execution import ToolExecution
 from app.models.base import utcnow
 from app.schemas.tool import ToolRegistryEntryRead
 from app.services.codegen import CodeGenerator, CodegenError
-from app.services.cost_tracking import CostTracker
 from app.services.events import record_event
 from app.services.knowledge import KnowledgeService
 from app.services.reviewer import DiffReviewer, ReviewContext
@@ -641,29 +640,17 @@ class ToolGateway:
         source_repo_path = str(source_repo_path_value) if isinstance(source_repo_path_value, str) else None
 
         try:
-            result = CodeGenerator(self.settings).generate_patch(
+            actor_name_value = actor_context.get("actor_name")
+            result = CodeGenerator(self.settings, db=self.db).generate_patch(
                 task_id=task_id,
                 plan_json=dict(plan_json_value),
                 context_files={str(path): str(content) for path, content in context_files_value.items()},
                 task_description=task_description,
                 source_repo_path=source_repo_path,
+                actor_name=str(actor_name_value) if actor_name_value else None,
             )
         except CodegenError as exc:
             raise ToolInvocationError(str(exc), retryable=False) from exc
-
-        actor_name_value = actor_context.get("actor_name")
-        try:
-            CostTracker(self.db).record_usage(
-                task_id=task_id,
-                actor_name=str(actor_name_value) if actor_name_value else None,
-                provider_name=result.provider_name,
-                model_name=result.model_name or "",
-                input_tokens=result.input_tokens,
-                output_tokens=result.output_tokens,
-                purpose="codegen",
-            )
-        except Exception:
-            pass
 
         return result.model_dump(mode="json")
 

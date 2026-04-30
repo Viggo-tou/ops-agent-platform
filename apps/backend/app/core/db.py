@@ -210,9 +210,36 @@ def ensure_local_schema() -> None:
             )
 
         if "event" in existing_tables:
-            event_columns = {column["name"] for column in inspector.get_columns("event")}
+            event_columns_full = inspector.get_columns("event")
+            event_columns = {column["name"] for column in event_columns_full}
             if "session_id" not in event_columns:
                 connection.execute(text("ALTER TABLE event ADD COLUMN session_id VARCHAR(36)"))
+            # Stage 17 (T-LLM-METRICS) lifted NOT NULL on event.task_id so
+            # system-level events (LLM_CALL outside a task scope) can write
+            # without a task_id. SQLite has no DROP NOT NULL — rebuild the
+            # table when the existing column still says NOT NULL. Idempotent
+            # on already-migrated DBs (skip when nullable=True).
+            task_id_col = next((c for c in event_columns_full if c["name"] == "task_id"), None)
+            if task_id_col is not None and not task_id_col.get("nullable", True):
+                # Drop user indexes on the old table — they'll be recreated
+                # when SQLAlchemy creates the new table from metadata.
+                # sqlite_autoindex_* are auto-managed by SQLite (PK), don't drop.
+                for idx_row in connection.execute(text(
+                    "SELECT name FROM sqlite_master WHERE type='index' "
+                    "AND tbl_name='event' AND name NOT LIKE 'sqlite_%'"
+                )).fetchall():
+                    connection.execute(text(f"DROP INDEX IF EXISTS {idx_row[0]}"))
+                connection.execute(text("ALTER TABLE event RENAME TO event__pre_task_id_nullable"))
+                # Recreate the event table with the current SQLAlchemy schema
+                # (which now has nullable=True on task_id) — also recreates indexes.
+                Base.metadata.tables["event"].create(bind=connection, checkfirst=False)
+                # Copy by explicit column list to be schema-stable.
+                copy_cols = [c["name"] for c in event_columns_full if c["name"] in event_columns]
+                col_csv = ", ".join(copy_cols)
+                connection.execute(text(
+                    f"INSERT INTO event ({col_csv}) SELECT {col_csv} FROM event__pre_task_id_nullable"
+                ))
+                connection.execute(text("DROP TABLE event__pre_task_id_nullable"))
 
         if "approval" in existing_tables:
             approval_columns = {column["name"] for column in inspector.get_columns("approval")}

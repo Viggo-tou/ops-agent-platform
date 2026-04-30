@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
+import time
 
 import httpx
+from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
 from app.schemas.knowledge import KnowledgeCitation
+from app.services.llm_telemetry import LlmCall, record_llm_call
 
 
 # Bumped when the synthesis system-prompt is materially revised. Recorded
@@ -23,8 +27,18 @@ class KnowledgeSynthesisError(RuntimeError):
 
 
 class KnowledgeSynthesizer:
-    def __init__(self, settings: Settings | None = None):
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        db: Session | None = None,
+        task_id: str | None = None,
+        actor_name: str | None = None,
+    ):
         self.settings = settings or get_settings()
+        self.db = db
+        self.task_id = task_id
+        self.actor_name = actor_name
 
     def synthesize(
         self,
@@ -54,13 +68,42 @@ class KnowledgeSynthesizer:
             use_chinese=use_chinese,
         )
 
-        response_text = self._call_minimax(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-        )
+        started = time.perf_counter()
+        prompt_fingerprint = hashlib.sha256(f"{system_prompt}\n{user_prompt}".encode("utf-8")).hexdigest()[:10]
+        try:
+            response_text, input_tokens, output_tokens = self._call_minimax(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+        except Exception as exc:
+            self._record_call(
+                input_tokens=0,
+                output_tokens=0,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                success=False,
+                error_type=type(exc).__name__,
+                prompt_fingerprint=prompt_fingerprint,
+            )
+            raise
         cleaned = response_text.strip()
         if not cleaned:
-            raise KnowledgeSynthesisError("MiniMax returned empty answer")
+            error = KnowledgeSynthesisError("MiniMax returned empty answer")
+            self._record_call(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                success=False,
+                error_type=type(error).__name__,
+                prompt_fingerprint=prompt_fingerprint,
+            )
+            raise error
+        self._record_call(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            success=True,
+            prompt_fingerprint=prompt_fingerprint,
+        )
         return cleaned
 
     @staticmethod
@@ -164,7 +207,7 @@ class KnowledgeSynthesizer:
             "Produce the structured response exactly as specified."
         )
 
-    def _call_minimax(self, *, system_prompt: str, user_prompt: str) -> str:
+    def _call_minimax(self, *, system_prompt: str, user_prompt: str) -> tuple[str, int, int]:
         payload = {
             "model": self.settings.knowledge_synthesis_model,
             "messages": [
@@ -195,4 +238,38 @@ class KnowledgeSynthesizer:
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str) or not content.strip():
             raise KnowledgeSynthesisError("MiniMax response missing content")
-        return content
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        return (
+            content,
+            int(usage.get("prompt_tokens", 0) or 0),
+            int(usage.get("completion_tokens", 0) or 0),
+        )
+
+    def _record_call(
+        self,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        latency_ms: int,
+        success: bool,
+        prompt_fingerprint: str,
+        error_type: str | None = None,
+    ) -> None:
+        if self.db is None:
+            return
+        record_llm_call(
+            self.db,
+            LlmCall(
+                purpose="synthesis",
+                provider="minimax",
+                model=self.settings.knowledge_synthesis_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                latency_ms=latency_ms,
+                success=success,
+                error_type=error_type,
+                prompt_fingerprint=prompt_fingerprint,
+                task_id=self.task_id,
+                actor_name=self.actor_name,
+            ),
+        )

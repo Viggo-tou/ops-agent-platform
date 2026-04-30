@@ -16,7 +16,7 @@ Backend root: `apps/backend/`. Run from there.
 ## Goal
 
 Make every LLM call across the platform — synthesis, judge, planner,
-codegen, semantic translator, CC agent provider — produce two records:
+codegen, semantic translator, CC agent provider, **cards generator** — produce two records:
 
 1. A `LlmUsage` row (existing schema) for $$ accounting (tokens + cost).
 2. An `Event` of type `LLM_CALL` whose `payload_json` carries diagnostic
@@ -75,7 +75,7 @@ from app.services.cost_tracking import CostTracker
 
 @dataclass
 class LlmCall:
-    purpose: str            # synthesis | judge | planner | codegen | semantic_translator | cc_agent
+    purpose: str            # synthesis | judge | planner | codegen | semantic_translator | cc_agent | cards
     provider: str           # minimax | claude_code | codex | anthropic | openai | deepseek
     model: str
     input_tokens: int
@@ -176,6 +176,7 @@ to update:
 | codegen             | same provider chain                                   | provider chain step → `fallback_step` |
 | semantic_translator | `app/services/semantic_translator.py`                 | MiniMax httpx call                  |
 | cc_agent            | `app/services/cc_agentic.py` per-tool-call            | tool calls (Glob/Grep/Read) — log per round at minimum |
+| cards               | `app/services/cards.py:CardGenerator.generate()` (added Stage 16) | wrap MiniMax httpx call; one event per card built — useful for "build_cards run took N tokens" reporting |
 
 **Out of scope for this ticket**: judge wiring inside `run_qa_benchmark.py`
 because it has no DB session; tracked separately in T-BENCH-JUDGE-METRICS.
@@ -215,6 +216,7 @@ optimising for huge volumes — benchmark runs produce <1000 events.
 4. `apps/backend/app/services/semantic_translator.py` — wire translator path
 5. `apps/backend/app/services/agent_provider.py` (or wherever planner/codegen lives) — wire provider chain
 6. `apps/backend/app/services/cc_agentic.py` — wire per-call tool log
+6b. `apps/backend/app/services/cards.py` — wire CardGenerator.generate() with purpose="cards"
 7. `apps/backend/app/api/metrics.py` — add `/llm-calls` endpoint
 8. `apps/backend/tests/services/test_llm_telemetry.py` — NEW (5+ tests)
 9. `apps/backend/tests/api/test_metrics_llm_calls.py` — NEW (3+ tests)
