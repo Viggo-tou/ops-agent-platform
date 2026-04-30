@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
 
 import httpx
+from sqlalchemy.orm import Session
 
 from app.agents.schemas import CodegenResult
 from app.core.config import Settings, get_settings
+from app.services.llm_telemetry import LlmCall, record_llm_call
 from app.services.reviewer import DiffReviewer
 
 
@@ -86,8 +90,9 @@ class CodegenError(Exception):
 
 
 class CodeGenerator:
-    def __init__(self, settings: Settings | None = None):
+    def __init__(self, settings: Settings | None = None, *, db: Session | None = None):
         self.settings = settings or get_settings()
+        self.db = db
 
     def generate_patch(
         self,
@@ -97,6 +102,7 @@ class CodeGenerator:
         context_files: dict[str, str],
         task_description: str = "",
         source_repo_path: str | None = None,
+        actor_name: str | None = None,
     ) -> CodegenResult:
         """Generate a unified diff from a plan and file context."""
         providers = self._resolve_provider_chain()
@@ -116,6 +122,8 @@ class CodeGenerator:
                     context_files=context_files,
                     task_description=task_description,
                     source_repo_path=source_repo_path,
+                    actor_name=actor_name,
+                    fallback_step=provider_idx,
                 )
                 _logger.info("Provider %s succeeded: %d files changed", provider, len(result.files_changed))
                 attempts.append({"provider": provider, "status": "succeeded"})
@@ -147,6 +155,8 @@ class CodeGenerator:
         context_files: dict[str, str],
         task_description: str,
         source_repo_path: str | None = None,
+        actor_name: str | None = None,
+        fallback_step: int = 0,
     ) -> CodegenResult:
         """Attempt codegen with a single provider, with up to 3 retries for parse errors."""
         if provider == "ollama":
@@ -164,6 +174,7 @@ class CodeGenerator:
 
         max_attempts = 3
         last_error: str | None = None
+        prompt_fingerprint = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:10]
         for attempt in range(max_attempts):
             call_prompt = prompt
             if attempt > 0:
@@ -181,34 +192,121 @@ class CodeGenerator:
                     )
 
             try:
+                started = time.perf_counter()
                 if provider == "claude_code":
-                    return self._call_claude_code(
+                    result = self._call_claude_code(
                         call_prompt,
                         context_files=context_files,
                         source_repo_path=source_repo_path,
                         task_id=task_id,
                     )
-                if provider == "codex":
-                    return self._call_codex(call_prompt, context_files=context_files)
-                if provider == "anthropic":
-                    return self._call_anthropic(call_prompt)
-                if provider == "deepseek":
-                    return self._call_deepseek(call_prompt)
-                if provider == "ollama":
-                    return self._call_ollama(call_prompt, context_files=context_files)
-                if provider == "minimax":
-                    return self._call_minimax(call_prompt, context_files=context_files)
-                if provider == "openai":
-                    return self._call_openai(call_prompt)
-
-                raise CodegenError(f"Unknown provider: {provider}")
+                elif provider == "codex":
+                    result = self._call_codex(call_prompt, context_files=context_files)
+                elif provider == "anthropic":
+                    result = self._call_anthropic(call_prompt)
+                elif provider == "deepseek":
+                    result = self._call_deepseek(call_prompt)
+                elif provider == "ollama":
+                    result = self._call_ollama(call_prompt, context_files=context_files)
+                elif provider == "minimax":
+                    result = self._call_minimax(call_prompt, context_files=context_files)
+                elif provider == "openai":
+                    result = self._call_openai(call_prompt)
+                else:
+                    raise CodegenError(f"Unknown provider: {provider}")
+                self._record_codegen_call(
+                    task_id=task_id,
+                    actor_name=actor_name,
+                    result=result,
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    success=True,
+                    retry_count=attempt,
+                    fallback_step=fallback_step,
+                    prompt_fingerprint=prompt_fingerprint,
+                )
+                return result
             except CodegenError as exc:
+                self._record_codegen_failure(
+                    task_id=task_id,
+                    actor_name=actor_name,
+                    provider=provider,
+                    latency_ms=int((time.perf_counter() - started) * 1000) if "started" in locals() else 0,
+                    retry_count=attempt,
+                    fallback_step=fallback_step,
+                    prompt_fingerprint=prompt_fingerprint,
+                    error_type=type(exc).__name__,
+                )
                 if _is_retryable_codegen_error(exc):
                     last_error = str(exc)
                     continue
                 raise
 
         raise CodegenError(f"Failed to generate valid diff after {max_attempts} attempts. Last error: {last_error}")
+
+    def _record_codegen_call(
+        self,
+        *,
+        task_id: str,
+        actor_name: str | None,
+        result: CodegenResult,
+        latency_ms: int,
+        success: bool,
+        retry_count: int,
+        fallback_step: int,
+        prompt_fingerprint: str,
+    ) -> None:
+        if self.db is None:
+            return
+        record_llm_call(
+            self.db,
+            LlmCall(
+                purpose="codegen",
+                provider=result.provider_name,
+                model=result.model_name or "",
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                latency_ms=latency_ms,
+                success=success,
+                retry_count=retry_count,
+                fallback_step=fallback_step,
+                prompt_fingerprint=prompt_fingerprint,
+                task_id=task_id,
+                actor_name=actor_name,
+            ),
+        )
+
+    def _record_codegen_failure(
+        self,
+        *,
+        task_id: str,
+        actor_name: str | None,
+        provider: str,
+        latency_ms: int,
+        retry_count: int,
+        fallback_step: int,
+        prompt_fingerprint: str,
+        error_type: str,
+    ) -> None:
+        if self.db is None:
+            return
+        record_llm_call(
+            self.db,
+            LlmCall(
+                purpose="codegen",
+                provider=provider,
+                model=self._resolve_model_name(provider) if provider not in {"claude_code", "codex"} else provider,
+                input_tokens=0,
+                output_tokens=0,
+                latency_ms=latency_ms,
+                success=False,
+                retry_count=retry_count,
+                fallback_step=fallback_step,
+                error_type=error_type,
+                prompt_fingerprint=prompt_fingerprint,
+                task_id=task_id,
+                actor_name=actor_name,
+            ),
+        )
 
     def _resolve_provider_chain(self) -> list[str]:
         """Return an ordered list of providers to try. Auto mode returns all configured providers."""

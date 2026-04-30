@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
 import subprocess
+import time
 from typing import Any
 
 import httpx
+from sqlalchemy.orm import Session
 
 from app.agents.schemas import (
     ApprovalRequirement,
@@ -28,6 +31,7 @@ from app.agents.schemas import (
 from app.core.config import Settings, get_settings
 from app.core.enums import RiskLevel, RoleName, TaskStatus, ToolPermissionCategory
 from app.core.jira import extract_jira_issue_reference
+from app.services.llm_telemetry import LlmCall, record_llm_call
 from app.tools.registry import ToolRegistry
 
 
@@ -749,8 +753,9 @@ def build_fallback_plan_payload(
 
 
 class PrimaryAgentPlanner:
-    def __init__(self, settings: Settings | None = None):
+    def __init__(self, settings: Settings | None = None, *, db: Session | None = None):
         self.settings = settings or get_settings()
+        self.db = db
 
     def _resolve_model_name(self, provider_name: str) -> str:
         if provider_name == "claude_code":
@@ -812,9 +817,11 @@ class PrimaryAgentPlanner:
         )
 
         last_error: str | None = None
-        for provider_name in providers:
+        prompt_fingerprint = hashlib.sha256(f"{scenario}\n{request_text}".encode("utf-8")).hexdigest()[:10]
+        for fallback_step, provider_name in enumerate(providers):
+            started = time.perf_counter()
             try:
-                return self._try_plan_provider(
+                result = self._try_plan_provider(
                     provider_name=provider_name,
                     task_id=task_id,
                     request_text=request_text,
@@ -822,8 +829,30 @@ class PrimaryAgentPlanner:
                     actor_name=actor_name,
                     default_payload=default_payload,
                 )
+                self._record_plan_call(
+                    task_id=task_id,
+                    actor_name=actor_name,
+                    provider_name=provider_name,
+                    model_name=result.model_name or self._resolve_model_name(provider_name),
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    success=True,
+                    fallback_step=fallback_step,
+                    prompt_fingerprint=prompt_fingerprint,
+                )
+                return result
             except Exception as exc:
                 last_error = str(exc)
+                self._record_plan_call(
+                    task_id=task_id,
+                    actor_name=actor_name,
+                    provider_name=provider_name,
+                    model_name=self._resolve_model_name(provider_name),
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    success=False,
+                    fallback_step=fallback_step,
+                    prompt_fingerprint=prompt_fingerprint,
+                    error_type=type(exc).__name__,
+                )
                 continue  # cascade to next provider
 
         # All providers failed or none configured — use mock fallback
@@ -843,6 +872,39 @@ class PrimaryAgentPlanner:
             model_name=None,
             used_fallback=True,
             fallback_reason=last_error,
+        )
+
+    def _record_plan_call(
+        self,
+        *,
+        task_id: str,
+        actor_name: str,
+        provider_name: str,
+        model_name: str | None,
+        latency_ms: int,
+        success: bool,
+        fallback_step: int,
+        prompt_fingerprint: str,
+        error_type: str | None = None,
+    ) -> None:
+        if self.db is None:
+            return
+        record_llm_call(
+            self.db,
+            LlmCall(
+                purpose="planner",
+                provider=provider_name,
+                model=model_name or "",
+                input_tokens=0,
+                output_tokens=0,
+                latency_ms=latency_ms,
+                success=success,
+                fallback_step=fallback_step,
+                error_type=error_type,
+                prompt_fingerprint=prompt_fingerprint,
+                task_id=task_id,
+                actor_name=actor_name,
+            ),
         )
 
     def _try_plan_provider(

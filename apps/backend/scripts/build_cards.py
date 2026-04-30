@@ -65,7 +65,7 @@ def _generate_one(document_id: str, settings: Settings) -> tuple[str, float]:
         document = db.get(KnowledgeDocument, document_id)
         if document is None:
             raise LookupError(f"Knowledge document not found: {document_id}")
-        card_text, model_name = CardGenerator(settings).generate(document=document)
+        card_text, model_name = CardGenerator(settings, db=db).generate(document=document)
         upsert_card(db, document=document, card_text=card_text, model_name=model_name)
         db.commit()
     return model_name, time.perf_counter() - start

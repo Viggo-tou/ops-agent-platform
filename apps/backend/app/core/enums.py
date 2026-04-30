@@ -100,6 +100,7 @@ class EventType(str, Enum):
     APPROVAL_EXPIRED = "approval_expired"
     APPROVAL_CANCELLED = "approval_cancelled"
     FAILURE_DIAGNOSIS_GENERATED = "failure_diagnosis_generated"
+    LLM_CALL = "llm_call"
     GUARDRAIL_TRIGGERED = "guardrail_triggered"
     FINAL_RESPONSE_EMITTED = "final_response_emitted"
     ROLLBACK_REQUESTED = "rollback_requested"

@@ -17,7 +17,7 @@ class Event(Base):
     __tablename__ = "event"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
-    task_id: Mapped[str] = mapped_column(ForeignKey("task.id"), index=True)
+    task_id: Mapped[str | None] = mapped_column(ForeignKey("task.id"), index=True, nullable=True)
     session_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
     event_type: Mapped[EventType] = mapped_column(SqlEnum(EventType, native_enum=False), index=True)
     source: Mapped[EventSource] = mapped_column(SqlEnum(EventSource, native_enum=False), index=True)

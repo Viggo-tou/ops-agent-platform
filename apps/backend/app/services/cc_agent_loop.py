@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -13,12 +14,14 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
+from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.schemas.evidence import EvidenceItem
 from app.services import cc_agent as cc_tools
 from app.services.cc_agent import CCToolResult
 from app.services.cc_agent_prompts import build_decision_prompt
+from app.services.llm_telemetry import LlmCall, record_llm_call
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +54,9 @@ def run_cc_agent(
     cwd: Path,
     budget: CCAgentBudget,
     provider_chain: list[str] | None = None,
+    db: Session | None = None,
+    task_id: str | None = None,
+    actor_name: str | None = None,
 ) -> CCAgentResult:
     if not cwd.exists():
         raise FileNotFoundError(f"source repo path does not exist: {cwd}")
@@ -77,6 +83,9 @@ def run_cc_agent(
                 prompt=prompt,
                 cwd=cwd,
                 timeout_s=min(budget.per_call_timeout_s, max(1.0, budget.overall_timeout_s - _elapsed_s(start))),
+                db=db,
+                task_id=task_id,
+                actor_name=actor_name,
             )
         except CCDecisionError:
             logger.warning("cc_agent all providers failed; falling back to RAG")
@@ -124,14 +133,41 @@ def _call_first_available_provider(
     prompt: str,
     cwd: Path,
     timeout_s: float,
+    db: Session | None = None,
+    task_id: str | None = None,
+    actor_name: str | None = None,
 ) -> tuple[str, str]:
     failures: list[str] = []
-    for provider in providers:
+    prompt_fingerprint = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:10]
+    for fallback_step, provider in enumerate(providers):
+        started = time.perf_counter()
         try:
-            return _call_decision_provider(provider, prompt=prompt, cwd=cwd, timeout_s=timeout_s), provider
+            text = _call_decision_provider(provider, prompt=prompt, cwd=cwd, timeout_s=timeout_s)
+            _record_cc_llm_call(
+                db=db,
+                provider=provider,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                success=True,
+                fallback_step=fallback_step,
+                prompt_fingerprint=prompt_fingerprint,
+                task_id=task_id,
+                actor_name=actor_name,
+            )
+            return text, provider
         except Exception as exc:  # noqa: BLE001
             failures.append(f"{provider}: {exc}")
             logger.warning("cc_agent decision provider failed provider=%s error=%s", provider, str(exc)[:300])
+            _record_cc_llm_call(
+                db=db,
+                provider=provider,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                success=False,
+                fallback_step=fallback_step,
+                prompt_fingerprint=prompt_fingerprint,
+                task_id=task_id,
+                actor_name=actor_name,
+                error_type=type(exc).__name__,
+            )
     raise CCDecisionError("; ".join(failures))
 
 
@@ -322,3 +358,41 @@ def _result(
 
 def _elapsed_s(start: float) -> float:
     return time.perf_counter() - start
+
+
+def _record_cc_llm_call(
+    *,
+    db: Session | None,
+    provider: str,
+    latency_ms: int,
+    success: bool,
+    fallback_step: int,
+    prompt_fingerprint: str,
+    task_id: str | None,
+    actor_name: str | None,
+    error_type: str | None = None,
+) -> None:
+    if db is None:
+        return
+    model = {
+        "claude_code": "claude-code-cli",
+        "codex": "codex-cli",
+        "minimax": getattr(get_settings(), "semantic_translator_model", "MiniMax-M2.7"),
+    }.get(provider, provider)
+    record_llm_call(
+        db,
+        LlmCall(
+            purpose="cc_agent",
+            provider=provider,
+            model=model,
+            input_tokens=0,
+            output_tokens=0,
+            latency_ms=latency_ms,
+            success=success,
+            fallback_step=fallback_step,
+            error_type=error_type,
+            prompt_fingerprint=prompt_fingerprint,
+            task_id=task_id,
+            actor_name=actor_name,
+        ),
+    )

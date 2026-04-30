@@ -189,8 +189,8 @@ def detect_user_language(text: str) -> str:
 class PrimaryOrchestrator:
     def __init__(self, db: Session):
         self.db = db
-        self.primary_agent = PrimaryAgentPlanner()
-        self.semantic_translator = SemanticTranslator()
+        self.primary_agent = PrimaryAgentPlanner(db=db)
+        self.semantic_translator = SemanticTranslator(db=db)
         self.action_agent = ActionAgent()
         self.reviewer_agent = ReviewerAgent()
         self.tool_gateway = ToolGateway(db)

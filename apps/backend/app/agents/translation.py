@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
+import time
 from typing import Any
 
 import httpx
+from sqlalchemy.orm import Session
 
 from app.agents.schemas import (
     GeneratedSemanticTranslation,
@@ -13,6 +16,7 @@ from app.agents.schemas import (
 )
 from app.core.config import Settings, get_settings
 from app.core.jira import JiraIssueReference, extract_jira_issue_reference
+from app.services.llm_telemetry import LlmCall, record_llm_call
 
 STOPWORDS = {
     "a",
@@ -288,8 +292,9 @@ def build_fallback_semantic_translation_payload(
 
 
 class SemanticTranslator:
-    def __init__(self, settings: Settings | None = None):
+    def __init__(self, settings: Settings | None = None, *, db: Session | None = None):
         self.settings = settings or get_settings()
+        self.db = db
 
     def translate(
         self,
@@ -306,12 +311,24 @@ class SemanticTranslator:
         )
 
         if should_try_minimax:
+            started = time.perf_counter()
+            fingerprint_text = f"{scenario}\n{request_text}\n{json.dumps(issue_context or {}, sort_keys=True, default=str)}"
+            prompt_fingerprint = hashlib.sha256(fingerprint_text.encode("utf-8")).hexdigest()[:10]
             try:
-                translation_payload = self._translate_with_minimax(
+                translation_payload, input_tokens, output_tokens = self._translate_with_minimax(
                     request_text=request_text,
                     scenario=scenario,
                     actor_name=actor_name,
                     issue_context=issue_context,
+                )
+                self._record_call(
+                    task_id=task_id,
+                    actor_name=actor_name,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    success=True,
+                    prompt_fingerprint=prompt_fingerprint,
                 )
                 translation = _materialize_translation(
                     payload=translation_payload,
@@ -328,6 +345,16 @@ class SemanticTranslator:
                     model_name=self.settings.semantic_translator_model,
                 )
             except Exception as exc:
+                self._record_call(
+                    task_id=task_id,
+                    actor_name=actor_name,
+                    input_tokens=0,
+                    output_tokens=0,
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    success=False,
+                    error_type=type(exc).__name__,
+                    prompt_fingerprint=prompt_fingerprint,
+                )
                 fallback_translation = _materialize_translation(
                     payload=build_fallback_semantic_translation_payload(
                         request_text,
@@ -373,7 +400,7 @@ class SemanticTranslator:
         scenario: str,
         actor_name: str,
         issue_context: dict[str, object] | None,
-    ) -> SemanticTranslationPayload:
+    ) -> tuple[SemanticTranslationPayload, int, int]:
         if not self.settings.minimax_api_key:
             raise RuntimeError("OPS_AGENT_MINIMAX_API_KEY is not configured")
 
@@ -421,7 +448,43 @@ class SemanticTranslator:
 
         content = self._extract_minimax_content(response_payload)
         raw_translation = self._parse_json_content(content)
-        return SemanticTranslationPayload.model_validate(raw_translation)
+        usage = response_payload.get("usage") if isinstance(response_payload.get("usage"), dict) else {}
+        return (
+            SemanticTranslationPayload.model_validate(raw_translation),
+            int(usage.get("prompt_tokens", 0) or 0),
+            int(usage.get("completion_tokens", 0) or 0),
+        )
+
+    def _record_call(
+        self,
+        *,
+        task_id: str,
+        actor_name: str,
+        input_tokens: int,
+        output_tokens: int,
+        latency_ms: int,
+        success: bool,
+        prompt_fingerprint: str,
+        error_type: str | None = None,
+    ) -> None:
+        if self.db is None:
+            return
+        record_llm_call(
+            self.db,
+            LlmCall(
+                purpose="semantic_translator",
+                provider="minimax",
+                model=self.settings.semantic_translator_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                latency_ms=latency_ms,
+                success=success,
+                error_type=error_type,
+                prompt_fingerprint=prompt_fingerprint,
+                task_id=task_id,
+                actor_name=actor_name,
+            ),
+        )
 
     @staticmethod
     def _build_translation_instructions() -> str:
