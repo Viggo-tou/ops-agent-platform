@@ -89,6 +89,14 @@ class InfrastructureError(RuntimeError):
     pass
 
 
+class DatasetValidationError(RuntimeError):
+    pass
+
+
+class SourceFilterError(InfrastructureError):
+    pass
+
+
 @dataclass(frozen=True)
 class DatasetRow:
     id: str
@@ -96,6 +104,7 @@ class DatasetRow:
     question: str
     expected_answer_keypoints: list[str]
     expected_citations: list[str]
+    source_name: str | None = None
 
 
 def utc_now() -> datetime:
@@ -114,6 +123,7 @@ def resolve_cli_path(value: str) -> Path:
 
 
 def load_dataset(path: Path, limit: int | None) -> list[DatasetRow]:
+    payloads: list[dict[str, Any]] = []
     rows: list[DatasetRow] = []
     with path.open("r", encoding="utf-8") as handle:
         for raw_line in handle:
@@ -121,15 +131,39 @@ def load_dataset(path: Path, limit: int | None) -> list[DatasetRow]:
             if not line:
                 continue
             payload = json.loads(line)
-            rows.append(
-                DatasetRow(
-                    id=str(payload["id"]),
-                    tier=str(payload["tier"]),
-                    question=str(payload["question"]),
-                    expected_answer_keypoints=[str(item) for item in payload["expected_answer_keypoints"]],
-                    expected_citations=[str(item) for item in payload["expected_citations"]],
-                )
+            if not isinstance(payload, dict):
+                raise SystemExit(f"Dataset row in {path} is not a JSON object")
+            payloads.append(payload)
+
+    distinct_sources = {
+        str(payload.get("source_name")).strip()
+        for payload in payloads
+        if isinstance(payload.get("source_name"), str) and str(payload.get("source_name")).strip()
+    }
+    missing_source_ids = [
+        str(payload.get("id", "<unknown>"))
+        for payload in payloads
+        if not isinstance(payload.get("source_name"), str) or not str(payload.get("source_name")).strip()
+    ]
+    if len(distinct_sources) > 1 and missing_source_ids:
+        raise DatasetValidationError(
+            "Multi-source benchmark dataset requires source_name on every row; "
+            f"missing for question id(s): {', '.join(missing_source_ids)}"
+        )
+
+    for payload in payloads:
+        source_name = payload.get("source_name")
+        source_name = source_name.strip() if isinstance(source_name, str) and source_name.strip() else None
+        rows.append(
+            DatasetRow(
+                id=str(payload["id"]),
+                tier=str(payload["tier"]),
+                question=str(payload["question"]),
+                expected_answer_keypoints=[str(item) for item in payload["expected_answer_keypoints"]],
+                expected_citations=[str(item) for item in payload["expected_citations"]],
+                source_name=source_name,
             )
+        )
     if limit is not None:
         return rows[:limit]
     return rows
@@ -197,7 +231,9 @@ def normalize_citation_path(path: str) -> str:
     return normalized
 
 
-def extract_answer_and_citations(task_payload: dict[str, Any]) -> tuple[str, list[str], list[str]]:
+def extract_answer_and_citations(
+    task_payload: dict[str, Any],
+) -> tuple[str, list[str], list[str], list[dict[str, Any]], dict[str, Any]]:
     latest_result = task_payload.get("latest_result_json")
     latest_result = latest_result if isinstance(latest_result, dict) else {}
     result = latest_result.get("result")
@@ -211,6 +247,7 @@ def extract_answer_and_citations(task_payload: dict[str, Any]) -> tuple[str, lis
 
     display_citations: list[str] = []
     canonical_citations: list[str] = []
+    structured_citations: list[dict[str, Any]] = []
     raw_citations = result.get("citations")
     if isinstance(raw_citations, list):
         for item in raw_citations:
@@ -224,7 +261,10 @@ def extract_answer_and_citations(task_payload: dict[str, Any]) -> tuple[str, lis
                     citation_text = f"{source_name.strip()}/{citation_text}"
                 display_citations.append(citation_text)
                 canonical_citations.append(normalize_citation_path(relative_path))
-    return answer.strip(), display_citations, canonical_citations
+                structured_citations.append(dict(item))
+    trace = result.get("answer_trace")
+    trace = trace if isinstance(trace, dict) else {}
+    return answer.strip(), display_citations, canonical_citations, structured_citations, trace
 
 
 def extract_minimax_content(response_payload: dict[str, Any]) -> str:
@@ -705,6 +745,8 @@ class BenchmarkClient:
             "actor_name": self.actor_name,
             "actor_role": ACTOR_ROLE,
         }
+        if row.source_name:
+            payload["source_name"] = row.source_name
         try:
             response = self.client.post(f"{self.backend_url}/api/tasks", json=payload)
             response.raise_for_status()
@@ -743,6 +785,129 @@ def compute_citation_precision(expected_paths: Sequence[str], found_paths: Seque
     return len(expected & found) / max(len(found), 1)
 
 
+def _matches_citation(returned: str, expected: str) -> bool:
+    """Match expected citation paths, including legacy source-name aliases."""
+    aliases = {
+        "handyman-admin-dashboard": "hosteddashboard",
+        "hosteddashboard": "hosteddashboard",
+    }
+    returned_normalized = returned.strip().replace("\\", "/").lower()
+    expected_normalized = expected.strip().replace("\\", "/").lower()
+    if "/" not in expected_normalized:
+        return normalize_citation_path(returned_normalized) == normalize_citation_path(expected_normalized)
+    expected_source, expected_rel = expected_normalized.split("/", 1)
+    expected_source = aliases.get(expected_source, expected_source)
+    known_sources = {"hosteddashboard", "handymanapp", *aliases.values()}
+    if expected_source not in known_sources:
+        return normalize_citation_path(returned_normalized) == normalize_citation_path(expected_normalized)
+    if "/" not in returned_normalized:
+        return normalize_citation_path(returned_normalized) == normalize_citation_path(expected_rel)
+    returned_source, returned_rel = returned_normalized.split("/", 1)
+    return returned_source == expected_source and normalize_citation_path(returned_rel) == normalize_citation_path(expected_rel)
+
+
+def _citation_identity(citation: dict[str, Any]) -> str:
+    source_name = str(citation.get("source_name") or "").strip()
+    relative_path = str(citation.get("relative_path") or "").strip()
+    return f"{source_name}/{relative_path}" if source_name else relative_path
+
+
+def _any_kp_substring(keypoints: Sequence[str], card_text: str) -> bool:
+    normalized_card = card_text.lower()
+    for keypoint in keypoints:
+        normalized_keypoint = normalize_text(str(keypoint))
+        if len(normalized_keypoint) >= 4 and normalized_keypoint in normalized_card:
+            return True
+        for token in re.findall(r"[@a-z0-9_./-]{4,}", str(keypoint).lower()):
+            if token in normalized_card:
+                return True
+    return False
+
+
+def compute_retrieval_diagnostics(
+    row: DatasetRow,
+    trace: dict[str, Any],
+    citations: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    expected_first_rank: int | None = None
+    for index, citation in enumerate(citations, start=1):
+        returned = _citation_identity(citation)
+        if any(_matches_citation(returned, expected) for expected in row.expected_citations):
+            expected_first_rank = index
+            break
+
+    source_distribution = Counter(
+        str(citation.get("source_name") or "").strip() or "<missing>"
+        for citation in citations
+    )
+    requested = row.source_name
+    wrong_source = (
+        sum(count for source, count in source_distribution.items() if source != requested)
+        if requested
+        else 0
+    )
+
+    expected_fact_in_card: bool | None = None
+    for citation in citations:
+        returned = _citation_identity(citation)
+        if any(_matches_citation(returned, expected) for expected in row.expected_citations):
+            card_text = str(citation.get("card_text") or "").strip().lower()
+            if card_text:
+                expected_fact_in_card = _any_kp_substring(row.expected_answer_keypoints, card_text)
+            break
+
+    return {
+        "expected_citation_top_rank": expected_first_rank,
+        "top_k_source_distribution": dict(source_distribution),
+        "wrong_source_in_top_k": wrong_source,
+        "expected_fact_in_card": expected_fact_in_card,
+        "selected_sources": trace.get("selected_sources") if isinstance(trace.get("selected_sources"), list) else [],
+    }
+
+
+def assign_stage19_buckets(record: dict[str, Any], diagnostics: dict[str, Any]) -> list[str]:
+    buckets: list[str] = []
+    expected_rank = diagnostics.get("expected_citation_top_rank")
+    wrong_source_count = int(diagnostics.get("wrong_source_in_top_k") or 0)
+    if wrong_source_count > 0 or expected_rank is None:
+        buckets.append("retrieval_wrong_source")
+    if expected_rank is not None and int(expected_rank) > 4:
+        buckets.append("retrieval_right_source_wrong_file")
+    if diagnostics.get("expected_fact_in_card") is False:
+        buckets.append("card_missing_keypoint_facts")
+
+    keypoint_coverage = float(record.get("keypoint_coverage") or 0.0)
+    if (
+        record.get("tier") in {"C", "D"}
+        and keypoint_coverage < 0.3
+        and expected_rank is not None
+        and not any(bucket.startswith("retrieval_") for bucket in buckets)
+    ):
+        buckets.append("cross_file_reasoning_miss")
+
+    android_terms = {
+        "Composable",
+        "Fragment",
+        "ViewModel",
+        "Firebase",
+        "Navigation",
+        "Activity",
+        "RecyclerView",
+        "Adapter",
+        "navController",
+        "LazyColumn",
+        "@composable",
+        "compose",
+        "androidx",
+    }
+    answer = str(record.get("answer_excerpt") or "").lower()
+    keypoint_text = " ".join(str(item) for item in record.get("expected_answer_keypoints") or []).lower()
+    has_android = any(term.lower() in keypoint_text for term in android_terms)
+    if has_android and not any(term.lower() in answer for term in android_terms):
+        buckets.append("domain_jargon_miss")
+    return buckets
+
+
 def mean(values: Sequence[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
@@ -764,6 +929,30 @@ def tier_summary(records: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]
             "mean_score": round(mean(scores), 2) if scores else 0.0,
             "min_score": round(min(scores), 2) if scores else 0.0,
             "max_score": round(max(scores), 2) if scores else 0.0,
+        }
+    return summary
+
+
+def source_summary(records: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    summary: dict[str, dict[str, Any]] = {}
+    sources = sorted(
+        {
+            str(record.get("source_name") or "").strip()
+            for record in records
+            if str(record.get("source_name") or "").strip()
+        }
+    )
+    for source_name in sources:
+        source_records = [record for record in records if record.get("source_name") == source_name]
+        valid_records = [
+            record for record in source_records if str(record.get("score_status", "valid")) == "valid"
+        ]
+        scores = [float(record["score"]) for record in valid_records]
+        summary[source_name] = {
+            "count": len(source_records),
+            "valid_score_count": len(valid_records),
+            "invalid_score_count": len(source_records) - len(valid_records),
+            "mean_score": round(mean(scores), 2) if scores else 0.0,
         }
     return summary
 
@@ -863,10 +1052,21 @@ def build_summary(
     judge_counts = Counter(str(record.get("judge_status", "unknown")) for record in records)
     score_counts = Counter(str(record.get("score_status", "unknown")) for record in records)
     failure_buckets = Counter()
+    stage19_buckets = Counter()
     for record in records:
         bucket = classify_failure_bucket(record)
         if bucket:
             failure_buckets[bucket] += 1
+        stage19_buckets.update(record.get("stage19_buckets") or [])
+    retrieval_rank_distribution = Counter(
+        "absent"
+        if record.get("expected_citation_top_rank") is None
+        else f"top{min(int(record['expected_citation_top_rank']), 8)}"
+        for record in records
+    )
+    fact_records = [
+        record for record in records if record.get("expected_fact_in_card") is not None
+    ]
     pinned_judge_failure_count = (
         sum(1 for record in records if record.get("judge_status") == "fail")
         if requested_judge_mode != "auto"
@@ -909,10 +1109,20 @@ def build_summary(
         "judge_status_counts": dict(sorted(judge_counts.items())),
         "score_status_counts": dict(sorted(score_counts.items())),
         "failure_bucket_counts": dict(sorted(failure_buckets.items())),
+        "retrieval_top_rank_distribution": dict(sorted(retrieval_rank_distribution.items())),
+        "wrong_source_record_count": sum(
+            1 for record in records if int(record.get("wrong_source_in_top_k") or 0) > 0
+        ),
+        "expected_fact_in_card_rate": (
+            sum(1 for record in fact_records if record.get("expected_fact_in_card") is True)
+            / max(len(fact_records), 1)
+        ),
+        "stage19_bucket_counts": dict(sorted(stage19_buckets.items())),
         "abc_completed": abc_completed,
         "abc_total": abc_total,
         "abc_completion_ratio": round(completion_ratio, 4),
         "tier_summary": tier_summary(records),
+        "source_summary": source_summary(records),
     }
     return summary
 
@@ -1005,7 +1215,11 @@ def main() -> int:
     args = parse_args()
     dataset_path = resolve_cli_path(args.dataset)
     out_dir = resolve_cli_path(args.out_dir)
-    rows = load_dataset(dataset_path, args.limit)
+    try:
+        rows = load_dataset(dataset_path, args.limit)
+    except DatasetValidationError as exc:
+        print(f"Dataset validation failed: {exc}", file=sys.stderr)
+        return 2
 
     if not rows:
         raise SystemExit("Dataset is empty.")
@@ -1096,6 +1310,8 @@ def main() -> int:
             answer = ""
             citations_found_display: list[str] = []
             citations_found_canonical: list[str] = []
+            structured_citations: list[dict[str, Any]] = []
+            answer_trace: dict[str, Any] = {}
             answer_excerpt = ""
             error_text: str | None = None
             judge_error: str | None = None
@@ -1119,7 +1335,20 @@ def main() -> int:
                 else:
                     task_status = str(final_task.get("status") or "").strip().lower()
                     completed = task_status in TERMINAL_STATUSES
-                    answer, citations_found_display, citations_found_canonical = extract_answer_and_citations(final_task)
+                    (
+                        answer,
+                        citations_found_display,
+                        citations_found_canonical,
+                        structured_citations,
+                        answer_trace,
+                    ) = extract_answer_and_citations(final_task)
+                    if row.source_name:
+                        selected_sources = answer_trace.get("selected_sources")
+                        if selected_sources != [row.source_name]:
+                            raise SourceFilterError(
+                                f"Source filter smoke check failed for {row.id}: "
+                                f"expected selected_sources={[row.source_name]!r}, got {selected_sources!r}"
+                            )
                     answer_excerpt = truncate_utf8(answer, ANSWER_EXCERPT_MAX_BYTES)
                     citation_precision = compute_citation_precision(row.expected_citations, citations_found_canonical)
                     if answer.strip():
@@ -1144,6 +1373,8 @@ def main() -> int:
                 task_status = "infrastructure_error"
                 synthesis_status = "task_error"
                 error_text = str(exc)
+                if isinstance(exc, SourceFilterError):
+                    abort_reason = "source_filter_broken"
             except Exception as exc:  # pragma: no cover - defensive failure capture
                 infrastructure_failed = True
                 duration_s = time.monotonic() - question_started
@@ -1178,7 +1409,9 @@ def main() -> int:
                     {"keypoint": keypoint, "hit": hit}
                     for keypoint, hit in zip(row.expected_answer_keypoints, keypoint_hits)
                 ],
+                "expected_answer_keypoints": row.expected_answer_keypoints,
                 "expected_citations": row.expected_citations,
+                "source_name": row.source_name,
                 "citations_found": citations_found_display,
                 "judge_mode": judge_mode_used,
                 "duration_s": round(duration_s, 3),
@@ -1186,6 +1419,16 @@ def main() -> int:
                 "error": error_text,
                 "judge_error": judge_error,
             }
+            diagnostics = compute_retrieval_diagnostics(row, answer_trace, structured_citations)
+            record.update(
+                {
+                    "expected_citation_top_rank": diagnostics["expected_citation_top_rank"],
+                    "top_k_source_distribution": diagnostics["top_k_source_distribution"],
+                    "wrong_source_in_top_k": diagnostics["wrong_source_in_top_k"],
+                    "expected_fact_in_card": diagnostics["expected_fact_in_card"],
+                }
+            )
+            record["stage19_buckets"] = assign_stage19_buckets(record, diagnostics)
             records.append(record)
 
             if score_status == "invalid" and synthesis_status in INFRA_INVALID_SYNTH_STATUSES:
