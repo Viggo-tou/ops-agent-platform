@@ -403,3 +403,69 @@ Hybrid's smaller gap is partly artifact per the disagreement audit. **Stage 20C 
 - IF confirmed (≥70% real synth misses): spec synth-A/B experiment (Codex CLI as synthesizer, V1 MM judge for cross-family)
 - IF refuted (≤30% real synth misses): proceed with cards-v2 narrow scope per Stage 20C
 - T-DATASET-HANDYMANAPP-EXPAND remains queued (P1)
+
+---
+
+## Session 2026-05-01-1705 — Synth multifile lever attempted + retired; pivot to UX dogfood
+
+**Tag**: `session-start/2026-05-01-1705` at `c2d11ed`.
+
+### Outcomes
+
+1. **`T-SYNTH-MULTIFILE-COVERAGE-V1` implemented + retired-as-failed**. Two iterations, both reverted. See DECISIONS D-010 third amendment. Implementation branch `feat/synth-multifile-coverage-v1` kept for future investigation. Reverts on checkpoint: `a925ffe` (widening) + `fffa0eb` (base).
+
+2. **Manual sample inspection (8 cases of `both_no_evidence_yes`) found 5/8 = 62.5% real synth gaps**, dominant pattern: multi-file selection failure (synth fixates on one file, omits others). The +8.8 score lift in Phase 1 iteration 1 was unattributed (multifile_mode fired 0/5).
+
+3. **Phase 1 iteration 2 with widened regex regressed C-05 from 44 → 10** because the spec's "say not-covered explicitly" instruction created benchmark-hostile structured output. Two failure modes confirmed:
+   - Regex calibration fragile (0/5 too narrow, over-broaden creates false positives)
+   - "Not-covered" instruction crashes kp_coverage on imperfect retrieval
+
+4. **Strategic pivot decided**: **quality milestone (mean ≥60) is NOT the gate for UX dogfood**. UX dogfood validates flow/diagnostics/evidence/failure-handling, NOT accuracy. V1 MM-only baseline (handymanapp 51.78 / dashboard 60.24) is stable enough for INTERNAL dogfood marked "experimental".
+
+### Touched files (since `session-start/2026-05-01-1705`)
+
+**Specs**:
+- `docs/ai/tasks/T-SYNTH-MULTIFILE-COVERAGE-V1-WIDEN-EXTRACTOR.md` (new — widening spec, retired with parent)
+
+**Code (reverted)**:
+- `apps/backend/app/services/knowledge_synthesis.py` — V1 entity extractor + V2 widening (both reverted)
+- `apps/backend/scripts/run_qa_benchmark.py` — multifile post-processor (reverted)
+- `apps/backend/scripts/rejudge_run.py` — mirror (reverted)
+- `apps/backend/tests/scripts/test_run_qa_benchmark.py` — V1 + widening tests (reverted)
+- `apps/backend/tests/services/test_knowledge_synthesis.py` — V1 + widening tests (reverted)
+
+**Bench artifacts (untracked, useful for future investigation)**:
+- `qa-run-20260501T080027Z.jsonl` — Phase 1A v1 (HAND C-09/C-12)
+- `qa-run-20260501T081633Z.jsonl` — Phase 1B v1 (DASH B-04/B-09/C-05)
+- `qa-run-20260501T100255Z.jsonl` — Phase 1B v2 (showed C-05 regression)
+- `qa_regression_phase1_handymanapp.jsonl` + `qa_regression_phase1_dashboard.jsonl` — 5Q regression sets
+
+**Doc updates (committed in this session's docs commit)**:
+- `DECISIONS.md` — D-010 third amendment (lever retired-as-failed)
+- `SESSION_HANDOFF.md` — this section
+
+### Stage 20C state
+
+- P0 (synth multifile prompt fix) — **RETIRED-AS-FAILED**
+- New P0 candidates queued for next session:
+  - **Dataset audit** (cheapest) — sample 8-10 keypoints, check if some are over-strict (require literal path tokens that no good answer would write)
+  - **Citation-grounded prompt** — small synth change, targets cp axis (currently ~0.25, lifting to 0.5 = +10 score directly)
+  - **HAND C-09 +20 mystery** — 30-min investigation into why score lifted when multifile_mode=False (might reveal a no-cost prompt insight)
+- Cards-v2 narrow (62 true-misses target) → P1, deferred to after smaller levers measured
+- Synth model swap (Codex synthesizer A/B) → P2, deferred (high cost, high uncertainty)
+- T-DATASET-HANDYMANAPP-EXPAND → P1 still queued
+
+### Quality vs UX track separation (D-010 third amendment context)
+
+Quality milestone "mean ≥60 on both datasets" is **not yet met** on handymanapp (51.78). The synth lever didn't deliver. Quality work continues on the queued levers above.
+
+UX dogfood is **separately approved** as the next active track because:
+- V1 baseline is stable
+- No critical regression
+- Failed experiments cleanly reverted
+- Citations + V1 judge mode are visible in artifact
+- Internal dogfood ≠ external launch claim
+
+### What to say to continue
+
+> 继续 Stage 20: dogfood 当前 V1 前端，记录 UX 痛点。同时 quality track 走 dataset audit / citation-grounded prompt / HAND C-09 +20 mystery 三选一作为下一个 P0 lever。Cards-v2 和 synth model swap 留到 dataset audit 之后再决定。

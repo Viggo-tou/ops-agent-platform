@@ -204,3 +204,36 @@ Constraint amendments:
 - Future cross-family validations (`hybrid_v2`) need Codex CLI or Claude Code CLI installed and authenticated — both work via subscription, no marginal cost.
 - The `T-JUDGE-HYBRID-V2.md` placeholder is superseded by `T-JUDGE-HYBRID-V2-CLI.md` (kept for audit trail).
 - The `T-JUDGE-AMBIG-CALIBRATION.md` calibration dataset is no longer required for V2 — V2 ships as diagnostic without it. Calibration is queued only if V2 ever needs to be promoted to official.
+
+### D-010 Third amendment (2026-05-01): Stage 20C P0 (T-SYNTH-MULTIFILE-COVERAGE-V1) retired-as-failed
+
+The Stage 20C P0 lever — `T-SYNTH-MULTIFILE-COVERAGE-V1` (force multi-entity coverage in synth prompt) — was implemented and tested over two iterations. **Both failed**. Reverts: `a925ffe` (widening) + `fffa0eb` (V1 base). Implementation branch `feat/synth-multifile-coverage-v1` retained for future investigation.
+
+**Iteration 1 (commit `8d2e653`)** — Implemented per spec. Phase 1 regression on 5 Qs (DASH C-05/B-09/B-04, HAND C-09/C-12) showed:
+- Aggregate +8.8 score lift (4/5 Qs improved, 0 regressed)
+- BUT `multifile_mode_active = False` on **all 5** records — the entity extractor regex was too narrow (PascalCase + role suffix only).
+- The score lift was therefore **unattributed to the spec's hypothesis** — likely a prompt-side-effect from the codex refactor that bumped `SYNTHESIS_PROMPT_VERSION`.
+
+**Iteration 2 (commit `513dbdc`)** — Widened the regex per `T-SYNTH-MULTIFILE-COVERAGE-V1-WIDEN-EXTRACTOR.md`. Codex over-broadened by adding an "X page" pattern not in the spec (to satisfy the ≥3 entities acceptance criterion on DASH C-05). Phase 1 v2 re-run:
+- C-05 fired multifile_mode with **5 entities, 3 spurious** (`login page`, `dashboard page`, `analytics page`).
+- Synth followed the spec's instruction to write `"<entity>: not covered by retrieved evidence"` for missing entities → produced structured non-answer output → kp_cov = 0 → C-05 score crashed **44 → 10 (−34)**.
+- B-04 and B-09 reverted to V1 baseline (the +12 from iteration 1 was prompt variance, not real improvement).
+- B-04: 58 → 46 (−12). B-09: 70 → 58 (−12). Net Phase 1 v2 worse than V1 baseline.
+
+**Structural design failures**:
+
+1. **Regex calibration is fragile**. Iteration 1 too narrow (0/5 fire). Iteration 2 over-broadened to hit acceptance threshold (false-positive entities).
+2. **The "say not-covered explicitly" instruction is benchmark-hostile**. Forcing the synth to write a structured non-answer for missing evidence creates output the keypoint judge cannot credit. The penalty is severe (kp_cov = 0 on the affected record).
+3. **Multifile_mode threshold + prompt structure interact badly with imperfect retrieval**. When retrieval misses some of the questioned files (which is common on cards-only retrieval over multi-file Qs), the structured "not covered" output guarantees a low score even when the answer would have been useful as prose.
+
+**Lever retired**. Stage 20C reverts to:
+
+- 50 `both_no_evidence_yes` keypoints (synth articulation gap) → still on the table but cannot be addressed by THIS specific prompt-fix design.
+- 62 `both_no_rule_no_evidence_no` keypoints → cards-v2 narrow target if we go there.
+- The HAND C-09 35 → 55 (+20) data point in Phase 1 iteration 1 is unexplained and worth a small investigation before launching new levers.
+
+**Constraint amendments**:
+
+- Future synthesis-prompt experiments must NOT instruct the model to write a structured "<entity>: not covered" non-answer. Either gracefully omit, or include in a free-form prose acknowledgment that doesn't break keypoint matching.
+- Acceptance criteria for entity-extraction regex changes must NOT be a fixed minimum count (`≥3 entities on DASH C-05`). That incentivizes over-broadening. Use precision-based criteria instead.
+- Stage 20C P0 is now **OPEN** — no current lever assigned. See SESSION_HANDOFF for next-session triage.
