@@ -469,3 +469,22 @@ UX dogfood is **separately approved** as the next active track because:
 ### What to say to continue
 
 > 继续 Stage 20: dogfood 当前 V1 前端，记录 UX 痛点。同时 quality track 走 dataset audit / citation-grounded prompt / HAND C-09 +20 mystery 三选一作为下一个 P0 lever。Cards-v2 和 synth model swap 留到 dataset audit 之后再决定。
+
+### UX dogfood attempted later same session — surfaced critical pipeline reliability bugs
+
+First UX dogfood attempt did NOT validate UX flow — instead it surfaced a CRITICAL backend pipeline reliability problem that blocks any meaningful dogfood. Documented as `docs/ai/tasks/T-DOGFOOD-OBSERVABILITY-BUGS-2026-05-01.md` with 4 bugs:
+
+- **Bug 1**: No timeout / progress signal when task hangs (UI shows "正在生成" forever)
+- **Bug 2**: No automatic recovery from worker-pool stall
+- **Bug 3**: Backend stdout/stderr not captured by start-backend.ps1
+- **Bug 4** (added after Playwright reproduction): **Pipeline hangs deterministically on jira_issue_develop**, jira_issue_plan stops mid-pipeline, AND **POST /api/tasks endpoint blocks** after a few attempts. /health still reports "healthy". Likely root cause: SQLite write-lock contention between API and worker threads, OR unbounded MM synthesis calls that jam the 2-worker pool.
+
+Bug 4 makes UX dogfood unproductive until fixed. **All Jira-scenario dogfood attempts hit this wall.** Recommendation: don't continue dogfood until Bug 2/4 are fixed.
+
+Successful test trail (Playwright via http://127.0.0.1:5173):
+- Submitted "完成Jira的P69-4" → task `7da25ba3-7994-47d7-a346-c1748558b6f4` created at 2026-05-01T12:08:11Z, hangs at created/intake forever (200+ seconds observed, no progress).
+- Original P69-4 attempt (`f4c9aaf8`) marked failed by orphan sweep on backend restart.
+- A `jira_issue_plan` (English) at 12:19:28Z fired `semantic_translation_started` event but no further events.
+- Subsequent task creation HUNG (POST /api/tasks returned empty body).
+
+Next session: the bug 2/4 investigation should be the FIRST item, not a quality lever.
