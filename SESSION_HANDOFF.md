@@ -243,3 +243,59 @@ Orchestrator._execute_develop_pipeline
 See git history and prior handoff entries for T-039, T-038, T-034, T-026 context.
 Prior test baselines: T-039 = 171 passed, T-034 = 129 passed.
 Current baseline with T-041: 256+ tests (defense suites alone = 101).
+
+---
+
+## Session 2026-05-01 — Stage 19 official + Stage 20 judge-bias verdict
+
+**Tag**: `session-start/2026-05-01-0930` (retroactively created at `a3f0cf4`; the mandatory session-start ritual was missed at the actual start and patched at session-close).
+
+### Outcomes
+
+1. **Stage 19 official rule-judge results recorded.** Dashboard 34Q mean **59.32** valid 25/34 (`qa-run-20260430T155831Z.jsonl`). Handymanapp 26Q mean **34.20** valid 17/26 (`qa-run-20260501T000245Z.jsonl`). Per-tier handymanapp: A 30.5 / B 41.3 / C 36.7 / D 10.0 (n=1).
+2. **Stage 20 judge-bias verdict landed** (`docs/ai/specs/stage20-judge-verdict.md` + `DECISIONS.md` D-010). Cross-family rejudge (MiniMax) of both artifacts collapsed the dashboard→handymanapp gap from rule-judge **+25.12** to semantic-judge **+8.46**. The Stage 19 reading "cards don't generalize to Android" was largely a rule-judge paraphrase artifact, not retrieval/cards failure.
+3. **Stage 20 priority locked in D-010**: 20A (hybrid judge) = PRIMARY; 20B (answer prompt) = DEPRIORITIZED; 20C (cards-v2) = NARROW + CONDITIONAL on n≥40 re-bench.
+
+### Touched files (since `session-start/2026-05-01-0930`)
+
+**Modified**:
+- `apps/backend/scripts/run_qa_benchmark.py` — V3 smoke abort policy loosened (cross-source-only abort, not empty-source); new `retrieval_empty_no_source` bucket; systematic-empty 3-streak guardrail + early-window guardrail.
+- `apps/backend/tests/scripts/test_run_qa_benchmark.py` — +6 tests for new bucket / smoke abort behavior. **27 green**.
+- `apps/backend/scripts/rejudge_run.py` — 1-line fix: V3 `extract_answer_and_citations` returns 5-tuple; rejudge was unpacking 3.
+- `apps/backend/tests/benchmarks/qa_benchmark_dataset.jsonl` — top-level `source_name` field on all 60 rows.
+- `DECISIONS.md` — D-010 (Stage 20A → PRIMARY).
+- `SESSION_HANDOFF.md` — this section.
+
+**New**:
+- `apps/backend/scripts/analyze_stage19_diagnostic.py` — diagnostic analyzer (per-tier means, low/high sample triage, hybrid-judge recommendation). Reusable across stages.
+- `apps/backend/tests/benchmarks/qa_benchmark_dataset_handymanapp.jsonl` — 26Q split.
+- `apps/backend/tests/benchmarks/qa_benchmark_dataset_hosteddashboard.jsonl` — 34Q split.
+- `docs/ai/specs/stage20-judge-verdict.md` — ADR-style verdict (1.5 pages, 5 caveats, hybrid sketch, 4-item action plan).
+
+**Bench artifacts (committed)**:
+- `apps/backend/tests/benchmarks/runs/qa-run-20260430T155831Z.jsonl` — dashboard official.
+- `apps/backend/tests/benchmarks/runs/qa-run-20260501T000245Z.jsonl` — handymanapp official.
+- `apps/backend/tests/benchmarks/runs/qa-rejudge-handymanapp-minimax.jsonl` — Stage 20 diagnostic.
+- `apps/backend/tests/benchmarks/runs/qa-rejudge-dashboard-minimax.jsonl` — Stage 20 diagnostic.
+
+**Bench artifacts (left untracked)**:
+Smoke runs and aborted-attempt artifacts under `tests/benchmarks/runs/` are not part of the verdict evidence chain. Either commit later as a "historical archive" or `.gitignore` selectively. Untouched in this session's commits.
+
+### Tests
+
+- `apps/backend/tests/scripts/test_run_qa_benchmark.py` — **27 passed** after V3 smoke patch.
+
+### Queued tickets (referenced in `docs/ai/specs/stage20-judge-verdict.md`)
+
+1. `T-JUDGE-HYBRID-V1` — implement hybrid judge in `KeypointJudge` per the verdict's sketch. Add second LLM family (restore Anthropic credit OR add OpenAI fallback). Currently MiniMax is the only cross-family judge.
+2. `T-BENCH-TIMEOUT-HANDYMANAPP` — raise `question_timeout_seconds` to 360-480s for handymanapp (rejudge rescued 4 records where backend completed past the 240s polling deadline).
+3. `T-STAGE19-REBENCH-N40` — after the above two land, re-bench handymanapp at n≥40 valid records to confirm/falsify the residual 8.46 gap.
+4. Stage 20C decision deferred until n≥40 residual is measured.
+
+### Independent infra issue
+
+**Anthropic API key has zero credit balance** (`apps/backend/.env`). Stage 20A spec depends on a second LLM judge family — credit must be restored, or OpenAI added as the second-family fallback.
+
+### What to say to continue
+
+> 继续 Stage 20A：实现 hybrid judge per `docs/ai/specs/stage20-judge-verdict.md` sketch，同时恢复 Anthropic credit 或加 OpenAI judge fallback。然后跑 T-BENCH-TIMEOUT-HANDYMANAPP，再 re-bench 验证 residual gap.

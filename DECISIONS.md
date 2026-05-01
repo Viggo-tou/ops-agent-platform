@@ -1,6 +1,6 @@
 # Decisions
 
-Last updated: 2026-04-11
+Last updated: 2026-05-01
 
 ## D-001 Single Runtime Remains The Default
 
@@ -118,3 +118,26 @@ Constraint:
 
 - Do not commit either half until the bench has been run with a strict-pinned judge (per T-BENCH-HARNESS-RESILIENCE) and `score_status="valid"` for all 34 questions in the artifact.
 - The stage-log entry in commit 2 must explicitly record the accept/revert decision. If revert: commit 2 is `revert(<area>): drop <ticket-id> per bench` and commit 1's hash is recorded in the stage-log close summary.
+
+## D-010 Stage 20A (Hybrid Judge) Promoted To PRIMARY
+
+Cross-family rejudge of Stage 19 artifacts (handymanapp + dashboard via MiniMax) collapsed the dashboard→handymanapp gap from rule-judge **+25.12** to semantic-judge **+8.46**. Rule judge has a structural Android/Kotlin paraphrasing bias that systematically under-scores answers on stacks whose keypoint vocabulary diverges from natural-English connectives.
+
+Stage 20 priority is therefore:
+
+- **20A (hybrid judge) = PRIMARY**, not infrastructure. Rule-only is structurally fragile cross-stack and blocks every future cross-stack benchmark.
+- **20B (answer prompt rewrite) = DEPRIORITIZED**. Answers are already comprehensive when judge is fair (handymanapp MiniMax 51.78 ≈ dashboard MiniMax 60.24).
+- **20C (cards-v2) = NARROW + CONDITIONAL**. Scope only to C/D multi-file synthesis; commit only after re-bench at n≥40 valid confirms residual gap is real, not sample variance.
+
+Reason:
+
+- Without 20A, every Stage 20+ benchmark on a non-React stack will be misread the same way.
+- A-tier handymanapp records like A-17 (rule 13.3 → MiniMax 73.3, with manual verification of all 3 keypoints literally present in answer) are unambiguous evidence the bias is in the judge, not the answer.
+- MiniMax is not blanket-lenient: dashboard total delta is +0.92 (essentially zero), dashboard C-tier delta is **−4.12** (stricter than rule), and confirmed misses (B-12, C-11, D-09, D-10) stayed at 0.
+
+Constraint:
+
+- Stage 20A spec must add a second LLM judge family (restore Anthropic credit or add OpenAI) before tightening claims further. Single-LLM-judge view is suggestive but not definitive.
+- Hybrid judge does NOT replace rule judge. Rule = strict lexical conformance; LLM = semantic coverage; both kept and reported. See `docs/ai/specs/stage20-judge-verdict.md` for the hybrid-judge sketch and full caveats.
+- D-tier conclusions are out of scope of this decision (n=1 vs n=3, insufficient sample).
+- Independent Stage 19 follow-up: bench `question_timeout_seconds=240s` is too short for handymanapp (rejudge rescued 4 timeout records where backend actually completed). Raise to 360-480s in next handymanapp run.
