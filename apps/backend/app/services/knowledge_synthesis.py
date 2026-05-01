@@ -19,7 +19,143 @@ from app.services.llm_telemetry import LlmCall, record_llm_call
 # History:
 #   v1-baseline: original prompt, citations + concrete-answer constraint.
 #   v2-claim-binding: answer prose plus structured claim-to-citation bindings.
-SYNTHESIS_PROMPT_VERSION = "v2-claim-binding"
+#   v3-multientity-coverage: require coverage for explicitly mentioned entities.
+SYNTHESIS_PROMPT_VERSION = "v3-multientity-coverage"
+
+ENTITY_PATTERN = re.compile(
+    r"`[^`]{3,80}`"
+    r"|(?<![A-Za-z0-9_])("
+    r"[A-Z][A-Za-z0-9]+(?:Fragment|Activity|Adapter|ViewModel|Screen|Service|Controller|Component|Page)"
+    r"|[A-Z][A-Za-z0-9]+\.(?:kt|js|tsx|ts|jsx|py|java|go)"
+    r"|[a-z][a-z0-9_]*\.(?:kt|js|tsx|ts|jsx|py|java|go|xml|json|yml|yaml|gradle)"
+    r")(?![A-Za-z0-9_])"
+)
+ENTITY_EXTENSIONS = (
+    ".kt",
+    ".js",
+    ".tsx",
+    ".ts",
+    ".jsx",
+    ".py",
+    ".java",
+    ".go",
+    ".xml",
+    ".json",
+    ".yml",
+    ".yaml",
+    ".gradle",
+)
+COMMON_ENTITY_WORDS = {
+    "the",
+    "and",
+    "or",
+    "for",
+    "with",
+    "from",
+    "into",
+    "about",
+    "class",
+    "file",
+    "files",
+}
+
+
+def _normalize_entities(raw_entities: list[str]) -> list[str]:
+    entities: list[str] = []
+    seen: set[str] = set()
+    for raw_entity in raw_entities:
+        entity = raw_entity.strip().strip("`").strip()
+        if not entity:
+            continue
+        if entity.lower() in COMMON_ENTITY_WORDS:
+            continue
+        key = entity.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entities.append(entity)
+    return entities
+
+
+def extract_question_entities(question: str) -> list[str]:
+    """Return explicitly mentioned code entities in question order."""
+    return _normalize_entities([match.group(0) for match in ENTITY_PATTERN.finditer(question or "")])
+
+
+def _entity_search_terms(entity: str) -> list[str]:
+    clean = entity.strip().strip("`").strip()
+    if not clean:
+        return []
+    normalized_path = clean.replace("\\", "/")
+    basename = normalized_path.rsplit("/", 1)[-1]
+    core = basename
+    for extension in ENTITY_EXTENSIONS:
+        if core.lower().endswith(extension):
+            core = core[: -len(extension)]
+            break
+    terms: list[str] = []
+    for term in (clean, normalized_path, basename, core):
+        if term and term.lower() not in {item.lower() for item in terms}:
+            terms.append(term)
+    return terms
+
+
+def _entity_appears_in_answer(entity: str, answer: str) -> bool:
+    """Return True when the entity or its extensionless file/class token appears."""
+    if not answer:
+        return False
+    clean = entity.strip().strip("`").strip()
+    not_covered_pattern = re.compile(
+        rf"`?{re.escape(clean)}`?\s*:\s*not covered by retrieved evidence\.?",
+        re.IGNORECASE,
+    )
+    if not_covered_pattern.search(answer):
+        return False
+    normalized_answer = answer.replace("\\", "/").lower()
+    return any(term.lower() in normalized_answer for term in _entity_search_terms(clean))
+
+
+def compute_question_entity_coverage(question: str, answer: str) -> dict[str, object]:
+    mentioned_entities = extract_question_entities(question)
+    covered_entities = [
+        entity for entity in mentioned_entities if _entity_appears_in_answer(entity, answer)
+    ]
+    covered = set(covered_entities)
+    omitted_entities = [entity for entity in mentioned_entities if entity not in covered]
+    coverage_rate = (
+        len(covered_entities) / len(mentioned_entities)
+        if mentioned_entities
+        else 1.0
+    )
+    return {
+        "mentioned_entities": mentioned_entities,
+        "covered_entities": covered_entities,
+        "omitted_entities": omitted_entities,
+        "multifile_mode_active": len(mentioned_entities) >= 2,
+        "coverage_rate": coverage_rate,
+    }
+
+
+def _build_multi_entity_coverage_block(entities: list[str] | None) -> str:
+    if not entities or len(entities) < 2:
+        return ""
+    entity_lines = "\n".join(f"  {index}. {entity}" for index, entity in enumerate(entities, start=1))
+    return (
+        "The user's question explicitly mentions the following code entities, in order:\n"
+        f"{entity_lines}\n\n"
+        "Your answer MUST include at least one specific factual claim about each\n"
+        "of these entities. A \"specific factual claim\" is a sentence that references\n"
+        "a concrete API, method, field, file path, data path, routing decision, or\n"
+        "behavior of that entity. A generic mention like \"X is also part of this\n"
+        "flow\" does NOT count.\n\n"
+        "If the retrieved evidence does not contain enough information to make a\n"
+        "specific claim about a mentioned entity, write exactly: \"<entity_name>:\n"
+        "not covered by retrieved evidence.\" Do not omit it silently. Do not\n"
+        "fabricate behavior.\n\n"
+        "Structure: when answering a flow / comparison / multi-file question, use\n"
+        "either ordered steps (for flow) or per-entity bullets (for comparison /\n"
+        "listing). Avoid prose-only structure when >=3 entities are listed."
+    )
 
 
 class KnowledgeSynthesisError(RuntimeError):
@@ -58,8 +194,12 @@ class KnowledgeSynthesizer:
             raise KnowledgeSynthesisError("no citations to synthesize over")
 
         use_chinese = self._use_chinese(query=query, language=language)
+        mentioned_entities = extract_question_entities(query)
         evidence_block = self._format_evidence(citations)
-        system_prompt = self._build_system_prompt(use_chinese=use_chinese)
+        system_prompt = self._build_system_prompt(
+            use_chinese=use_chinese,
+            mentioned_entities=mentioned_entities,
+        )
         user_prompt = self._build_user_prompt(
             query=query,
             evidence_block=evidence_block,
@@ -131,7 +271,11 @@ class KnowledgeSynthesizer:
         return "\n\n".join(parts)
 
     @staticmethod
-    def _build_system_prompt(*, use_chinese: bool) -> str:
+    def _build_system_prompt(
+        *,
+        use_chinese: bool,
+        mentioned_entities: list[str] | None = None,
+    ) -> str:
         language_rule = (
             "Answer prose and claim restatements must be in Chinese."
             if use_chinese
@@ -160,7 +304,7 @@ class KnowledgeSynthesizer:
             "- Do not output JSON or markdown code fences."
         )
         if use_chinese:
-            return (
+            prompt = (
                 "You are an enterprise codebase Q&A assistant. Answer in Chinese. "
                 "The retrieval system has already selected candidate files and snippets as evidence.\n\n"
                 f"{language_rule}\n"
@@ -170,7 +314,9 @@ class KnowledgeSynthesizer:
                 "Keep the tone natural and direct, like a senior engineer explaining to a teammate.\n\n"
                 f"{claim_structure}"
             )
-        return (
+            coverage_block = _build_multi_entity_coverage_block(mentioned_entities)
+            return f"{prompt}\n\n{coverage_block}" if coverage_block else prompt
+        prompt = (
             "You are an enterprise codebase Q&A assistant. The user asked about the codebase; "
             "the retrieval system has already selected candidate files and snippets as evidence.\n\n"
             f"{language_rule}\n"
@@ -181,6 +327,8 @@ class KnowledgeSynthesizer:
             "Do not emit a rigid template.\n\n"
             f"{claim_structure}"
         )
+        coverage_block = _build_multi_entity_coverage_block(mentioned_entities)
+        return f"{prompt}\n\n{coverage_block}" if coverage_block else prompt
 
     def _build_user_prompt(
         self,

@@ -17,10 +17,12 @@ from scripts.run_qa_benchmark import (
     KeypointJudge,
     _judge_family_metadata,
     compute_citation_precision,
+    compute_question_entity_coverage,
     coerce_keypoint_hit_details,
     extract_answer_and_citations,
     hybrid_v2_disagreement_summary,
     judge_rung_summary,
+    multifile_coverage_summary,
     _miss_details,
     truncate_utf8,
 )
@@ -195,6 +197,7 @@ def main() -> int:
             cp = compute_citation_precision(expected, citations)
             score_status = "valid" if synthesis_status == "pass" and judge_status == "pass" else "invalid"
             score = (kp * 60.0 + cp * 40.0) if score_status == "valid" else 0.0
+            entity_coverage = compute_question_entity_coverage(question, answer)
             out = dict(record)
             out.update(
                 task_status=task_status,
@@ -213,6 +216,11 @@ def main() -> int:
                 answer_excerpt=truncate_utf8(answer, min(ANSWER_EXCERPT_MAX_BYTES, 1500)),
                 error=error,
                 judge_error=judge_error,
+                mentioned_entities=entity_coverage["mentioned_entities"],
+                covered_entities=entity_coverage["covered_entities"],
+                omitted_entities=entity_coverage["omitted_entities"],
+                multifile_mode_active=entity_coverage["multifile_mode_active"],
+                coverage_rate=round(float(entity_coverage["coverage_rate"]), 4),
             )
             records.append(out)
             print(f"[Q{index:02d}/{len(input_records):02d}] {qid} score={score:.2f} (kp={kp:.2f}, cp={cp:.2f}) judge={judge_mode}", file=sys.stderr)
@@ -238,6 +246,7 @@ def main() -> int:
         args.judge_mode,
         records,
     )
+    multifile_summary = multifile_coverage_summary(records)
     summary.update(
         status="completed",
         started_at_utc=started_at.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
@@ -284,6 +293,11 @@ def main() -> int:
         v2_disagreement_taxonomy=v2_disagreement_taxonomy,
         v2_codex_failure_count=v2_codex_failures,
         v2_disagreement_rate=v2_disagreement_rate,
+        multifile_mode_records=multifile_summary["multifile_mode_records"],
+        multifile_mode_avg_coverage_rate=multifile_summary[
+            "multifile_mode_avg_coverage_rate"
+        ],
+        total_omitted_entities=multifile_summary["total_omitted_entities"],
     )
     write_run(resolve(args.out_run), summary, records)
     by_tier: dict[str, list[float]] = defaultdict(list)

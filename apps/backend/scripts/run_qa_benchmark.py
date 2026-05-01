@@ -41,6 +41,10 @@ if _BACKEND_ENV.is_file():
             os.environ[_k] = _v
 
 from app.core.config import get_settings
+from app.services.knowledge_synthesis import (
+    compute_question_entity_coverage,
+    extract_question_entities,
+)
 
 DEFAULT_DATASET_PATH = REPO_ROOT / "apps" / "backend" / "tests" / "benchmarks" / "qa_benchmark_dataset.jsonl"
 DEFAULT_OUT_DIR = REPO_ROOT / "apps" / "backend" / "tests" / "benchmarks" / "runs"
@@ -1454,6 +1458,25 @@ def source_summary(records: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any
     return summary
 
 
+def multifile_coverage_summary(records: Sequence[dict[str, Any]]) -> dict[str, float | int]:
+    multifile_records = [
+        record for record in records if bool(record.get("multifile_mode_active"))
+    ]
+    coverage_rates = [float(record.get("coverage_rate") or 0.0) for record in multifile_records]
+    total_omitted = sum(
+        len(record.get("omitted_entities") or [])
+        for record in records
+        if isinstance(record.get("omitted_entities") or [], list)
+    )
+    return {
+        "multifile_mode_records": len(multifile_records),
+        "multifile_mode_avg_coverage_rate": round(mean(coverage_rates), 4)
+        if coverage_rates
+        else 0.0,
+        "total_omitted_entities": total_omitted,
+    }
+
+
 _LLM_JUDGE_FAMILIES = {"minimax", "anthropic", "claude_code", "codex"}
 
 
@@ -1763,6 +1786,7 @@ def build_summary(
         requested_judge_mode,
         records,
     )
+    multifile_summary = multifile_coverage_summary(records)
     summary = {
         "type": "summary",
         "status": "running" if running else "completed",
@@ -1817,6 +1841,11 @@ def build_summary(
         "v2_disagreement_taxonomy": v2_disagreement_taxonomy,
         "v2_codex_failure_count": v2_codex_failures,
         "v2_disagreement_rate": v2_disagreement_rate,
+        "multifile_mode_records": multifile_summary["multifile_mode_records"],
+        "multifile_mode_avg_coverage_rate": multifile_summary[
+            "multifile_mode_avg_coverage_rate"
+        ],
+        "total_omitted_entities": multifile_summary["total_omitted_entities"],
         "abc_completed": abc_completed,
         "abc_total": abc_total,
         "abc_completion_ratio": round(completion_ratio, 4),
@@ -2155,6 +2184,7 @@ def main() -> int:
             else:
                 score_status = "invalid"
 
+            entity_coverage = compute_question_entity_coverage(row.question, answer)
             record = {
                 "type": "question",
                 "question_id": row.id,
@@ -2181,6 +2211,11 @@ def main() -> int:
                 "answer_excerpt": answer_excerpt,
                 "error": error_text,
                 "judge_error": judge_error,
+                "mentioned_entities": entity_coverage["mentioned_entities"],
+                "covered_entities": entity_coverage["covered_entities"],
+                "omitted_entities": entity_coverage["omitted_entities"],
+                "multifile_mode_active": entity_coverage["multifile_mode_active"],
+                "coverage_rate": round(float(entity_coverage["coverage_rate"]), 4),
             }
             diagnostics = compute_retrieval_diagnostics(row, answer_trace, structured_citations)
             record.update(
