@@ -45,7 +45,7 @@ from app.core.config import get_settings
 DEFAULT_DATASET_PATH = REPO_ROOT / "apps" / "backend" / "tests" / "benchmarks" / "qa_benchmark_dataset.jsonl"
 DEFAULT_OUT_DIR = REPO_ROOT / "apps" / "backend" / "tests" / "benchmarks" / "runs"
 TERMINAL_STATUSES = {"completed", "failed", "rolled_back"}
-QUESTION_TIMEOUT_SECONDS = 240.0
+QUESTION_TIMEOUT_SECONDS = 480.0
 POLL_INTERVAL_SECONDS = 1.0
 ANSWER_EXCERPT_MAX_BYTES = 2048
 ACTOR_ROLE = "employee"
@@ -1476,8 +1476,8 @@ def parse_args() -> argparse.Namespace:
         default=QUESTION_TIMEOUT_SECONDS,
         help=(
             "Per-question backend polling deadline in seconds. Each question that "
-            "stays running past this is marked timed_out. Default 240s; raise if "
-            "synthesis is slow under heavy load."
+            "stays running past this is marked timed_out. Default 480s; lower if "
+            "synthesis is fast and infrastructure is stable."
         ),
     )
     parser.add_argument(
