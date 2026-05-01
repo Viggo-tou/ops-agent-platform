@@ -31,6 +31,28 @@ from app.services.rollback import RollbackExecutor
 logger = logging.getLogger("app.services.tasks")
 
 
+def _external_timeout_payload(exc: Exception) -> dict[str, str] | None:
+    error_name = type(exc).__name__
+    error_text = str(exc)
+    if error_name in {
+        "ConnectTimeout",
+        "PoolTimeout",
+        "ReadTimeout",
+        "TimeoutException",
+        "TimeoutExpired",
+    } or "timed out" in error_text.lower() or "timeout" in error_text.lower():
+        payload = {
+            "reason": "external_api_timeout",
+            "error_type": error_name,
+            "error": error_text,
+        }
+        provider_name = getattr(exc, "provider_name", None)
+        if isinstance(provider_name, str) and provider_name:
+            payload["provider_name"] = provider_name
+        return payload
+    return None
+
+
 def run_pipeline_job(task_id: str, actor_name: str) -> None:
     """Runs inside the thread pool. Owns its own SessionLocal."""
     db = SessionLocal()
@@ -54,7 +76,10 @@ def run_pipeline_job(task_id: str, actor_name: str) -> None:
                     logger.warning("Pipeline crash handler could not find task %s", task_id)
                     return
 
-                error_payload = {"error_type": type(exc).__name__, "error": str(exc)}
+                error_payload = _external_timeout_payload(exc) or {
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
                 set_task_status(
                     db2,
                     task=failed_task,

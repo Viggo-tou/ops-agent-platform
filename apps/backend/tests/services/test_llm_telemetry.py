@@ -243,7 +243,7 @@ def test_synthesis_path_records_one_event_per_call(
     )
 
     assert answer == "Use a.py."
-    event = db_session.scalars(select(Event)).one()
+    event = db_session.scalars(select(Event).where(Event.event_type == EventType.LLM_CALL)).one()
     assert event.payload_json["purpose"] == "synthesis"
     assert event.payload_json["input_tokens"] == 42
     assert event.payload_json["output_tokens"] == 9

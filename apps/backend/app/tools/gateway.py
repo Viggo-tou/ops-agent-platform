@@ -23,6 +23,7 @@ from app.core.enums import (
     WorkflowStage,
 )
 from app.core.telemetry import get_tracer
+from app.core.timeouts import external_http_timeout
 from app.models.approval import Approval
 from app.models.tool_execution import ToolExecution
 from app.models.base import utcnow
@@ -321,7 +322,11 @@ class ToolGateway:
             )
 
         if definition.name == "knowledge.search":
-            return self._execute_knowledge_search(payload)
+            return self._execute_knowledge_search(
+                payload,
+                task_id=task_id,
+                actor_name=str(actor_context.get("actor_name") or "") or None,
+            )
         if definition.name == "sandbox.run_command":
             return self._execute_sandbox_run_command(definition=definition, payload=payload)
         if definition.name == "sandbox.apply_patch":
@@ -396,7 +401,13 @@ class ToolGateway:
 
         return None
 
-    def _execute_knowledge_search(self, payload: Mapping[str, object]) -> dict[str, object]:
+    def _execute_knowledge_search(
+        self,
+        payload: Mapping[str, object],
+        *,
+        task_id: str | None,
+        actor_name: str | None,
+    ) -> dict[str, object]:
         query = str(payload.get("query", "")).strip()
         top_k = payload.get("top_k")
         source_name = payload.get("source_name")
@@ -406,6 +417,8 @@ class ToolGateway:
             top_k=int(top_k) if isinstance(top_k, int) else None,
             source_name=str(source_name) if isinstance(source_name, str) and source_name else None,
             language=str(language) if isinstance(language, str) and language else None,
+            task_id=task_id,
+            actor_name=actor_name,
         )
         return result.model_dump(mode="json")
 
@@ -1092,7 +1105,7 @@ class ToolGateway:
         auth: tuple[str, str] | None = None,
     ) -> dict[str, object]:
         try:
-            with httpx.Client(timeout=timeout_seconds) as client:
+            with httpx.Client(timeout=external_http_timeout(timeout_seconds)) as client:
                 response = client.request(
                     method,
                     url,

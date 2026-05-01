@@ -4,12 +4,16 @@ import json
 import hashlib
 import re
 import time
+import traceback
 
 import httpx
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
+from app.core.enums import EventSource, EventType, RoleName, WorkflowStage
+from app.core.timeouts import external_http_timeout
 from app.schemas.knowledge import KnowledgeCitation
+from app.services.events import commit_checkpoint, record_event
 from app.services.llm_telemetry import LlmCall, record_llm_call
 
 
@@ -70,12 +74,28 @@ class KnowledgeSynthesizer:
 
         started = time.perf_counter()
         prompt_fingerprint = hashlib.sha256(f"{system_prompt}\n{user_prompt}".encode("utf-8")).hexdigest()[:10]
+        request_size_bytes = len(f"{system_prompt}\n{user_prompt}".encode("utf-8"))
+        self._record_synthesis_lifecycle(
+            event_type=EventType.SYNTHESIS_CALL_STARTED,
+            message="Knowledge synthesis MiniMax call started.",
+            request_size_bytes=request_size_bytes,
+            duration_ms=0,
+            checkpoint_label="synthesis_call_started",
+        )
         try:
             response_text, input_tokens, output_tokens = self._call_minimax(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
             )
         except Exception as exc:
+            self._record_synthesis_lifecycle(
+                event_type=EventType.SYNTHESIS_CALL_FAILED,
+                message="Knowledge synthesis MiniMax call failed.",
+                request_size_bytes=request_size_bytes,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                error=exc,
+                checkpoint_label="synthesis_call_failed",
+            )
             self._record_call(
                 input_tokens=0,
                 output_tokens=0,
@@ -88,6 +108,14 @@ class KnowledgeSynthesizer:
         cleaned = response_text.strip()
         if not cleaned:
             error = KnowledgeSynthesisError("MiniMax returned empty answer")
+            self._record_synthesis_lifecycle(
+                event_type=EventType.SYNTHESIS_CALL_FAILED,
+                message="Knowledge synthesis MiniMax call returned an empty answer.",
+                request_size_bytes=request_size_bytes,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                error=error,
+                checkpoint_label="synthesis_call_failed",
+            )
             self._record_call(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
@@ -97,6 +125,13 @@ class KnowledgeSynthesizer:
                 prompt_fingerprint=prompt_fingerprint,
             )
             raise error
+        self._record_synthesis_lifecycle(
+            event_type=EventType.SYNTHESIS_CALL_SUCCEEDED,
+            message="Knowledge synthesis MiniMax call completed.",
+            request_size_bytes=request_size_bytes,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            checkpoint_label="synthesis_call_succeeded",
+        )
         self._record_call(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -105,6 +140,45 @@ class KnowledgeSynthesizer:
             prompt_fingerprint=prompt_fingerprint,
         )
         return cleaned
+
+    def _record_synthesis_lifecycle(
+        self,
+        *,
+        event_type: EventType,
+        message: str,
+        request_size_bytes: int,
+        duration_ms: int,
+        checkpoint_label: str,
+        error: Exception | None = None,
+    ) -> None:
+        if self.db is None or not self.task_id:
+            return
+        payload: dict[str, object] = {
+            "provider_name": "minimax",
+            "model_name": self.settings.knowledge_synthesis_model,
+            "request_size_bytes": request_size_bytes,
+            "duration_ms": duration_ms,
+        }
+        if error is not None:
+            trace = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            payload.update(
+                {
+                    "error_type": type(error).__name__,
+                    "error_message": str(error)[:1000],
+                    "traceback": trace[:2000],
+                }
+            )
+        record_event(
+            self.db,
+            task_id=self.task_id,
+            event_type=event_type,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.KNOWLEDGE,
+            role=RoleName.KNOWLEDGE,
+            message=message,
+            payload=payload,
+        )
+        commit_checkpoint(self.db, label=checkpoint_label)
 
     @staticmethod
     def _use_chinese(*, query: str, language: str | None) -> bool:
@@ -220,7 +294,9 @@ class KnowledgeSynthesizer:
             "Content-Type": "application/json",
         }
         try:
-            with httpx.Client(timeout=self.settings.knowledge_synthesis_timeout_seconds) as client:
+            with httpx.Client(
+                timeout=external_http_timeout(self.settings.knowledge_synthesis_timeout_seconds)
+            ) as client:
                 response = client.post(
                     f"{self.settings.minimax_base_url.rstrip('/')}/v1/text/chatcompletion_v2",
                     headers=headers,
