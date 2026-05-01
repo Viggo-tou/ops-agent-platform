@@ -48,8 +48,10 @@ def read_run(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
 def task_answer(task: dict[str, Any]) -> tuple[str, list[str], list[str]]:
     """Reuse the bench's normalized extractor so citation_precision compares
     canonical paths against the dataset's expected_citations (also canonical).
-    Returns (answer, display_citations, canonical_citations)."""
-    return extract_answer_and_citations(task)
+    Returns (answer, display_citations, canonical_citations).
+    V3 extractor returns 5-tuple; rejudge only needs the first 3."""
+    answer, display, canonical, _structured, _trace = extract_answer_and_citations(task)
+    return answer, display, canonical
 
 
 def keypoints(record: dict[str, Any]) -> list[str]:

@@ -468,6 +468,7 @@ def test_diagnostics_count_wrong_source_citations() -> None:
 def test_buckets_assign_retrieval_wrong_source() -> None:
     record = {
         "tier": "A",
+        "source_name": "repo",
         "keypoint_coverage": 1.0,
         "expected_answer_keypoints": ["ping"],
         "answer_excerpt": "ping",
@@ -475,10 +476,52 @@ def test_buckets_assign_retrieval_wrong_source() -> None:
     diagnostics = {
         "expected_citation_top_rank": None,
         "wrong_source_in_top_k": 1,
+        "top_k_source_distribution": {"repo": 0, "other": 1},
         "expected_fact_in_card": None,
     }
 
     assert "retrieval_wrong_source" in bench.assign_stage19_buckets(record, diagnostics)
+
+
+def test_buckets_assign_retrieval_empty_no_source() -> None:
+    record = {
+        "tier": "A",
+        "source_name": "repo",
+        "keypoint_coverage": 1.0,
+        "expected_answer_keypoints": ["ping"],
+        "answer_excerpt": "ping",
+    }
+    diagnostics = {
+        "expected_citation_top_rank": None,
+        "wrong_source_in_top_k": 0,
+        "top_k_source_distribution": {},
+        "expected_fact_in_card": None,
+    }
+
+    buckets = bench.assign_stage19_buckets(record, diagnostics)
+    assert "retrieval_empty_no_source" in buckets
+    assert "retrieval_wrong_source" not in buckets
+
+
+def test_buckets_empty_with_right_source_hits_classifies_as_wrong_file() -> None:
+    record = {
+        "tier": "A",
+        "source_name": "repo",
+        "keypoint_coverage": 1.0,
+        "expected_answer_keypoints": ["ping"],
+        "answer_excerpt": "ping",
+    }
+    diagnostics = {
+        "expected_citation_top_rank": None,
+        "wrong_source_in_top_k": 0,
+        "top_k_source_distribution": {"repo": 3},
+        "expected_fact_in_card": None,
+    }
+
+    buckets = bench.assign_stage19_buckets(record, diagnostics)
+    assert "retrieval_right_source_wrong_file" in buckets
+    assert "retrieval_wrong_source" not in buckets
+    assert "retrieval_empty_no_source" not in buckets
 
 
 def test_buckets_assign_card_missing_keypoint_facts() -> None:
@@ -495,6 +538,73 @@ def test_buckets_assign_card_missing_keypoint_facts() -> None:
     }
 
     assert bench.assign_stage19_buckets(record, diagnostics) == ["card_missing_keypoint_facts"]
+
+
+def _task_with_trace(
+    answer: str,
+    *,
+    source_name: str,
+    selected_sources: list[str] | None,
+    relative_path: str = "src/a.py",
+) -> dict[str, object]:
+    citations = (
+        [{"relative_path": relative_path, "source_name": source_name, "card_text": None}]
+        if answer
+        else []
+    )
+    trace = {"selected_sources": selected_sources} if selected_sources is not None else {}
+    return {
+        "status": "completed",
+        "latest_result_json": {
+            "result": {"answer": answer, "citations": citations, "answer_trace": trace}
+        },
+    }
+
+
+def test_smoke_aborts_on_cross_source_contamination(bench_run) -> None:
+    FakeClient.tasks = [
+        _task_with_trace(
+            "answer ping",
+            source_name="handymanapp",
+            selected_sources=["hosteddashboard"],
+        )
+    ]
+    run, out_dir = bench_run
+    assert run(judge_mode="rule", count=1, source_names=["handymanapp"]) == 2
+    summary, _ = _read_artifact(out_dir)
+    assert summary["abort_reason"] == "source_filter_broken"
+
+
+def test_smoke_does_not_abort_on_single_empty_selected_sources(bench_run) -> None:
+    FakeClient.tasks = [
+        _task_with_trace(
+            "answer ping",
+            source_name="handymanapp",
+            selected_sources=[],
+        ),
+        _task("answer ping", source_name="handymanapp"),
+    ]
+    run, out_dir = bench_run
+    assert run(judge_mode="rule", count=2, source_names=["handymanapp", "handymanapp"]) == 0
+    summary, _ = _read_artifact(out_dir)
+    assert summary["abort_reason"] is None
+
+
+def test_smoke_aborts_on_three_consecutive_empty_selected_sources(bench_run) -> None:
+    FakeClient.tasks = [
+        _task_with_trace("answer ping", source_name="handymanapp", selected_sources=[]),
+        _task_with_trace("answer ping", source_name="handymanapp", selected_sources=[]),
+        _task_with_trace("answer ping", source_name="handymanapp", selected_sources=[]),
+        _task("answer ping", source_name="handymanapp"),
+    ]
+    run, out_dir = bench_run
+    assert run(
+        judge_mode="rule",
+        count=4,
+        source_names=["handymanapp"] * 4,
+    ) == 2
+    summary, _ = _read_artifact(out_dir)
+    assert summary["abort_reason"] == "systematic_empty_retrieval"
 
 
 def test_summary_emits_per_source_means(bench_run) -> None:

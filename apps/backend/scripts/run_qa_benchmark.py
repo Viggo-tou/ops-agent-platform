@@ -869,8 +869,17 @@ def assign_stage19_buckets(record: dict[str, Any], diagnostics: dict[str, Any]) 
     buckets: list[str] = []
     expected_rank = diagnostics.get("expected_citation_top_rank")
     wrong_source_count = int(diagnostics.get("wrong_source_in_top_k") or 0)
-    if wrong_source_count > 0 or expected_rank is None:
+    source_distribution = diagnostics.get("top_k_source_distribution") or {}
+    requested_source = record.get("source_name")
+    requested_source_hits = (
+        int(source_distribution.get(requested_source, 0)) if requested_source else 0
+    )
+    if wrong_source_count > 0:
         buckets.append("retrieval_wrong_source")
+    elif expected_rank is None and requested_source_hits == 0:
+        buckets.append("retrieval_empty_no_source")
+    elif expected_rank is None:
+        buckets.append("retrieval_right_source_wrong_file")
     if expected_rank is not None and int(expected_rank) > 4:
         buckets.append("retrieval_right_source_wrong_file")
     if diagnostics.get("expected_fact_in_card") is False:
@@ -1233,6 +1242,12 @@ def main() -> int:
     records: list[dict[str, Any]] = []
     infrastructure_failed = False
     consecutive_infra_invalid = 0
+    empty_source_streak = 0
+    empty_source_count = 0
+    smoke_attempt_count = 0
+    SMOKE_EMPTY_STREAK_LIMIT = 3
+    SMOKE_EARLY_WINDOW = 5
+    SMOKE_EARLY_EMPTY_FRACTION = 0.5
     infra_burst_count = 0
     abort_reason: str | None = None
     preflight_judge_status = "not_run"
@@ -1343,12 +1358,40 @@ def main() -> int:
                         answer_trace,
                     ) = extract_answer_and_citations(final_task)
                     if row.source_name:
-                        selected_sources = answer_trace.get("selected_sources")
-                        if selected_sources != [row.source_name]:
+                        smoke_attempt_count += 1
+                        selected_sources_raw = answer_trace.get("selected_sources")
+                        selected_set = set(
+                            selected_sources_raw if isinstance(selected_sources_raw, list) else []
+                        )
+                        cross_source_set = selected_set - {row.source_name}
+                        if cross_source_set:
                             raise SourceFilterError(
                                 f"Source filter smoke check failed for {row.id}: "
-                                f"expected selected_sources={[row.source_name]!r}, got {selected_sources!r}"
+                                f"expected selected_sources subset of {{{row.source_name!r}}}, "
+                                f"got cross-source contamination {sorted(cross_source_set)!r} "
+                                f"(full set: {selected_sources_raw!r})"
                             )
+                        if not selected_set:
+                            empty_source_streak += 1
+                            empty_source_count += 1
+                            if empty_source_streak >= SMOKE_EMPTY_STREAK_LIMIT:
+                                raise SourceFilterError(
+                                    f"Systematic empty retrieval for {row.id}: "
+                                    f"{empty_source_streak} consecutive Qs returned empty "
+                                    f"selected_sources for requested {row.source_name!r}"
+                                )
+                            if (
+                                smoke_attempt_count <= SMOKE_EARLY_WINDOW
+                                and empty_source_count
+                                >= max(2, int(smoke_attempt_count * SMOKE_EARLY_EMPTY_FRACTION) + 1)
+                            ):
+                                raise SourceFilterError(
+                                    f"Systematic empty retrieval for {row.id}: "
+                                    f"{empty_source_count}/{smoke_attempt_count} early Qs returned empty "
+                                    f"selected_sources for requested {row.source_name!r}"
+                                )
+                        else:
+                            empty_source_streak = 0
                     answer_excerpt = truncate_utf8(answer, ANSWER_EXCERPT_MAX_BYTES)
                     citation_precision = compute_citation_precision(row.expected_citations, citations_found_canonical)
                     if answer.strip():
@@ -1374,7 +1417,11 @@ def main() -> int:
                 synthesis_status = "task_error"
                 error_text = str(exc)
                 if isinstance(exc, SourceFilterError):
-                    abort_reason = "source_filter_broken"
+                    abort_reason = (
+                        "systematic_empty_retrieval"
+                        if "Systematic empty retrieval" in str(exc)
+                        else "source_filter_broken"
+                    )
             except Exception as exc:  # pragma: no cover - defensive failure capture
                 infrastructure_failed = True
                 duration_s = time.monotonic() - question_started
