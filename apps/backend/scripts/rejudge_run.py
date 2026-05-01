@@ -15,6 +15,7 @@ from scripts.run_qa_benchmark import (
     ANSWER_EXCERPT_MAX_BYTES,
     TERMINAL_STATUSES,
     KeypointJudge,
+    _judge_family_metadata,
     compute_citation_precision,
     coerce_keypoint_hit_details,
     extract_answer_and_citations,
@@ -28,7 +29,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Re-judge a completed QA benchmark run.")
     parser.add_argument("--in-run", required=True)
     parser.add_argument("--backend-url", required=True)
-    parser.add_argument("--judge-mode", choices=("auto", "claude_code", "codex", "anthropic", "minimax", "rule", "hybrid"), default="claude_code")
+    parser.add_argument(
+        "--judge-mode",
+        choices=("minimax", "claude_code", "codex", "anthropic", "rule", "hybrid"),
+        default="minimax",
+        help=(
+            "Rejudge mode. V1 default: minimax. 'rule' is lexical diagnostic; "
+            "'hybrid' is experimental (see T-JUDGE-HYBRID-V2). 'auto' is "
+            "REMOVED — pin explicitly."
+        ),
+    )
     parser.add_argument("--judge-samples", type=int, default=3)
     parser.add_argument("--out-run", required=True)
     return parser.parse_args()
@@ -202,6 +212,9 @@ def main() -> int:
         records,
         enabled=args.judge_mode == "hybrid",
     )
+    judge_family_count, cross_family_validated, judge_caveats = _judge_family_metadata(
+        args.judge_mode
+    )
     summary.update(
         status="completed",
         started_at_utc=started_at.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
@@ -217,15 +230,15 @@ def main() -> int:
                 if record.get("judge_mode") and str(record.get("judge_mode")) != "skipped"
             )
         ),
-        pinned_judge_failure_count=(
-            sum(1 for record in records if record.get("judge_status") == "fail")
-            if args.judge_mode != "auto"
-            else 0
+        pinned_judge_failure_count=sum(
+            1 for record in records if record.get("judge_status") == "fail"
         ),
-        pinned_judge_run_intact=(
-            args.judge_mode == "auto"
-            or not any(record.get("judge_status") == "fail" for record in records)
+        pinned_judge_run_intact=not any(
+            record.get("judge_status") == "fail" for record in records
         ),
+        judge_family_count=judge_family_count,
+        cross_family_validated=cross_family_validated,
+        judge_caveats=judge_caveats,
         score_averaging_note=(
             "Records with score_status='invalid' are infrastructure/judge/synthesis failures "
             "and must not be averaged as model-quality scores."
