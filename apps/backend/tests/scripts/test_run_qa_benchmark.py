@@ -108,7 +108,15 @@ class PassingJudge:
         self.judge_model = "fake"
         self.auto_rule_reason: str | None = None
 
-    def judge(self, *, question: str, answer: str, keypoints: list[str] | tuple[str, ...]) -> tuple[list[bool], str]:
+    def judge(
+        self,
+        *,
+        question: str,
+        answer: str,
+        keypoints: list[str] | tuple[str, ...],
+        citations: object = None,
+        expected_citations: object = None,
+    ) -> tuple[list[bool], str]:
         return [True] * len(keypoints), self.requested_mode if self.requested_mode != "auto" else "rule"
 
 
@@ -161,7 +169,15 @@ def bench_run(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
 
 def test_strict_pin_fails_fast_on_preflight_failure(bench_run, capsys: pytest.CaptureFixture[str]) -> None:
     class FailingPreflightJudge(PassingJudge):
-        def judge(self, *, question: str, answer: str, keypoints: list[str] | tuple[str, ...]) -> tuple[list[bool], str]:
+        def judge(
+            self,
+            *,
+            question: str,
+            answer: str,
+            keypoints: list[str] | tuple[str, ...],
+            citations: object = None,
+            expected_citations: object = None,
+        ) -> tuple[list[bool], str]:
             raise RuntimeError("judge down")
 
     run, out_dir = bench_run
@@ -175,7 +191,15 @@ def test_strict_pin_fails_fast_on_preflight_failure(bench_run, capsys: pytest.Ca
 
 def test_strict_pin_records_per_q_judge_failure_without_fallback(bench_run) -> None:
     class PerQuestionFailJudge(PassingJudge):
-        def judge(self, *, question: str, answer: str, keypoints: list[str] | tuple[str, ...]) -> tuple[list[bool], str]:
+        def judge(
+            self,
+            *,
+            question: str,
+            answer: str,
+            keypoints: list[str] | tuple[str, ...],
+            citations: object = None,
+            expected_citations: object = None,
+        ) -> tuple[list[bool], str]:
             if question == "ping":
                 return [True], "claude_code"
             raise RuntimeError("npm EPERM")
@@ -193,7 +217,15 @@ def test_strict_pin_records_per_q_judge_failure_without_fallback(bench_run) -> N
 
 def test_auto_mode_falls_back_with_recorded_reason(bench_run) -> None:
     class AutoFallbackJudge(PassingJudge):
-        def judge(self, *, question: str, answer: str, keypoints: list[str] | tuple[str, ...]) -> tuple[list[bool], str]:
+        def judge(
+            self,
+            *,
+            question: str,
+            answer: str,
+            keypoints: list[str] | tuple[str, ...],
+            citations: object = None,
+            expected_citations: object = None,
+        ) -> tuple[list[bool], str]:
             self.auto_rule_reason = "Claude Code CLI judge failed: npm EPERM; trying next."
             return [True] * len(keypoints), "rule"
 
@@ -207,7 +239,15 @@ def test_auto_mode_falls_back_with_recorded_reason(bench_run) -> None:
 
 def test_answer_excerpt_populated_when_judge_fails(bench_run) -> None:
     class PerQuestionFailJudge(PassingJudge):
-        def judge(self, *, question: str, answer: str, keypoints: list[str] | tuple[str, ...]) -> tuple[list[bool], str]:
+        def judge(
+            self,
+            *,
+            question: str,
+            answer: str,
+            keypoints: list[str] | tuple[str, ...],
+            citations: object = None,
+            expected_citations: object = None,
+        ) -> tuple[list[bool], str]:
             if question == "ping":
                 return [True], "claude_code"
             raise RuntimeError("judge failed")
@@ -222,7 +262,15 @@ def test_answer_excerpt_populated_when_judge_fails(bench_run) -> None:
 
 def test_status_fields_separated_synthesis_pass_judge_fail(bench_run) -> None:
     class PerQuestionFailJudge(PassingJudge):
-        def judge(self, *, question: str, answer: str, keypoints: list[str] | tuple[str, ...]) -> tuple[list[bool], str]:
+        def judge(
+            self,
+            *,
+            question: str,
+            answer: str,
+            keypoints: list[str] | tuple[str, ...],
+            citations: object = None,
+            expected_citations: object = None,
+        ) -> tuple[list[bool], str]:
             if question == "ping":
                 return [True], "claude_code"
             raise RuntimeError("judge failed")
@@ -638,3 +686,225 @@ def test_summary_emits_per_source_means(bench_run) -> None:
     assert summary["retrieval_top_rank_distribution"] == {"top1": 2}
     assert summary["stage19_bucket_counts"] == {}
     assert records[0]["source_name"] == "hosteddashboard"
+
+
+def test_hybrid_credits_rule_when_rule_matches(monkeypatch: pytest.MonkeyPatch) -> None:
+    judge = bench.KeypointJudge("hybrid")
+    monkeypatch.setattr(
+        judge,
+        "_judge_with_minimax",
+        lambda *, question, answer, keypoints: [False] * len(keypoints),
+    )
+
+    details, mode = judge.judge(
+        question="Where is auth configured?",
+        answer="The app uses Firebase Auth.",
+        keypoints=["Firebase Auth"],
+        citations=[],
+    )
+
+    assert mode == "hybrid"
+    assert details[0]["provenance"] == "rule"
+    assert details[0]["hit_score"] == 1.0
+    assert details[0]["rule_credit"] == 1.0
+
+
+def test_hybrid_credits_evidence_when_only_card_text_contains_keypoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge = bench.KeypointJudge("hybrid")
+    monkeypatch.setattr(
+        judge,
+        "_judge_with_minimax",
+        lambda *, question, answer, keypoints: [False] * len(keypoints),
+    )
+
+    details, _mode = judge.judge(
+        question="Where is data stored?",
+        answer="The answer describes remote persistence without naming the service.",
+        keypoints=["Firebase Realtime Database"],
+        citations=[
+            {
+                "source_name": "repo",
+                "relative_path": "src/a.kt",
+                "card_text": "Firebase Realtime Database writes jobs",
+            }
+        ],
+        expected_citations=["src/a.kt"],
+    )
+
+    assert details[0]["provenance"] == "evidence"
+    assert details[0]["hit_score"] == 0.6
+    assert details[0]["evidence_credit"] == 0.6
+
+
+def test_hybrid_evidence_credits_only_expected_citation_card_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge = bench.KeypointJudge("hybrid")
+    monkeypatch.setattr(
+        judge,
+        "_judge_with_minimax",
+        lambda *, question, answer, keypoints: [False] * len(keypoints),
+    )
+
+    details, _mode = judge.judge(
+        question="Where is auth configured?",
+        answer="The answer describes sign-in without naming the implementation.",
+        keypoints=["FirebaseAuth.getInstance"],
+        citations=[
+            {
+                "source_name": "hosteddashboard",
+                "relative_path": "src/pages/Login.js",
+                "card_text": "Login calls FirebaseAuth.getInstance during setup",
+            }
+        ],
+        expected_citations=["handyman-admin-dashboard/src/pages/Login.js"],
+    )
+
+    assert details[0]["provenance"] == "evidence"
+    assert details[0]["hit_score"] == 0.6
+    assert details[0]["evidence_credit"] == 0.6
+
+
+def test_hybrid_evidence_does_not_credit_wrong_file_card_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge = bench.KeypointJudge("hybrid")
+    monkeypatch.setattr(
+        judge,
+        "_judge_with_minimax",
+        lambda *, question, answer, keypoints: [False] * len(keypoints),
+    )
+
+    details, _mode = judge.judge(
+        question="Where is data stored?",
+        answer="The answer describes remote persistence without naming the service.",
+        keypoints=["Firebase Realtime Database"],
+        citations=[
+            {
+                "source_name": "repo",
+                "relative_path": "src/wrong.kt",
+                "card_text": "Firebase Realtime Database writes jobs",
+            }
+        ],
+        expected_citations=["src/expected.kt"],
+    )
+
+    assert details[0]["provenance"] == "miss"
+    assert details[0]["hit_score"] == 0.0
+    assert details[0]["evidence_credit"] == 0.0
+
+
+def test_hybrid_credits_llm_when_only_paraphrase(monkeypatch: pytest.MonkeyPatch) -> None:
+    judge = bench.KeypointJudge("hybrid")
+    monkeypatch.setattr(
+        judge,
+        "_judge_with_minimax",
+        lambda *, question, answer, keypoints: [True] * len(keypoints),
+    )
+
+    details, _mode = judge.judge(
+        question="Where is data stored?",
+        answer="The app persists records in the cloud backend.",
+        keypoints=["Firebase Realtime Database"],
+        citations=[{"source_name": "repo", "relative_path": "src/a.kt", "card_text": "unrelated"}],
+    )
+
+    assert details[0]["provenance"] == "llm"
+    assert details[0]["hit_score"] == 0.7
+    assert details[0]["llm_credit"] == 0.7
+
+
+def test_hybrid_returns_zero_when_all_rungs_miss(monkeypatch: pytest.MonkeyPatch) -> None:
+    judge = bench.KeypointJudge("hybrid")
+    monkeypatch.setattr(
+        judge,
+        "_judge_with_minimax",
+        lambda *, question, answer, keypoints: [False] * len(keypoints),
+    )
+
+    details, _mode = judge.judge(
+        question="Where is data stored?",
+        answer="No relevant implementation detail is present.",
+        keypoints=["Firebase Realtime Database"],
+        citations=[
+            {
+                "source_name": "repo",
+                "relative_path": "src/a.kt",
+                "card_text": "Firebase Realtime Database writes jobs",
+            }
+        ],
+    )
+
+    assert details[0]["provenance"] == "miss"
+    assert details[0]["hit"] is False
+    assert details[0]["hit_score"] == 0.0
+    assert details[0]["evidence_credit"] == 0.0
+
+
+def test_hybrid_max_picks_rule_over_lower_rungs(monkeypatch: pytest.MonkeyPatch) -> None:
+    judge = bench.KeypointJudge("hybrid")
+    monkeypatch.setattr(
+        judge,
+        "_judge_with_minimax",
+        lambda *, question, answer, keypoints: [True] * len(keypoints),
+    )
+
+    details, _mode = judge.judge(
+        question="Where is auth configured?",
+        answer="Firebase Auth is configured in the Android app.",
+        keypoints=["Firebase Auth"],
+        citations=[{"source_name": "repo", "relative_path": "src/a.kt", "card_text": "Firebase Auth"}],
+        expected_citations=["src/a.kt"],
+    )
+
+    assert details[0]["provenance"] == "rule"
+    assert details[0]["hit_score"] == 1.0
+    assert details[0]["rule_credit"] == 1.0
+    assert details[0]["evidence_credit"] == 0.6
+    assert details[0]["llm_credit"] == 0.7
+
+
+def test_hybrid_summary_aggregates_per_rung_hit_rate(bench_run) -> None:
+    class HybridAggregateJudge(PassingJudge):
+        def judge(
+            self,
+            *,
+            question: str,
+            answer: str,
+            keypoints: list[str] | tuple[str, ...],
+            citations: object = None,
+            expected_citations: object = None,
+        ) -> tuple[list[bench.KeypointHitDetail], str]:
+            keypoint = keypoints[0]
+            if question == "Question 1?":
+                return [bench._keypoint_detail(keypoint=keypoint, rule_credit=1.0)], "hybrid"
+            if question == "Question 2?":
+                return [bench._keypoint_detail(keypoint=keypoint, evidence_credit=0.6)], "hybrid"
+            return [bench._keypoint_detail(keypoint=keypoint, evidence_credit=0.6, llm_credit=0.7)], "hybrid"
+
+    FakeClient.tasks = [
+        _task("answer ping"),
+        _task("answer ping"),
+        _task("answer ping"),
+    ]
+    run, out_dir = bench_run
+
+    assert run(judge_mode="hybrid", judge_cls=HybridAggregateJudge, count=3) == 0
+
+    summary, records = _read_artifact(out_dir)
+    assert summary["per_rung_kp_hit_rate"] == {"rule": 0.3333, "evidence": 0.6667, "llm": 0.3333}
+    assert summary["judge_rung_usage"] == {
+        "rule_only": 1,
+        "evidence_only": 1,
+        "llm_only": 0,
+        "rule_and_llm": 0,
+        "rule_and_evidence": 0,
+        "llm_and_evidence": 1,
+        "all_three": 0,
+        "all_miss": 0,
+    }
+    assert summary["disagreement_count"] == 3
+    assert records[1]["keypoint_hits"][0]["provenance"] == "evidence"
+    assert records[2]["keypoint_coverage"] == 0.7
