@@ -21,8 +21,6 @@ from app.models.knowledge_document import KnowledgeDocument  # noqa: E402
 from app.schemas.knowledge import KnowledgeCitation  # noqa: E402
 from app.services.knowledge import KnowledgeService  # noqa: E402
 from app.services.knowledge_synthesis import (  # noqa: E402
-    compute_question_entity_coverage,
-    extract_question_entities,
     KnowledgeSynthesisError,
     KnowledgeSynthesizer,
 )
@@ -61,117 +59,6 @@ def _citation(snippet: str = "login failure handler") -> KnowledgeCitation:
         score=17.5,
         metadata={},
     )
-
-
-def extract(question: str) -> list[str]:
-    return extract_question_entities(question)
-
-
-def test_extract_question_entities_finds_pascalcase_without_role_suffix() -> None:
-    assert extract("PaginationControls and FirebaseAuth") == [
-        "PaginationControls",
-        "FirebaseAuth",
-    ]
-    assert extract("How does FormValidator work") == ["FormValidator"]
-    assert extract("the RecyclerView pattern") == ["RecyclerView"]
-
-
-def test_extract_question_entities_finds_allcaps_compounds() -> None:
-    assert extract("the customer KYC and handyman KYC flows") == [
-        "customer KYC",
-        "handyman KYC",
-    ]
-    assert extract("uses OAuth login") == ["OAuth login"]
-
-
-def test_extract_question_entities_finds_dotted_filenames() -> None:
-    assert extract("Login.js, Dashboard.js, ServiceAnalytics.js") == [
-        "Login.js",
-        "Dashboard.js",
-        "ServiceAnalytics.js",
-    ]
-    assert extract("nav_graph.xml routes") == ["nav_graph.xml"]
-
-
-def test_extract_question_entities_excludes_standalone_words() -> None:
-    assert extract("how does the page render") == []
-    assert extract("Fragment lifecycle") == []
-    assert extract("the API returns json") == []
-    # This is intentionally treated as a compound entity: ALLCAPS alone is
-    # ignored, but an adjacent lowercase domain noun gives the token context.
-    assert extract("KYC validation logic") == ["KYC validation"]
-
-
-def test_extract_question_entities_combines_rules_in_question_order() -> None:
-    assert extract("Login.js calls FirebaseAuth.signIn during the customer KYC flow") == [
-        "Login.js",
-        "FirebaseAuth",
-        "customer KYC",
-    ]
-
-
-def test_extract_question_entities_finds_phase_1_question_texts() -> None:
-    phase_1_questions = [
-        (
-            "DASH B-09",
-            "How does PaginationControls decide what page buttons to show?",
-            1,
-        ),
-        (
-            "DASH C-05",
-            "How are the Firebase exports consumed across the login, dashboard, analytics, and support feedback pages, and where do those imports live?",
-            3,
-        ),
-        (
-            "DASH B-04",
-            "How does the Support Feedback page reply to a ticket and create new tickets?",
-            1,
-        ),
-        (
-            "HAND C-09",
-            "Which fragments consume the customer-side job list and details views in the handyman app?",
-            2,
-        ),
-        (
-            "HAND C-12",
-            "How are the customer KYC and handyman KYC flows structured, and where do they diverge?",
-            2,
-        ),
-    ]
-
-    multifile_ready = 0
-    for question_id, question, expected_min_entities in phase_1_questions:
-        entities = extract(question)
-        assert len(entities) >= expected_min_entities, question_id
-        if len(entities) >= 2:
-            multifile_ready += 1
-
-    assert multifile_ready >= 3
-
-
-def test_extract_question_entities_does_not_overfire_on_simple_a_tier_questions() -> None:
-    assert extract("Where is HandymanLogin.kt") == ["HandymanLogin.kt"]
-    assert (
-        compute_question_entity_coverage(
-            "Where is HandymanLogin.kt",
-            "HandymanLogin.kt handles login.",
-        )["multifile_mode_active"]
-        is False
-    )
-    assert extract("Where is Firebase configured for this frontend, and what does that file export?") == [
-        "Firebase",
-    ]
-    assert extract("Which file contains the service analytics page?") == []
-
-
-def test_compute_question_entity_coverage_reports_list_diagnostic() -> None:
-    coverage = compute_question_entity_coverage(
-        "Compare Login.js, Dashboard.js, and ServiceAnalytics.js.",
-        "Login.js and Dashboard.js are covered.",
-    )
-
-    assert coverage["entity_list_pattern_detected"] is True
-    assert coverage["multifile_mode_active"] is True
 
 
 def test_synthesize_success_returns_llm_text(monkeypatch: pytest.MonkeyPatch) -> None:

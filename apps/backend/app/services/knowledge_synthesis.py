@@ -22,37 +22,13 @@ from app.services.llm_telemetry import LlmCall, record_llm_call
 #   v3-multientity-coverage: require coverage for explicitly mentioned entities.
 SYNTHESIS_PROMPT_VERSION = "v3-multientity-coverage"
 
-_ENTITY_EXTENSIONS_PATTERN = r"kt|js|tsx|ts|jsx|py|java|go|xml|json|yml|yaml|gradle"
-_ABBREVIATION_PATTERN = r"(?:[A-Z]{2,5}|OAuth)"
-_LOWER_ENTITY_WORD_PATTERN = (
-    r"(?!(?:the|a|an|and|or|uses|use|used|is|are|does|do|where|which)\b)"
-    r"[a-z][a-z]+"
-)
 ENTITY_PATTERN = re.compile(
-    r"(?P<backtick>`[^`]{3,80}`)"
-    rf"|(?P<filename>(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_-]*\.(?:{_ENTITY_EXTENSIONS_PATTERN})(?![A-Za-z0-9_]))"
-    r"|(?P<pascal>(?<![A-Za-z0-9_])[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+(?![A-Za-z0-9_]))"
-    r"|(?P<known>(?<![A-Za-z0-9_])(?:Firebase)(?![A-Za-z0-9_]))"
-    rf"|(?P<abbrev_prefix>(?<![A-Za-z0-9_])(?:{_LOWER_ENTITY_WORD_PATTERN}\s+){{1,2}}{_ABBREVIATION_PATTERN}(?![A-Za-z0-9_]))"
-    rf"|(?P<abbrev_suffix>(?<![A-Za-z0-9_]){_ABBREVIATION_PATTERN}\s+{_LOWER_ENTITY_WORD_PATTERN}(?![A-Za-z0-9_]))"
-)
-TITLE_SURFACE_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9_])"
-    r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}\s+"
-    r"(?:page|pages|screen|screens|view|views|flow|flows)"
-    r"(?![A-Za-z0-9_])"
-)
-CONTEXTUAL_COMMA_LIST_PATTERN = re.compile(
-    r"\b(?P<items>"
-    r"[a-z][a-z-]*(?:\s+[a-z][a-z-]*)?"
-    r"(?:\s*,\s*[a-z][a-z-]*(?:\s+[a-z][a-z-]*)?){1,}"
-    r"(?:,?\s+and\s+[a-z][a-z-]*(?:\s+[a-z][a-z-]*)?)?"
-    r")\s+(?P<noun>pages|views|flows)\b"
-)
-CONTEXTUAL_AND_LIST_PATTERN = re.compile(
-    r"\b(?P<first>[a-z][a-z-]*(?:\s+[a-z][a-z-]*)?)\s+and\s+"
-    r"(?P<second>[a-z][a-z-]*(?:\s+[a-z][a-z-]*)?)\s+"
-    r"(?P<noun>pages|views|flows)\b"
+    r"`[^`]{3,80}`"
+    r"|(?<![A-Za-z0-9_])("
+    r"[A-Z][A-Za-z0-9]+(?:Fragment|Activity|Adapter|ViewModel|Screen|Service|Controller|Component|Page)"
+    r"|[A-Z][A-Za-z0-9]+\.(?:kt|js|tsx|ts|jsx|py|java|go)"
+    r"|[a-z][a-z0-9_]*\.(?:kt|js|tsx|ts|jsx|py|java|go|xml|json|yml|yaml|gradle)"
+    r")(?![A-Za-z0-9_])"
 )
 ENTITY_EXTENSIONS = (
     ".kt",
@@ -82,38 +58,6 @@ COMMON_ENTITY_WORDS = {
     "file",
     "files",
 }
-ABBREVIATION_SUFFIX_STOPWORDS = {
-    "and",
-    "are",
-    "by",
-    "does",
-    "for",
-    "from",
-    "has",
-    "have",
-    "in",
-    "is",
-    "or",
-    "return",
-    "returns",
-    "the",
-    "to",
-    "use",
-    "used",
-    "uses",
-    "with",
-}
-SURFACE_NOUNS = {
-    "flow": "flow",
-    "flows": "flow",
-    "page": "page",
-    "pages": "page",
-    "screen": "screen",
-    "screens": "screen",
-    "view": "view",
-    "views": "view",
-}
-SURFACE_NOUN_SUFFIXES = tuple(f" {noun}" for noun in SURFACE_NOUNS)
 
 
 def _normalize_entities(raw_entities: list[str]) -> list[str]:
@@ -133,92 +77,9 @@ def _normalize_entities(raw_entities: list[str]) -> list[str]:
     return entities
 
 
-def _valid_entity_candidate(entity: str, kind: str | None = None) -> bool:
-    words = entity.strip().split()
-    if kind not in {"abbrev_prefix", "abbrev_suffix"}:
-        return True
-    if len(words) < 2:
-        return False
-    if kind == "abbrev_prefix":
-        return words[0].lower() not in COMMON_ENTITY_WORDS
-    return words[-1].lower() not in ABBREVIATION_SUFFIX_STOPWORDS
-
-
-def _contextual_item_entity(item: str, noun: str) -> str:
-    clean = item.strip(" ,")
-    words = clean.split()
-    while words and words[0].lower() in COMMON_ENTITY_WORDS:
-        words = words[1:]
-    clean = " ".join(words)
-    singular_noun = SURFACE_NOUNS[noun]
-    if singular_noun == "view" and clean.endswith(" list"):
-        return clean
-    return f"{clean} {singular_noun}"
-
-
-def _split_contextual_list_items(items_text: str) -> list[str]:
-    normalized = re.sub(r",?\s+and\s+", ", ", items_text.strip())
-    return [item.strip() for item in normalized.split(",") if item.strip()]
-
-
-def _contextual_list_entities(question: str) -> list[tuple[int, str]]:
-    entities: list[tuple[int, str]] = []
-    for match in CONTEXTUAL_COMMA_LIST_PATTERN.finditer(question):
-        noun = match.group("noun")
-        items_text = match.group("items")
-        for item in _split_contextual_list_items(items_text):
-            start = match.start("items") + items_text.find(item)
-            entities.append((start, _contextual_item_entity(item, noun)))
-    for match in CONTEXTUAL_AND_LIST_PATTERN.finditer(question):
-        first = match.group("first")
-        second = match.group("second")
-        noun = match.group("noun")
-        entities.append((match.start("first"), _contextual_item_entity(first, noun)))
-        entities.append((match.start("second"), _contextual_item_entity(second, noun)))
-    return entities
-
-
 def extract_question_entities(question: str) -> list[str]:
     """Return explicitly mentioned code entities in question order."""
-    text = question or ""
-    candidates: list[tuple[int, str]] = []
-    for match in ENTITY_PATTERN.finditer(text):
-        kind = match.lastgroup
-        entity = match.group(0)
-        if _valid_entity_candidate(entity, kind):
-            candidates.append((match.start(), entity))
-    candidates.extend((match.start(), match.group(0)) for match in TITLE_SURFACE_PATTERN.finditer(text))
-    candidates.extend(_contextual_list_entities(text))
-    candidates.sort(key=lambda item: item[0])
-    return _normalize_entities([entity for _, entity in candidates])
-
-
-def _detect_list_pattern(question: str, entities: list[str]) -> bool:
-    if len(entities) < 2:
-        return False
-    text = question or ""
-    if CONTEXTUAL_COMMA_LIST_PATTERN.search(text) or CONTEXTUAL_AND_LIST_PATTERN.search(text):
-        return True
-    normalized_text = text.lower()
-    positions: list[tuple[int, str]] = []
-    for entity in entities:
-        index = normalized_text.find(entity.lower())
-        if index >= 0:
-            positions.append((index, entity))
-    positions.sort(key=lambda item: item[0])
-    for (left_index, left_entity), (right_index, _) in zip(positions, positions[1:]):
-        between = normalized_text[left_index + len(left_entity) : right_index]
-        if "," in between or re.search(r"\band\b", between):
-            return True
-    return False
-
-
-def _strip_surface_noun_suffix(entity: str) -> str:
-    lower = entity.lower()
-    for suffix in SURFACE_NOUN_SUFFIXES:
-        if lower.endswith(suffix):
-            return entity[: -len(suffix)].strip()
-    return entity
+    return _normalize_entities([match.group(0) for match in ENTITY_PATTERN.finditer(question or "")])
 
 
 def _entity_search_terms(entity: str) -> list[str]:
@@ -232,9 +93,8 @@ def _entity_search_terms(entity: str) -> list[str]:
         if core.lower().endswith(extension):
             core = core[: -len(extension)]
             break
-    surface_core = _strip_surface_noun_suffix(core)
     terms: list[str] = []
-    for term in (clean, normalized_path, basename, core, surface_core):
+    for term in (clean, normalized_path, basename, core):
         if term and term.lower() not in {item.lower() for item in terms}:
             terms.append(term)
     return terms
@@ -272,7 +132,6 @@ def compute_question_entity_coverage(question: str, answer: str) -> dict[str, ob
         "covered_entities": covered_entities,
         "omitted_entities": omitted_entities,
         "multifile_mode_active": len(mentioned_entities) >= 2,
-        "entity_list_pattern_detected": _detect_list_pattern(question, mentioned_entities),
         "coverage_rate": coverage_rate,
     }
 
