@@ -19,6 +19,7 @@ from scripts.run_qa_benchmark import (
     compute_citation_precision,
     coerce_keypoint_hit_details,
     extract_answer_and_citations,
+    hybrid_v2_disagreement_summary,
     judge_rung_summary,
     _miss_details,
     truncate_utf8,
@@ -31,12 +32,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend-url", required=True)
     parser.add_argument(
         "--judge-mode",
-        choices=("minimax", "claude_code", "codex", "anthropic", "rule", "hybrid"),
+        choices=("minimax", "claude_code", "codex", "anthropic", "rule", "hybrid", "hybrid_v2"),
         default="minimax",
         help=(
             "Rejudge mode. V1 default: minimax. 'rule' is lexical diagnostic; "
-            "'hybrid' is experimental (see T-JUDGE-HYBRID-V2). 'auto' is "
-            "REMOVED — pin explicitly."
+            "'hybrid' is the retired V1 experimental max judge. 'hybrid_v2' "
+            "is the conservative MiniMax+Codex AND-gated diagnostic judge. "
+            "'auto' is REMOVED; pin explicitly."
         ),
     )
     parser.add_argument("--judge-samples", type=int, default=3)
@@ -134,6 +136,7 @@ def main() -> int:
             points = keypoints(record)
             answer, citations, display_citations, structured_citations = "", [], [], []
             error, judge_error = None, None
+            judge_status_codex_rung, judge_error_codex_rung = None, None
             hits = _miss_details(points)
             judge_mode = "skipped"
             task_status, completed, question = "fetch_error", False, str(record.get("question") or "")
@@ -172,6 +175,15 @@ def main() -> int:
                         judge_error = f"MiniMax hybrid rung failed: {hybrid_llm_error}"
                         if error is None:
                             error = judge_error
+                    judge_status_codex_rung = getattr(judge, "last_codex_rung_status", None)
+                    judge_error_codex_rung = getattr(judge, "last_codex_rung_error", None)
+                    if (
+                        args.judge_mode == "hybrid_v2"
+                        and judge_status_codex_rung
+                        and judge_status_codex_rung != "pass"
+                        and judge_error is None
+                    ):
+                        judge_error = f"Codex rung failed: {judge_error_codex_rung or judge_status_codex_rung}"
                     judge_status = "pass"
                 except Exception as exc:  # noqa: BLE001
                     judge_mode = args.judge_mode
@@ -193,6 +205,8 @@ def main() -> int:
                 keypoint_hits=hits,
                 citations_found=display_citations,
                 judge_mode=judge_mode,
+                judge_status_codex_rung=judge_status_codex_rung,
+                judge_error_codex_rung=judge_error_codex_rung,
                 synthesis_status=synthesis_status,
                 judge_status=judge_status,
                 score_status=score_status,
@@ -212,8 +226,17 @@ def main() -> int:
         records,
         enabled=args.judge_mode == "hybrid",
     )
+    (
+        v2_disagreement_taxonomy,
+        v2_codex_failures,
+        v2_disagreement_rate,
+    ) = hybrid_v2_disagreement_summary(
+        records,
+        enabled=args.judge_mode == "hybrid_v2",
+    )
     judge_family_count, cross_family_validated, judge_caveats = _judge_family_metadata(
-        args.judge_mode
+        args.judge_mode,
+        records,
     )
     summary.update(
         status="completed",
@@ -258,6 +281,9 @@ def main() -> int:
         judge_rung_usage=judge_rung_usage,
         per_rung_kp_hit_rate=per_rung_kp_hit_rate,
         disagreement_count=disagreement_count,
+        v2_disagreement_taxonomy=v2_disagreement_taxonomy,
+        v2_codex_failure_count=v2_codex_failures,
+        v2_disagreement_rate=v2_disagreement_rate,
     )
     write_run(resolve(args.out_run), summary, records)
     by_tier: dict[str, list[float]] = defaultdict(list)
