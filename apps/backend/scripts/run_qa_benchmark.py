@@ -53,6 +53,17 @@ ACTOR_APP_ROLE = "member"
 INFRA_INVALID_SYNTH_STATUSES = {"task_error", "timeout"}
 INFRA_BURST_THRESHOLD = 3
 INFRA_BURST_BACKOFF_S = [30.0, 60.0]
+CODEX_JUDGE_TIMEOUT_SECONDS = 30
+HYBRID_V2_TAXONOMY_KEYS = (
+    "both_yes_rule_yes_evidence_yes",
+    "both_yes_rule_no_evidence_yes",
+    "both_yes_rule_no_evidence_no",
+    "mm_yes_codex_no",
+    "codex_yes_mm_no",
+    "both_no_rule_yes",
+    "both_no_evidence_yes",
+    "both_no_rule_no_evidence_no",
+)
 STOPWORDS = {
     "a",
     "an",
@@ -283,7 +294,34 @@ def extract_minimax_content(response_payload: dict[str, Any]) -> str:
     raise RuntimeError("MiniMax response did not include assistant content")
 
 
-class KeypointHitDetail(TypedDict):
+def _is_rate_limit_error(message: str) -> bool:
+    text = message.lower()
+    return any(
+        marker in text
+        for marker in (
+            "rate limit",
+            "rate_limit",
+            "rate-limit",
+            "rate limited",
+            "rate-limited",
+            "too many requests",
+            "429",
+        )
+    )
+
+
+class _KeypointHitDetailOptional(TypedDict, total=False):
+    mm_credit: float
+    codex_credit: float
+    primary: str
+    rule_hit: bool
+    evidence_hit: bool
+    mm_hit: bool
+    codex_hit: bool
+    judge_status_codex_rung: str
+
+
+class KeypointHitDetail(_KeypointHitDetailOptional):
     keypoint: str
     hit: bool
     hit_score: float
@@ -316,6 +354,63 @@ def _keypoint_detail(
         "evidence_credit": float(evidence_credit),
         "llm_credit": float(llm_credit),
         "provenance": provenance,
+    }
+
+
+def classify_v2(
+    rule_hit: bool,
+    evidence_hit: bool,
+    mm_hit: bool,
+    codex_hit: bool,
+) -> tuple[float, str]:
+    """V2 scoring: only MiniMax+Codex agreement gives keypoint credit.
+
+    Rule and evidence hits are carried as diagnostics, but they do not
+    affect the returned score.
+    """
+    _ = (rule_hit, evidence_hit)
+    if mm_hit and codex_hit:
+        return 1.0, "both_yes"
+    if not mm_hit and not codex_hit:
+        return 0.0, "both_no"
+    if mm_hit and not codex_hit:
+        return 0.0, "mm_yes_codex_no"
+    return 0.0, "codex_yes_mm_no"
+
+
+def _hybrid_v2_detail(
+    *,
+    keypoint: str,
+    rule_hit: bool,
+    evidence_hit: bool,
+    mm_hit: bool,
+    codex_hit: bool,
+    scoring_mm_hit: bool | None = None,
+    codex_rung_status: str = "pass",
+) -> KeypointHitDetail:
+    effective_mm_hit = mm_hit if scoring_mm_hit is None else scoring_mm_hit
+    hit_score, primary = classify_v2(
+        rule_hit=rule_hit,
+        evidence_hit=evidence_hit,
+        mm_hit=effective_mm_hit,
+        codex_hit=codex_hit,
+    )
+    return {
+        "keypoint": keypoint,
+        "hit": hit_score >= 0.5,
+        "hit_score": hit_score,
+        "rule_credit": 1.0 if rule_hit else 0.0,
+        "evidence_credit": 1.0 if evidence_hit else 0.0,
+        "llm_credit": 1.0 if mm_hit else 0.0,
+        "mm_credit": 1.0 if mm_hit else 0.0,
+        "codex_credit": 1.0 if codex_hit else 0.0,
+        "provenance": primary,
+        "primary": primary,
+        "rule_hit": bool(rule_hit),
+        "evidence_hit": bool(evidence_hit),
+        "mm_hit": bool(mm_hit),
+        "codex_hit": bool(codex_hit),
+        "judge_status_codex_rung": codex_rung_status,
     }
 
 
@@ -360,6 +455,8 @@ def coerce_keypoint_hit_details(
                 "rule_credit" not in item
                 and "evidence_credit" not in item
                 and "llm_credit" not in item
+                and "codex_credit" not in item
+                and "primary" not in item
             ):
                 details.extend(
                     _wrap_bool_hits(
@@ -368,6 +465,30 @@ def coerce_keypoint_hit_details(
                         mode=mode,
                     )
                 )
+                continue
+            if "codex_credit" in item or "mm_credit" in item or "primary" in item:
+                detail: KeypointHitDetail = {
+                    "keypoint": str(item.get("keypoint") or keypoint),
+                    "hit": bool(item.get("hit")),
+                    "hit_score": float(item.get("hit_score") or 0.0),
+                    "rule_credit": float(item.get("rule_credit") or 0.0),
+                    "evidence_credit": float(item.get("evidence_credit") or 0.0),
+                    "llm_credit": float(item.get("llm_credit") or 0.0),
+                    "provenance": str(item.get("provenance") or item.get("primary") or "miss"),
+                }
+                for optional_key in (
+                    "mm_credit",
+                    "codex_credit",
+                    "primary",
+                    "rule_hit",
+                    "evidence_hit",
+                    "mm_hit",
+                    "codex_hit",
+                    "judge_status_codex_rung",
+                ):
+                    if optional_key in item:
+                        detail[optional_key] = item[optional_key]  # type: ignore[literal-required]
+                details.append(detail)
                 continue
             details.append(
                 _keypoint_detail(
@@ -381,6 +502,10 @@ def coerce_keypoint_hit_details(
     return _wrap_bool_hits([bool(item) for item in raw_hits], keypoints=keypoints, mode=mode)
 
 
+class CodexJudgeParseError(RuntimeError):
+    """Codex judge returned output that was not the locked JSON shape."""
+
+
 class KeypointJudge:
     def __init__(self, requested_mode: str, samples: int = 1) -> None:
         # T-JUDGE-DEFAULT-MINIMAX-V1: auto mode is removed. Its silent
@@ -391,13 +516,16 @@ class KeypointJudge:
             raise ValueError(
                 "auto judge mode is no longer supported; pin --judge-mode "
                 "explicitly (minimax / claude_code / codex / anthropic / "
-                "rule / hybrid). See docs/ai/tasks/T-JUDGE-DEFAULT-MINIMAX-V1.md."
+                "rule / hybrid / hybrid_v2). See "
+                "docs/ai/tasks/T-JUDGE-DEFAULT-MINIMAX-V1.md."
             )
         self.requested_mode = requested_mode
         self.settings = get_settings()
         self.judge_model = self.settings.knowledge_synthesis_model or "MiniMax-M2.7"
         self.auto_rule_reason: str | None = None
         self.last_hybrid_llm_error: str | None = None
+        self.last_codex_rung_status: str | None = None
+        self.last_codex_rung_error: str | None = None
         self._auto_force_rule = False
         # Multi-sample judging: ask the same judge to evaluate the same
         # answer N times and take per-keypoint majority. Dampens the
@@ -426,7 +554,7 @@ class KeypointJudge:
         if not answer.strip():
             return _miss_details(keypoints), "rule"
 
-        if self.samples > 1 and self.requested_mode != "hybrid":
+        if self.samples > 1 and self.requested_mode not in {"hybrid", "hybrid_v2"}:
             return self._judge_multi_sample(
                 question=question,
                 answer=answer,
@@ -507,6 +635,15 @@ class KeypointJudge:
                 citations=citations,
                 expected_citations=expected_citations,
             ), "hybrid"
+
+        if self.requested_mode == "hybrid_v2":
+            return self._judge_with_hybrid_v2(
+                question=question,
+                answer=answer,
+                keypoints=keypoints,
+                citations=citations,
+                expected_citations=expected_citations,
+            ), "hybrid_v2"
 
         if self.requested_mode == "claude_code":
             hits = self._judge_with_claude_code(question=question, answer=answer, keypoints=keypoints)
@@ -612,6 +749,75 @@ class KeypointJudge:
                     rule_credit=rule_credit,
                     evidence_credit=evidence_credit,
                     llm_credit=llm_credit,
+                )
+            )
+        return details
+
+    def _judge_with_hybrid_v2(
+        self,
+        *,
+        question: str,
+        answer: str,
+        keypoints: Sequence[str],
+        citations: Sequence[dict[str, Any]] | None,
+        expected_citations: Sequence[str] | None,
+    ) -> list[KeypointHitDetail]:
+        self.last_hybrid_llm_error = None
+        self.last_codex_rung_status = "pass"
+        self.last_codex_rung_error = None
+
+        rule_hits = self._judge_with_rule(answer=answer, keypoints=keypoints)
+        evidence_hits = self._evidence_rung(
+            keypoints=keypoints,
+            citations=citations or [],
+            expected_citations=expected_citations,
+        )
+        mm_hits = self._judge_with_minimax(
+            question=question, answer=answer, keypoints=keypoints
+        )
+
+        codex_failed = False
+        try:
+            codex_hits = self._judge_with_codex(
+                question=question, answer=answer, keypoints=keypoints
+            )
+        except subprocess.TimeoutExpired as exc:
+            codex_failed = True
+            self.last_codex_rung_status = "timeout"
+            self.last_codex_rung_error = f"{type(exc).__name__}: {exc}"
+            codex_hits = [False] * len(keypoints)
+        except CodexJudgeParseError as exc:
+            codex_failed = True
+            self.last_codex_rung_status = "parse_error"
+            self.last_codex_rung_error = f"{type(exc).__name__}: {exc}"
+            codex_hits = [False] * len(keypoints)
+        except RuntimeError as exc:
+            codex_failed = True
+            error_text = str(exc)
+            self.last_codex_rung_status = "rate_limit" if _is_rate_limit_error(error_text) else "error"
+            self.last_codex_rung_error = f"{type(exc).__name__}: {exc}"
+            codex_hits = [False] * len(keypoints)
+        except Exception as exc:  # noqa: BLE001
+            codex_failed = True
+            self.last_codex_rung_status = "error"
+            self.last_codex_rung_error = f"{type(exc).__name__}: {exc}"
+            codex_hits = [False] * len(keypoints)
+
+        details: list[KeypointHitDetail] = []
+        for index, keypoint in enumerate(keypoints):
+            rule_hit = index < len(rule_hits) and bool(rule_hits[index])
+            evidence_hit = index < len(evidence_hits) and bool(evidence_hits[index])
+            mm_hit = index < len(mm_hits) and bool(mm_hits[index])
+            codex_hit = index < len(codex_hits) and bool(codex_hits[index])
+            details.append(
+                _hybrid_v2_detail(
+                    keypoint=str(keypoint),
+                    rule_hit=rule_hit,
+                    evidence_hit=evidence_hit,
+                    mm_hit=mm_hit,
+                    codex_hit=codex_hit,
+                    scoring_mm_hit=False if codex_failed else mm_hit,
+                    codex_rung_status=self.last_codex_rung_status or "pass",
                 )
             )
         return details
@@ -817,6 +1023,23 @@ class KeypointJudge:
             f"in the same order. No prose before or after the JSON."
         )
 
+    @staticmethod
+    def _build_codex_judge_prompt(*, question: str, answer: str, keypoints: Sequence[str]) -> str:
+        numbered_keypoints = "\n".join(f"  {i + 1}. {k}" for i, k in enumerate(keypoints))
+        return (
+            "You are a strict benchmark judge. For each expected keypoint, decide\n"
+            "whether the answer text below explicitly conveys the keypoint's meaning.\n\n"
+            f"Question: {question}\n"
+            f"Answer: {answer}\n"
+            "Expected keypoints (numbered):\n"
+            f"{numbered_keypoints}\n\n"
+            "Reply with JSON only, exactly this shape:\n"
+            '{"hits": [true, false, ...]}\n\n'
+            f"The hits array must have exactly {len(keypoints)} booleans, one per keypoint, in order.\n"
+            "Do NOT search for, read, or reference any files. Do NOT use any tools.\n"
+            "Judge ONLY based on the answer text provided."
+        )
+
     def _parse_hits_from_text(self, text: str, *, keypoints_count: int) -> list[bool]:
         """Extract a {"hits": [bool, ...]} object from arbitrary CLI text output."""
         cleaned = (text or "").strip()
@@ -842,6 +1065,23 @@ class KeypointJudge:
             except json.JSONDecodeError:
                 pass
         raise RuntimeError(f"could not parse hits array from CLI output: {cleaned[:300]!r}")
+
+    def _parse_hits_from_json_only(self, text: str, *, keypoints_count: int) -> list[bool]:
+        cleaned = (text or "").strip()
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            raise CodexJudgeParseError(f"Codex judge did not return JSON only: {cleaned[:300]!r}") from exc
+        if not isinstance(parsed, dict):
+            raise CodexJudgeParseError("Codex judge did not return a JSON object")
+        raw_hits = parsed.get("hits")
+        if (
+            not isinstance(raw_hits, list)
+            or len(raw_hits) != keypoints_count
+            or not all(isinstance(item, bool) for item in raw_hits)
+        ):
+            raise CodexJudgeParseError("Codex judge returned an invalid hits array")
+        return list(raw_hits)
 
     def _judge_with_claude_code(self, *, question: str, answer: str, keypoints: Sequence[str]) -> list[bool]:
         """Use the Claude Code CLI as a cross-family judge.
@@ -927,31 +1167,40 @@ class KeypointJudge:
         if not codex_cmd:
             raise RuntimeError(f"Codex CLI not found: {self.settings.codex_command}")
 
-        prompt = self._build_judge_prompt(question=question, answer=answer, keypoints=keypoints)
+        prompt = self._build_codex_judge_prompt(question=question, answer=answer, keypoints=keypoints)
 
         env = {**os.environ}
-        if self.settings.openai_api_key:
-            env["OPENAI_API_KEY"] = self.settings.openai_api_key
+        env.pop("OPENAI_API_KEY", None)
 
-        # codex exec reads prompt from stdin via "-"; --full-auto avoids
-        # interactive confirmations.
-        cmd = [codex_cmd, "exec", "--full-auto", "-"]
+        # codex exec reads prompt from stdin via "-". Keep the benchmark
+        # judge read-only and non-agentic: the prompt also forbids tools.
+        cmd = [codex_cmd, "exec", "--sandbox", "read-only", "-"]
 
-        proc = subprocess.run(
-            cmd,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=int(self.settings.codex_timeout_seconds),
-        )
-
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"Codex CLI returned rc={proc.returncode}: {(proc.stderr or proc.stdout)[:300]}"
+        last_message = ""
+        for attempt in range(2):
+            proc = subprocess.run(
+                cmd,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                timeout=CODEX_JUDGE_TIMEOUT_SECONDS,
             )
 
-        return self._parse_hits_from_text(proc.stdout, keypoints_count=len(keypoints))
+            if proc.returncode == 0:
+                return self._parse_hits_from_json_only(proc.stdout, keypoints_count=len(keypoints))
+
+            last_message = (proc.stderr or proc.stdout or "").strip()
+            if attempt == 0 and _is_rate_limit_error(last_message):
+                time.sleep(30)
+                continue
+            raise RuntimeError(
+                f"Codex CLI returned rc={proc.returncode}: {last_message[:300]}"
+            )
+
+        raise RuntimeError(f"Codex CLI rate limit retry failed: {last_message[:300]}")
 
 
 class BenchmarkClient:
@@ -1208,7 +1457,19 @@ def source_summary(records: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any
 _LLM_JUDGE_FAMILIES = {"minimax", "anthropic", "claude_code", "codex"}
 
 
-def _judge_family_metadata(requested_judge_mode: str) -> tuple[int, bool, list[str]]:
+def v2_codex_failure_count(records: Sequence[dict[str, Any]]) -> int:
+    return sum(
+        1
+        for record in records
+        if str(record.get("judge_status_codex_rung") or "").strip()
+        and str(record.get("judge_status_codex_rung") or "").strip() != "pass"
+    )
+
+
+def _judge_family_metadata(
+    requested_judge_mode: str,
+    records: Sequence[dict[str, Any]] | None = None,
+) -> tuple[int, bool, list[str]]:
     """Per T-JUDGE-DEFAULT-MINIMAX-V1: surface single-LLM-family caveats
     in the artifact so downstream readers cannot mistake an MM-only run
     for a cross-family-validated one."""
@@ -1231,6 +1492,19 @@ def _judge_family_metadata(requested_judge_mode: str) -> tuple[int, bool, list[s
                 "calibration dataset)."
             ],
         )
+    if requested_judge_mode == "hybrid_v2":
+        codex_failures = v2_codex_failure_count(records or [])
+        total_records = len(records or [])
+        if codex_failures:
+            return (
+                2,
+                False,
+                [
+                    f"Codex rung failed on {codex_failures}/{total_records} records - "
+                    "partial cross-family validation"
+                ],
+            )
+        return (2, True, [])
     if requested_judge_mode in _LLM_JUDGE_FAMILIES:
         return (
             1,
@@ -1241,6 +1515,57 @@ def _judge_family_metadata(requested_judge_mode: str) -> tuple[int, bool, list[s
             ],
         )
     return (0, False, [f"unknown judge mode: {requested_judge_mode!r}"])
+
+
+def _hybrid_v2_taxonomy_cell(primary: str, *, rule_hit: bool, evidence_hit: bool) -> str:
+    if primary == "both_yes":
+        if rule_hit and evidence_hit:
+            return "both_yes_rule_yes_evidence_yes"
+        if not rule_hit and evidence_hit:
+            return "both_yes_rule_no_evidence_yes"
+        return "both_yes_rule_no_evidence_no"
+    if primary == "mm_yes_codex_no":
+        return "mm_yes_codex_no"
+    if primary == "codex_yes_mm_no":
+        return "codex_yes_mm_no"
+    if rule_hit:
+        return "both_no_rule_yes"
+    if evidence_hit:
+        return "both_no_evidence_yes"
+    return "both_no_rule_no_evidence_no"
+
+
+def hybrid_v2_disagreement_summary(
+    records: Sequence[dict[str, Any]],
+    *,
+    enabled: bool,
+) -> tuple[dict[str, int], int, float]:
+    counts = {key: 0 for key in HYBRID_V2_TAXONOMY_KEYS}
+    if not enabled:
+        return counts, 0, 0.0
+
+    total_keypoints = 0
+    for record in records:
+        for item in record.get("keypoint_hits") or []:
+            if not isinstance(item, dict):
+                continue
+            total_keypoints += 1
+            primary = str(item.get("primary") or item.get("provenance") or "both_no")
+            rule_hit = (
+                bool(item.get("rule_hit"))
+                if "rule_hit" in item
+                else float(item.get("rule_credit") or 0.0) > 0.0
+            )
+            evidence_hit = (
+                bool(item.get("evidence_hit"))
+                if "evidence_hit" in item
+                else float(item.get("evidence_credit") or 0.0) > 0.0
+            )
+            counts[_hybrid_v2_taxonomy_cell(primary, rule_hit=rule_hit, evidence_hit=evidence_hit)] += 1
+
+    disagreement_count = counts["mm_yes_codex_no"] + counts["codex_yes_mm_no"]
+    disagreement_rate = round(disagreement_count / max(total_keypoints, 1), 4)
+    return counts, v2_codex_failure_count(records), disagreement_rate
 
 
 def judge_rung_summary(
@@ -1426,8 +1751,17 @@ def build_summary(
         records,
         enabled=requested_judge_mode == "hybrid",
     )
+    (
+        v2_disagreement_taxonomy,
+        v2_codex_failures,
+        v2_disagreement_rate,
+    ) = hybrid_v2_disagreement_summary(
+        records,
+        enabled=requested_judge_mode == "hybrid_v2",
+    )
     judge_family_count, cross_family_validated, judge_caveats = _judge_family_metadata(
-        requested_judge_mode
+        requested_judge_mode,
+        records,
     )
     summary = {
         "type": "summary",
@@ -1480,6 +1814,9 @@ def build_summary(
         "judge_rung_usage": judge_rung_usage,
         "per_rung_kp_hit_rate": per_rung_kp_hit_rate,
         "disagreement_count": disagreement_count,
+        "v2_disagreement_taxonomy": v2_disagreement_taxonomy,
+        "v2_codex_failure_count": v2_codex_failures,
+        "v2_disagreement_rate": v2_disagreement_rate,
         "abc_completed": abc_completed,
         "abc_total": abc_total,
         "abc_completion_ratio": round(completion_ratio, 4),
@@ -1544,13 +1881,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--judge-mode",
-        choices=("minimax", "claude_code", "codex", "anthropic", "rule", "hybrid"),
+        choices=("minimax", "claude_code", "codex", "anthropic", "rule", "hybrid", "hybrid_v2"),
         default="minimax",
         help=(
             "Scoring judge mode (V1 default: minimax — semantic LLM judge). "
             "Pin one explicitly for official benchmarks. 'rule' is a lexical "
             "diagnostic, not an Android/Kotlin-fair evaluator. 'hybrid' is "
-            "experimental — see docs/ai/tasks/T-JUDGE-HYBRID-V2.md. 'auto' "
+            "the retired V1 experimental max judge. 'hybrid_v2' is the "
+            "conservative MiniMax+Codex AND-gated diagnostic judge. 'auto' "
             "(silent rule fallback) is REMOVED in V1; pin explicitly."
         ),
     )
@@ -1684,6 +2022,8 @@ def main() -> int:
             answer_excerpt = ""
             error_text: str | None = None
             judge_error: str | None = None
+            judge_status_codex_rung: str | None = None
+            judge_error_codex_rung: str | None = None
             keypoint_hits = _miss_details(row.expected_answer_keypoints)
             judge_mode_used = "skipped"
             citation_precision = 0.0
@@ -1768,6 +2108,15 @@ def main() -> int:
                                 judge_error = f"MiniMax hybrid rung failed: {hybrid_llm_error}"
                                 if error_text is None:
                                     error_text = judge_error
+                            judge_status_codex_rung = getattr(judge, "last_codex_rung_status", None)
+                            judge_error_codex_rung = getattr(judge, "last_codex_rung_error", None)
+                            if (
+                                args.judge_mode == "hybrid_v2"
+                                and judge_status_codex_rung
+                                and judge_status_codex_rung != "pass"
+                                and judge_error is None
+                            ):
+                                judge_error = f"Codex rung failed: {judge_error_codex_rung or judge_status_codex_rung}"
                             judge_status = "pass"
                         except Exception as exc:  # noqa: BLE001
                             judge_status = "fail"
@@ -1826,6 +2175,8 @@ def main() -> int:
                 "source_name": row.source_name,
                 "citations_found": citations_found_display,
                 "judge_mode": judge_mode_used,
+                "judge_status_codex_rung": judge_status_codex_rung,
+                "judge_error_codex_rung": judge_error_codex_rung,
                 "duration_s": round(duration_s, 3),
                 "answer_excerpt": answer_excerpt,
                 "error": error_text,

@@ -905,3 +905,166 @@ def test_hybrid_summary_aggregates_per_rung_hit_rate(bench_run) -> None:
     assert summary["disagreement_count"] == 3
     assert records[1]["keypoint_hits"][0]["provenance"] == "evidence"
     assert records[2]["keypoint_coverage"] == 0.7
+
+
+def test_hybrid_v2_credits_only_when_both_llms_agree(monkeypatch: pytest.MonkeyPatch) -> None:
+    judge = bench.KeypointJudge("hybrid_v2")
+    monkeypatch.setattr(judge, "_judge_with_rule", lambda *, answer, keypoints: [False] * len(keypoints))
+    monkeypatch.setattr(
+        judge,
+        "_evidence_rung",
+        lambda *, keypoints, citations, expected_citations: [False] * len(keypoints),
+    )
+    monkeypatch.setattr(judge, "_judge_with_minimax", lambda *, question, answer, keypoints: [True, True, False])
+    monkeypatch.setattr(judge, "_judge_with_codex", lambda *, question, answer, keypoints: [True, False, True])
+
+    details, mode = judge.judge(
+        question="Question?",
+        answer="A semantic answer.",
+        keypoints=["a", "b", "c"],
+        citations=[],
+    )
+
+    assert mode == "hybrid_v2"
+    assert [item["hit_score"] for item in details] == [1.0, 0.0, 0.0]
+    assert [item["primary"] for item in details] == [
+        "both_yes",
+        "mm_yes_codex_no",
+        "codex_yes_mm_no",
+    ]
+    coerced = bench.coerce_keypoint_hit_details(details, keypoints=["a", "b", "c"], mode=mode)
+    assert [item["hit_score"] for item in coerced] == [1.0, 0.0, 0.0]
+    assert [item["primary"] for item in coerced] == [
+        "both_yes",
+        "mm_yes_codex_no",
+        "codex_yes_mm_no",
+    ]
+
+
+def test_hybrid_v2_does_not_use_rule_for_scoring(monkeypatch: pytest.MonkeyPatch) -> None:
+    judge = bench.KeypointJudge("hybrid_v2")
+    monkeypatch.setattr(judge, "_judge_with_rule", lambda *, answer, keypoints: [True])
+    monkeypatch.setattr(
+        judge,
+        "_evidence_rung",
+        lambda *, keypoints, citations, expected_citations: [False],
+    )
+    monkeypatch.setattr(judge, "_judge_with_minimax", lambda *, question, answer, keypoints: [False])
+    monkeypatch.setattr(judge, "_judge_with_codex", lambda *, question, answer, keypoints: [False])
+
+    details, _mode = judge.judge(
+        question="Question?",
+        answer="Lexically mentions the keypoint.",
+        keypoints=["keypoint"],
+        citations=[],
+    )
+
+    assert details[0]["hit_score"] == 0.0
+    assert details[0]["primary"] == "both_no"
+    assert details[0]["rule_hit"] is True
+    assert details[0]["rule_credit"] == 1.0
+
+
+def test_hybrid_v2_does_not_use_evidence_for_scoring(monkeypatch: pytest.MonkeyPatch) -> None:
+    judge = bench.KeypointJudge("hybrid_v2")
+    monkeypatch.setattr(judge, "_judge_with_rule", lambda *, answer, keypoints: [False])
+    monkeypatch.setattr(
+        judge,
+        "_evidence_rung",
+        lambda *, keypoints, citations, expected_citations: [True],
+    )
+    monkeypatch.setattr(judge, "_judge_with_minimax", lambda *, question, answer, keypoints: [False])
+    monkeypatch.setattr(judge, "_judge_with_codex", lambda *, question, answer, keypoints: [False])
+
+    details, _mode = judge.judge(
+        question="Question?",
+        answer="Does not articulate the expected fact.",
+        keypoints=["retrieved fact"],
+        citations=[{"source_name": "repo", "relative_path": "src/a.py", "card_text": "retrieved fact"}],
+        expected_citations=["src/a.py"],
+    )
+
+    assert details[0]["hit_score"] == 0.0
+    assert details[0]["primary"] == "both_no"
+    assert details[0]["evidence_hit"] is True
+    assert details[0]["evidence_credit"] == 1.0
+
+
+def test_hybrid_v2_taxonomy_categorizes_correctly() -> None:
+    specs = [
+        ("both_yes_rule_yes_evidence_yes", True, True, True, True),
+        ("both_yes_rule_no_evidence_yes", False, True, True, True),
+        ("both_yes_rule_no_evidence_no", False, False, True, True),
+        ("mm_yes_codex_no", False, False, True, False),
+        ("codex_yes_mm_no", False, False, False, True),
+        ("both_no_rule_yes", True, False, False, False),
+        ("both_no_evidence_yes", False, True, False, False),
+        ("both_no_rule_no_evidence_no", False, False, False, False),
+    ]
+    records = [
+        {
+            "keypoint_hits": [
+                bench._hybrid_v2_detail(
+                    keypoint=name,
+                    rule_hit=rule_hit,
+                    evidence_hit=evidence_hit,
+                    mm_hit=mm_hit,
+                    codex_hit=codex_hit,
+                )
+            ]
+        }
+        for name, rule_hit, evidence_hit, mm_hit, codex_hit in specs
+    ]
+
+    taxonomy, codex_failures, disagreement_rate = bench.hybrid_v2_disagreement_summary(
+        records,
+        enabled=True,
+    )
+
+    assert taxonomy == {name: 1 for name, *_rest in specs}
+    assert codex_failures == 0
+    assert disagreement_rate == 0.25
+
+
+def test_hybrid_v2_codex_failure_records_partial_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    judge = bench.KeypointJudge("hybrid_v2")
+    monkeypatch.setattr(judge, "_judge_with_rule", lambda *, answer, keypoints: [False])
+    monkeypatch.setattr(
+        judge,
+        "_evidence_rung",
+        lambda *, keypoints, citations, expected_citations: [False],
+    )
+    monkeypatch.setattr(judge, "_judge_with_minimax", lambda *, question, answer, keypoints: [True])
+
+    def raise_timeout(*, question: str, answer: str, keypoints: list[str] | tuple[str, ...]) -> list[bool]:
+        raise bench.subprocess.TimeoutExpired(cmd="codex", timeout=30)
+
+    monkeypatch.setattr(judge, "_judge_with_codex", raise_timeout)
+
+    details, mode = judge.judge(
+        question="Question?",
+        answer="MiniMax would credit this answer.",
+        keypoints=["semantic fact"],
+        citations=[],
+    )
+    record = {
+        "keypoint_hits": details,
+        "judge_status_codex_rung": judge.last_codex_rung_status,
+    }
+    taxonomy, codex_failures, disagreement_rate = bench.hybrid_v2_disagreement_summary(
+        [record],
+        enabled=True,
+    )
+    family_count, validated, caveats = bench._judge_family_metadata("hybrid_v2", [record])
+
+    assert mode == "hybrid_v2"
+    assert judge.last_codex_rung_status == "timeout"
+    assert details[0]["hit_score"] == 0.0
+    assert details[0]["primary"] == "both_no"
+    assert details[0]["mm_hit"] is True
+    assert details[0]["codex_hit"] is False
+    assert taxonomy["both_no_rule_no_evidence_no"] == 1
+    assert codex_failures == 1
+    assert disagreement_rate == 0.0
+    assert (family_count, validated) == (2, False)
+    assert caveats == ["Codex rung failed on 1/1 records - partial cross-family validation"]
