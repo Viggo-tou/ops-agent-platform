@@ -92,6 +92,31 @@ def test_synthesize_success_returns_llm_text(monkeypatch: pytest.MonkeyPatch) ->
     assert "Citation indices are 1-indexed" in system_prompt
 
 
+def test_synthesis_prompt_includes_multientity_coverage_block_for_two_entities() -> None:
+    prompt = KnowledgeSynthesizer._build_system_prompt(
+        use_chinese=False,
+        mentioned_entities=["Login.js", "ServiceAnalytics.js", "Dashboard.js"],
+    )
+
+    assert "The user's question explicitly mentions the following code entities" in prompt
+    assert "  1. Login.js" in prompt
+    assert "  2. ServiceAnalytics.js" in prompt
+    assert "  3. Dashboard.js" in prompt
+    assert "Your answer MUST include at least one specific factual claim about each" in prompt
+    assert "\"<entity_name>:\nnot covered by retrieved evidence.\"" in prompt
+
+
+def test_synthesis_prompt_omits_multientity_coverage_block_for_single_focus() -> None:
+    legacy_prompt = KnowledgeSynthesizer._build_system_prompt(use_chinese=False)
+    single_entity_prompt = KnowledgeSynthesizer._build_system_prompt(
+        use_chinese=False,
+        mentioned_entities=["Login.js"],
+    )
+
+    assert "The user's question explicitly mentions the following code entities" not in single_entity_prompt
+    assert single_entity_prompt == legacy_prompt
+
+
 def test_synthesize_no_api_key_raises() -> None:
     with pytest.raises(KnowledgeSynthesisError):
         KnowledgeSynthesizer(_settings(minimax_api_key=None)).synthesize(
