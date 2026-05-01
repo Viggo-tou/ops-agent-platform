@@ -383,6 +383,16 @@ def coerce_keypoint_hit_details(
 
 class KeypointJudge:
     def __init__(self, requested_mode: str, samples: int = 1) -> None:
+        # T-JUDGE-DEFAULT-MINIMAX-V1: auto mode is removed. Its silent
+        # fallback to rule produced artifacts that looked like LLM-judged
+        # runs but used the lexical judge — a benchmarking footgun.
+        # Smoke / experimental runs must pin a mode explicitly.
+        if requested_mode == "auto":
+            raise ValueError(
+                "auto judge mode is no longer supported; pin --judge-mode "
+                "explicitly (minimax / claude_code / codex / anthropic / "
+                "rule / hybrid). See docs/ai/tasks/T-JUDGE-DEFAULT-MINIMAX-V1.md."
+            )
         self.requested_mode = requested_mode
         self.settings = get_settings()
         self.judge_model = self.settings.knowledge_synthesis_model or "MiniMax-M2.7"
@@ -1195,6 +1205,44 @@ def source_summary(records: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any
     return summary
 
 
+_LLM_JUDGE_FAMILIES = {"minimax", "anthropic", "claude_code", "codex"}
+
+
+def _judge_family_metadata(requested_judge_mode: str) -> tuple[int, bool, list[str]]:
+    """Per T-JUDGE-DEFAULT-MINIMAX-V1: surface single-LLM-family caveats
+    in the artifact so downstream readers cannot mistake an MM-only run
+    for a cross-family-validated one."""
+    if requested_judge_mode == "rule":
+        return (
+            0,
+            False,
+            [
+                "lexical-only judge; not suitable for cross-stack comparison "
+                "(see docs/ai/specs/stage20-judge-verdict.md)"
+            ],
+        )
+    if requested_judge_mode == "hybrid":
+        return (
+            1,
+            False,
+            [
+                "experimental hybrid judge; not the V1 default. Cross-family "
+                "validation pending T-JUDGE-HYBRID-V2 (second LLM family + "
+                "calibration dataset)."
+            ],
+        )
+    if requested_judge_mode in _LLM_JUDGE_FAMILIES:
+        return (
+            1,
+            False,
+            [
+                "single-LLM-family judge; cross-family validation pending "
+                "T-JUDGE-HYBRID-V2"
+            ],
+        )
+    return (0, False, [f"unknown judge mode: {requested_judge_mode!r}"])
+
+
 def judge_rung_summary(
     records: Sequence[dict[str, Any]],
     *,
@@ -1371,14 +1419,15 @@ def build_summary(
     fact_records = [
         record for record in records if record.get("expected_fact_in_card") is not None
     ]
-    pinned_judge_failure_count = (
-        sum(1 for record in records if record.get("judge_status") == "fail")
-        if requested_judge_mode != "auto"
-        else 0
+    pinned_judge_failure_count = sum(
+        1 for record in records if record.get("judge_status") == "fail"
     )
     judge_rung_usage, per_rung_kp_hit_rate, disagreement_count = judge_rung_summary(
         records,
         enabled=requested_judge_mode == "hybrid",
+    )
+    judge_family_count, cross_family_validated, judge_caveats = _judge_family_metadata(
+        requested_judge_mode
     )
     summary = {
         "type": "summary",
@@ -1399,9 +1448,11 @@ def build_summary(
         "preflight_judge_error": preflight_judge_error,
         "pinned_judge_failure_count": pinned_judge_failure_count,
         "pinned_judge_run_intact": (
-            abort_reason is None
-            and (requested_judge_mode == "auto" or pinned_judge_failure_count == 0)
+            abort_reason is None and pinned_judge_failure_count == 0
         ),
+        "judge_family_count": judge_family_count,
+        "cross_family_validated": cross_family_validated,
+        "judge_caveats": judge_caveats,
         "score_averaging_note": (
             "Records with score_status='invalid' are infrastructure/judge/synthesis failures "
             "and must not be averaged as model-quality scores."
@@ -1493,13 +1544,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--judge-mode",
-        choices=("auto", "claude_code", "codex", "anthropic", "minimax", "rule", "hybrid"),
-        default="auto",
+        choices=("minimax", "claude_code", "codex", "anthropic", "rule", "hybrid"),
+        default="minimax",
         help=(
-            "Scoring judge mode. 'auto' prefers CLI judges (claude_code, then "
-            "codex) — they're cross-family vs the MiniMax synthesizer AND don't "
-            "consume API credits — then falls back to Anthropic API, MiniMax, "
-            "rule. Explicit modes pin the choice."
+            "Scoring judge mode (V1 default: minimax — semantic LLM judge). "
+            "Pin one explicitly for official benchmarks. 'rule' is a lexical "
+            "diagnostic, not an Android/Kotlin-fair evaluator. 'hybrid' is "
+            "experimental — see docs/ai/tasks/T-JUDGE-HYBRID-V2.md. 'auto' "
+            "(silent rule fallback) is REMOVED in V1; pin explicitly."
         ),
     )
     parser.add_argument(

@@ -215,26 +215,23 @@ def test_strict_pin_records_per_q_judge_failure_without_fallback(bench_run) -> N
     assert summary["pinned_judge_run_intact"] is False
 
 
-def test_auto_mode_falls_back_with_recorded_reason(bench_run) -> None:
-    class AutoFallbackJudge(PassingJudge):
-        def judge(
-            self,
-            *,
-            question: str,
-            answer: str,
-            keypoints: list[str] | tuple[str, ...],
-            citations: object = None,
-            expected_citations: object = None,
-        ) -> tuple[list[bool], str]:
-            self.auto_rule_reason = "Claude Code CLI judge failed: npm EPERM; trying next."
-            return [True] * len(keypoints), "rule"
+def test_auto_mode_rejected_at_construction() -> None:
+    """T-JUDGE-DEFAULT-MINIMAX-V1: auto mode is removed. KeypointJudge
+    must raise at construction time so the preflight call doesn't
+    silently produce a rule-fallback artifact that looks LLM-judged."""
+    with pytest.raises(ValueError, match="auto judge mode is no longer supported"):
+        bench.KeypointJudge("auto")
 
+
+def test_summary_includes_judge_family_metadata(bench_run) -> None:
     run, out_dir = bench_run
-    assert run(judge_mode="auto", judge_cls=AutoFallbackJudge) == 0
-    summary, records = _read_artifact(out_dir)
-    assert records[0]["judge_mode"] == "rule"
-    assert summary["judge_modes_used"] == ["rule"]
-    assert summary["judge_auto_fallback_reason"]
+    assert run(judge_mode="minimax", judge_cls=PassingJudge, count=1) == 0
+    summary, _ = _read_artifact(out_dir)
+    assert summary["judge_family_count"] == 1
+    assert summary["cross_family_validated"] is False
+    assert summary["judge_caveats"] == [
+        "single-LLM-family judge; cross-family validation pending T-JUDGE-HYBRID-V2"
+    ]
 
 
 def test_answer_excerpt_populated_when_judge_fails(bench_run) -> None:
