@@ -141,3 +141,26 @@ Constraint:
 - Hybrid judge does NOT replace rule judge. Rule = strict lexical conformance; LLM = semantic coverage; both kept and reported. See `docs/ai/specs/stage20-judge-verdict.md` for the hybrid-judge sketch and full caveats.
 - D-tier conclusions are out of scope of this decision (n=1 vs n=3, insufficient sample).
 - Independent Stage 19 follow-up: bench `question_timeout_seconds=240s` is too short for handymanapp (rejudge rescued 4 timeout records where backend actually completed). Raise to 360-480s in next handymanapp run.
+
+### D-010 Amendment (2026-05-01 same day): V1 ships as MM-only, hybrid deferred to V2
+
+Hybrid judge implementation landed in `feat/judge-hybrid-v1` and `T-JUDGE-HYBRID-V1-FIX` and was smoked. Manual inspection of the 10 rule-vs-MiniMax disagreement cases (where rule fired but MM did not) found:
+
+- TP (rule legitimately catches MM false negative): 2
+- FP (rule fires but answer doesn't cover keypoint): 3
+- Ambiguous: 5
+
+Net signal `TP − FP = −1`. Even the most generous reading of ambiguous cases (all → TP) gives 7/10 with a 30% false-positive rate on rule's "lift over MM" — too noisy to trust as primary judge. **V1 is therefore retired-as-default and replaced by `T-JUDGE-DEFAULT-MINIMAX-V1`**: the default `--judge-mode` becomes `minimax`, `auto` is removed (silent fallback to rule was a benchmarking footgun), and `hybrid` stays in the codebase as an experimental flag.
+
+The original D-010 framing ("Stage 20A = hybrid judge primary") is **superseded** by:
+
+- **Stage 20A V1 = MM-only semantic judge** (this amendment).
+- **Stage 20A V2 = cross-family hybrid** — deferred to `T-JUDGE-HYBRID-V2.md`, gated on (a) second LLM family available (Anthropic credit or OpenAI key) AND (b) `T-JUDGE-AMBIG-CALIBRATION` calibration dataset complete.
+
+V1 ships with explicit single-family caveat in artifact metadata (`judge_family_count`, `cross_family_validated`, `judge_caveats`) so downstream readers cannot mistake an MM-only run for a cross-family-validated one.
+
+Constraint amendments:
+
+- Stage 20C (cards-v2) decision still gated on n≥40 rebench under V1 (MM-only). The cross-stack gap to interpret is `+8.46` (rule rejudge to MM rejudge), not the hybrid `+4.84` (which we now know is partly artifact).
+- The hybrid scaffolding in `feat/judge-hybrid-v1` should be merged into checkpoint as experimental code (not deleted), so V2 has a base to build on.
+- Auto judge mode removal is mandatory; smoke runs must pin a mode.

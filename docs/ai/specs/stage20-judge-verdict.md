@@ -96,3 +96,24 @@ This is a **sketch**, not a full spec. Full spec is the Stage 20A implementation
 - Does NOT claim MiniMax score is the new official Stage 19 number — rule-judge artifact remains the dashboard-comparable baseline.
 - Does NOT claim cards generalize perfectly to Kotlin/Android. Real residual gap may exist; it cannot be confirmed at current sample size.
 - Does NOT claim Stage 20A alone closes all cross-stack quality gaps. C/D synthesis has a real but unmeasured-magnitude residual.
+
+## V1 Landing (2026-05-01): MM-only after hybrid disagreement audit
+
+Same-day update. The hybrid judge sketched in this verdict (rule + cited-evidence + LLM rungs) was implemented and smoked. Manual inspection of 10 rule-vs-MiniMax disagreement cases (cases where rule rung fired but MiniMax did not) found:
+
+- TP (rule legitimately catches MM false negative): 2
+- FP (rule fires but answer doesn't cover the keypoint): 3
+- Ambiguous (partial / judgment-dependent coverage): 5
+
+Net signal `TP − FP = −1`. Hybrid `ev=0` aggregate cross-stack gap landed at +4.84 (vs MM-only +8.46 vs rule +25.12) — the smallest, but partly composed of rule false positives that distort cross-stack comparisons unreliably.
+
+**V1 ships as MM-only**, not hybrid. See `docs/ai/tasks/T-JUDGE-DEFAULT-MINIMAX-V1.md` for the V1 ship spec. The hybrid scaffolding is preserved in code as `--judge-mode hybrid` (experimental flag) for V2 reuse.
+
+V2 picks up via `docs/ai/tasks/T-JUDGE-HYBRID-V2.md`, gated on:
+
+1. Second LLM judge family available (Anthropic credit restored OR OpenAI configured)
+2. `T-JUDGE-AMBIG-CALIBRATION` calibration dataset complete (the 5 ambiguous cases + ~15 more for V2 weight tuning)
+
+Both prerequisites are queued; neither is on V1's path. V1's MM-only headline cross-stack gap remains **+8.46** (rule rejudge to MM rejudge), and Stage 20C decisions should anchor on that number, not the hybrid `+4.84` (which we now know is partly artifact).
+
+`auto` judge mode is removed in V1 (silent rule fallback was a benchmarking footgun). Smoke and exploratory runs must pin `--judge-mode` explicitly.

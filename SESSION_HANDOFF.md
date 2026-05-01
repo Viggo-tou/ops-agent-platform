@@ -299,3 +299,71 @@ Smoke runs and aborted-attempt artifacts under `tests/benchmarks/runs/` are not 
 ### What to say to continue
 
 > 继续 Stage 20A：实现 hybrid judge per `docs/ai/specs/stage20-judge-verdict.md` sketch，同时恢复 Anthropic credit 或加 OpenAI judge fallback。然后跑 T-BENCH-TIMEOUT-HANDYMANAPP，再 re-bench 验证 residual gap.
+
+---
+
+## Session 2026-05-01-1324 — Stage 20A V1 landed (MM-only); hybrid retired-as-default
+
+**Tag**: `session-start/2026-05-01-1324` at `db5ee82` (created at session open).
+
+### Outcomes
+
+1. **Hybrid judge implemented and smoked, then RETIRED as V1 default**. T-JUDGE-HYBRID-V1 + T-JUDGE-HYBRID-V1-FIX landed in code. Smoke against handymanapp and dashboard surfaced two issues: (a) wrong-file evidence credit (fixed by V1-FIX), (b) rule rung over-fires keypoints LLM correctly says miss. Manual inspection of 10 rule-vs-MM disagreement cases found TP=2, FP=3, ambig=5; net `TP − FP = −1`. Hybrid stays in code as `--judge-mode hybrid` (experimental) for V2 reuse.
+
+2. **Stage 20A V1 = MM-only**. T-JUDGE-DEFAULT-MINIMAX-V1 landed: argparse default minimax, `auto` mode removed (silent rule-fallback was a benchmarking footgun), 3 new artifact summary fields (`judge_family_count`, `cross_family_validated`, `judge_caveats`) so single-family limitation is surfaced in every artifact.
+
+3. **Bench question_timeout 240s → 480s** (T-BENCH-TIMEOUT-HANDYMANAPP). Rejudge had rescued 4 records where backend completed past the 240s polling deadline; default raised to 480s for cross-stack runs.
+
+4. **DECISIONS.md D-010 amended**: original "Stage 20A = hybrid primary" framing superseded by "V1 = MM-only, V2 = cross-family hybrid (deferred)".
+
+### Touched files (since `session-start/2026-05-01-1324`)
+
+**Specs / docs (all new in this session)**:
+- `docs/ai/tasks/T-JUDGE-HYBRID-V1.md` — original hybrid spec (retired-as-default)
+- `docs/ai/tasks/T-JUDGE-HYBRID-V1-FIX.md` — evidence-rung scope fix (retired-as-default with V1)
+- `docs/ai/tasks/T-JUDGE-DEFAULT-MINIMAX-V1.md` — V1 ship spec (the one that landed)
+- `docs/ai/tasks/T-JUDGE-HYBRID-V2.md` — V2 deferred spec stub
+- `docs/ai/tasks/T-JUDGE-AMBIG-CALIBRATION.md` — V2 prerequisite calibration dataset stub
+- `docs/ai/specs/stage20-judge-verdict.md` — V1 landing addendum appended
+
+**DECISIONS.md** — D-010 amendment (V1 = MM-only, V2 deferred)
+**SESSION_HANDOFF.md** — this section
+
+**Code**:
+- `apps/backend/scripts/run_qa_benchmark.py` — hybrid implementation (mode + helpers + summary aggregates) + V1 reset (default minimax, auto removed, family metadata helper)
+- `apps/backend/scripts/rejudge_run.py` — hybrid mode wiring + V1 reset (default minimax, family metadata)
+- `apps/backend/tests/scripts/test_run_qa_benchmark.py` — 6 hybrid tests, 2 evidence-scope tests, 3 wiring tests, 1 auto-rejected test, 1 family-metadata test (replaced 1 auto-fallback test). Net **36 passed**.
+
+**Bench artifacts (committed)**:
+- `qa-rejudge-handymanapp-hybrid-fixed.jsonl` — experimental hybrid rejudge (post-FIX); useful evidence for V2 calibration
+
+### Tests
+
+- `apps/backend/tests/scripts/test_run_qa_benchmark.py` — **36 passed** after V1 reset.
+
+### Headline numbers (handymanapp 17 valid records, apples-to-apples vs same-set MM rejudge)
+
+| Judge mode | Mean | Cross-stack gap (dashboard − handymanapp) |
+|---|---|---|
+| Rule | 34.20 | +25.12 |
+| MiniMax | 51.78 | +8.46 |
+| Hybrid (post V1-FIX) | 57.48 | +5.69 |
+| Hybrid weights `rule=1/llm=1/ev=0` (recompute) | 57.08 | +4.84 |
+
+Hybrid's smaller gap is partly artifact per the disagreement audit. **Stage 20C decisions should anchor on the MM gap of +8.46**, not the hybrid number.
+
+### Queued tickets (current)
+
+1. `T-JUDGE-HYBRID-V2` (P2, deferred) — cross-family hybrid; gated on Anthropic credit OR OpenAI key + calibration dataset.
+2. `T-JUDGE-AMBIG-CALIBRATION` (P3) — build 20-30 row calibration dataset for V2.
+3. `T-DATASET-HANDYMANAPP-EXPAND` (P2) — 26Q → 50-60Q for n≥40 valid records.
+4. `T-STAGE19-REBENCH-N40` (P2) — re-bench under V1 with expanded dataset to confirm/falsify residual cross-stack gap.
+
+### Independent infra issues
+
+1. **Anthropic API key still has zero credit balance** (`apps/backend/.env`). Blocks T-JUDGE-HYBRID-V2 unless OpenAI added as alternative second family.
+2. The dead `auto`-chain code in `KeypointJudge._judge_one` (lines ~517-568) is unreachable post-V1 reset. Cleanup ticket can be filed if surface area is a concern.
+
+### What to say to continue
+
+> 继续 Stage 20: 跑 T-DATASET-HANDYMANAPP-EXPAND（人工 + LLM 辅助扩 24-34 道题）然后 T-STAGE19-REBENCH-N40 验证 residual gap。Stage 20C 的 cards-v2 decision 要等 n≥40 数据。Anthropic credit 恢复后就可以 unblock T-JUDGE-HYBRID-V2.
