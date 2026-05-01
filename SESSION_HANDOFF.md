@@ -488,3 +488,69 @@ Successful test trail (Playwright via http://127.0.0.1:5173):
 - Subsequent task creation HUNG (POST /api/tasks returned empty body).
 
 Next session: the bug 2/4 investigation should be the FIRST item, not a quality lever.
+
+### Same-session pipeline reliability fix landed + dogfood verified
+
+**Commits**:
+- `b3e4c30` docs: 4 bugs from first UX dogfood
+- `c19b1a9` fix(pipeline): WAL + timeouts + heartbeats + health (19 files, +854/-57)
+- `4700e42` merge into checkpoint
+
+**Fix landed**:
+- SQLite WAL mode + busy_timeout 30s on connect (verified `journal_mode=wal`, `busy_timeout=30000`)
+- httpx + subprocess timeouts on all external API call sites (MiniMax, Anthropic, Codex CLI, Claude Code CLI, Jira)
+- 9 new heartbeat events (jira_fetch_*, mm_translation_*, synthesis_call_*) with provider/model/duration payloads
+- `/health` upgraded with `pipeline_workers={active,max,queue_depth,last_event_age_seconds,saturation_age_seconds}` + `external_api_recent_failures_5min={minimax,anthropic,jira,codex_cli}` + `status: healthy|degraded`
+- 5 new tests pass
+
+**Dogfood verification — TWO real tickets ran end-to-end via Playwright**:
+
+P69-4 ("Workflow redesign: admin assignment model"):
+- Task `42a40215`, ~6.5 min wall, 58 events, all gates green, 6 reservations flagged
+- Result: **under-scope** — agent only modified 4 handyman layout XML files
+- P69-4 needs cross-component refactor (customer + admin + handyman + backend) — agent recognized only the handyman UI slice
+- This is a known capability ceiling (multi-component scope identification) — Stage 22-level work to fix
+
+P69-10 ("Data and Role Cleanup"):
+- Task `85ecd211`, ~13 min wall, 77 events, all gates green, **0 reservations**
+- Result: **3/4 items covered (75%)**, code quality high
+- Items hit: cache cleanup (item 3), role normalization Admin/Staff (item 4), partial Minij fix (item 1 via cache)
+- Item missed: ServiceAnalytics.js dummy data (item 2) — clean miss
+- Code quality notable: defensive try/catch with active cache cleanup, role normalization handling 5 alias forms (master admin / superadmin etc.)
+
+**Honest "perfect completion" verdict**: NOT perfect.
+- Pipeline-reliability layer: working
+- Single-component scoped tickets: ~70-75% coverage with reviewer-grade code quality
+- Multi-component refactor tickets: severely under-scope (10-20% coverage)
+- Self-verification (testing changes): not done; tests.yaml config not found, agent skipped test step
+
+**Burst-load residual**: under 8-concurrent task stress, SQLite write-lock contention still kills 2-3 tasks even with WAL+busy_timeout=30s. The deeper cause is pipeline workers holding open SessionLocal for the entire 5-15 min pipeline. Real users (sequential) don't hit this. Follow-up ticket: `T-PIPELINE-SESSION-LIFETIME-FIX`.
+
+### Stage 20+ candidates ranked for next session
+
+**Tier A — quick wins (1-2 days each)**:
+1. **Dataset audit + keypoint relaxation** — refine over-strict expected_keypoints (e.g. require full path tokens that no answer would write). Cheap rejudge → likely +5-10 mean lift.
+2. **Citation-grounded prompt** — force synth to cite specific files/lines per claim. Targets cp axis (currently ~0.25, lifting to 0.5 = +10 score directly).
+3. **HAND C-09 +20 mystery investigation** — 30 min diff read; possible free prompt insight.
+
+**Tier B — reliability hardening (1 week)**:
+4. **`T-PIPELINE-SESSION-LIFETIME-FIX`** — refactor `run_pipeline_job` to commit short transactions per stage instead of one giant transaction. Eliminates burst-load residual.
+5. **Bug 1 (UI timeout/progress signal)** — frontend shows stage indicator + soft-timeout affordance.
+6. **Bug 3 (start-backend log capture)** — `-LogFile` parameter so backend stdout doesn't get discarded by hidden window.
+
+**Tier C — capability work (2-4 weeks each)**:
+7. **Multi-component scope identification** — directly addresses P69-4 under-scope problem. Higher leverage on "完美完成 ticket" goal than cards-v2/synth swap. Likely involves: planner sees task description + queries multiple files via different lenses (UI/backend/data/test) before settling on scope.
+8. **Cards-v2 narrow** — only after scope identification; targets the 62 `both_no_rule_no_evidence_no` keypoints from V2 audit.
+9. **Synth model swap (Codex CLI as synthesizer)** — only if quality work above is insufficient; high uncertainty.
+
+**Tier D — calibration**:
+10. **T-DATASET-HANDYMANAPP-EXPAND** — 26Q → 50-60Q for n≥40 valid; required before any "real" baseline claim.
+11. **T-STAGE19-REBENCH-N40** — final mean lock-in.
+
+### What to say to continue
+
+> 收完 session，下一阶段两条优先路线：
+> 1. Quality 轴：dataset audit + citation prompt（Tier A，1-2 天能见效）
+> 2. Capability 轴：scope identification 是当前 agent 真瓶颈（P69-4 under-scope / P69-10 漏 analytics 都是这个问题），但工程量大（2-4 周）。Stage 22 级别。
+> 
+> 推荐顺序：先 Tier A 拿便宜的分数提升（baseline 50→60 区间），同时收集更多 dogfood 数据（多跑几个 Jira ticket 量化 scope-identification 失败率），然后再决定是否启动 Tier C。
