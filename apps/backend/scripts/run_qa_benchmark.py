@@ -13,7 +13,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Sequence, TypedDict
 
 import httpx
 
@@ -283,12 +283,111 @@ def extract_minimax_content(response_payload: dict[str, Any]) -> str:
     raise RuntimeError("MiniMax response did not include assistant content")
 
 
+class KeypointHitDetail(TypedDict):
+    keypoint: str
+    hit: bool
+    hit_score: float
+    rule_credit: float
+    evidence_credit: float
+    llm_credit: float
+    provenance: str
+
+
+def _keypoint_detail(
+    *,
+    keypoint: str,
+    rule_credit: float = 0.0,
+    evidence_credit: float = 0.0,
+    llm_credit: float = 0.0,
+) -> KeypointHitDetail:
+    candidates = [
+        ("rule", float(rule_credit)),
+        ("llm", float(llm_credit)),
+        ("evidence", float(evidence_credit)),
+    ]
+    provenance, hit_score = max(candidates, key=lambda item: item[1])
+    if hit_score == 0.0:
+        provenance = "miss"
+    return {
+        "keypoint": keypoint,
+        "hit": hit_score >= 0.5,
+        "hit_score": hit_score,
+        "rule_credit": float(rule_credit),
+        "evidence_credit": float(evidence_credit),
+        "llm_credit": float(llm_credit),
+        "provenance": provenance,
+    }
+
+
+def _miss_details(keypoints: Sequence[str]) -> list[KeypointHitDetail]:
+    return [_keypoint_detail(keypoint=str(keypoint)) for keypoint in keypoints]
+
+
+def _wrap_bool_hits(
+    hits: Sequence[bool],
+    *,
+    keypoints: Sequence[str],
+    mode: str,
+) -> list[KeypointHitDetail]:
+    details: list[KeypointHitDetail] = []
+    bool_hits = list(hits)
+    for index, keypoint in enumerate(keypoints):
+        hit = bool_hits[index] if index < len(bool_hits) else False
+        if not hit:
+            details.append(_keypoint_detail(keypoint=str(keypoint)))
+        elif mode == "rule":
+            details.append(_keypoint_detail(keypoint=str(keypoint), rule_credit=1.0))
+        else:
+            details.append(_keypoint_detail(keypoint=str(keypoint), llm_credit=1.0))
+    return details
+
+
+def coerce_keypoint_hit_details(
+    raw_hits: Sequence[Any],
+    *,
+    keypoints: Sequence[str],
+    mode: str,
+) -> list[KeypointHitDetail]:
+    if raw_hits and all(isinstance(item, dict) for item in raw_hits):
+        details: list[KeypointHitDetail] = []
+        raw_list = list(raw_hits)
+        for index, keypoint in enumerate(keypoints):
+            item = raw_list[index] if index < len(raw_list) else {}
+            if not isinstance(item, dict):
+                details.append(_keypoint_detail(keypoint=str(keypoint)))
+                continue
+            if (
+                "rule_credit" not in item
+                and "evidence_credit" not in item
+                and "llm_credit" not in item
+            ):
+                details.extend(
+                    _wrap_bool_hits(
+                        [bool(item.get("hit"))],
+                        keypoints=[str(item.get("keypoint") or keypoint)],
+                        mode=mode,
+                    )
+                )
+                continue
+            details.append(
+                _keypoint_detail(
+                    keypoint=str(item.get("keypoint") or keypoint),
+                    rule_credit=float(item.get("rule_credit") or 0.0),
+                    evidence_credit=float(item.get("evidence_credit") or 0.0),
+                    llm_credit=float(item.get("llm_credit") or 0.0),
+                )
+            )
+        return details
+    return _wrap_bool_hits([bool(item) for item in raw_hits], keypoints=keypoints, mode=mode)
+
+
 class KeypointJudge:
     def __init__(self, requested_mode: str, samples: int = 1) -> None:
         self.requested_mode = requested_mode
         self.settings = get_settings()
         self.judge_model = self.settings.knowledge_synthesis_model or "MiniMax-M2.7"
         self.auto_rule_reason: str | None = None
+        self.last_hybrid_llm_error: str | None = None
         self._auto_force_rule = False
         # Multi-sample judging: ask the same judge to evaluate the same
         # answer N times and take per-keypoint majority. Dampens the
@@ -305,29 +404,57 @@ class KeypointJudge:
             return
         self.auto_rule_reason = f"{self.auto_rule_reason} {reason}".strip() if self.auto_rule_reason else reason
 
-    def judge(self, *, question: str, answer: str, keypoints: Sequence[str]) -> tuple[list[bool], str]:
+    def judge(
+        self,
+        *,
+        question: str,
+        answer: str,
+        keypoints: Sequence[str],
+        citations: Sequence[dict[str, Any]] | None = None,
+        expected_citations: Sequence[str] | None = None,
+    ) -> tuple[list[KeypointHitDetail], str]:
         if not answer.strip():
-            return [False] * len(keypoints), "rule"
+            return _miss_details(keypoints), "rule"
 
-        if self.samples > 1:
+        if self.samples > 1 and self.requested_mode != "hybrid":
             return self._judge_multi_sample(
-                question=question, answer=answer, keypoints=keypoints
+                question=question,
+                answer=answer,
+                keypoints=keypoints,
+                citations=citations,
+                expected_citations=expected_citations,
             )
-        return self._judge_one(question=question, answer=answer, keypoints=keypoints)
+        return self._judge_one(
+            question=question,
+            answer=answer,
+            keypoints=keypoints,
+            citations=citations,
+            expected_citations=expected_citations,
+        )
 
     def _judge_multi_sample(
-        self, *, question: str, answer: str, keypoints: Sequence[str]
-    ) -> tuple[list[bool], str]:
+        self,
+        *,
+        question: str,
+        answer: str,
+        keypoints: Sequence[str],
+        citations: Sequence[dict[str, Any]] | None,
+        expected_citations: Sequence[str] | None,
+    ) -> tuple[list[KeypointHitDetail], str]:
         """Run ``self.samples`` independent judge calls and take per-keypoint
         majority vote. If samples disagree on the judge mode actually used
         (e.g. one fell back to rule), the first non-rule mode wins for the
         reported judge_mode field; if all fell back to rule, "rule" wins.
         """
-        per_sample_hits: list[list[bool]] = []
+        per_sample_hits: list[list[KeypointHitDetail]] = []
         modes_used: list[str] = []
         for _ in range(self.samples):
             hits, mode = self._judge_one(
-                question=question, answer=answer, keypoints=keypoints
+                question=question,
+                answer=answer,
+                keypoints=keypoints,
+                citations=citations,
+                expected_citations=expected_citations,
             )
             per_sample_hits.append(hits)
             modes_used.append(mode)
@@ -337,43 +464,69 @@ class KeypointJudge:
         majority: list[bool] = []
         for i in range(n):
             true_count = sum(
-                1 for sample in per_sample_hits if i < len(sample) and sample[i]
+                1
+                for sample in per_sample_hits
+                if i < len(sample) and bool(sample[i].get("hit"))
             )
             majority.append(true_count > self.samples // 2)
         # Pick the most-informative mode label.
         non_rule = next((m for m in modes_used if m != "rule"), None)
         reported_mode = non_rule or modes_used[0]
-        return majority, reported_mode
+        return _wrap_bool_hits(majority, keypoints=keypoints, mode=reported_mode), reported_mode
 
-    def _judge_one(self, *, question: str, answer: str, keypoints: Sequence[str]) -> tuple[list[bool], str]:
+    def _judge_one(
+        self,
+        *,
+        question: str,
+        answer: str,
+        keypoints: Sequence[str],
+        citations: Sequence[dict[str, Any]] | None,
+        expected_citations: Sequence[str] | None,
+    ) -> tuple[list[KeypointHitDetail], str]:
         """Single judge invocation following the legacy mode-selection chain."""
 
         if self.requested_mode == "rule":
-            return self._judge_with_rule(answer=answer, keypoints=keypoints), "rule"
+            hits = self._judge_with_rule(answer=answer, keypoints=keypoints)
+            return _wrap_bool_hits(hits, keypoints=keypoints, mode="rule"), "rule"
+
+        if self.requested_mode == "hybrid":
+            return self._judge_with_hybrid(
+                question=question,
+                answer=answer,
+                keypoints=keypoints,
+                citations=citations,
+                expected_citations=expected_citations,
+            ), "hybrid"
 
         if self.requested_mode == "claude_code":
-            return self._judge_with_claude_code(question=question, answer=answer, keypoints=keypoints), "claude_code"
+            hits = self._judge_with_claude_code(question=question, answer=answer, keypoints=keypoints)
+            return _wrap_bool_hits(hits, keypoints=keypoints, mode="claude_code"), "claude_code"
 
         if self.requested_mode == "codex":
-            return self._judge_with_codex(question=question, answer=answer, keypoints=keypoints), "codex"
+            hits = self._judge_with_codex(question=question, answer=answer, keypoints=keypoints)
+            return _wrap_bool_hits(hits, keypoints=keypoints, mode="codex"), "codex"
 
         if self.requested_mode == "anthropic":
-            return self._judge_with_anthropic(question=question, answer=answer, keypoints=keypoints), "anthropic"
+            hits = self._judge_with_anthropic(question=question, answer=answer, keypoints=keypoints)
+            return _wrap_bool_hits(hits, keypoints=keypoints, mode="anthropic"), "anthropic"
 
         if self.requested_mode == "minimax":
-            return self._judge_with_minimax(question=question, answer=answer, keypoints=keypoints), "minimax"
+            hits = self._judge_with_minimax(question=question, answer=answer, keypoints=keypoints)
+            return _wrap_bool_hits(hits, keypoints=keypoints, mode="minimax"), "minimax"
 
         # auto: prefer CLI judges (cross-family vs MiniMax synthesizer
         # AND no API credit billing) → fall back to Anthropic API →
         # MiniMax → rule.
         if self._auto_force_rule:
-            return self._judge_with_rule(answer=answer, keypoints=keypoints), "rule"
+            hits = self._judge_with_rule(answer=answer, keypoints=keypoints)
+            return _wrap_bool_hits(hits, keypoints=keypoints, mode="rule"), "rule"
 
         # Claude Code CLI: cross-family judge using local OAuth — best
         # bias profile, no billing dependency.
         if shutil.which(self.settings.claude_code_command):
             try:
-                return self._judge_with_claude_code(question=question, answer=answer, keypoints=keypoints), "claude_code"
+                hits = self._judge_with_claude_code(question=question, answer=answer, keypoints=keypoints)
+                return _wrap_bool_hits(hits, keypoints=keypoints, mode="claude_code"), "claude_code"
             except Exception as exc:  # noqa: BLE001
                 self._append_auto_reason(f"Claude Code CLI judge failed: {exc}; trying next.")
         else:
@@ -382,7 +535,8 @@ class KeypointJudge:
         # Codex CLI: also cross-family vs MiniMax, uses ChatGPT auth.
         if shutil.which(self.settings.codex_command):
             try:
-                return self._judge_with_codex(question=question, answer=answer, keypoints=keypoints), "codex"
+                hits = self._judge_with_codex(question=question, answer=answer, keypoints=keypoints)
+                return _wrap_bool_hits(hits, keypoints=keypoints, mode="codex"), "codex"
             except Exception as exc:  # noqa: BLE001
                 self._append_auto_reason(f"Codex CLI judge failed: {exc}; trying next.")
         else:
@@ -390,7 +544,8 @@ class KeypointJudge:
 
         if self.settings.anthropic_api_key:
             try:
-                return self._judge_with_anthropic(question=question, answer=answer, keypoints=keypoints), "anthropic"
+                hits = self._judge_with_anthropic(question=question, answer=answer, keypoints=keypoints)
+                return _wrap_bool_hits(hits, keypoints=keypoints, mode="anthropic"), "anthropic"
             except (httpx.HTTPError, json.JSONDecodeError, RuntimeError) as exc:
                 # Don't force-rule yet — fall through to MiniMax before giving up.
                 self._append_auto_reason(f"Anthropic judge failed: {exc}; trying next.")
@@ -400,14 +555,88 @@ class KeypointJudge:
         if not self.settings.minimax_api_key:
             self._auto_force_rule = True
             self._append_auto_reason("OPS_AGENT_MINIMAX_API_KEY not configured; falling back to rule.")
-            return self._judge_with_rule(answer=answer, keypoints=keypoints), "rule"
+            hits = self._judge_with_rule(answer=answer, keypoints=keypoints)
+            return _wrap_bool_hits(hits, keypoints=keypoints, mode="rule"), "rule"
 
         try:
-            return self._judge_with_minimax(question=question, answer=answer, keypoints=keypoints), "minimax"
+            hits = self._judge_with_minimax(question=question, answer=answer, keypoints=keypoints)
+            return _wrap_bool_hits(hits, keypoints=keypoints, mode="minimax"), "minimax"
         except (httpx.HTTPError, json.JSONDecodeError, RuntimeError) as exc:
             self._auto_force_rule = True
             self._append_auto_reason(f"MiniMax judge unavailable: {exc}; falling back to rule.")
-            return self._judge_with_rule(answer=answer, keypoints=keypoints), "rule"
+            hits = self._judge_with_rule(answer=answer, keypoints=keypoints)
+            return _wrap_bool_hits(hits, keypoints=keypoints, mode="rule"), "rule"
+
+    def _judge_with_hybrid(
+        self,
+        *,
+        question: str,
+        answer: str,
+        keypoints: Sequence[str],
+        citations: Sequence[dict[str, Any]] | None,
+        expected_citations: Sequence[str] | None,
+    ) -> list[KeypointHitDetail]:
+        self.last_hybrid_llm_error = None
+        rule_hits = self._judge_with_rule(answer=answer, keypoints=keypoints)
+        evidence_hits = self._evidence_rung(
+            keypoints=keypoints,
+            citations=citations or [],
+            expected_citations=expected_citations,
+        )
+        try:
+            llm_hits = self._judge_with_minimax(
+                question=question, answer=answer, keypoints=keypoints
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.last_hybrid_llm_error = f"{type(exc).__name__}: {exc}"
+            llm_hits = [False] * len(keypoints)
+
+        details: list[KeypointHitDetail] = []
+        for index, keypoint in enumerate(keypoints):
+            rule_credit = 1.0 if index < len(rule_hits) and rule_hits[index] else 0.0
+            evidence_credit = 0.6 if index < len(evidence_hits) and evidence_hits[index] else 0.0
+            llm_credit = 0.7 if index < len(llm_hits) and llm_hits[index] else 0.0
+            details.append(
+                _keypoint_detail(
+                    keypoint=str(keypoint),
+                    rule_credit=rule_credit,
+                    evidence_credit=evidence_credit,
+                    llm_credit=llm_credit,
+                )
+            )
+        return details
+
+    def _evidence_rung(
+        self,
+        *,
+        keypoints: Sequence[str],
+        citations: Sequence[dict[str, Any]],
+        expected_citations: Sequence[str] | None,
+    ) -> list[bool]:
+        if not expected_citations:
+            return [False] * len(keypoints)
+
+        card_texts: list[str] = []
+        for citation in citations:
+            returned = _citation_identity(citation)
+            if not any(_matches_citation(returned, expected) for expected in expected_citations):
+                continue
+            card_text = str(citation.get("card_text") or "").strip().lower()
+            if card_text:
+                card_texts.append(card_text)
+
+        if not card_texts:
+            return [False] * len(keypoints)
+
+        hits: list[bool] = []
+        for keypoint in keypoints:
+            matched = False
+            for card_text in card_texts:
+                if _any_kp_substring([str(keypoint)], card_text):
+                    matched = True
+                    break
+            hits.append(matched)
+        return hits
 
     def _judge_with_rule(self, *, answer: str, keypoints: Sequence[str]) -> list[bool]:
         answer_normalized = normalize_text(answer)
@@ -966,6 +1195,72 @@ def source_summary(records: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any
     return summary
 
 
+def judge_rung_summary(
+    records: Sequence[dict[str, Any]],
+    *,
+    enabled: bool,
+) -> tuple[dict[str, int], dict[str, float], int]:
+    usage = {
+        "rule_only": 0,
+        "evidence_only": 0,
+        "llm_only": 0,
+        "rule_and_llm": 0,
+        "rule_and_evidence": 0,
+        "llm_and_evidence": 0,
+        "all_three": 0,
+        "all_miss": 0,
+    }
+    hit_rates = {"rule": 0.0, "evidence": 0.0, "llm": 0.0}
+    if not enabled:
+        return usage, hit_rates, 0
+
+    total_keypoints = 0
+    rung_hits = Counter()
+    disagreement_count = 0
+    usage_key = {
+        frozenset({"rule"}): "rule_only",
+        frozenset({"evidence"}): "evidence_only",
+        frozenset({"llm"}): "llm_only",
+        frozenset({"rule", "llm"}): "rule_and_llm",
+        frozenset({"rule", "evidence"}): "rule_and_evidence",
+        frozenset({"llm", "evidence"}): "llm_and_evidence",
+        frozenset({"rule", "llm", "evidence"}): "all_three",
+    }
+
+    for record in records:
+        contributors: set[str] = set()
+        record_disagreed = False
+        for item in record.get("keypoint_hits") or []:
+            if not isinstance(item, dict):
+                continue
+            total_keypoints += 1
+            decisions = {
+                "rule": float(item.get("rule_credit") or 0.0) > 0.0,
+                "evidence": float(item.get("evidence_credit") or 0.0) > 0.0,
+                "llm": float(item.get("llm_credit") or 0.0) > 0.0,
+            }
+            for rung, hit in decisions.items():
+                if hit:
+                    contributors.add(rung)
+                    rung_hits[rung] += 1
+            if len(set(decisions.values())) > 1:
+                record_disagreed = True
+        if record_disagreed:
+            disagreement_count += 1
+        if contributors:
+            usage[usage_key[frozenset(contributors)]] += 1
+        else:
+            usage["all_miss"] += 1
+
+    denominator = max(total_keypoints, 1)
+    hit_rates = {
+        "rule": round(rung_hits["rule"] / denominator, 4),
+        "evidence": round(rung_hits["evidence"] / denominator, 4),
+        "llm": round(rung_hits["llm"] / denominator, 4),
+    }
+    return usage, hit_rates, disagreement_count
+
+
 def parse_infra_burst_backoff(value: str) -> list[float]:
     backoffs: list[float] = []
     for raw_part in value.split(","):
@@ -1081,6 +1376,10 @@ def build_summary(
         if requested_judge_mode != "auto"
         else 0
     )
+    judge_rung_usage, per_rung_kp_hit_rate, disagreement_count = judge_rung_summary(
+        records,
+        enabled=requested_judge_mode == "hybrid",
+    )
     summary = {
         "type": "summary",
         "status": "running" if running else "completed",
@@ -1127,6 +1426,9 @@ def build_summary(
             / max(len(fact_records), 1)
         ),
         "stage19_bucket_counts": dict(sorted(stage19_buckets.items())),
+        "judge_rung_usage": judge_rung_usage,
+        "per_rung_kp_hit_rate": per_rung_kp_hit_rate,
+        "disagreement_count": disagreement_count,
         "abc_completed": abc_completed,
         "abc_total": abc_total,
         "abc_completion_ratio": round(completion_ratio, 4),
@@ -1191,7 +1493,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--judge-mode",
-        choices=("auto", "claude_code", "codex", "anthropic", "minimax", "rule"),
+        choices=("auto", "claude_code", "codex", "anthropic", "minimax", "rule", "hybrid"),
         default="auto",
         help=(
             "Scoring judge mode. 'auto' prefers CLI judges (claude_code, then "
@@ -1330,7 +1632,7 @@ def main() -> int:
             answer_excerpt = ""
             error_text: str | None = None
             judge_error: str | None = None
-            keypoint_hits = [False] * len(row.expected_answer_keypoints)
+            keypoint_hits = _miss_details(row.expected_answer_keypoints)
             judge_mode_used = "skipped"
             citation_precision = 0.0
             keypoint_coverage = 0.0
@@ -1401,7 +1703,19 @@ def main() -> int:
                                 question=row.question,
                                 answer=answer,
                                 keypoints=row.expected_answer_keypoints,
+                                citations=structured_citations,
+                                expected_citations=row.expected_citations,
                             )
+                            keypoint_hits = coerce_keypoint_hit_details(
+                                keypoint_hits,
+                                keypoints=row.expected_answer_keypoints,
+                                mode=judge_mode_used,
+                            )
+                            hybrid_llm_error = getattr(judge, "last_hybrid_llm_error", None)
+                            if hybrid_llm_error:
+                                judge_error = f"MiniMax hybrid rung failed: {hybrid_llm_error}"
+                                if error_text is None:
+                                    error_text = judge_error
                             judge_status = "pass"
                         except Exception as exc:  # noqa: BLE001
                             judge_status = "fail"
@@ -1432,7 +1746,9 @@ def main() -> int:
             if task_status in TERMINAL_STATUSES:
                 completed = True
             if synthesis_status == "pass" and judge_status == "pass":
-                keypoint_coverage = sum(1 for hit in keypoint_hits if hit) / max(len(keypoint_hits), 1)
+                keypoint_coverage = sum(
+                    float(item.get("hit_score") or 0.0) for item in keypoint_hits
+                ) / max(len(keypoint_hits), 1)
                 score_status = "valid"
                 score = (keypoint_coverage * 60.0) + (citation_precision * 40.0)
             else:
@@ -1452,10 +1768,7 @@ def main() -> int:
                 "score": round(score, 2),
                 "keypoint_coverage": round(keypoint_coverage, 4),
                 "citation_precision": round(citation_precision, 4),
-                "keypoint_hits": [
-                    {"keypoint": keypoint, "hit": hit}
-                    for keypoint, hit in zip(row.expected_answer_keypoints, keypoint_hits)
-                ],
+                "keypoint_hits": keypoint_hits,
                 "expected_answer_keypoints": row.expected_answer_keypoints,
                 "expected_citations": row.expected_citations,
                 "source_name": row.source_name,

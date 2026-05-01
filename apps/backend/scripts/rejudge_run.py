@@ -16,7 +16,10 @@ from scripts.run_qa_benchmark import (
     TERMINAL_STATUSES,
     KeypointJudge,
     compute_citation_precision,
+    coerce_keypoint_hit_details,
     extract_answer_and_citations,
+    judge_rung_summary,
+    _miss_details,
     truncate_utf8,
 )
 
@@ -25,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Re-judge a completed QA benchmark run.")
     parser.add_argument("--in-run", required=True)
     parser.add_argument("--backend-url", required=True)
-    parser.add_argument("--judge-mode", choices=("auto", "claude_code", "codex", "anthropic", "minimax", "rule"), default="claude_code")
+    parser.add_argument("--judge-mode", choices=("auto", "claude_code", "codex", "anthropic", "minimax", "rule", "hybrid"), default="claude_code")
     parser.add_argument("--judge-samples", type=int, default=3)
     parser.add_argument("--out-run", required=True)
     return parser.parse_args()
@@ -45,13 +48,12 @@ def read_run(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     return summary, [record for record in records if record.get("type") == "question"]
 
 
-def task_answer(task: dict[str, Any]) -> tuple[str, list[str], list[str]]:
+def task_answer(task: dict[str, Any]) -> tuple[str, list[str], list[str], list[dict[str, Any]]]:
     """Reuse the bench's normalized extractor so citation_precision compares
     canonical paths against the dataset's expected_citations (also canonical).
-    Returns (answer, display_citations, canonical_citations).
-    V3 extractor returns 5-tuple; rejudge only needs the first 3."""
-    answer, display, canonical, _structured, _trace = extract_answer_and_citations(task)
-    return answer, display, canonical
+    Returns (answer, display_citations, canonical_citations, structured_citations)."""
+    answer, display, canonical, structured, _trace = extract_answer_and_citations(task)
+    return answer, display, canonical, structured
 
 
 def keypoints(record: dict[str, Any]) -> list[str]:
@@ -120,8 +122,10 @@ def main() -> int:
             task_id = str(record.get("task_id") or "").strip()
             expected = [str(item) for item in record.get("expected_citations") or []]
             points = keypoints(record)
-            answer, citations, display_citations, error, judge_error = "", [], [], None, None
-            hits, judge_mode = [False] * len(points), "skipped"
+            answer, citations, display_citations, structured_citations = "", [], [], []
+            error, judge_error = None, None
+            hits = _miss_details(points)
+            judge_mode = "skipped"
             task_status, completed, question = "fetch_error", False, str(record.get("question") or "")
             synthesis_status, judge_status = "task_error", "skipped"
             try:
@@ -133,7 +137,7 @@ def main() -> int:
                 question = str(task.get("request_text") or question)
                 task_status = str(task.get("status") or record.get("task_status") or "")
                 completed = task_status.lower() in TERMINAL_STATUSES
-                answer, display_citations, citations = task_answer(task)
+                answer, display_citations, citations, structured_citations = task_answer(task)
                 synthesis_status = "pass" if answer.strip() else (
                     "empty" if task_status.lower() == "completed" else "task_error"
                 )
@@ -141,7 +145,23 @@ def main() -> int:
                 error = f"{type(exc).__name__}: {exc}"
             if answer.strip():
                 try:
-                    hits, judge_mode = judge.judge(question=question, answer=answer, keypoints=points)
+                    hits, judge_mode = judge.judge(
+                        question=question,
+                        answer=answer,
+                        keypoints=points,
+                        citations=structured_citations,
+                        expected_citations=expected,
+                    )
+                    hits = coerce_keypoint_hit_details(
+                        hits,
+                        keypoints=points,
+                        mode=judge_mode,
+                    )
+                    hybrid_llm_error = getattr(judge, "last_hybrid_llm_error", None)
+                    if hybrid_llm_error:
+                        judge_error = f"MiniMax hybrid rung failed: {hybrid_llm_error}"
+                        if error is None:
+                            error = judge_error
                     judge_status = "pass"
                 except Exception as exc:  # noqa: BLE001
                     judge_mode = args.judge_mode
@@ -149,7 +169,7 @@ def main() -> int:
                     judge_error = f"{type(exc).__name__}: {exc}"
             if args.judge_mode == "claude_code" and judge_mode == "rule":
                 fallback_to_rule_count += 1
-            kp = sum(1 for hit in hits if hit) / max(len(hits), 1)
+            kp = sum(float(item.get("hit_score") or 0.0) for item in hits) / max(len(hits), 1)
             cp = compute_citation_precision(expected, citations)
             score_status = "valid" if synthesis_status == "pass" and judge_status == "pass" else "invalid"
             score = (kp * 60.0 + cp * 40.0) if score_status == "valid" else 0.0
@@ -160,7 +180,7 @@ def main() -> int:
                 score=round(score, 2),
                 keypoint_coverage=round(kp, 4),
                 citation_precision=round(cp, 4),
-                keypoint_hits=[{"keypoint": point, "hit": hit} for point, hit in zip(points, hits)],
+                keypoint_hits=hits,
                 citations_found=display_citations,
                 judge_mode=judge_mode,
                 synthesis_status=synthesis_status,
@@ -178,6 +198,10 @@ def main() -> int:
     judge_counts = Counter(str(record.get("judge_status")) for record in records)
     score_counts = Counter(str(record.get("score_status")) for record in records)
     summary = dict(original_summary)
+    judge_rung_usage, per_rung_kp_hit_rate, disagreement_count = judge_rung_summary(
+        records,
+        enabled=args.judge_mode == "hybrid",
+    )
     summary.update(
         status="completed",
         started_at_utc=started_at.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
@@ -218,6 +242,9 @@ def main() -> int:
         score_status_counts=dict(sorted(score_counts.items())),
         tier_summary=tier_summary(records),
         overall_mean_score=round(mean([float(record.get("score") or 0.0) for record in records]), 2),
+        judge_rung_usage=judge_rung_usage,
+        per_rung_kp_hit_rate=per_rung_kp_hit_rate,
+        disagreement_count=disagreement_count,
     )
     write_run(resolve(args.out_run), summary, records)
     by_tier: dict[str, list[float]] = defaultdict(list)
