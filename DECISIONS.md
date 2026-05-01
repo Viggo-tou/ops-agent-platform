@@ -164,3 +164,43 @@ Constraint amendments:
 - Stage 20C (cards-v2) decision still gated on n≥40 rebench under V1 (MM-only). The cross-stack gap to interpret is `+8.46` (rule rejudge to MM rejudge), not the hybrid `+4.84` (which we now know is partly artifact).
 - The hybrid scaffolding in `feat/judge-hybrid-v1` should be merged into checkpoint as experimental code (not deleted), so V2 has a base to build on.
 - Auto judge mode removal is mandatory; smoke runs must pin a mode.
+
+### D-010 Second amendment (2026-05-01 same day): V2-CLI lands as diagnostic, not promoted to official
+
+T-JUDGE-HYBRID-V2-CLI implementation landed (`feat/judge-hybrid-v2-cli` merged at commit `5387a21`). It uses Codex CLI (subscription, no API budget needed) as the second LLM judge family, AND-gated against MiniMax. The original V2 deferral assumption ("Anthropic credit OR OpenAI key required") was wrong — Codex CLI satisfies cross-family without API budget.
+
+V2 promotion criteria check (from spec): **2/7 thresholds failed**. V2 does NOT auto-promote to official default.
+
+Quantitative results (apples-to-apples, valid in rule + MM + V2):
+
+| Dataset | Rule | MM (V1) | V2 | V2 − MM |
+|---|---|---|---|---|
+| Dashboard (n=25) | 59.32 | 60.24 | **52.72** | -7.52 |
+| Handymanapp (n=17) | 34.20 | 51.78 | **47.08** | -4.71 |
+| Cross-stack gap | +25.12 | +8.46 | **+5.64** | (narrowest) |
+
+Cross-family agreement: dashboard 92%, handymanapp 95%. Codex CLI failure rate: 0% (post UTF-8 stdin fix).
+
+The V2 mean drops below V1 MM-only by 4-8 points. **This is by design** — AND-gate forces `hit_score = 1.0` ONLY when both LLMs agree, so MM-yes-Codex-no kps that V1 credited 1.0 now score 0.0. The drop is not a quality regression; it's the conservative invariant the V2 spec required (`V2_mean ≤ V1_MM_only_mean` per dataset). The promotion criterion was set at ±3 points which is too tight given the math; relaxing to ±10 would have passed, but that defeats the "guard against silent over-promotion" intent.
+
+V2 verdict: **stays as `--judge-mode hybrid_v2` for cross-family diagnostic**. V1 (`--judge-mode minimax`) remains official default. V2's value is the disagreement taxonomy, not the score.
+
+Most actionable diagnostic from V2 (highest-leverage Stage 20C input):
+
+- `both_no_evidence_yes` count = **50 keypoints** (dashboard 34 + handymanapp 16) — retrieval found the expected file with the keypoint substring, but neither MM nor Codex saw the answer articulating it.
+- `both_no_rule_no_evidence_no` count = **62 keypoints** — true misses (cards/retrieval/synth all failed).
+- `mm_yes_codex_no` count = **14 keypoints** — MM credit Codex refuses (Codex tilts slightly stricter than MM).
+
+Stage 20C reframe (data-locked, not opinion-locked):
+
+- The 50 `both_no_evidence_yes` count is suggestive of a synthesis articulation gap. **Not yet confirmed** — needs sample inspection to distinguish real synth misses from evidence-rung false-positive hits (e.g., card_text containing keypoint substring incidentally).
+- If sample inspection confirms ≥70% real synth gap → synthesizer A/B experiment becomes Stage 20C P0, cards-v2 becomes parallel P1 (62 true-miss kps).
+- If sample inspection shows the signal is weak → cards-v2 stays P0.
+
+Constraint amendments:
+
+- V2 mode `hybrid_v2` ships in code but is NOT the default. CLI `--judge-mode minimax` (V1) remains default.
+- The Codex CLI judge subprocess MUST use UTF-8 encoding for stdin (commit `fb8afa7` fix). Reverting this would cause silent failures on non-ASCII prompts.
+- Future cross-family validations (`hybrid_v2`) need Codex CLI or Claude Code CLI installed and authenticated — both work via subscription, no marginal cost.
+- The `T-JUDGE-HYBRID-V2.md` placeholder is superseded by `T-JUDGE-HYBRID-V2-CLI.md` (kept for audit trail).
+- The `T-JUDGE-AMBIG-CALIBRATION.md` calibration dataset is no longer required for V2 — V2 ships as diagnostic without it. Calibration is queued only if V2 ever needs to be promoted to official.

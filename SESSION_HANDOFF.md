@@ -367,3 +367,39 @@ Hybrid's smaller gap is partly artifact per the disagreement audit. **Stage 20C 
 ### What to say to continue
 
 > 继续 Stage 20: 跑 T-DATASET-HANDYMANAPP-EXPAND（人工 + LLM 辅助扩 24-34 道题）然后 T-STAGE19-REBENCH-N40 验证 residual gap。Stage 20C 的 cards-v2 decision 要等 n≥40 数据。Anthropic credit 恢复后就可以 unblock T-JUDGE-HYBRID-V2.
+
+### Stage 20A V2-CLI follow-up (same session)
+
+**Discovery**: Codex CLI (ChatGPT subscription) and Claude Code CLI (Claude subscription) both satisfy "second LLM judge family" requirement WITHOUT needing API budget. The deferred V2 placeholder (`T-JUDGE-HYBRID-V2.md`) was replaced by `T-JUDGE-HYBRID-V2-CLI.md` with concrete Codex CLI integration.
+
+**Implemented and committed** (commit `fb8afa7`, merged via `5387a21`):
+- `--judge-mode hybrid_v2` mode: MM + Codex CLI co-primary AND-gated semantic judge
+- 8-cell disagreement taxonomy in artifact summary
+- UTF-8 stdin fix for Codex CLI subprocess (Windows cp936 → UTF-8)
+- 41 tests green (5 new V2 tests)
+
+**V2 verdict** (DECISIONS.md D-010 second amendment):
+- V2 does NOT auto-promote to official (mean drift exceeds ±3 threshold)
+- V2 mean drop is by design (AND-gate is mathematically conservative)
+- V1 (`--judge-mode minimax`) remains official default
+- V2 stays in code as `hybrid_v2` for cross-family diagnostic
+
+**Cross-family validation outcome**:
+- Dashboard 92%, handymanapp 95% MM-Codex agreement
+- Cross-stack gap narrows: rule +25.12 → MM +8.46 → V2 +5.64
+- 0 codex failures across 60 records post UTF-8 fix
+
+**Most actionable diagnostic (Stage 20C decision input)**:
+- `both_no_evidence_yes`: 50 kps (retrieval grounded, answer didn't articulate) → possible synthesis bottleneck
+- `both_no_rule_no_evidence_no`: 62 kps (true misses) → cards-v2 target
+- Both signals are similar magnitude; cards-v2 should NOT be deprioritized just because synth signal exists
+
+**Bench artifacts (committed in this session's bench commit)**:
+- `qa-rejudge-handymanapp-hybrid-v2.jsonl`
+- `qa-rejudge-dashboard-hybrid-v2.jsonl`
+
+**Open follow-up (next session)**:
+- Manual sample inspection of 5-10 `both_no_evidence_yes` cases to confirm/refute the synthesis bottleneck hypothesis
+- IF confirmed (≥70% real synth misses): spec synth-A/B experiment (Codex CLI as synthesizer, V1 MM judge for cross-family)
+- IF refuted (≤30% real synth misses): proceed with cards-v2 narrow scope per Stage 20C
+- T-DATASET-HANDYMANAPP-EXPAND remains queued (P1)
