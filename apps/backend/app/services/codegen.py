@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.agents.schemas import CodegenResult
 from app.core.config import Settings, get_settings
+from app.core.timeouts import external_http_timeout
 from app.services.llm_telemetry import LlmCall, record_llm_call
 from app.services.reviewer import DiffReviewer
 
@@ -342,7 +343,10 @@ class CodeGenerator:
     def _ollama_available(self) -> bool:
         """Check if Ollama is running and reachable."""
         try:
-            resp = httpx.get(f"{self.settings.ollama_base_url.replace('/v1', '')}/api/tags", timeout=2)
+            resp = httpx.get(
+                f"{self.settings.ollama_base_url.replace('/v1', '')}/api/tags",
+                timeout=external_http_timeout(2),
+            )
             return resp.status_code == 200
         except Exception:
             return False
@@ -379,7 +383,12 @@ class CodeGenerator:
             "temperature": 0.2,
         }
         try:
-            response = httpx.post(url, json=body, headers=headers, timeout=120)
+            response = httpx.post(
+                url,
+                json=body,
+                headers=headers,
+                timeout=external_http_timeout(120),
+            )
             response.raise_for_status()
             data = response.json()
             content = ""
@@ -1387,7 +1396,7 @@ class CodeGenerator:
                 url,
                 json=body,
                 headers=headers,
-                timeout=max(self.settings.minimax_planner_timeout_seconds, 180),
+                timeout=external_http_timeout(max(self.settings.minimax_planner_timeout_seconds, 180)),
             )
             response.raise_for_status()
             data = response.json()
@@ -1441,7 +1450,7 @@ class CodeGenerator:
             response = httpx.post(
                 url,
                 json=body,
-                timeout=self.settings.ollama_timeout_seconds,
+                timeout=external_http_timeout(self.settings.ollama_timeout_seconds),
             )
             response.raise_for_status()
             data = response.json()
@@ -1492,7 +1501,7 @@ class CodeGenerator:
                 url,
                 json=body,
                 headers=headers,
-                timeout=self.settings.deepseek_timeout_seconds,
+                timeout=external_http_timeout(self.settings.deepseek_timeout_seconds),
             )
             response.raise_for_status()
             data = response.json()
@@ -1533,7 +1542,7 @@ class CodeGenerator:
                 url,
                 json=body,
                 headers=headers,
-                timeout=getattr(self.settings, "primary_agent_timeout_seconds", 90),
+                timeout=external_http_timeout(getattr(self.settings, "primary_agent_timeout_seconds", 90)),
             )
             response.raise_for_status()
             data = response.json()

@@ -31,6 +31,7 @@ from app.agents.schemas import (
 from app.core.config import Settings, get_settings
 from app.core.enums import RiskLevel, RoleName, TaskStatus, ToolPermissionCategory
 from app.core.jira import extract_jira_issue_reference
+from app.core.timeouts import external_http_timeout
 from app.services.llm_telemetry import LlmCall, record_llm_call
 from app.tools.registry import ToolRegistry
 
@@ -1020,7 +1021,7 @@ class PrimaryAgentPlanner:
             "Content-Type": "application/json",
         }
 
-        with httpx.Client(timeout=self.settings.primary_agent_timeout_seconds) as client:
+        with httpx.Client(timeout=external_http_timeout(self.settings.primary_agent_timeout_seconds)) as client:
             response = client.post(
                 f"{self.settings.openai_base_url.rstrip('/')}/responses",
                 headers=headers,
@@ -1078,7 +1079,7 @@ class PrimaryAgentPlanner:
             f"{self.settings.anthropic_base_url.rstrip('/')}/v1/messages",
             headers=headers,
             json=payload,
-            timeout=max(self.settings.primary_agent_timeout_seconds, 120),
+            timeout=external_http_timeout(max(self.settings.primary_agent_timeout_seconds, 120)),
         )
         response.raise_for_status()
         response_payload = response.json()
@@ -1253,7 +1254,7 @@ class PrimaryAgentPlanner:
             self.settings.minimax_planner_timeout_seconds,
         )
 
-        with httpx.Client(timeout=planner_timeout) as client:
+        with httpx.Client(timeout=external_http_timeout(planner_timeout)) as client:
             response = client.post(
                 f"{self.settings.minimax_base_url.rstrip('/')}/v1/text/chatcompletion_v2",
                 headers=headers,

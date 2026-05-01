@@ -20,13 +20,18 @@ engine = create_engine(
     connect_args={"check_same_thread": False, "timeout": 30} if is_sqlite else {},
 )
 
+def set_sqlite_pragmas(dbapi_conn) -> None:  # noqa: ANN001
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.execute("PRAGMA busy_timeout=30000")
+    cursor.close()
+
+
 if is_sqlite:
     @sa_event.listens_for(engine, "connect")
     def _set_sqlite_pragma(dbapi_conn, _connection_record):  # noqa: ANN001
-        cursor = dbapi_conn.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA busy_timeout=30000")
-        cursor.close()
+        set_sqlite_pragmas(dbapi_conn)
 
 SessionLocal = sessionmaker(
     bind=engine,

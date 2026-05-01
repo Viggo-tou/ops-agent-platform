@@ -81,7 +81,9 @@ def test_synthesize_success_returns_llm_text(monkeypatch: pytest.MonkeyPatch) ->
     )
 
     assert result == "Use src/auth.py lines 10-14."
-    client_factory.assert_called_once_with(timeout=3.0)
+    timeout = client_factory.call_args.kwargs["timeout"]
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.read == 3.0
     payload = client.post.call_args.kwargs["json"]
     assert payload["model"] == "minimax-text-01"
     system_prompt = payload["messages"][0]["content"]

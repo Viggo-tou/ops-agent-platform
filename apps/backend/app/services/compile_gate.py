@@ -92,16 +92,17 @@ def _check_js(path: Path) -> str | None:
     if is_esm:
         err = _check_js_esm(node, source)
     else:
-        err = _check_js_classic(node, path)
+        err = _check_js_classic(node, source)
 
     return err
 
 
-def _check_js_classic(node: str, path: Path) -> str | None:
-    """CJS files: standard ``node --check``."""
+def _check_js_classic(node: str, source: str) -> str | None:
+    """CJS files: pipe via stdin so Node does not need to realpath Unicode paths."""
     try:
         result = subprocess.run(
-            [node, "--check", str(path)],
+            [node, "--check", "-"],
+            input=source,
             capture_output=True,
             text=True,
             encoding="utf-8",

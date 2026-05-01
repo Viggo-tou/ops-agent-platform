@@ -53,11 +53,11 @@ class Settings(BaseSettings):
     # Claude Code CLI (planner)
     claude_code_command: str = "npx"
     claude_code_args: str = "--yes @anthropic-ai/claude-code"
-    claude_code_timeout_seconds: float = 300.0
+    claude_code_timeout_seconds: float = 240.0
     claude_code_git_bash_path: str | None = None
     # Codex CLI (codegen)
     codex_command: str = "codex"
-    codex_timeout_seconds: float = 300.0
+    codex_timeout_seconds: float = 240.0
     codex_model: str = "gpt-5.4"
     # CLI retry: retry codegen/planning subprocess on timeout or transient failure
     cli_max_retries: int = 1

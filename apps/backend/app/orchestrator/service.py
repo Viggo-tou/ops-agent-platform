@@ -5,6 +5,7 @@ import logging
 import re
 import shutil
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from app.agents.translation import SemanticTranslator
 from app.core.enums import ActorRole, ApprovalStatus, EventSource, EventType, RoleName, TaskStatus, WorkflowStage
 from app.core.jira import extract_jira_issue_reference, looks_like_jira_issue_url
 from app.core.telemetry import get_current_trace_id, get_tracer
+from app.core.timeouts import external_http_timeout
 from app.models.approval import Approval
 from app.models.event import Event
 from app.models.task import Task
@@ -56,6 +58,17 @@ def _truncate_text(value: object, *, limit: int) -> str:
     if len(normalized) <= limit:
         return normalized
     return f"{normalized[: max(limit - 3, 1)]}..."
+
+
+def _json_size_bytes(value: object) -> int:
+    return len(json.dumps(value, default=str, ensure_ascii=True).encode("utf-8"))
+
+
+def _truncated_traceback(exc: BaseException, *, limit: int = 2000) -> str:
+    text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    if len(text) <= limit:
+        return text
+    return text[:limit]
 
 
 def _set_span_attribute(span: object, key: str, value: object | None) -> None:
@@ -832,16 +845,91 @@ class PrimaryOrchestrator:
             payload={"scenario": task.scenario, "actor_name": actor_name},
         )
 
-        translation_result = self.semantic_translator.translate(
-            task_id=task.id,
-            request_text=task.request_text,
-            scenario=task.scenario,
-            actor_name=actor_name,
-            issue_context=issue_context,
+        translator_settings = self.semantic_translator.settings
+        provider_mode = translator_settings.semantic_translator_provider
+        will_call_minimax = provider_mode == "minimax" or (
+            provider_mode == "auto" and bool(translator_settings.minimax_api_key)
         )
+        request_size_bytes = _json_size_bytes(
+            {
+                "request_text": task.request_text,
+                "scenario": task.scenario,
+                "actor_name": actor_name,
+                "issue_context": issue_context,
+            }
+        )
+        translation_started = time.perf_counter()
+        if will_call_minimax:
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.MM_TRANSLATION_STARTED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.PLANNING,
+                role=RoleName.PRIMARY,
+                message="MiniMax semantic translation call started.",
+                payload={
+                    "provider_name": "minimax",
+                    "model_name": translator_settings.semantic_translator_model,
+                    "request_size_bytes": request_size_bytes,
+                    "duration_ms": 0,
+                },
+            )
+            commit_checkpoint(self.db, label="mm_translation_started")
+
+        try:
+            translation_result = self.semantic_translator.translate(
+                task_id=task.id,
+                request_text=task.request_text,
+                scenario=task.scenario,
+                actor_name=actor_name,
+                issue_context=issue_context,
+            )
+        except Exception as exc:
+            if will_call_minimax:
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.MM_TRANSLATION_FAILED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.PLANNING,
+                    role=RoleName.PRIMARY,
+                    message="MiniMax semantic translation call failed.",
+                    payload={
+                        "provider_name": "minimax",
+                        "model_name": translator_settings.semantic_translator_model,
+                        "request_size_bytes": request_size_bytes,
+                        "duration_ms": int((time.perf_counter() - translation_started) * 1000),
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc)[:1000],
+                        "traceback": _truncated_traceback(exc),
+                    },
+                )
+                commit_checkpoint(self.db, label="mm_translation_failed")
+            raise
         translation_document = translation_result.translation
 
         if translation_result.used_fallback and translation_result.fallback_reason:
+            if will_call_minimax:
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.MM_TRANSLATION_FAILED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.PLANNING,
+                    role=RoleName.PRIMARY,
+                    message="MiniMax semantic translation failed and fallback translation was used.",
+                    payload={
+                        "provider_name": "minimax",
+                        "model_name": translator_settings.semantic_translator_model,
+                        "request_size_bytes": request_size_bytes,
+                        "duration_ms": int((time.perf_counter() - translation_started) * 1000),
+                        "error_type": "ProviderFallback",
+                        "error_message": translation_result.fallback_reason[:1000],
+                        "traceback": "",
+                    },
+                )
+                commit_checkpoint(self.db, label="mm_translation_failed")
             record_event(
                 self.db,
                 task_id=task.id,
@@ -856,6 +944,23 @@ class PrimaryOrchestrator:
                     "fallback_reason": translation_result.fallback_reason,
                 },
             )
+        elif will_call_minimax:
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.MM_TRANSLATION_SUCCEEDED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.PLANNING,
+                role=RoleName.PRIMARY,
+                message="MiniMax semantic translation call completed.",
+                payload={
+                    "provider_name": "minimax",
+                    "model_name": translator_settings.semantic_translator_model,
+                    "request_size_bytes": request_size_bytes,
+                    "duration_ms": int((time.perf_counter() - translation_started) * 1000),
+                },
+            )
+            commit_checkpoint(self.db, label="mm_translation_succeeded")
 
         record_event(
             self.db,
@@ -943,6 +1048,27 @@ class PrimaryOrchestrator:
             payload={"issue_key": issue_key},
         )
 
+        jira_started = time.perf_counter()
+        jira_request_size_bytes = _json_size_bytes({"issue_key": issue_key})
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.JIRA_FETCH_STARTED,
+            source=EventSource.TOOL_GATEWAY,
+            stage=WorkflowStage.PLANNING,
+            role=RoleName.PLANNER,
+            tool_name="jira.get_issue",
+            message="Jira issue context fetch started.",
+            payload={
+                "provider_name": "jira",
+                "model_name": None,
+                "request_size_bytes": jira_request_size_bytes,
+                "duration_ms": 0,
+                "issue_key": issue_key,
+            },
+        )
+        commit_checkpoint(self.db, label="jira_fetch_started")
+
         try:
             result = self.tool_gateway.execute(
                 task_id=task.id,
@@ -958,6 +1084,19 @@ class PrimaryOrchestrator:
             self._sync_retry_count(task)
             event_type = EventType.TOOL_TIMED_OUT if isinstance(exc, ToolInvocationError) and exc.timed_out else EventType.TOOL_FAILED
             error_kind, user_message = self._classify_jira_error(exc, issue_key)
+            failure_payload = {
+                "issue_key": issue_key,
+                "error": str(exc),
+                "error_kind": error_kind,
+                "http_status": getattr(exc, "http_status", None),
+            }
+            if event_type == EventType.TOOL_TIMED_OUT:
+                failure_payload.update(
+                    {
+                        "reason": "external_api_timeout",
+                        "provider_name": "jira",
+                    }
+                )
             # Disambiguate 404: Jira returns 404 for both "issue missing" and
             # "token can't see project". Probe /myself to detect the
             # token-expiry case so the user gets the right remediation.
@@ -972,6 +1111,29 @@ class PrimaryOrchestrator:
                         f"https://id.atlassian.com/manage-profile/security/api-tokens and restart the backend. "
                         f"(Original failure: {exc})"
                     )
+                    failure_payload["error_kind"] = error_kind
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.JIRA_FETCH_FAILED,
+                source=EventSource.TOOL_GATEWAY,
+                stage=WorkflowStage.PLANNING,
+                role=RoleName.PLANNER,
+                tool_name="jira.get_issue",
+                message="Jira issue context fetch failed.",
+                payload={
+                    "provider_name": "jira",
+                    "model_name": None,
+                    "request_size_bytes": jira_request_size_bytes,
+                    "duration_ms": int((time.perf_counter() - jira_started) * 1000),
+                    "issue_key": issue_key,
+                    "http_status": getattr(exc, "http_status", None),
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc)[:1000],
+                    "traceback": _truncated_traceback(exc),
+                },
+            )
+            commit_checkpoint(self.db, label="jira_fetch_failed")
             record_event(
                 self.db,
                 task_id=task.id,
@@ -981,12 +1143,7 @@ class PrimaryOrchestrator:
                 role=RoleName.PLANNER,
                 tool_name="jira.get_issue",
                 message="Planner failed to load Jira issue context before plan generation.",
-                payload={
-                    "issue_key": issue_key,
-                    "error": str(exc),
-                    "error_kind": error_kind,
-                    "http_status": getattr(exc, "http_status", None),
-                },
+                payload=failure_payload,
             )
             task.latest_result_json = {
                 "status": TaskStatus.FAILED.value,
@@ -996,6 +1153,9 @@ class PrimaryOrchestrator:
                 "http_status": getattr(exc, "http_status", None),
                 "semantic_translation": task.translation_json,
             }
+            if event_type == EventType.TOOL_TIMED_OUT:
+                task.latest_result_json["reason"] = "external_api_timeout"
+                task.latest_result_json["provider_name"] = "jira"
             set_task_status(
                 self.db,
                 task=task,
@@ -1017,6 +1177,25 @@ class PrimaryOrchestrator:
             )
             return None
 
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.JIRA_FETCH_SUCCEEDED,
+            source=EventSource.TOOL_GATEWAY,
+            stage=WorkflowStage.PLANNING,
+            role=RoleName.PLANNER,
+            tool_name="jira.get_issue",
+            message="Jira issue context fetch completed.",
+            payload={
+                "provider_name": "jira",
+                "model_name": None,
+                "request_size_bytes": jira_request_size_bytes,
+                "duration_ms": int((time.perf_counter() - jira_started) * 1000),
+                "issue_key": issue_key,
+                "http_status": result.get("_status_code") if isinstance(result, dict) else None,
+            },
+        )
+        commit_checkpoint(self.db, label="jira_fetch_succeeded")
         record_event(
             self.db,
             task_id=task.id,
@@ -1042,18 +1221,19 @@ class PrimaryOrchestrator:
         this is a diagnostic call, not a primary code path.
         """
         try:
-            base_url = (self.settings.jira_base_url or "").rstrip("/")
+            settings = self.tool_gateway.settings
+            base_url = (settings.jira_base_url or "").rstrip("/")
             if not base_url:
                 return None
             headers = {"Accept": "application/json"}
             auth: tuple[str, str] | None = None
-            if getattr(self.settings, "jira_bearer_token", None):
-                headers["Authorization"] = f"Bearer {self.settings.jira_bearer_token}"
-            elif self.settings.jira_email and self.settings.jira_api_token:
-                auth = (self.settings.jira_email, self.settings.jira_api_token)
+            if getattr(settings, "jira_bearer_token", None):
+                headers["Authorization"] = f"Bearer {settings.jira_bearer_token}"
+            elif settings.jira_email and settings.jira_api_token:
+                auth = (settings.jira_email, settings.jira_api_token)
             else:
                 return None
-            with httpx.Client(timeout=5.0) as client:
+            with httpx.Client(timeout=external_http_timeout(5.0)) as client:
                 response = client.get(
                     f"{base_url}/rest/api/3/myself",
                     headers=headers,
@@ -1473,6 +1653,19 @@ class PrimaryOrchestrator:
         except Exception as exc:
             self._sync_retry_count(task)
             failed_event_type = EventType.TOOL_TIMED_OUT if isinstance(exc, ToolInvocationError) and exc.timed_out else EventType.TOOL_FAILED
+            failure_payload = {"error": str(exc), "approval_id": approval_id}
+            latest_result = {
+                "status": TaskStatus.FAILED.value,
+                "message": str(exc),
+            }
+            if failed_event_type == EventType.TOOL_TIMED_OUT:
+                failure_payload.update(
+                    {
+                        "reason": "external_api_timeout",
+                        "provider_name": tool_name.split(".", 1)[0],
+                    }
+                )
+                latest_result.update(failure_payload)
             record_event(
                 self.db,
                 task_id=task.id,
@@ -1482,7 +1675,7 @@ class PrimaryOrchestrator:
                 role=execution_role,
                 tool_name=tool_name,
                 message="Tool execution failed.",
-                payload={"error": str(exc), "approval_id": approval_id},
+                payload=failure_payload,
             )
             record_event(
                 self.db,
@@ -1493,12 +1686,9 @@ class PrimaryOrchestrator:
                 role=execution_role,
                 tool_name=tool_name,
                 message="Execution failed during tool execution.",
-                payload={"error": str(exc)},
+                payload=failure_payload,
             )
-            task.latest_result_json = {
-                "status": TaskStatus.FAILED.value,
-                "message": str(exc),
-            }
+            task.latest_result_json = latest_result
             set_task_status(
                 self.db,
                 task=task,
@@ -3668,6 +3858,14 @@ class PrimaryOrchestrator:
                 if isinstance(exc, ToolInvocationError) and exc.timed_out
                 else EventType.TOOL_FAILED
             )
+            failure_payload = {"error": str(exc), "approval_id": approval_id}
+            if failed_event_type == EventType.TOOL_TIMED_OUT:
+                failure_payload.update(
+                    {
+                        "reason": "external_api_timeout",
+                        "provider_name": tool_name.split(".", 1)[0],
+                    }
+                )
             record_event(
                 self.db,
                 task_id=task.id,
@@ -3677,7 +3875,7 @@ class PrimaryOrchestrator:
                 role=role,
                 tool_name=tool_name,
                 message="Development pipeline tool failed.",
-                payload={"error": str(exc), "approval_id": approval_id},
+                payload=failure_payload,
             )
             raise
 

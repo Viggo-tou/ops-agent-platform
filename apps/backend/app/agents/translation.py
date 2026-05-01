@@ -16,6 +16,7 @@ from app.agents.schemas import (
 )
 from app.core.config import Settings, get_settings
 from app.core.jira import JiraIssueReference, extract_jira_issue_reference
+from app.core.timeouts import external_http_timeout
 from app.services.llm_telemetry import LlmCall, record_llm_call
 
 STOPWORDS = {
@@ -437,7 +438,9 @@ class SemanticTranslator:
             "Content-Type": "application/json",
         }
 
-        with httpx.Client(timeout=self.settings.semantic_translator_timeout_seconds) as client:
+        with httpx.Client(
+            timeout=external_http_timeout(self.settings.semantic_translator_timeout_seconds)
+        ) as client:
             response = client.post(
                 f"{self.settings.minimax_base_url.rstrip('/')}/v1/text/chatcompletion_v2",
                 headers=headers,

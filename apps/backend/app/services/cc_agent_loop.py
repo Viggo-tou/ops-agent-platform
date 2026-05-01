@@ -17,6 +17,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.core.timeouts import external_http_timeout
 from app.schemas.evidence import EvidenceItem
 from app.services import cc_agent as cc_tools
 from app.services.cc_agent import CCToolResult
@@ -211,7 +212,7 @@ def _call_decision_provider(provider: str, *, prompt: str, cwd: Path, timeout_s:
                 "temperature": 0.1,
                 "max_tokens": 1000,
             },
-            timeout=timeout_s,
+            timeout=external_http_timeout(timeout_s),
         )
         response.raise_for_status()
         data = response.json()

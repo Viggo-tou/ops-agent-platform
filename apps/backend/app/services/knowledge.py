@@ -319,6 +319,8 @@ class KnowledgeService:
         top_k: int | None = None,
         source_name: str | None = None,
         language: str | None = None,
+        task_id: str | None = None,
+        actor_name: str | None = None,
     ) -> KnowledgeSearchResult:
         self.ensure_repositories_ready()
         source_specs = self._resolve_source_specs()
@@ -345,6 +347,8 @@ class KnowledgeService:
             selected_sources=selected_sources,
             documents=documents,
             language=language,
+            task_id=task_id,
+            actor_name=actor_name,
         )
         if cc_result is not None:
             return cc_result
@@ -484,6 +488,8 @@ class KnowledgeService:
             hallucination_risk=hallucination_risk,
             route_kind=route.kind,
             language=language,
+            task_id=task_id,
+            actor_name=actor_name,
         )
         claims = []
         ungrounded_claim_count = 0
@@ -1252,6 +1258,8 @@ class KnowledgeService:
         selected_sources: list[SourceSpec],
         documents: list[KnowledgeDocument],
         language: str | None,
+        task_id: str | None,
+        actor_name: str | None,
     ) -> KnowledgeSearchResult | None:
         if not bool(getattr(self.settings, "cc_agentic_enabled", True)):
             return None
@@ -1276,6 +1284,8 @@ class KnowledgeService:
                 budget=budget,
                 provider_chain=provider_chain,
                 db=self.db,
+                task_id=task_id,
+                actor_name=actor_name,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("cc_agent crashed, falling back to RAG: %s", exc)
@@ -1314,6 +1324,8 @@ class KnowledgeService:
             top_k=top_k,
             language=language,
             answer_provider_suffix=result.decision_model or "unknown",
+            task_id=task_id,
+            actor_name=actor_name,
         )
 
     def _cc_evidence_to_citations(
@@ -1387,6 +1399,8 @@ class KnowledgeService:
         top_k: int,
         language: str | None,
         answer_provider_suffix: str,
+        task_id: str | None,
+        actor_name: str | None,
     ) -> KnowledgeSearchResult:
         query_tokens = _tokenize(query)
         selected_paths = [citation.relative_path for citation in citations]
@@ -1414,6 +1428,8 @@ class KnowledgeService:
             hallucination_risk=hallucination_risk,
             route_kind=route.kind,
             language=language,
+            task_id=task_id,
+            actor_name=actor_name,
         )
         cards_available_count = sum(1 for citation in citations if citation.card_text)
         claims = []
@@ -1655,6 +1671,8 @@ class KnowledgeService:
         hallucination_risk: str,
         route_kind: str,
         language: str | None,
+        task_id: str | None,
+        actor_name: str | None,
     ) -> tuple[str, str]:
         """Return answer text and provider, falling back to the deterministic template."""
         from app.services.knowledge_synthesis import (
@@ -1663,7 +1681,12 @@ class KnowledgeService:
         )
 
         if citations and self.settings.knowledge_synthesis_enabled:
-            synthesizer = KnowledgeSynthesizer(self.settings, db=self.db)
+            synthesizer = KnowledgeSynthesizer(
+                self.settings,
+                db=self.db,
+                task_id=task_id,
+                actor_name=actor_name,
+            )
             try:
                 answer = synthesizer.synthesize(
                     query=query,
