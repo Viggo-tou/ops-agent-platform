@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import os
 import re
 import shutil
@@ -10,6 +11,7 @@ import time
 from typing import Any
 
 import httpx
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.agents.schemas import (
@@ -32,9 +34,12 @@ from app.core.config import Settings, get_settings
 from app.core.enums import RiskLevel, RoleName, TaskStatus, ToolPermissionCategory
 from app.core.jira import extract_jira_issue_reference
 from app.core.timeouts import external_http_timeout
+from app.models.knowledge_document import KnowledgeDocument
 from app.services.llm_telemetry import LlmCall, record_llm_call
 from app.tools.registry import ToolRegistry
 
+
+logger = logging.getLogger(__name__)
 
 PLAN_STRING_LIST_LIMITS = {
     "assumptions": 8,
@@ -110,6 +115,44 @@ def _extract_plan_locations_from_knowledge(planning_knowledge: dict[str, Any] | 
         if len(locations) >= 6:
             break
     return locations
+
+
+def _validate_must_touch_against_kb(must_touch: list[str], db: Session) -> tuple[list[str], list[str]]:
+    """Return (kept, dropped), dropping paths not present in KnowledgeDocument."""
+    if not must_touch:
+        return [], []
+
+    indexed_paths = set(
+        db.execute(
+            select(KnowledgeDocument.relative_path).where(KnowledgeDocument.relative_path.in_(must_touch))
+        ).scalars()
+    )
+    kept: list[str] = []
+    dropped: list[str] = []
+    for path in must_touch:
+        if path in indexed_paths:
+            kept.append(path)
+        else:
+            dropped.append(path)
+    return kept, dropped
+
+
+def _log_plan_target_warnings(
+    *,
+    scenario: str,
+    must_touch_files: list[str],
+    expected_new_files: list[str],
+) -> None:
+    if scenario in {"jira_issue_develop", "bug_fix"} and not must_touch_files and not expected_new_files:
+        logger.info(
+            "plan target files under-specified: scenario=%s has empty must_touch_files and expected_new_files",
+            scenario,
+        )
+    if scenario == "process_question" and must_touch_files:
+        logger.info(
+            "plan target files over-specified: process_question has must_touch_files=%s",
+            must_touch_files,
+        )
 
 
 def _materialize_plan(
@@ -857,6 +900,7 @@ class PrimaryAgentPlanner:
                 continue  # cascade to next provider
 
         # All providers failed or none configured — use mock fallback
+        default_payload = self._validate_plan_targets(default_payload)
         fallback_plan = _materialize_plan(
             payload=default_payload,
             task_id=task_id,
@@ -960,6 +1004,7 @@ class PrimaryAgentPlanner:
         else:
             raise ValueError(f"Unknown plan provider: {provider_name}")
 
+        plan_payload = self._validate_plan_targets(plan_payload)
         plan = _materialize_plan(
             payload=plan_payload,
             task_id=task_id,
@@ -974,6 +1019,22 @@ class PrimaryAgentPlanner:
             provider_name=provider_name,
             model_name=model_name,
         )
+
+    def _validate_plan_targets(self, plan_payload: GeneratedPlanPayload) -> GeneratedPlanPayload:
+        must_touch = list(plan_payload.must_touch_files or [])
+        if self.db is not None and must_touch:
+            kept, dropped = _validate_must_touch_against_kb(must_touch, self.db)
+            if dropped:
+                logger.warning("must_touch_files entries dropped (not in KB): %s", dropped)
+            if kept != must_touch:
+                plan_payload = plan_payload.model_copy(update={"must_touch_files": kept})
+
+        _log_plan_target_warnings(
+            scenario=plan_payload.scenario,
+            must_touch_files=list(plan_payload.must_touch_files or []),
+            expected_new_files=list(plan_payload.expected_new_files or []),
+        )
+        return plan_payload
 
     def _generate_plan_with_openai(
         self,
@@ -1361,7 +1422,7 @@ class PrimaryAgentPlanner:
             if isinstance(value, list) and value:
                 merged[field_name] = value
 
-        for field_name in ("affected_code_locations", "tools", "steps"):
+        for field_name in ("affected_code_locations", "must_touch_files", "expected_new_files", "tools", "steps"):
             value = raw.get(field_name)
             if isinstance(value, list) and value:
                 merged[field_name] = value
@@ -1427,6 +1488,16 @@ class PrimaryAgentPlanner:
         sanitized["requires_approval"] = bool(sanitized.get("requires_approval"))
 
         for field_name, limit in PLAN_STRING_LIST_LIMITS.items():
+            raw_values = sanitized.get(field_name)
+            if not isinstance(raw_values, list):
+                sanitized[field_name] = []
+                continue
+            sanitized[field_name] = _trim_string_list(
+                [value for value in raw_values if isinstance(value, str)],
+                limit=limit,
+            )
+
+        for field_name, limit in (("must_touch_files", 12), ("expected_new_files", 8)):
             raw_values = sanitized.get(field_name)
             if not isinstance(raw_values, list):
                 sanitized[field_name] = []
@@ -1576,13 +1647,19 @@ class PrimaryAgentPlanner:
             "- If the user request asks to CREATE new files, list the NEW file paths (infer from the request text, e.g. filenames mentioned like 'database.rules.json'). "
             "- If the user request asks to MODIFY existing files, list the target paths (which may or may not overlap with citations). "
             "- If unsure, leave affected_code_locations empty rather than copying citations. "
-            "For must_touch_files, populate it ONLY when ALL of these hold: "
-            "(a) the request uses a destructive/modifying verb (remove, rename, delete, fix, refactor, replace, simplify, clean), "
-            "(b) repository retrieval has located one or more citation files that demonstrably contain the targeted symbol/string/behavior, "
-            "(c) the patch will be invalid if those files are not modified. "
-            "List the relative paths from retrieval citations that hold the existing dirty code that must be edited. "
-            "These files cannot be merely created or referenced \u2014 they must be edited. "
-            "Leave must_touch_files empty for pure scaffold/feature/question tasks. "
+            "For must_touch_files, populate it when the task will edit one or more EXISTING files in the repository to satisfy the request, "
+            "AND repository retrieval has located those files. The trigger is not just destructive verbs \u2014 also \"add to existing\", "
+            "\"integrate into\", \"extend\", \"embed in\", \"wire up\", or any modification of an existing component. "
+            "Populate must_touch_files when ALL of these hold: "
+            "(a) The patch will be invalid if those files are not modified. "
+            "(b) Repository retrieval has located one or more citation files that demonstrably contain the targeted symbol/string/component or the natural extension point for the request. "
+            "(c) The task is jira_issue_develop, bug_fix, refactor, or feature-on-existing-file. "
+            "List the relative paths from retrieval citations that hold the existing code that must be edited or extended. "
+            "Leave must_touch_files empty ONLY for: "
+            "- process_question (knowledge Q&A) "
+            "- pure scaffolding tasks where every change is in new files (use expected_new_files instead) "
+            "- jira_issue_plan (plan-only scenarios) "
+            "- internal_db_query / internal_api_request / slack_message. "
             "For expected_new_files, list any files that MUST BE CREATED to satisfy the task and that do not yet exist in the repository. "
             "Examples: a new Firebase rules file (database.rules.json), a new config file (firebase.json), a new migration, a new schema, a new test fixture. "
             "Infer new file paths from the request text when the task is clearly asking for a new artifact (keywords: create, add new file, write a new, set up, introduce). "
