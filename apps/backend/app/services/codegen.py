@@ -95,6 +95,48 @@ class CodeGenerator:
         self.settings = settings or get_settings()
         self.db = db
 
+    @staticmethod
+    def _extract_plan_target_paths(plan_json: dict[str, Any]) -> tuple[list[str], list[str], set[str]]:
+        def clean(values: Any) -> list[str]:
+            if not isinstance(values, list):
+                return []
+            cleaned: list[str] = []
+            seen: set[str] = set()
+            for value in values:
+                if not isinstance(value, str):
+                    continue
+                path = value.strip()
+                if not path or path in seen:
+                    continue
+                seen.add(path)
+                cleaned.append(path)
+            return cleaned
+
+        must_touch = clean(plan_json.get("must_touch_files"))
+        expected_new = clean(plan_json.get("expected_new_files"))
+        return must_touch, expected_new, set(must_touch) | set(expected_new)
+
+    @staticmethod
+    def _validate_changed_files_within_allowed(
+        files_changed: list[str],
+        *,
+        allowed_paths: set[str],
+        must_touch_files: list[str],
+        expected_new_files: list[str],
+    ) -> None:
+        actual_files = {
+            path.strip()
+            for path in files_changed
+            if isinstance(path, str) and path.strip()
+        }
+        extra = sorted(actual_files - allowed_paths)
+        if extra:
+            raise CodegenError(
+                "file_outside_allowed_set: codegen modified files not in plan: "
+                f"{extra}. Allowed must_touch_files={sorted(must_touch_files)}, "
+                f"expected_new_files={sorted(expected_new_files)}"
+            )
+
     def generate_patch(
         self,
         *,
@@ -107,6 +149,8 @@ class CodeGenerator:
     ) -> CodegenResult:
         """Generate a unified diff from a plan and file context."""
         providers = self._resolve_provider_chain()
+        must_touch_files, expected_new_files, allowed_paths = self._extract_plan_target_paths(plan_json)
+        enforce = bool(allowed_paths)
 
         import logging as _log
         _logger = _log.getLogger("codegen.provider_chain")
@@ -126,6 +170,13 @@ class CodeGenerator:
                     actor_name=actor_name,
                     fallback_step=provider_idx,
                 )
+                if enforce:
+                    self._validate_changed_files_within_allowed(
+                        result.files_changed,
+                        allowed_paths=allowed_paths,
+                        must_touch_files=must_touch_files,
+                        expected_new_files=expected_new_files,
+                    )
                 _logger.info("Provider %s succeeded: %d files changed", provider, len(result.files_changed))
                 attempts.append({"provider": provider, "status": "succeeded"})
                 try:
@@ -1298,6 +1349,20 @@ class CodeGenerator:
             parts.extend(["", "=== CONSTRAINTS (MUST OBEY) ==="])
             for c in constraints:
                 parts.append(f"- {c}")
+
+        must_touch_files, expected_new_files, allowed_paths = self._extract_plan_target_paths(plan_json)
+        if allowed_paths:
+            parts.extend(["", "=== ALLOWED FILES (you may only modify or create these) ==="])
+            for path in must_touch_files:
+                parts.append(f"- {path}")
+            for path in expected_new_files:
+                parts.append(f"- {path} (new)")
+            parts.extend(
+                [
+                    "",
+                    "You MUST NOT modify any other files. If the request seems to require modifying other files, return an error indicating which file you would need.",
+                ]
+            )
 
         # Compact plan: only include steps, not full JSON
         steps = plan_json.get("steps", [])
