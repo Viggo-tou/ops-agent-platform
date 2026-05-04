@@ -99,6 +99,8 @@ class EventType(str, Enum):
     TOOL_SUCCEEDED = "tool_succeeded"
     TOOL_FAILED = "tool_failed"
     TOOL_SKIPPED = "tool_skipped"
+    VERIFICATION_SKIPPED = "verification_skipped"
+    COMPILE_FAILED = "compile_failed"
     POLICY_EVALUATION_STARTED = "policy_evaluation_started"
     POLICY_EVALUATION_COMPLETED = "policy_evaluation_completed"
     POLICY_DENIED = "policy_denied"

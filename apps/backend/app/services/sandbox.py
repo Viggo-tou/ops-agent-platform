@@ -186,10 +186,14 @@ class ExecutionSandbox:
         cwd: str | None = None,
         timeout_seconds: float = 60,
         max_output_bytes: int = 64 * 1024,
+        env: dict[str, str] | None = None,
     ) -> dict[str, object]:
         """Run a shell command inside the sandbox. Returns structured result."""
         work_dir = self._resolve_work_dir(cwd)
         max_output_chars = max(0, int(max_output_bytes))
+        run_env = None
+        if env:
+            run_env = {**os.environ, **env}
 
         start = time.monotonic()
         try:
@@ -200,6 +204,7 @@ class ExecutionSandbox:
                 text=True,
                 timeout=timeout_seconds,
                 cwd=str(work_dir),
+                env=run_env,
             )
             duration_ms = int((time.monotonic() - start) * 1000)
             return {
