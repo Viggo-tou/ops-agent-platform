@@ -3860,6 +3860,81 @@ class PrimaryOrchestrator:
                 sandbox_snapshot_id=self._build_develop_sandbox(task).snapshot_id(),
             )
 
+        # --- Stage X.8.b feature-presence pre-gate ---
+        # Catches the P69-17 failure mode: compile_repair reverted the
+        # feature, baseline file ships, all LLM gates pass on diff text
+        # but FILE has no implementation. Static check: each must_touch
+        # file must contain at least one required token derived from
+        # plan.objective + translation.search_queries + spec text.
+        if not pipeline_state.get("feature_presence_done"):
+            try:
+                from app.services.feature_presence_check import (
+                    derive_required_tokens,
+                    evaluate_feature_presence,
+                )
+                translation = task.translation_json if isinstance(task.translation_json, dict) else {}
+                required_tokens = derive_required_tokens(
+                    objective=str(getattr(plan, "objective", "") or ""),
+                    search_queries=translation.get("search_queries") or [],
+                    must_touch_files=list(getattr(plan, "must_touch_files", []) or []),
+                    spec_text=str(translation.get("normalized_request") or ""),
+                )
+                must_touch = list(getattr(plan, "must_touch_files", []) or [])
+                file_contents: dict[str, str] = {}
+                fp_sandbox_dir = self._develop_sandbox_dir(task)
+                if fp_sandbox_dir.exists():
+                    for rel in must_touch:
+                        try:
+                            full = fp_sandbox_dir / rel
+                            if full.is_file():
+                                file_contents[rel] = full.read_text(encoding="utf-8", errors="replace")
+                        except Exception:
+                            pass
+                # Defensive: skip when no file contents read (e.g. test
+                # fixtures without populated sandbox, or read errors).
+                if not file_contents:
+                    pipeline_state["feature_presence_done"] = True
+                    pipeline_state["feature_presence_skipped"] = "no_file_contents"
+                    self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+                else:
+                    presence = evaluate_feature_presence(
+                        must_touch_files=must_touch,
+                        file_contents=file_contents,
+                        required_tokens=required_tokens,
+                    )
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=(
+                            EventType.TOOL_FAILED if presence.feature_absent else EventType.TOOL_SUCCEEDED
+                        ),
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="feature_presence_check.evaluate",
+                        message=f"feature presence: {presence.reason[:200]}",
+                        payload=presence.to_payload(),
+                    )
+                    if presence.feature_absent:
+                        self._fail_develop_pipeline(
+                            task=task,
+                            event_type=EventType.REVIEW_FAILED,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            message=f"Feature presence pre-gate rejected: {presence.reason}",
+                            payload={"plan_id": plan.plan_id, "feature_presence": presence.to_payload()},
+                        )
+                        return
+                    pipeline_state["feature_presence_done"] = True
+                    pipeline_state["feature_presence"] = presence.to_payload()
+                    self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+            except Exception as exc:
+                self._workspace_append_audit(
+                    task,
+                    "feature_presence_check.errored",
+                    {"error": str(exc)[:400]},
+                )
+
         # --- Runtime validation gate (with 1 repair cycle) ---
         if not pipeline_state.get("runtime_validation_done"):
             from app.services.runtime_validation import validate_diff_semantics, build_repair_prompt
