@@ -1792,14 +1792,14 @@ class ActionAgent:
             comment_text = ""
             comment_markers = [
                 "comment:",
-                "评论:",
-                "评论：",
-                "备注:",
-                "备注：",
+                "Comment:",
+                "Comment: ",
+                "Remark:",
+                "Remark: ",
                 "note:",
                 "comment ",
-                "评论 ",
-                "备注 ",
+                "Comment ",
+                "Remark ",
                 "note ",
             ]
             for marker in comment_markers:

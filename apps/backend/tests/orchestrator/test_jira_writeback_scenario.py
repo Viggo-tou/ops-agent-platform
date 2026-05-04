@@ -45,7 +45,7 @@ class JiraWritebackScenarioTests(unittest.TestCase):
         self.assertEqual(classify_request("把 OPS-123 标记为 in progress"), "jira_issue_writeback")
 
     def test_classify_request_writeback_with_comment(self) -> None:
-        self.assertEqual(classify_request("在 OPS-123 上加评论"), "jira_issue_writeback")
+        self.assertEqual(classify_request("add comment on OPS-123"), "jira_issue_writeback")
 
     def test_classify_request_plan_not_writeback(self) -> None:
         self.assertEqual(classify_request("plan the implementation for OPS-123"), "jira_issue_plan")

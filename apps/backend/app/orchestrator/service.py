@@ -214,17 +214,17 @@ def classify_request(request_text: str) -> str:
             "transition",
             "move to",
             "status",
-            "标记为",
-            "推进",
-            "移到",
+            "Marked as",
+            "Advance",
+            "Move to",
             "in progress",
             "done",
             "complete",
             "close",
             "reopen",
             "comment",
-            "评论",
-            "备注",
+            "Comment",
+            "Remark",
             "note",
         )
     ):
@@ -2543,7 +2543,7 @@ class PrimaryOrchestrator:
             new_stage=WorkflowStage.ACTION,
             role=RoleName.ACTION,
             source=EventSource.ORCHESTRATOR,
-            message="Jira 开发流水线已启动。" if user_lang == "zh" else "Task entered Jira issue development pipeline.",
+            message="Jira Development pipeline started." if user_lang == "zh" else "Task entered Jira issue development pipeline.",
             payload={"approval_id": approval_id},
         )
         record_event(
@@ -2759,8 +2759,8 @@ class PrimaryOrchestrator:
                         role=RoleName.ACTION,
                         tool_name="codegen.deterministic_rename",
                         message=(
-                            f"确定性重命名完成: {rename_pair[0]} → {rename_pair[1]}, "
-                            f"修改了 {len(codegen_result.get('files_changed', []))} 个文件"
+                            f"Deterministic rename completed: {rename_pair[0]} → {rename_pair[1]}, "
+                            f"Modified {len(codegen_result.get('files_changed', []))}  file(s)"
                         ),
                         payload=codegen_result.get("files_changed", []),
                     )
@@ -2776,8 +2776,8 @@ class PrimaryOrchestrator:
                         role=RoleName.ACTION,
                         tool_name="codegen.deterministic_rename",
                         message=(
-                            f"确定性重命名跳过: '{rename_pair[0]}' 在 {len(context_files)} 个上下文文件中未找到, "
-                            f"回退到 LLM codegen"
+                            f"Deterministic rename skipped: '{rename_pair[0]}' 在 {len(context_files)}  not found in context files, "
+                            f"Falling back to LLM codegen"
                         ),
                         payload={
                             "old_name": rename_pair[0],
@@ -4533,7 +4533,7 @@ class PrimaryOrchestrator:
                         issue_key = str(result["issue_key"])
                         break
 
-        parts.append(f"## {issue_key} {'开发完成' if zh else 'Development Complete'}\n")
+        parts.append(f"## {issue_key} {'Development completed' if zh else 'Development Complete'}\n")
 
         # --- Change summary section ---
         raw_file_summaries = pipeline_state.get("file_summaries")
@@ -4545,10 +4545,10 @@ class PrimaryOrchestrator:
 
         files = pipeline_state.get("files_changed")
         if isinstance(files, list) and files:
-            parts.append(f"### {'改动总结' if zh else 'Change Summary'}\n")
+            parts.append(f"### {'Change summary' if zh else 'Change Summary'}\n")
             parts.append(
-                f"{'本次修改了' if zh else 'Modified'} **{len(files)}** "
-                f"{'个文件' if zh else 'file(s)'}{'：' if zh else ':'}"
+                f"{'Modified in this run:' if zh else 'Modified'} **{len(files)}** "
+                f"{' file(s)' if zh else 'file(s)'}{'：' if zh else ':'}"
             )
             if file_summaries:
                 parts.extend(file_summaries)
@@ -4559,42 +4559,42 @@ class PrimaryOrchestrator:
 
         diff = str(pipeline_state.get("diff") or "")
         if diff:
-            parts.append(f"### {'代码变更' if zh else 'Code Changes'}\n")
+            parts.append(f"### {'Code changes' if zh else 'Code Changes'}\n")
             parts.append(f"```diff\n{diff}\n```")
             parts.append("")
 
-        parts.append(f"### {'流水线执行' if zh else 'Pipeline'}\n")
-        parts.append(f"- {'代码生成：' if zh else 'Code generation: '}{pipeline_state.get('codegen_provider', 'unknown')}")
+        parts.append(f"### {'Pipeline execution' if zh else 'Pipeline'}\n")
+        parts.append(f"- {'Codegen: ' if zh else 'Code generation: '}{pipeline_state.get('codegen_provider', 'unknown')}")
         method = str(pipeline_state.get("patch_method") or "")
         if method:
-            parts.append(f"- {'补丁应用方式：' if zh else 'Patch applied via: '}{method}")
+            parts.append(f"- {'Patch apply method: ' if zh else 'Patch applied via: '}{method}")
         if pipeline_state.get("test_skipped"):
-            parts.append(f"- {'测试：已跳过（无测试配置）' if zh else 'Tests: skipped (no test config)'}")
+            parts.append(f"- {'Tests: skipped (no test config)' if zh else 'Tests: skipped (no test config)'}")
         else:
-            parts.append(f"- {'测试：通过' if zh else 'Tests: passed'}")
-        parts.append(f"- {'审查：' if zh else 'Review: '}{pipeline_state.get('review_verdict', 'N/A')}")
+            parts.append(f"- {'Tests: passed' if zh else 'Tests: passed'}")
+        parts.append(f"- {'Review: ' if zh else 'Review: '}{pipeline_state.get('review_verdict', 'N/A')}")
 
         jira_writeback = pipeline_state.get("jira_writeback")
         if isinstance(jira_writeback, dict) and jira_writeback.get("transition"):
-            parts.append(f"- {'Jira：已转换状态' if zh else 'Jira: transitioned'}")
+            parts.append(f"- {'Jira: status transitioned' if zh else 'Jira: transitioned'}")
         elif isinstance(jira_writeback, dict) and jira_writeback.get("comment"):
-            parts.append(f"- {'Jira：已添加评论' if zh else 'Jira: commented'}")
+            parts.append(f"- {'Jira: comment added' if zh else 'Jira: commented'}")
         else:
-            parts.append(f"- {'Jira：未找到 issue key，跳过回写' if zh else 'Jira: no issue key found, writeback skipped'}")
+            parts.append(f"- {'Jira: no issue key found, skipping writeback' if zh else 'Jira: no issue key found, writeback skipped'}")
 
         completeness = pipeline_state.get("completeness_check")
         if isinstance(completeness, dict):
             if completeness.get("complete"):
-                parts.append(f"\n### {'完整度检查' if zh else 'Completeness Check'}\n")
-                parts.append(f"{'所有目标关键词已清除。' if zh else 'All target keywords removed.'}")
+                parts.append(f"\n### {'Completeness Check' if zh else 'Completeness Check'}\n")
+                parts.append(f"{'All target keywords cleared。' if zh else 'All target keywords removed.'}")
             else:
                 remaining = completeness.get("remaining_files", 0)
                 hits = completeness.get("remaining_hits", 0)
-                parts.append(f"\n### {'完整度检查' if zh else 'Completeness Check'}\n")
+                parts.append(f"\n### {'Completeness Check' if zh else 'Completeness Check'}\n")
                 parts.append(
-                    f"{'仍有' if zh else 'Still '}"
-                    f"**{remaining}** {'个文件包含目标关键词' if zh else ' file(s) contain target keywords'}"
-                    f"{'（共' if zh else ' ('}{hits} {'处）' if zh else ' hits)'}："
+                    f"{'Still has' if zh else 'Still '}"
+                    f"**{remaining}** {' file(s) contain target keyword(s)' if zh else ' file(s) contain target keywords'}"
+                    f"{' (total ' if zh else ' ('}{hits} {' place(s))' if zh else ' hits)'}："
                 )
                 details = completeness.get("details", {})
                 for path, count in details.items():
