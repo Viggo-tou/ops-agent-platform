@@ -76,6 +76,10 @@ class Settings(BaseSettings):
     codegen_repair_files_per_round: int = 5
     codegen_repair_round_timeout_seconds: float = 180.0
     codegen_repair_cap_exceeded_to_approval: bool = True
+    verification_compile_fail_to_approval: bool = False  # Stage 25 contract: cap-exceeded -> fail
+    verification_profile_enabled: bool = True
+    verification_compile_timeout_seconds: int = 240
+    verification_max_repair_rounds: int = 3
     failure_diagnosis_enabled: bool = True
     failure_diagnosis_timeout_seconds: float = 30.0
     failure_diagnosis_max_events: int = 30
@@ -153,7 +157,11 @@ class Settings(BaseSettings):
     tool_permission_overrides: str | None = None
     tool_default_timeout_seconds: float = 15.0
     tool_default_retry_count: int = 1
+    # Default points to a relative path next to backend; can be overridden
+    # via env to escape non-ASCII parent paths (Windows Android Gradle plugin
+    # rejects non-ASCII paths).
     sandbox_base_dir: str = "data/sandboxes"
+    sandbox_external_root: str | None = None
     sandbox_clone_timeout_seconds: float = 120.0
     # Sandbox retention: at startup, delete sandbox dirs whose owning task
     # is in a terminal status AND completed earlier than this many hours

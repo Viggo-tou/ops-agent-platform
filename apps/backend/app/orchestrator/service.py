@@ -2807,24 +2807,32 @@ class PrimaryOrchestrator:
             except Exception as exc:
                 error_message = str(exc)
                 if self._is_missing_test_pipeline_config_error(error_message):
-                    test_result = {
-                        "status": "skipped",
-                        "overall_passed": True,
-                        "skipped_count": 1,
-                        "reason": error_message,
-                    }
-                    pipeline_state["test_skipped"] = True
-                    record_event(
-                        self.db,
-                        task_id=task.id,
-                        event_type=EventType.TOOL_SKIPPED,
-                        source=EventSource.ORCHESTRATOR,
-                        stage=WorkflowStage.ACTION,
-                        role=RoleName.ACTION,
-                        tool_name="test_pipeline.run",
-                        message=f"Test pipeline skipped: {error_message}",
-                        payload={"error": error_message, "plan_id": plan.plan_id},
-                    )
+                    if bool(getattr(self.tool_gateway.settings, "verification_profile_enabled", True)):
+                        test_result = self._prepare_compile_only_verification(
+                            task=task,
+                            plan=plan,
+                            pipeline_state=pipeline_state,
+                            error_message=error_message,
+                        )
+                    else:
+                        test_result = {
+                            "status": "skipped",
+                            "overall_passed": True,
+                            "skipped_count": 1,
+                            "reason": error_message,
+                        }
+                        pipeline_state["test_skipped"] = True
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_SKIPPED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.ACTION,
+                            role=RoleName.ACTION,
+                            tool_name="test_pipeline.run",
+                            message=f"Test pipeline skipped: {error_message}",
+                            payload={"error": error_message, "plan_id": plan.plan_id},
+                        )
                 else:
                     self._fail_develop_pipeline(
                         task=task,
@@ -4325,21 +4333,68 @@ class PrimaryOrchestrator:
           - ``"errored"``          — gate itself errored or skipped; pipeline continues.
         """
         from app.services.compile_gate import run_compile_gate
+        from app.services.verification_profile import resolve_verification_profile, run_compile_check
 
         sandbox_dir = self._develop_sandbox_dir(task)
         changed = list(pipeline_state.get("files_changed") or [])
 
         settings_obj = self.tool_gateway.settings
-        max_rounds = max(0, int(getattr(settings_obj, "codegen_max_repair_rounds", 3)))
+        profile_compile_enabled = (
+            bool(pipeline_state.get("verification_compile_pending"))
+            and bool(getattr(settings_obj, "verification_profile_enabled", True))
+        )
+        allowed_paths = self._verification_allowed_paths(plan)
+        profile = None
+        if profile_compile_enabled:
+            if not allowed_paths:
+                self._verification_skipped_result(
+                    task=task,
+                    pipeline_state=pipeline_state,
+                    reason="empty_allowed_paths",
+                    message="Verification skipped: plan has no allowed files to validate.",
+                    payload={"plan_id": plan.plan_id},
+                )
+                pipeline_state["compile_gate_done"] = True
+                self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+                return "errored"
+            profile = resolve_verification_profile(sandbox_dir, has_tests_yaml=False)
+            pipeline_state["verification_profile"] = profile.to_dict()
+            pipeline_state["verification_allowed_paths"] = sorted(allowed_paths)
+            if profile.repo_type == "unknown" or not profile.compile_command:
+                self._verification_skipped_result(
+                    task=task,
+                    pipeline_state=pipeline_state,
+                    reason="unknown_repo_type",
+                    message="Verification skipped: repository type could not be detected.",
+                    payload={"plan_id": plan.plan_id, "profile": profile.to_dict()},
+                )
+                pipeline_state["compile_gate_done"] = True
+                self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+                return "errored"
+
+        default_max_rounds = int(getattr(settings_obj, "codegen_max_repair_rounds", 3))
+        if profile_compile_enabled:
+            default_max_rounds = int(
+                getattr(settings_obj, "verification_max_repair_rounds", default_max_rounds)
+            )
+        max_rounds = max(0, default_max_rounds)
         files_per_round = max(
             1, int(getattr(settings_obj, "codegen_repair_files_per_round", 5))
         )
         round_timeout = float(
             getattr(settings_obj, "codegen_repair_round_timeout_seconds", 180.0)
         )
-        fail_to_approval = bool(
-            getattr(settings_obj, "codegen_repair_cap_exceeded_to_approval", True)
-        )
+        # Stage 25 contract: when verification_profile is the active compile mode,
+        # cap-exceeded means task FAILED (no silent awaiting_approval). Legacy
+        # codegen-repair path retains the old "send to approval" semantics.
+        if profile_compile_enabled:
+            fail_to_approval = bool(
+                getattr(settings_obj, "verification_compile_fail_to_approval", False)
+            )
+        else:
+            fail_to_approval = bool(
+                getattr(settings_obj, "codegen_repair_cap_exceeded_to_approval", True)
+            )
 
         rounds_summary: list[dict] = []
         compile_passed = False
@@ -4356,10 +4411,45 @@ class PrimaryOrchestrator:
             if compile_passed:
                 break
             try:
-                compile_result = run_compile_gate(
-                    sandbox_dir=sandbox_dir,
-                    changed_files=changed,
-                )
+                if profile_compile_enabled and profile is not None:
+                    timeout_seconds = int(
+                        getattr(
+                            settings_obj,
+                            "verification_compile_timeout_seconds",
+                            profile.timeout_seconds,
+                        )
+                    )
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_CALL_REQUESTED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="verification.compile",
+                        message=(
+                            f"Running compile-only verification for {profile.repo_type} "
+                            f"(round {round_index + 1})."
+                        ),
+                        payload={
+                            "repo_type": profile.repo_type,
+                            "command": profile.compile_command,
+                            "timeout_seconds": timeout_seconds,
+                        },
+                    )
+                    compile_result = run_compile_check(
+                        sandbox=self._build_develop_sandbox(task),
+                        profile=profile,
+                        timeout_seconds=timeout_seconds,
+                        max_output_bytes=int(
+                            getattr(settings_obj, "sandbox_max_output_bytes", 65536)
+                        ),
+                    )
+                else:
+                    compile_result = run_compile_gate(
+                        sandbox_dir=sandbox_dir,
+                        changed_files=changed,
+                    )
             except Exception as exc:
                 compile_result = None
                 compile_errored = True
@@ -4379,10 +4469,46 @@ class PrimaryOrchestrator:
             if compile_result is None:
                 break
 
+            compile_errors = list(getattr(compile_result, "errors", []) or [])
+            if profile_compile_enabled and allowed_paths:
+                repairable_errors = [
+                    error for error in compile_errors
+                    if self._compile_error_in_allowed_paths(error, allowed_paths)
+                ]
+                if compile_errors and not repairable_errors:
+                    self._verification_skipped_result(
+                        task=task,
+                        pipeline_state=pipeline_state,
+                        reason="compile_errors_outside_allowed_paths",
+                        message=(
+                            "Verification skipped: compiler errors were outside "
+                            "the plan's allowed file set."
+                        ),
+                        payload={
+                            "plan_id": plan.plan_id,
+                            "allowed_paths": sorted(allowed_paths),
+                            "errors": compile_errors,
+                        },
+                    )
+                    pipeline_state["compile_gate_done"] = True
+                    self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+                    return "errored"
+                compile_errors = repairable_errors
+
             pipeline_state["compile_gate"] = {
                 "passed": compile_result.passed,
-                "errors": compile_result.errors,
+                "errors": compile_errors,
             }
+            if profile_compile_enabled and profile is not None:
+                pipeline_state["compile_gate"].update(
+                    {
+                        "verified_by": "compile",
+                        "repo_type": profile.repo_type,
+                        "command": profile.compile_command,
+                        "timed_out": bool(getattr(compile_result, "timed_out", False)),
+                        "duration_ms": int(getattr(compile_result, "duration_ms", 0)),
+                    }
+                )
             self._workspace_write_attempt_compile(
                 task,
                 pipeline_state,
@@ -4390,6 +4516,8 @@ class PrimaryOrchestrator:
             )
 
             if compile_result.passed:
+                if profile_compile_enabled:
+                    pipeline_state.pop("verification_compile_pending", None)
                 record_event(
                     self.db,
                     task_id=task.id,
@@ -4404,6 +4532,14 @@ class PrimaryOrchestrator:
                 compile_passed = True
                 break
 
+            self._record_compile_failed_event(
+                task=task,
+                compile_errors=compile_errors,
+                compile_result=compile_result,
+                profile_repo_type=profile.repo_type if profile_compile_enabled and profile is not None else None,
+                allowed_paths=allowed_paths if profile_compile_enabled else None,
+            )
+
             if round_index == max_rounds:
                 rounds_summary.append(
                     {
@@ -4413,7 +4549,7 @@ class PrimaryOrchestrator:
                         "duration_seconds": 0.0,
                         "compile_gate_after": {
                             "passed": False,
-                            "error_count": len(compile_result.errors),
+                            "error_count": len(compile_errors),
                         },
                         "note": "no repair budget remaining",
                     }
@@ -4423,14 +4559,14 @@ class PrimaryOrchestrator:
                     "compile_repair.cap_reached",
                     {
                         "rounds_attempted": max_rounds,
-                        "residual_error_count": len(compile_result.errors),
+                        "residual_error_count": len(compile_errors),
                     },
                 )
                 break
 
             files_queued = [
                 str(e.get("file") or "")
-                for e in compile_result.errors[:files_per_round]
+                for e in compile_errors[:files_per_round]
                 if e.get("file")
             ]
             round_label = round_index + 1
@@ -4465,12 +4601,13 @@ class PrimaryOrchestrator:
                 repaired, files_touched = self._attempt_compile_repair(
                     task=task,
                     actor_name=actor_name,
-                    compile_errors=compile_result.errors,
+                    compile_errors=compile_errors,
                     sandbox_dir=sandbox_dir,
                     pipeline_state=pipeline_state,
                     approval_id=approval_id,
                     timeout_seconds=round_timeout,
                     files_per_round=files_per_round,
+                    allowed_paths=allowed_paths if profile_compile_enabled else None,
                 )
             except RepairRoundTimeout as timeout_exc:
                 timed_out = True
@@ -4543,6 +4680,13 @@ class PrimaryOrchestrator:
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
             return "errored"
 
+        residual_errors = []
+        compile_gate_payload = pipeline_state.get("compile_gate")
+        if isinstance(compile_gate_payload, dict):
+            raw_errors = compile_gate_payload.get("errors")
+            if isinstance(raw_errors, list):
+                residual_errors = raw_errors
+
         pipeline_state["compile_repair_rounds"] = rounds_summary
         pipeline_state["compile_repair_cap_exceeded"] = True
         self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
@@ -4561,7 +4705,7 @@ class PrimaryOrchestrator:
             payload={
                 "rounds_attempted": max_rounds,
                 "rounds_summary": rounds_summary,
-                "residual_compile_errors": compile_result.errors,
+                "residual_compile_errors": residual_errors,
             },
         )
         if fail_to_approval:
@@ -4570,7 +4714,7 @@ class PrimaryOrchestrator:
                 plan=plan,
                 pipeline_state=pipeline_state,
                 rounds_summary=rounds_summary,
-                residual_errors=compile_result.errors,
+                residual_errors=residual_errors,
                 sandbox_dir=sandbox_dir,
             )
             return "approval_requested"
@@ -4580,13 +4724,62 @@ class PrimaryOrchestrator:
             event_type=EventType.REVIEW_FAILED,
             stage=WorkflowStage.REVIEW,
             role=RoleName.REVIEWER,
-            message=f"Compile gate: {compile_result.summary()}",
+            message=(
+                f"compile_gate_exhausted: {compile_result.summary()}"
+            ),
             payload={
+                "reason": "compile_gate_exhausted",
                 "compile_gate": pipeline_state.get("compile_gate"),
                 "rounds_summary": rounds_summary,
+                "rounds_attempted": max_rounds,
             },
         )
         return "failed"
+
+    @staticmethod
+    def _compile_error_in_allowed_paths(error: dict, allowed_paths: set[str]) -> bool:
+        file_path = str(error.get("file") or "").strip().replace("\\", "/")
+        if not file_path:
+            return True
+        return file_path in allowed_paths
+
+    def _record_compile_failed_event(
+        self,
+        *,
+        task: Task,
+        compile_errors: list[dict],
+        compile_result: object,
+        profile_repo_type: str | None,
+        allowed_paths: set[str] | None,
+    ) -> None:
+        failed_files = sorted(
+            {str(error.get("file") or "") for error in compile_errors if error.get("file")}
+        )
+        output = str(getattr(compile_result, "output", "") or "")
+        excerpt = " ".join(output.strip().split())[:2000]
+        if not excerpt and compile_errors:
+            excerpt = "; ".join(str(error.get("error") or "") for error in compile_errors[:5])[:2000]
+        payload: dict[str, object] = {
+            "failed_files": failed_files,
+            "errors": compile_errors,
+            "error_excerpt": excerpt,
+        }
+        if profile_repo_type:
+            payload["repo_type"] = profile_repo_type
+            payload["verified_by"] = "compile"
+        if allowed_paths is not None:
+            payload["allowed_paths"] = sorted(allowed_paths)
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.COMPILE_FAILED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            tool_name="compile_failed",
+            message="Compile verification failed; attempting repair within allowed files.",
+            payload=payload,
+        )
 
     def _attempt_compile_repair(
         self,
@@ -4599,6 +4792,7 @@ class PrimaryOrchestrator:
         approval_id: str | None,
         timeout_seconds: float | None = None,
         files_per_round: int | None = None,
+        allowed_paths: set[str] | None = None,
     ) -> tuple[bool, list[str]]:
         """Attempt a narrow syntax-only repair after compile gate failure.
 
@@ -4633,9 +4827,11 @@ class PrimaryOrchestrator:
                     f"Repair round exceeded {timeout_seconds:.1f}s deadline "
                     f"after touching {len(all_repair_touched)} file(s)."
                 )
-            rel_path = err.get("file", "")
+            rel_path = str(err.get("file") or "").strip().replace("\\", "/")
             error_msg = err.get("error", "syntax error")
             if not rel_path:
+                continue
+            if allowed_paths is not None and rel_path not in allowed_paths:
                 continue
 
             full = sandbox_dir / rel_path.replace("/", "\\") if "\\" in str(sandbox_dir) else sandbox_dir / rel_path
@@ -4660,10 +4856,20 @@ class PrimaryOrchestrator:
                         f"=== ORIGINAL {rel_path} ===\n{orig[:4000]}\n=== END ORIGINAL ===\n\n"
                     )
 
+            scope_section = ""
+            if allowed_paths:
+                scope_section = (
+                    "Modify only files in must_touch_files/expected_new_files: "
+                    + ", ".join(sorted(allowed_paths))
+                    + "\n"
+                )
+
             repair_prompt = (
                 f"STRUCTURAL REPAIR TASK — fix ONE broken file: {rel_path}\n\n"
-                f"This file has a syntax error caused by a malformed patch. "
-                "Common problems include:\n"
+                "These compile errors must be fixed without changing task scope.\n"
+                + scope_section
+                + "Common problems include:\n"
+                "- Missing imports or unresolved symbols introduced by the patch\n"
                 "- Duplicated code blocks (same function/import appears twice)\n"
                 "- Code from inside a function appearing AFTER the module's "
                 "default export or closing brace\n"
@@ -4678,7 +4884,7 @@ class PrimaryOrchestrator:
                 "hardcoded values) but fix the broken structure\n"
                 "- Do NOT add new features or change business logic beyond what "
                 "the original patch intended\n\n"
-                f"ERROR:\n  {rel_path}: {error_msg[:300]}\n\n"
+                f"ERROR:\n  {rel_path}: {str(error_msg)[:1000]}\n\n"
                 + orig_section
                 + f"Output ONLY valid unified diff hunks that fix {rel_path}.\n"
                 f"Start with 'diff --git a/{rel_path} b/{rel_path}'.\n"
@@ -5302,6 +5508,138 @@ class PrimaryOrchestrator:
     def _is_missing_test_pipeline_config_error(error_message: str) -> bool:
         normalized = error_message.casefold()
         return "config not found" in normalized or ("not found" in normalized and "config" in normalized)
+
+    @staticmethod
+    def _verification_allowed_paths(plan: GeneratedPlan) -> set[str]:
+        paths: set[str] = set()
+        for value in list(getattr(plan, "must_touch_files", []) or []) + list(
+            getattr(plan, "expected_new_files", []) or []
+        ):
+            if not isinstance(value, str):
+                continue
+            normalized = value.strip().replace("\\", "/")
+            if normalized:
+                paths.add(normalized)
+        return paths
+
+    def _prepare_compile_only_verification(
+        self,
+        *,
+        task: Task,
+        plan: GeneratedPlan,
+        pipeline_state: dict[str, object],
+        error_message: str,
+    ) -> dict[str, object]:
+        """Degrade missing tests.yaml to profile compile verification."""
+        from app.services.verification_profile import resolve_verification_profile
+
+        sandbox_dir = self._develop_sandbox_dir(task)
+        allowed_paths = self._verification_allowed_paths(plan)
+        if not allowed_paths:
+            pipeline_state["compile_gate_done"] = True
+            pipeline_state["test_skipped"] = True
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_SKIPPED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.ACTION,
+                role=RoleName.ACTION,
+                tool_name="test_pipeline.run",
+                message=f"Test pipeline skipped: {error_message}",
+                payload={"error": error_message, "plan_id": plan.plan_id},
+            )
+            return {
+                "status": "skipped",
+                "overall_passed": True,
+                "skipped_count": 1,
+                "reason": error_message,
+            }
+
+        profile = resolve_verification_profile(sandbox_dir, has_tests_yaml=False)
+        profile_payload = profile.to_dict()
+        pipeline_state["verification_profile"] = profile_payload
+        pipeline_state["verification_allowed_paths"] = sorted(allowed_paths)
+
+        if profile.repo_type == "unknown" or not profile.compile_command:
+            return self._verification_skipped_result(
+                task=task,
+                pipeline_state=pipeline_state,
+                reason="unknown_repo_type",
+                message="Verification skipped: repository type could not be detected.",
+                payload={
+                    "error": error_message,
+                    "plan_id": plan.plan_id,
+                    "profile": profile_payload,
+                },
+            )
+
+        pipeline_state["verification_compile_pending"] = True
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.TOOL_SUCCEEDED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.ACTION,
+            role=RoleName.ACTION,
+            tool_name="verification_profile.resolve",
+            message=(
+                f"Test pipeline config missing; degrading to compile-only "
+                f"verification for {profile.repo_type}."
+            ),
+            payload={
+                "error": error_message,
+                "plan_id": plan.plan_id,
+                "profile": profile_payload,
+                "allowed_paths": sorted(allowed_paths),
+            },
+        )
+        return {
+            "status": "compile_pending",
+            "overall_passed": True,
+            "total_steps": 0,
+            "passed_count": 0,
+            "failed_count": 0,
+            "skipped_count": 0,
+            "verified_by": "compile",
+            "repo_type": profile.repo_type,
+            "reason": "tests.yaml missing; compile-only verification will run before review",
+        }
+
+    def _verification_skipped_result(
+        self,
+        *,
+        task: Task,
+        pipeline_state: dict[str, object],
+        reason: str,
+        message: str,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        pipeline_state["verification_skipped"] = True
+        pipeline_state["verification_skip_reason"] = reason
+        pipeline_state["compile_gate_done"] = True
+        pipeline_state.pop("verification_compile_pending", None)
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.VERIFICATION_SKIPPED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.ACTION,
+            role=RoleName.ACTION,
+            tool_name="verification_skipped",
+            message=message,
+            payload={**payload, "reason": reason},
+        )
+        return {
+            "status": "skipped",
+            "overall_passed": True,
+            "total_steps": 0,
+            "passed_count": 0,
+            "failed_count": 0,
+            "skipped_count": 1,
+            "verified_by": None,
+            "reason": reason,
+        }
 
     @staticmethod
     def _evidence_chain_attestation(pipeline_state: dict[str, object]) -> dict[str, object] | None:

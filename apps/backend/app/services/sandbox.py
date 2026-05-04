@@ -7,6 +7,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from app.core.config import get_settings
 from app.services.diff_repair import repair_diff
 
 
@@ -27,15 +28,55 @@ def _sanitize_diff(raw_diff: str) -> str:
     return result
 
 
+def _is_ascii_path(path: Path) -> bool:
+    """Return True if every component of path is pure ASCII (Android plugin compat)."""
+    try:
+        str(path).encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
 class ExecutionSandbox:
     """Manages an isolated working directory for a single task."""
 
-    def __init__(self, task_id: str, *, base_dir: str = "data/sandboxes"):
+    def __init__(
+        self,
+        task_id: str,
+        *,
+        base_dir: str = "data/sandboxes",
+        sandbox_external_root: str | None = None,
+    ):
         if not task_id.strip():
             raise SandboxError("task_id is required for sandbox execution.")
 
         self.task_id = task_id
-        self.base_dir = Path(base_dir)
+        configured_external_root = sandbox_external_root
+        if configured_external_root is None:
+            configured_external_root = get_settings().sandbox_external_root
+
+        if configured_external_root:
+            external_root = Path(configured_external_root)
+            if not external_root.is_absolute():
+                raise ValueError(
+                    "sandbox_external_root must be an absolute path when set "
+                    f"(got {configured_external_root!r})."
+                )
+            if not _is_ascii_path(external_root):
+                logger.warning(
+                    "sandbox external root contains non-ASCII characters; Android Gradle plugin may reject builds",
+                    extra={"sandbox_external_root": str(external_root)},
+                )
+            self.base_dir = external_root
+        else:
+            self.base_dir = Path(base_dir)
+            effective_base_dir = self.base_dir if self.base_dir.is_absolute() else Path.cwd() / self.base_dir
+            if not _is_ascii_path(effective_base_dir):
+                logger.info(
+                    "sandbox fallback path contains non-ASCII characters; set OPS_AGENT_SANDBOX_EXTERNAL_ROOT "
+                    "to an ASCII absolute path to avoid Android Gradle plugin failures",
+                    extra={"sandbox_base_dir": str(effective_base_dir)},
+                )
         self.sandbox_dir = self.base_dir / task_id
         self._cloned = False
         self._validate_sandbox_dir()
@@ -186,10 +227,14 @@ class ExecutionSandbox:
         cwd: str | None = None,
         timeout_seconds: float = 60,
         max_output_bytes: int = 64 * 1024,
+        env: dict[str, str] | None = None,
     ) -> dict[str, object]:
         """Run a shell command inside the sandbox. Returns structured result."""
         work_dir = self._resolve_work_dir(cwd)
         max_output_chars = max(0, int(max_output_bytes))
+        run_env = None
+        if env:
+            run_env = {**os.environ, **env}
 
         start = time.monotonic()
         try:
@@ -200,6 +245,7 @@ class ExecutionSandbox:
                 text=True,
                 timeout=timeout_seconds,
                 cwd=str(work_dir),
+                env=run_env,
             )
             duration_ms = int((time.monotonic() - start) * 1000)
             return {
