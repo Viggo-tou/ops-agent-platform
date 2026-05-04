@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -12,9 +13,12 @@ BACKEND_ROOT = Path(__file__).resolve().parents[2]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
+from app.services import verification_profile as verification_profile_service  # noqa: E402
 from app.services.verification_profile import (  # noqa: E402
-    resolve_verification_profile,
+    VerificationProfile,
+    _resolve_executable,
     parse_compiler_errors,
+    resolve_verification_profile,
     run_compile_check,
 )
 
@@ -138,3 +142,127 @@ def test_compile_only_path_skipped_when_repo_type_unknown(work_dir: Path) -> Non
     assert result.passed
     assert result.status == "skipped"
     assert result.reason == "unknown_repo_type"
+
+
+def test_resolve_executable_finds_repo_local_gradlew(work_dir: Path) -> None:
+    wrapper = work_dir / "gradlew"
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    profile = _compile_profile("android_gradle", ["./gradlew", ":app:compileDebugKotlin"])
+
+    resolved = _resolve_executable(profile, work_dir)
+
+    assert resolved == str(wrapper.resolve())
+
+
+def test_resolve_executable_returns_none_for_missing_wrapper(work_dir: Path) -> None:
+    profile = _compile_profile("android_gradle", ["gradlew.bat", ":app:compileDebugKotlin"])
+
+    resolved = _resolve_executable(profile, work_dir)
+
+    assert resolved is None
+
+
+def test_resolve_executable_uses_shutil_which_for_plain_command(
+    monkeypatch: pytest.MonkeyPatch,
+    work_dir: Path,
+) -> None:
+    resolved_python = str(work_dir / "python.exe")
+    profile = _compile_profile("python", ["python", "-m", "compileall", "."])
+
+    monkeypatch.setattr(
+        verification_profile_service.shutil,
+        "which",
+        lambda executable: resolved_python if executable == "python" else None,
+    )
+
+    resolved = _resolve_executable(profile, work_dir)
+
+    assert resolved == resolved_python
+
+
+def test_run_compile_check_returns_skipped_when_wrapper_missing(work_dir: Path) -> None:
+    class FakeSandbox:
+        def __init__(self, root: Path):
+            self.work_dir = root
+
+        def run(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            raise AssertionError("missing wrapper must not execute a command")
+
+    profile = _compile_profile("android_gradle", ["./gradlew", ":app:compileDebugKotlin"])
+
+    result = run_compile_check(
+        sandbox=FakeSandbox(work_dir),
+        profile=profile,
+        timeout_seconds=10,
+    )
+
+    assert result.passed
+    assert result.status == "skipped"
+    assert result.reason == "wrapper_missing"
+    assert result.output == ""
+    assert result.errors == []
+
+
+def test_run_compile_check_returns_skipped_when_toolchain_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    work_dir: Path,
+) -> None:
+    class FakeSandbox:
+        def __init__(self, root: Path):
+            self.work_dir = root
+
+        def run(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            raise AssertionError("missing toolchain must not execute a command")
+
+    monkeypatch.setattr(verification_profile_service.shutil, "which", lambda executable: None)
+    profile = _compile_profile("python", ["python", "-m", "compileall", "."])
+
+    result = run_compile_check(
+        sandbox=FakeSandbox(work_dir),
+        profile=profile,
+        timeout_seconds=10,
+    )
+
+    assert result.passed
+    assert result.status == "skipped"
+    assert result.reason == "toolchain_missing"
+    assert result.output == ""
+    assert result.errors == []
+
+
+def test_run_compile_check_invokes_via_cmd_exe_on_windows_bat_wrapper(work_dir: Path) -> None:
+    wrapper = work_dir / "gradlew.bat"
+    wrapper.write_text("@echo off\n", encoding="utf-8")
+    commands: list[str] = []
+
+    class FakeSandbox:
+        def __init__(self, root: Path):
+            self.work_dir = root
+
+        def run(self, command, **kwargs):  # noqa: ANN001, ANN003
+            commands.append(command)
+            return {"stdout": "", "stderr": "", "exit_code": 0, "timed_out": False, "duration_ms": 12}
+
+    profile = _compile_profile("android_gradle", ["gradlew.bat", ":app:compileDebugKotlin", "--quiet"])
+
+    result = run_compile_check(
+        sandbox=FakeSandbox(work_dir),
+        profile=profile,
+        timeout_seconds=10,
+    )
+
+    expected_prefix = subprocess.list2cmdline(["cmd.exe", "/d", "/c", str(wrapper.resolve())])
+    assert result.passed
+    assert commands[0].startswith(expected_prefix)
+    assert ":app:compileDebugKotlin" in commands[0]
+
+
+def _compile_profile(repo_type: str, compile_command: list[str]) -> VerificationProfile:
+    return VerificationProfile(
+        repo_type=repo_type,  # type: ignore[arg-type]
+        compile_command=compile_command,
+        syntax_only_command=None,
+        test_command=None,
+        timeout_seconds=60,
+        detection_evidence=[],
+    )
