@@ -232,9 +232,25 @@ class ExecutionSandbox:
         """Run a shell command inside the sandbox. Returns structured result."""
         work_dir = self._resolve_work_dir(cwd)
         max_output_chars = max(0, int(max_output_bytes))
-        run_env = None
+        # JVM tools (gradle / javac / kotlinc) localize error messages
+        # via Locale.getDefault(), which on a zh-CN Windows machine emits
+        # GBK Chinese. The compile_gate repair-codegen pipeline can't
+        # parse Chinese error text reliably, so force Locale.US for ALL
+        # JVM child processes via JAVA_TOOL_OPTIONS. This env var is
+        # honored by every JVM started under this process tree, including
+        # gradle daemon, kotlinc, javac, and any test runners.
+        jvm_locale_opts = "-Duser.language=en -Duser.country=US -Dfile.encoding=UTF-8"
+        existing_jto = os.environ.get("JAVA_TOOL_OPTIONS", "")
+        if existing_jto:
+            jvm_locale_opts = f"{existing_jto} {jvm_locale_opts}"
+        run_env = {**os.environ, "JAVA_TOOL_OPTIONS": jvm_locale_opts}
         if env:
-            run_env = {**os.environ, **env}
+            # Caller-supplied env wins, but we still want to PREPEND our
+            # JVM locale flags to caller's JAVA_TOOL_OPTIONS rather than
+            # let the caller silently drop them.
+            caller_jto = env.get("JAVA_TOOL_OPTIONS", "")
+            merged_jto = f"{jvm_locale_opts} {caller_jto}".strip() if caller_jto else jvm_locale_opts
+            run_env = {**run_env, **env, "JAVA_TOOL_OPTIONS": merged_jto}
 
         start = time.monotonic()
         try:
