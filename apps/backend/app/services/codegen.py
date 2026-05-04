@@ -1583,12 +1583,19 @@ class CodeGenerator:
             raise CodegenError(f"Ollama API error: {exc}") from exc
 
     def _call_deepseek(self, prompt: str) -> CodegenResult:
-        """Call DeepSeek API (OpenAI-compatible) for code generation."""
+        """Call DeepSeek API (OpenAI-compatible) for code generation.
+
+        NOTE: settings.deepseek_base_url may point at the Anthropic-compat
+        path (e.g. https://api.deepseek.com/anthropic) when configured for
+        the deepseek_agent.py wrapper. /chat/completions only exists on
+        the OpenAI-compat path, so hardcode that here independent of the
+        configured deepseek_base_url. Same pattern as cc_agent_loop.
+        """
         if not self.settings.deepseek_api_key:
             raise CodegenError("OPS_AGENT_DEEPSEEK_API_KEY is not configured.")
 
         model_name = self.settings.deepseek_model
-        url = f"{self.settings.deepseek_base_url.rstrip('/')}/chat/completions"
+        url = "https://api.deepseek.com/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.settings.deepseek_api_key}",
             "Content-Type": "application/json",
