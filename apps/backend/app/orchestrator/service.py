@@ -1988,6 +1988,29 @@ class PrimaryOrchestrator:
                 result,
                 event_name="knowledge.prefetch",
             )
+            # Sandbox-source alignment: if KB router/scoring selected a specific
+            # source, look up its on-disk path from knowledge_source_specs and
+            # persist on task.translation_json["source_path"] so that
+            # _resolve_develop_repo_url picks it up (priority #1 in the chain)
+            # instead of falling back to settings.knowledge_source_path (which
+            # may point at a different repo entirely in multi-source setups).
+            try:
+                from app.services.source_spec_lookup import lookup_source_path
+                trace = result.get("answer_trace") if isinstance(result, dict) else None
+                selected = trace.get("selected_sources") if isinstance(trace, dict) else None
+                primary_name = ""
+                if isinstance(selected, list) and selected:
+                    primary_name = str(selected[0] or "").strip()
+                if primary_name:
+                    resolved = lookup_source_path(primary_name, self.tool_gateway.settings)
+                    if resolved:
+                        translation = dict(task.translation_json) if isinstance(task.translation_json, dict) else {}
+                        translation["source_path"] = resolved
+                        translation["source_name"] = primary_name
+                        task.translation_json = translation
+                        self.db.flush()
+            except Exception:
+                pass  # best-effort; downstream chain still has fallbacks
         return result
 
     @staticmethod
