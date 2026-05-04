@@ -25,7 +25,11 @@ class Settings(BaseSettings):
     primary_agent_timeout_seconds: float = 30.0
     minimax_planner_timeout_seconds: float = 90.0
     knowledge_synthesis_enabled: bool = True
+    knowledge_synthesis_provider: Literal["minimax", "deepseek"] = "minimax"
     knowledge_synthesis_model: str = "MiniMax-M2.7"
+    # Empty = inherit settings.deepseek_model (e.g. deepseek-v4-pro from .env).
+    # Set only when synthesis needs a different model from codegen/cc_agent.
+    knowledge_synthesis_deepseek_model: str = ""
     knowledge_synthesis_timeout_seconds: float = 45.0
     # Per-citation snippet cap fed to the answer synthesiser. AST chunking
     # now returns whole function bodies, so keep enough context for later
