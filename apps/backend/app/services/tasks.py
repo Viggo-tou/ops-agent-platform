@@ -106,6 +106,53 @@ def run_pipeline_job(task_id: str, actor_name: str) -> None:
         db.close()
 
 
+def resume_pipeline_job(task_id: str) -> None:
+    """Resume an interrupted task from its latest DB checkpoint."""
+    db = SessionLocal()
+    try:
+        task = db.get(Task, task_id)
+        if task is None:
+            logger.warning("Resume job could not find task %s", task_id)
+            return
+        try:
+            orchestrator = PrimaryOrchestrator(db)
+            resumed = orchestrator.resume_task(task=task, actor_name=task.actor_name)
+            if resumed:
+                db.commit()
+        except Exception as exc:
+            db.rollback()
+            logger.exception("Resume job crashed for task %s", task_id)
+            failed_task = db.get(Task, task_id)
+            if failed_task is None:
+                return
+            error_payload = _external_timeout_payload(exc) or {
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            set_task_status(
+                db,
+                task=failed_task,
+                new_status=TaskStatus.FAILED,
+                new_stage=WorkflowStage.DONE,
+                role=RoleName.SYSTEM,
+                message=f"Resume crashed: {type(exc).__name__}: {exc}",
+                payload=error_payload,
+            )
+            record_event(
+                db,
+                task_id=failed_task.id,
+                event_type=EventType.EXECUTION_FAILED,
+                source=EventSource.SYSTEM,
+                stage=WorkflowStage.DONE,
+                role=RoleName.SYSTEM,
+                message="Checkpoint resume raised an unhandled exception.",
+                payload=error_payload,
+            )
+            db.commit()
+    finally:
+        db.close()
+
+
 class TaskService:
     def __init__(self, db: Session):
         self.db = db

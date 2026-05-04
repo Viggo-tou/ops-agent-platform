@@ -70,6 +70,7 @@ class PolicyDecision(str, Enum):
 
 class EventType(str, Enum):
     TASK_CREATED = "task_created"
+    TASK_RESUMED = "task_resumed"
     USER_REQUEST_RECEIVED = "user_request_received"
     TASK_STATUS_CHANGED = "task_status_changed"
     SEMANTIC_TRANSLATION_STARTED = "semantic_translation_started"
