@@ -56,8 +56,10 @@ class KnowledgeSynthesizer:
         """Return LLM-synthesized answer or raise so callers can fall back."""
         if not self.settings.knowledge_synthesis_enabled:
             raise KnowledgeSynthesisError("synthesis disabled by config")
-        if not self.settings.minimax_api_key:
+        synth_provider = str(getattr(self.settings, "knowledge_synthesis_provider", "minimax") or "minimax").lower()
+        if synth_provider == "minimax" and not self.settings.minimax_api_key:
             raise KnowledgeSynthesisError("OPS_AGENT_MINIMAX_API_KEY not configured")
+        # deepseek path checks deepseek_api_key inside _call_deepseek.
         if not citations:
             raise KnowledgeSynthesisError("no citations to synthesize over")
 
@@ -83,7 +85,12 @@ class KnowledgeSynthesizer:
             checkpoint_label="synthesis_call_started",
         )
         try:
-            response_text, input_tokens, output_tokens = self._call_minimax(
+            provider = str(getattr(self.settings, "knowledge_synthesis_provider", "minimax") or "minimax").lower()
+            if provider == "deepseek":
+                call_fn = self._call_deepseek
+            else:
+                call_fn = self._call_minimax
+            response_text, input_tokens, output_tokens = call_fn(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
             )
@@ -279,6 +286,57 @@ class KnowledgeSynthesizer:
             f"Confidence tag: {hallucination_risk}\n\n"
             f"Evidence snippets (ranked by relevance):\n{evidence_block}\n\n"
             "Produce the structured response exactly as specified."
+        )
+
+    def _call_deepseek(self, *, system_prompt: str, user_prompt: str) -> tuple[str, int, int]:
+        """Call DeepSeek API (OpenAI-compatible) for knowledge synthesis.
+
+        NOTE: settings.deepseek_base_url may be configured for the
+        Anthropic-compat path used by the deepseek_agent.py wrapper.
+        /chat/completions only exists on the OpenAI-compat path, so
+        hardcode that here. Same pattern as cc_agent_loop / codegen.
+        """
+        if not getattr(self.settings, "deepseek_api_key", None):
+            raise KnowledgeSynthesisError("OPS_AGENT_DEEPSEEK_API_KEY not configured for synthesis")
+        deepseek_chat_url = "https://api.deepseek.com/v1/chat/completions"
+        # Prefer per-feature override; fall back to global deepseek_model
+        # (e.g. deepseek-v4-pro from .env) so this branch picks up the same
+        # model that cc_agent_loop and codegen use unless explicitly overridden.
+        model_name = (
+            getattr(self.settings, "knowledge_synthesis_deepseek_model", None)
+            or getattr(self.settings, "deepseek_model", None)
+            or "deepseek-chat"
+        )
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 2000,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.settings.deepseek_api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            with httpx.Client(
+                timeout=external_http_timeout(self.settings.knowledge_synthesis_timeout_seconds)
+            ) as client:
+                response = client.post(deepseek_chat_url, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            raise KnowledgeSynthesisError(f"DeepSeek synthesis call failed: {exc}") from exc
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message", {})
+        content = message.get("content", "") or ""
+        usage = data.get("usage", {})
+        return (
+            str(content),
+            int(usage.get("prompt_tokens", 0) or 0),
+            int(usage.get("completion_tokens", 0) or 0),
         )
 
     def _call_minimax(self, *, system_prompt: str, user_prompt: str) -> tuple[str, int, int]:
