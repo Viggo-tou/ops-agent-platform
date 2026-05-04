@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     api_prefix: str = "/api"
     database_url: str = f"sqlite:///{(BASE_DIR / 'ops_agent_platform.db').as_posix()}"
     pipeline_max_workers: int = 2
+    resumability_enabled: bool = True
+    resumability_max_age_hours: int = 6
+    resumability_orphan_threshold_hours: int = 6
     primary_agent_provider: Literal["auto", "mock", "openai", "minimax", "anthropic", "deepseek", "ollama", "claude_code", "codex"] = "auto"
     planner_provider: Literal["auto", "claude_code", "anthropic", "openai", "minimax", "mock"] | None = None
     codegen_provider: Literal["auto", "claude_code", "codex", "anthropic", "openai", "minimax", "deepseek", "ollama", "mock"] | None = None

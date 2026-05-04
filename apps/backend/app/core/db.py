@@ -181,6 +181,8 @@ def ensure_local_schema() -> None:
                 connection.execute(text("ALTER TABLE task ADD COLUMN governance_json JSON"))
             if "trace_id" not in task_columns:
                 connection.execute(text("ALTER TABLE task ADD COLUMN trace_id VARCHAR(64)"))
+            if "latest_checkpoint_json" not in task_columns:
+                connection.execute(text("ALTER TABLE task ADD COLUMN latest_checkpoint_json JSON"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_task_trace_id ON task (trace_id)"))
             connection.execute(text("UPDATE task SET actor_name = 'employee' WHERE actor_name IS NULL"))
             connection.execute(text("UPDATE task SET actor_role = 'EMPLOYEE' WHERE actor_role IS NULL"))

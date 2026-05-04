@@ -46,6 +46,22 @@ def _writable_mkdtemp() -> Path:
     # Python's tempfile uses 0o700, which is not writable in this Windows sandbox.
     tempfile._os.mkdir = mkdir_with_write_access
     try:
+        candidate_roots = []
+        if os.environ.get("OPS_AGENT_TEST_SANDBOX_ROOT"):
+            candidate_roots.append(Path(os.environ["OPS_AGENT_TEST_SANDBOX_ROOT"]))
+        candidate_roots.extend([Path(tempfile.gettempdir()), Path.home() / ".ops-agent-rollback-tests", BACKEND_ROOT])
+
+        for root in candidate_roots:
+            try:
+                str(root).encode("ascii")
+            except UnicodeEncodeError:
+                continue
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+                return Path(tempfile.mkdtemp(prefix="rollback-test-", dir=str(root)))
+            except OSError:
+                continue
+
         return Path(tempfile.mkdtemp(prefix="rollback-test-", dir=str(BACKEND_ROOT)))
     finally:
         tempfile._os.mkdir = original_mkdir

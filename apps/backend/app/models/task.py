@@ -60,6 +60,7 @@ class Task(Base):
     # JSON result envelope. Failure/approval transitions may include
     # ``failure_diagnosis`` with DiagnosisOutput-compatible fields.
     latest_result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    latest_checkpoint_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
