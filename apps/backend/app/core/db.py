@@ -9,6 +9,7 @@ from app.core.config import get_settings
 from app.models.base import Base
 from app.models.knowledge_card import KnowledgeCard
 from app.models.knowledge_document import KnowledgeDocument
+from app.models.knowledge_retrieval_cache import KnowledgeRetrievalCache
 
 settings = get_settings()
 is_sqlite = settings.database_url.startswith("sqlite")
@@ -272,6 +273,10 @@ def ensure_local_schema() -> None:
             tool_execution_columns = {column["name"] for column in inspector.get_columns("tool_execution")}
             if "inverse_action_json" not in tool_execution_columns:
                 connection.execute(text("ALTER TABLE tool_execution ADD COLUMN inverse_action_json JSON"))
+
+        knowledge_retrieval_cache_table = Base.metadata.tables.get("knowledge_retrieval_cache")
+        if "knowledge_retrieval_cache" not in existing_tables and knowledge_retrieval_cache_table is not None:
+            knowledge_retrieval_cache_table.create(bind=connection, checkfirst=True)
 
     with SessionLocal() as db:
         backfill_knowledge_fts_if_empty(db)

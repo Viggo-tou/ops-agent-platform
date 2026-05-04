@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     knowledge_cards_model: str = "MiniMax-M2.7"
     knowledge_cards_max_chars: int = 400 * 6
     knowledge_cards_concurrency: int = 5
+    knowledge_retrieval_cache_enabled: bool = True
+    knowledge_retrieval_cache_ttl_seconds: int = 3600
+    knowledge_retrieval_cache_max_entries: int = 1000
     llm_retry_on_rate_limit: bool = True
     llm_retry_max_attempts: int = 3
     llm_retry_base_delay_sec: float = 2.0
