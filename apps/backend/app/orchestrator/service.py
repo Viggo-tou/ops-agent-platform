@@ -5206,6 +5206,7 @@ class PrimaryOrchestrator:
         compile_passed = False
         compile_result = None
         compile_errored = False
+        compile_unexpected_exception = False
 
         if not (sandbox_dir.exists() and changed):
             # Nothing to check — preserve legacy "skip silently" behaviour.
@@ -5257,8 +5258,11 @@ class PrimaryOrchestrator:
                         changed_files=changed,
                     )
             except Exception as exc:
+                import traceback as _tb
+                tb_text = _tb.format_exc()
                 compile_result = None
                 compile_errored = True
+                compile_unexpected_exception = True  # used by caller to fail-close
                 record_event(
                     self.db,
                     task_id=task.id,
@@ -5267,9 +5271,11 @@ class PrimaryOrchestrator:
                     stage=WorkflowStage.REVIEW,
                     role=RoleName.REVIEWER,
                     tool_name="compile_gate.check",
-                    message=f"Compile gate errored: {exc}",
-                    payload={"error": str(exc)},
+                    message=f"Compile gate errored (unexpected): {exc}",
+                    payload={"error": str(exc), "traceback": tb_text[:4000], "type": type(exc).__name__},
                 )
+                pipeline_state["compile_gate_unexpected_exception"] = True
+                pipeline_state["compile_gate_traceback"] = tb_text[:4000]
                 break
 
             if compile_result is None:
@@ -5484,6 +5490,28 @@ class PrimaryOrchestrator:
         if compile_result is None or compile_errored:
             pipeline_state["compile_gate_done"] = True
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+            # Stage X.4: distinguish unexpected exception (fail-closed) from
+            # expected skip (continue). Unexpected = bug in our compile-check
+            # code; cannot trust downstream review gates because they only
+            # see the diff, not post-apply file state. Block the pipeline.
+            if compile_unexpected_exception:
+                self._fail_develop_pipeline(
+                    task=task,
+                    event_type=EventType.REVIEW_FAILED,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    message=(
+                        "Compile gate errored unexpectedly (likely a bug in "
+                        "verification_profile/run_compile_check). Pipeline "
+                        "blocked — cannot trust downstream gates without "
+                        "structural validation."
+                    ),
+                    payload={
+                        "plan_id": plan.plan_id,
+                        "compile_traceback": pipeline_state.get("compile_gate_traceback", ""),
+                    },
+                )
+                return "failed"
             return "errored"
 
         residual_errors = []
