@@ -124,6 +124,19 @@ class CodeGenerator:
         return must_touch, expected_new, set(must_touch) | set(expected_new)
 
     @staticmethod
+    def _paths_match(left: str, right: str) -> bool:
+        """Path-segment suffix-tolerant equality (mirrors evidence_chain helper)."""
+        if not left or not right:
+            return False
+        if left == right:
+            return True
+        if right.endswith("/" + left):
+            return True
+        if left.endswith("/" + right):
+            return True
+        return False
+
+    @staticmethod
     def _validate_changed_files_within_allowed(
         files_changed: list[str],
         *,
@@ -136,7 +149,10 @@ class CodeGenerator:
             for path in files_changed
             if isinstance(path, str) and path.strip()
         }
-        extra = sorted(actual_files - allowed_paths)
+        extra = sorted(
+            path for path in actual_files
+            if not any(CodeGenerator._paths_match(path, allowed) for allowed in allowed_paths)
+        )
         if extra:
             raise CodegenError(
                 "file_outside_allowed_set: codegen modified files not in plan: "

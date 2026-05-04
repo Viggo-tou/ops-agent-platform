@@ -82,6 +82,43 @@ def test_drift_rejected_with_clear_message() -> None:
     assert "good.py" in message
 
 
+def test_source_name_prefix_accepted_against_repo_relative_plan() -> None:
+    """Codegen re-emits with repo-name prefix; plan has repo-relative path. Must accept."""
+    result = _generate_with_mocked_codex(
+        plan_json={
+            "objective": "Update src/pages/UserVerification.js",
+            "must_touch_files": ["src/pages/UserVerification.js"],
+        },
+        files_changed=["handyman-admin-dashboard/src/pages/UserVerification.js"],
+        context_files={"src/pages/UserVerification.js": "old\n"},
+    )
+    assert result is not None
+
+
+def test_repo_relative_accepted_against_prefix_plan() -> None:
+    """Reverse direction: plan with prefix, codegen returns relative — must accept."""
+    result = _generate_with_mocked_codex(
+        plan_json={
+            "objective": "Update foo",
+            "must_touch_files": ["handyman-admin-dashboard/src/pages/UserVerification.js"],
+        },
+        files_changed=["src/pages/UserVerification.js"],
+        context_files={"src/pages/UserVerification.js": "old\n"},
+    )
+    assert result is not None
+
+
+def test_partial_segment_match_still_rejected() -> None:
+    """Suffix tolerance must respect segment boundaries. 'rc/foo.js' MUST NOT match 'src/foo.js'."""
+    with pytest.raises(CodegenError) as exc:
+        _generate_with_mocked_codex(
+            plan_json={"objective": "x", "must_touch_files": ["src/foo.js"]},
+            files_changed=["rc/foo.js"],
+            context_files={"src/foo.js": "old\n"},
+        )
+    assert "file_outside_allowed_set" in str(exc.value)
+
+
 def test_valid_targets_pass() -> None:
     result = _generate_with_mocked_codex(
         plan_json={"objective": "Update good.py", "must_touch_files": ["good.py"]},
