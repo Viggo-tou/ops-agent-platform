@@ -20,12 +20,14 @@ from app.core.db import Base, SessionLocal, engine, ensure_local_schema
 from app.core.enums import EventSource, EventType, RoleName, TaskStatus, WorkflowStage
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import RequestLoggingMiddleware
-from app.core.pipeline_executor import init_pipeline_executor, shutdown_pipeline_executor
+from app.core.pipeline_executor import init_pipeline_executor, shutdown_pipeline_executor, submit_pipeline_job
 from app.core.telemetry import configure_telemetry
 from app.models.task import Task
 from app.services.events import record_event, set_task_status
+from app.services.checkpointing import find_resumable_tasks, is_task_resumable
 from app.services.governance import bootstrap_governance_data
 from app.services.model_config import bootstrap_model_catalog
+from app.services.tasks import resume_pipeline_job
 from app.services.task_workspace import list_interrupted_workspaces, sweep_task_workspaces
 
 configure_logging()
@@ -51,6 +53,15 @@ def _sweep_orphaned_tasks() -> None:
         TaskStatus.QUEUED,
         TaskStatus.RUNNING,
     }
+    settings_obj = get_settings()
+    resumability_enabled = bool(getattr(settings_obj, "resumability_enabled", True))
+    resumability_age_hours = int(
+        getattr(
+            settings_obj,
+            "resumability_orphan_threshold_hours",
+            getattr(settings_obj, "resumability_max_age_hours", 6),
+        )
+    )
     with SessionLocal() as db:
         orphans = db.query(Task).filter(
             Task.status.in_([s for s in orphan_statuses]),
@@ -59,7 +70,14 @@ def _sweep_orphaned_tasks() -> None:
         if not orphans:
             return
         _startup_logger.info("orphan_sweep_start", count=len(orphans))
+        skipped_resumable = 0
         for task in orphans:
+            if resumability_enabled and is_task_resumable(
+                task,
+                max_age_hours=resumability_age_hours,
+            ):
+                skipped_resumable += 1
+                continue
             msg = (
                 f"Task orphaned by backend restart while in status={task.status.value}, "
                 f"stage={task.workflow_stage.value if task.workflow_stage else 'n/a'}. "
@@ -84,7 +102,27 @@ def _sweep_orphaned_tasks() -> None:
                 message=msg,
             )
         db.commit()
-        _startup_logger.info("orphan_sweep_done", count=len(orphans))
+        _startup_logger.info(
+            "orphan_sweep_done",
+            count=len(orphans),
+            skipped_resumable=skipped_resumable,
+        )
+
+
+def _resume_interrupted_tasks() -> None:
+    settings_obj = get_settings()
+    if not bool(getattr(settings_obj, "resumability_enabled", True)):
+        _startup_logger.info("task_resumability_disabled")
+        return
+    max_age_hours = int(getattr(settings_obj, "resumability_max_age_hours", 6))
+    with SessionLocal() as db:
+        tasks = find_resumable_tasks(db, max_age_hours=max_age_hours)
+        task_ids = [task.id for task in tasks]
+    if not task_ids:
+        return
+    _startup_logger.info("task_resume_start", count=len(task_ids))
+    for task_id in task_ids:
+        submit_pipeline_job(resume_pipeline_job, task_id)
 
 
 def _sweep_old_sandboxes() -> None:
@@ -242,10 +280,11 @@ async def lifespan(_: FastAPI):
     with SessionLocal() as db:
         bootstrap_model_catalog(db)
     _log_interrupted_task_workspaces()
+    init_pipeline_executor(settings.pipeline_max_workers)
+    _resume_interrupted_tasks()
     _sweep_orphaned_tasks()
     _sweep_old_sandboxes()
     _sweep_old_task_workspaces()
-    init_pipeline_executor(settings.pipeline_max_workers)
     try:
         yield
     finally:

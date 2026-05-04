@@ -595,6 +595,65 @@ class ExecutionSandbox:
     def exists(self) -> bool:
         return self.sandbox_dir.exists()
 
+    def snapshot_id(self) -> str | None:
+        """Return the current git commit for resume idempotency checks."""
+        if not self.exists():
+            return None
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=str(self.sandbox_dir),
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        sha = result.stdout.strip()
+        return f"git:{sha}" if sha else None
+
+    def is_clean(self) -> bool:
+        """Return True when the sandbox has no uncommitted changes."""
+        if not self.exists():
+            return True
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            cwd=str(self.sandbox_dir),
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return False
+        return not result.stdout.strip()
+
+    def rollback_to_snapshot(self, snapshot_id: str) -> bool:
+        """Best-effort rollback for a half-applied resume checkpoint."""
+        if not self.exists():
+            return False
+        prefix = "git:"
+        if not snapshot_id.startswith(prefix):
+            return False
+        sha = snapshot_id[len(prefix) :].strip()
+        if not sha:
+            return False
+        reset = subprocess.run(
+            ["git", "reset", "--hard", sha],
+            capture_output=True,
+            text=True,
+            cwd=str(self.sandbox_dir),
+            timeout=30,
+        )
+        if reset.returncode != 0:
+            return False
+        clean = subprocess.run(
+            ["git", "clean", "-fd"],
+            capture_output=True,
+            text=True,
+            cwd=str(self.sandbox_dir),
+            timeout=30,
+        )
+        return clean.returncode == 0
+
     def _validate_sandbox_dir(self) -> None:
         base_dir = self.base_dir.resolve()
         sandbox_dir = self.sandbox_dir.resolve()

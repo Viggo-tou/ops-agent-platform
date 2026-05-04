@@ -29,6 +29,7 @@ from app.schemas.knowledge import KnowledgeClaim
 from app.services.events import commit_checkpoint, record_event, set_task_status
 from app.services.evidence_chain import EvidenceChainReport, check_evidence_chain
 from app.services.failure_diagnosis import FailureKind, run_diagnosis
+from app.services.checkpointing import CheckpointStage, TaskCheckpoint, read_task_checkpoint, write_task_checkpoint
 from app.services.sandbox import ExecutionSandbox, SandboxError
 from app.services.spec_conformance import (
     ConformanceReport,
@@ -260,6 +261,15 @@ class PrimaryOrchestrator:
                 )
 
         self._workspace_call(task, _write)
+        self._write_task_checkpoint(
+            task,
+            stage="intake",
+            output_payload=self._task_checkpoint_payload(
+                task,
+                issue_context=issue_context,
+                language=language,
+            ),
+        )
         if issue_context:
             self._workspace_add_spec_anchor_evidence(task, issue_context=issue_context)
 
@@ -327,6 +337,60 @@ class PrimaryOrchestrator:
                 resume_args=resume_args,
             ),
         )
+
+    def _task_checkpoint_payload(self, task: Task, **extra: object) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "translation_json": getattr(task, "translation_json", None),
+            "plan_json": getattr(task, "plan_json", None),
+            "review_json": getattr(task, "review_json", None),
+        }
+        latest_result_json = getattr(task, "latest_result_json", None)
+        if isinstance(latest_result_json, dict):
+            payload["latest_result_json"] = latest_result_json
+            pipeline_state = latest_result_json.get("pipeline_state")
+            if isinstance(pipeline_state, dict):
+                payload["pipeline_state"] = pipeline_state
+        payload.update(extra)
+        return payload
+
+    def _write_task_checkpoint(
+        self,
+        task: Task,
+        *,
+        stage: CheckpointStage,
+        output_payload: dict[str, object] | None = None,
+        sandbox_snapshot_id: str | None = None,
+        can_resume: bool = True,
+        resume_method: str = "replay_from_output",
+    ) -> TaskCheckpoint | None:
+        if not bool(getattr(self.tool_gateway.settings, "resumability_enabled", True)):
+            return None
+        return write_task_checkpoint(
+            self.db,
+            task=task,
+            stage=stage,
+            output_payload=output_payload or self._task_checkpoint_payload(task),
+            sandbox_snapshot_id=sandbox_snapshot_id,
+            can_resume=can_resume,
+            resume_method=resume_method,  # type: ignore[arg-type]
+        )
+
+    def _restore_task_checkpoint_payload(self, task: Task, checkpoint: TaskCheckpoint) -> None:
+        payload = checkpoint.output_payload
+        for attr in ("translation_json", "plan_json", "review_json"):
+            value = payload.get(attr)
+            if isinstance(value, dict):
+                setattr(task, attr, value)
+
+        latest_result = payload.get("latest_result_json")
+        if isinstance(latest_result, dict):
+            task.latest_result_json = dict(latest_result)
+
+        pipeline_state = payload.get("pipeline_state")
+        if isinstance(pipeline_state, dict):
+            latest = dict(task.latest_result_json) if isinstance(task.latest_result_json, dict) else {}
+            latest["pipeline_state"] = dict(pipeline_state)
+            task.latest_result_json = latest
 
     def _workspace_write_plan(self, task: Task, plan: GeneratedPlan, *, reason: str) -> None:
         def _write(workspace: TaskWorkspace) -> None:
@@ -461,6 +525,14 @@ class PrimaryOrchestrator:
         semantic_translation = self._translate_request(task=task, actor_name=actor_name, issue_context=None)
         self._apply_jira_issue_key_fallback(task=task, semantic_translation=semantic_translation)
         task.translation_json = semantic_translation.model_dump(mode="json")
+        self._write_task_checkpoint(
+            task,
+            stage="translate",
+            output_payload=self._task_checkpoint_payload(
+                task,
+                semantic_translation=task.translation_json,
+            ),
+        )
 
         issue_context: dict[str, object] | None = None
         planning_knowledge_context: dict[str, object] | None = None
@@ -493,6 +565,15 @@ class PrimaryOrchestrator:
             )
             self._apply_jira_issue_key_fallback(task=task, semantic_translation=semantic_translation)
             task.translation_json = semantic_translation.model_dump(mode="json")
+            self._write_task_checkpoint(
+                task,
+                stage="translate",
+                output_payload=self._task_checkpoint_payload(
+                    task,
+                    semantic_translation=task.translation_json,
+                    issue_context=issue_context,
+                ),
+            )
             planning_knowledge_context = self._prefetch_planning_repository_context(
                 task=task,
                 actor_name=actor_name,
@@ -504,6 +585,17 @@ class PrimaryOrchestrator:
                 translation_document=task.translation_json,
                 issue_context=issue_context,
                 planning_knowledge_context=planning_knowledge_context,
+            )
+            self._write_task_checkpoint(
+                task,
+                stage="retrieve",
+                output_payload=self._task_checkpoint_payload(
+                    task,
+                    semantic_translation=task.translation_json,
+                    issue_context=issue_context,
+                    planning_knowledge_context=planning_knowledge_context,
+                    planning_request_text=planning_request_text,
+                ),
             )
         elif task.scenario == "jira_issue_writeback":
             issue_context = self._prefetch_jira_issue_context(
@@ -526,6 +618,15 @@ class PrimaryOrchestrator:
             )
             self._apply_jira_issue_key_fallback(task=task, semantic_translation=semantic_translation)
             task.translation_json = semantic_translation.model_dump(mode="json")
+            self._write_task_checkpoint(
+                task,
+                stage="translate",
+                output_payload=self._task_checkpoint_payload(
+                    task,
+                    semantic_translation=task.translation_json,
+                    issue_context=issue_context,
+                ),
+            )
 
             planning_request_text = self._augment_request_with_context(
                 original_request=task.request_text,
@@ -533,12 +634,34 @@ class PrimaryOrchestrator:
                 issue_context=issue_context,
                 planning_knowledge_context=None,
             )
+            self._write_task_checkpoint(
+                task,
+                stage="retrieve",
+                output_payload=self._task_checkpoint_payload(
+                    task,
+                    semantic_translation=task.translation_json,
+                    issue_context=issue_context,
+                    planning_knowledge_context=None,
+                    planning_request_text=planning_request_text,
+                ),
+            )
         elif task.translation_json:
             planning_request_text = self._augment_request_with_context(
                 original_request=task.request_text,
                 translation_document=task.translation_json,
                 issue_context=None,
                 planning_knowledge_context=None,
+            )
+            self._write_task_checkpoint(
+                task,
+                stage="retrieve",
+                output_payload=self._task_checkpoint_payload(
+                    task,
+                    semantic_translation=task.translation_json,
+                    issue_context=None,
+                    planning_knowledge_context=None,
+                    planning_request_text=planning_request_text,
+                ),
             )
 
         # --- Defense line 2: anchor pre-check ---
@@ -600,6 +723,18 @@ class PrimaryOrchestrator:
             },
         )
         self._workspace_write_plan(task, plan_document, reason="planner_generated")
+        self._write_task_checkpoint(
+            task,
+            stage="plan",
+            output_payload=self._task_checkpoint_payload(
+                task,
+                semantic_translation=task.translation_json,
+                issue_context=issue_context,
+                planning_knowledge_context=planning_knowledge_context,
+                planning_request_text=planning_request_text,
+                plan_json=task.plan_json,
+            ),
+        )
         commit_checkpoint(self.db, label="plan_generated")
 
         set_task_status(
@@ -631,6 +766,19 @@ class PrimaryOrchestrator:
                 plan=plan_document,
             )
         task.review_json = review_result.review.model_dump(mode="json")
+        self._write_task_checkpoint(
+            task,
+            stage="review_pre",
+            output_payload=self._task_checkpoint_payload(
+                task,
+                semantic_translation=task.translation_json,
+                issue_context=issue_context,
+                planning_knowledge_context=planning_knowledge_context,
+                planning_request_text=planning_request_text,
+                plan_json=task.plan_json,
+                review_json=task.review_json,
+            ),
+        )
 
         if review_result.review.verdict == "approved":
             record_event(
@@ -702,6 +850,16 @@ class PrimaryOrchestrator:
                 "approval_id": approval.id,
                 "review": task.review_json,
             }
+            self._write_task_checkpoint(
+                task,
+                stage="awaiting_approval",
+                output_payload=self._task_checkpoint_payload(
+                    task,
+                    approval_id=approval.id,
+                    plan_json=task.plan_json,
+                    review_json=task.review_json,
+                ),
+            )
 
             set_task_status(
                 self.db,
@@ -814,6 +972,387 @@ class PrimaryOrchestrator:
                 )
                 return
         self._execute_plan(task=task, actor_name=actor_name, plan=plan_document, approval_id=approval_id)
+
+    def resume_task(self, *, task: Task, actor_name: str | None = None) -> bool:
+        if not bool(getattr(self.tool_gateway.settings, "resumability_enabled", True)):
+            return False
+        checkpoint = read_task_checkpoint(task)
+        if checkpoint is None or not checkpoint.can_resume:
+            return False
+        actor = actor_name or task.actor_name
+        self._restore_task_checkpoint_payload(task, checkpoint)
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.TASK_RESUMED,
+            source=EventSource.SYSTEM,
+            stage=task.workflow_stage,
+            role=RoleName.SYSTEM,
+            message=f"Task resumed from checkpoint stage {checkpoint.stage}.",
+            payload={
+                "resumed_from_stage": checkpoint.stage,
+                "resume_method": checkpoint.resume_method,
+                "checkpoint_completed_at": checkpoint.completed_at.isoformat(),
+            },
+        )
+        commit_checkpoint(self.db, label=f"task_resumed_{checkpoint.stage}")
+
+        if checkpoint.stage == "awaiting_approval":
+            return True
+
+        if checkpoint.stage in {"codegen", "compile", "review_post"}:
+            plan_document = GeneratedPlan.model_validate(task.plan_json or {})
+            self._prepare_develop_resume(task=task, checkpoint=checkpoint)
+            self._execute_plan(task=task, actor_name=actor, plan=plan_document)
+            return True
+
+        if checkpoint.stage == "review_pre":
+            plan_document = GeneratedPlan.model_validate(task.plan_json or {})
+            self._resume_from_review_checkpoint(task=task, actor_name=actor, plan=plan_document)
+            return True
+
+        if checkpoint.stage == "plan":
+            plan_document = GeneratedPlan.model_validate(task.plan_json or {})
+            self._resume_after_plan_checkpoint(task=task, actor_name=actor, plan=plan_document)
+            return True
+
+        if checkpoint.stage in {"intake", "translate", "retrieve"}:
+            self._resume_pre_plan_checkpoint(task=task, actor_name=actor, checkpoint=checkpoint)
+            return True
+
+        return False
+
+    def _resume_pre_plan_checkpoint(
+        self,
+        *,
+        task: Task,
+        actor_name: str,
+        checkpoint: TaskCheckpoint,
+    ) -> None:
+        payload = checkpoint.output_payload
+        if checkpoint.stage == "intake":
+            semantic_translation = self._translate_request(task=task, actor_name=actor_name, issue_context=None)
+            self._apply_jira_issue_key_fallback(task=task, semantic_translation=semantic_translation)
+            task.translation_json = semantic_translation.model_dump(mode="json")
+            self._write_task_checkpoint(
+                task,
+                stage="translate",
+                output_payload=self._task_checkpoint_payload(
+                    task,
+                    semantic_translation=task.translation_json,
+                ),
+            )
+        else:
+            semantic_translation = GeneratedSemanticTranslation.model_validate(task.translation_json or {})
+        resume_stage = "translate" if checkpoint.stage == "intake" else checkpoint.stage
+        issue_context = payload.get("issue_context")
+        if not isinstance(issue_context, dict):
+            issue_context = None
+        planning_knowledge_context = payload.get("planning_knowledge_context")
+        if not isinstance(planning_knowledge_context, dict):
+            planning_knowledge_context = None
+        planning_request_text = payload.get("planning_request_text")
+        if not isinstance(planning_request_text, str) or not planning_request_text.strip():
+            planning_request_text = task.request_text
+
+        if resume_stage == "translate":
+            if task.scenario in {"jira_issue_plan", "jira_issue_develop", "jira_issue_writeback"}:
+                if issue_context is None:
+                    issue_context = self._prefetch_jira_issue_context(
+                        task=task,
+                        actor_name=actor_name,
+                        issue_key=semantic_translation.issue_key,
+                    )
+                    if issue_context is None:
+                        return
+                if task.scenario in {"jira_issue_plan", "jira_issue_develop"} and planning_knowledge_context is None:
+                    planning_knowledge_context = self._prefetch_planning_repository_context(
+                        task=task,
+                        actor_name=actor_name,
+                        semantic_translation=semantic_translation,
+                    )
+                planning_request_text = self._augment_request_with_context(
+                    original_request=task.request_text,
+                    translation_document=task.translation_json or {},
+                    issue_context=issue_context,
+                    planning_knowledge_context=(
+                        planning_knowledge_context
+                        if task.scenario in {"jira_issue_plan", "jira_issue_develop"}
+                        else None
+                    ),
+                )
+            else:
+                planning_request_text = self._augment_request_with_context(
+                    original_request=task.request_text,
+                    translation_document=task.translation_json or {},
+                    issue_context=None,
+                    planning_knowledge_context=None,
+                )
+            self._write_task_checkpoint(
+                task,
+                stage="retrieve",
+                output_payload=self._task_checkpoint_payload(
+                    task,
+                    semantic_translation=task.translation_json,
+                    issue_context=issue_context,
+                    planning_knowledge_context=planning_knowledge_context,
+                    planning_request_text=planning_request_text,
+                ),
+            )
+
+        if self._anchor_precheck_fails(task):
+            return
+
+        set_task_status(
+            self.db,
+            task=task,
+            new_status=TaskStatus.PLANNING,
+            new_stage=WorkflowStage.PLANNING,
+            role=RoleName.PLANNER,
+            source=EventSource.ORCHESTRATOR,
+            message="Task resumed planner execution from checkpoint.",
+        )
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.PLANNING_STARTED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.PLANNING,
+            role=RoleName.PLANNER,
+            message="Planner role resumed structured plan generation.",
+            payload={"actor_name": actor_name, "resumed_from_stage": checkpoint.stage},
+        )
+        planning_result = self.primary_agent.generate_plan(
+            task_id=task.id,
+            request_text=planning_request_text,
+            scenario=task.scenario,
+            actor_name=actor_name,
+            semantic_translation=semantic_translation,
+            planning_knowledge=planning_knowledge_context,
+            issue_context=issue_context,
+        )
+        plan_document = planning_result.plan
+        task.plan_json = plan_document.model_dump(mode="json")
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.PLAN_GENERATED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.PLANNING,
+            role=RoleName.PLANNER,
+            message="Execution plan generated after resume.",
+            payload={
+                "actor_name": actor_name,
+                "plan": task.plan_json,
+                "provider_name": planning_result.provider_name,
+                "model_name": planning_result.model_name,
+                "used_fallback": planning_result.used_fallback,
+                "fallback_reason": planning_result.fallback_reason,
+            },
+        )
+        self._workspace_write_plan(task, plan_document, reason="resume_planner_generated")
+        self._write_task_checkpoint(
+            task,
+            stage="plan",
+            output_payload=self._task_checkpoint_payload(
+                task,
+                semantic_translation=task.translation_json,
+                issue_context=issue_context,
+                planning_knowledge_context=planning_knowledge_context,
+                planning_request_text=planning_request_text,
+                plan_json=task.plan_json,
+            ),
+        )
+        commit_checkpoint(self.db, label="resume_plan_generated")
+        self._resume_after_plan_checkpoint(task=task, actor_name=actor_name, plan=plan_document)
+
+    def _resume_after_plan_checkpoint(
+        self,
+        *,
+        task: Task,
+        actor_name: str,
+        plan: GeneratedPlan,
+    ) -> None:
+        set_task_status(
+            self.db,
+            task=task,
+            new_status=TaskStatus.REVIEWING,
+            new_stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            source=EventSource.ORCHESTRATOR,
+            message="Reviewer resumed plan validation from checkpoint.",
+        )
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.REVIEW_STARTED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            message="Reviewer role resumed pre-execution validation.",
+            payload={"plan_id": plan.plan_id},
+        )
+        review_result = self.reviewer_agent.review_plan(
+            task_id=task.id,
+            actor_name=actor_name,
+            plan=plan,
+        )
+        task.review_json = review_result.review.model_dump(mode="json")
+        self._write_task_checkpoint(
+            task,
+            stage="review_pre",
+            output_payload=self._task_checkpoint_payload(
+                task,
+                plan_json=task.plan_json,
+                review_json=task.review_json,
+            ),
+        )
+        self._resume_from_review_checkpoint(task=task, actor_name=actor_name, plan=plan)
+
+    def _resume_from_review_checkpoint(
+        self,
+        *,
+        task: Task,
+        actor_name: str,
+        plan: GeneratedPlan,
+    ) -> None:
+        review_json = task.review_json if isinstance(task.review_json, dict) else {}
+        verdict = str(review_json.get("verdict") or "").casefold()
+        if verdict == "approved":
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.REVIEW_PASSED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                message="Reviewer-approved plan replayed from checkpoint.",
+                payload={"review": review_json},
+            )
+            commit_checkpoint(self.db, label="resume_review_passed_pre_execution")
+            self._execute_plan(task=task, actor_name=actor_name, plan=plan)
+            return
+        if verdict == "requires_approval":
+            self._request_pre_execution_resume_approval(task=task, plan=plan, review_json=review_json)
+            return
+        task.latest_result_json = {
+            "status": TaskStatus.FAILED.value,
+            "message": str(review_json.get("summary") or "Reviewer rejected the plan before execution."),
+            "review": review_json,
+        }
+        set_task_status(
+            self.db,
+            task=task,
+            new_status=TaskStatus.FAILED,
+            new_stage=WorkflowStage.DONE,
+            role=RoleName.REVIEWER,
+            source=EventSource.ORCHESTRATOR,
+            message="Task failed during resumed plan review.",
+        )
+
+    def _request_pre_execution_resume_approval(
+        self,
+        *,
+        task: Task,
+        plan: GeneratedPlan,
+        review_json: dict[str, object],
+    ) -> None:
+        approval_requirements = review_json.get("approval_requirements")
+        required_approver_role = ActorRole.TEAM_LEAD.value
+        if isinstance(approval_requirements, list) and approval_requirements:
+            first = approval_requirements[0]
+            if isinstance(first, dict) and first.get("approver_role"):
+                required_approver_role = str(first["approver_role"])
+        approval = Approval(
+            task_id=task.id,
+            action_name=self._resolve_tool_name(plan),
+            status=ApprovalStatus.PENDING,
+            requested_by_role=RoleName.REVIEWER,
+            approver_role=required_approver_role,
+            requested_by_actor_name=task.actor_name,
+            risk_level=task.risk_level,
+            risk_category=task.risk_category,
+            reason="Reviewer marked the resumed plan as approval-required before execution.",
+            request_payload_json={
+                "request_text": task.request_text,
+                "scenario": task.scenario,
+                "proposed_plan": task.plan_json,
+                "review": review_json,
+            },
+            policy_snapshot_json={
+                "decision": "require_approval",
+                "source": "reviewer_pre_execution_gate_resume",
+                "tool_name": self._resolve_tool_name(plan),
+                "actor_name": task.actor_name,
+                "actor_role": task.actor_role.value,
+                "risk_level": task.risk_level.value,
+                "risk_category": task.risk_category.value,
+                "required_approver_role": required_approver_role,
+            },
+        )
+        self.db.add(approval)
+        self.db.flush()
+        task.pending_approval = True
+        task.latest_result_json = {
+            "status": TaskStatus.AWAITING_APPROVAL.value,
+            "message": "Reviewer requires manual approval before execution can continue.",
+            "approval_id": approval.id,
+            "review": review_json,
+        }
+        self._write_task_checkpoint(
+            task,
+            stage="awaiting_approval",
+            output_payload=self._task_checkpoint_payload(
+                task,
+                approval_id=approval.id,
+                plan_json=task.plan_json,
+                review_json=review_json,
+            ),
+        )
+        set_task_status(
+            self.db,
+            task=task,
+            new_status=TaskStatus.AWAITING_APPROVAL,
+            new_stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            source=EventSource.ORCHESTRATOR,
+            message="Task is awaiting manual approval after resumed review.",
+        )
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.APPROVAL_REQUESTED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            message="Approval requested for resumed planned action.",
+            payload={
+                "approval_id": approval.id,
+                "action_name": approval.action_name,
+                "approver_role": approval.approver_role,
+                "review_summary": review_json.get("summary"),
+            },
+        )
+        commit_checkpoint(self.db, label="resume_awaiting_approval_pre_execution")
+
+    def _prepare_develop_resume(self, *, task: Task, checkpoint: TaskCheckpoint) -> None:
+        if task.scenario != "jira_issue_develop":
+            return
+        pipeline_state = self._load_develop_pipeline_state(task)
+        if checkpoint.stage == "codegen":
+            sandbox = self._build_develop_sandbox(task)
+            if sandbox.exists() and not sandbox.is_clean():
+                snapshot_id = (
+                    checkpoint.sandbox_snapshot_id
+                    or str(pipeline_state.get("pre_codegen_snapshot_id") or "")
+                )
+                if snapshot_id and sandbox.rollback_to_snapshot(snapshot_id):
+                    pipeline_state.pop("sandbox_result", None)
+                    pipeline_state.pop("patch_method", None)
+                    pipeline_state["sandbox_rollback_on_resume"] = True
+                    self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+                else:
+                    raise SandboxError("Cannot resume: sandbox has uncommitted changes and no valid snapshot.")
 
     def _translate_request(
         self,
@@ -1575,6 +2114,14 @@ class PrimaryOrchestrator:
         )
         if not task.translation_json:
             task.translation_json = semantic_translation.model_dump(mode="json")
+            self._write_task_checkpoint(
+                task,
+                stage="translate",
+                output_payload=self._task_checkpoint_payload(
+                    task,
+                    semantic_translation=task.translation_json,
+                ),
+            )
 
         set_task_status(
             self.db,
@@ -1717,6 +2264,16 @@ class PrimaryOrchestrator:
             message=succeeded_message,
             payload=result,
         )
+        if tool_name == "knowledge.search":
+            self._write_task_checkpoint(
+                task,
+                stage="retrieve",
+                output_payload=self._task_checkpoint_payload(
+                    task,
+                    tool_name=tool_name,
+                    tool_result=result,
+                ),
+            )
 
         if task.scenario == "jira_issue_plan":
             result = {
@@ -1756,6 +2313,16 @@ class PrimaryOrchestrator:
         )
         task.review_json = output_review.review.model_dump(mode="json")
         task.pending_approval = False
+        self._write_task_checkpoint(
+            task,
+            stage="review_post",
+            output_payload=self._task_checkpoint_payload(
+                task,
+                tool_name=tool_name,
+                tool_result=result,
+                review_json=task.review_json,
+            ),
+        )
 
         if output_review.review.verdict == "approved":
             record_event(
@@ -2074,6 +2641,17 @@ class PrimaryOrchestrator:
                         diff=str(codegen_result.get("diff") or ""),
                     )
                     self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+                    self._write_task_checkpoint(
+                        task,
+                        stage="codegen",
+                        output_payload=self._task_checkpoint_payload(
+                            task,
+                            pipeline_state=self._load_develop_pipeline_state(task),
+                            codegen_result=codegen_result,
+                            plan_json=task.plan_json,
+                        ),
+                        resume_method="redo_stage",
+                    )
                     record_event(
                         self.db,
                         task_id=task.id,
@@ -2445,6 +3023,17 @@ class PrimaryOrchestrator:
                 diff=str(codegen_result.get("diff") or ""),
             )
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+            self._write_task_checkpoint(
+                task,
+                stage="codegen",
+                output_payload=self._task_checkpoint_payload(
+                    task,
+                    pipeline_state=self._load_develop_pipeline_state(task),
+                    codegen_result=codegen_result,
+                    plan_json=task.plan_json,
+                ),
+                resume_method="redo_stage",
+            )
             record_event(
                 self.db,
                 task_id=task.id,
@@ -2485,6 +3074,23 @@ class PrimaryOrchestrator:
                     message="Development sandbox is ready.",
                     payload=sandbox_setup_result,
                 )
+                sandbox = self._build_develop_sandbox(task)
+                pre_apply_snapshot = sandbox.snapshot_id()
+                if pre_apply_snapshot:
+                    pipeline_state["pre_codegen_snapshot_id"] = pre_apply_snapshot
+                    self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+                self._write_task_checkpoint(
+                    task,
+                    stage="codegen",
+                    output_payload=self._task_checkpoint_payload(
+                        task,
+                        pipeline_state=self._load_develop_pipeline_state(task),
+                        codegen_result=codegen_result,
+                        plan_json=task.plan_json,
+                    ),
+                    sandbox_snapshot_id=pre_apply_snapshot,
+                    resume_method="redo_stage",
+                )
                 sandbox_result = self._execute_develop_tool(
                     task=task,
                     actor_name=actor_name,
@@ -2513,6 +3119,23 @@ class PrimaryOrchestrator:
             pipeline_state["sandbox_result"] = sandbox_result
             pipeline_state["patch_method"] = str(sandbox_result.get("method") or "git_apply")
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+            post_apply_snapshot = self._build_develop_sandbox(task).snapshot_id()
+            if post_apply_snapshot:
+                pipeline_state["sandbox_snapshot_id"] = post_apply_snapshot
+                self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+            self._write_task_checkpoint(
+                task,
+                stage="codegen",
+                output_payload=self._task_checkpoint_payload(
+                    task,
+                    pipeline_state=self._load_develop_pipeline_state(task),
+                    codegen_result=codegen_result,
+                    sandbox_result=sandbox_result,
+                    plan_json=task.plan_json,
+                ),
+                sandbox_snapshot_id=post_apply_snapshot,
+                resume_method="replay_from_output",
+            )
 
         # --- Completeness check ---
         # Strategy varies by task type:
@@ -2925,6 +3548,17 @@ class PrimaryOrchestrator:
             )
             if outcome in {"approval_requested", "failed"}:
                 return
+            self._write_task_checkpoint(
+                task,
+                stage="compile",
+                output_payload=self._task_checkpoint_payload(
+                    task,
+                    pipeline_state=self._load_develop_pipeline_state(task),
+                    compile_result=pipeline_state.get("compile_gate"),
+                    plan_json=task.plan_json,
+                ),
+                sandbox_snapshot_id=self._build_develop_sandbox(task).snapshot_id(),
+            )
 
         # --- Runtime validation gate (with 1 repair cycle) ---
         if not pipeline_state.get("runtime_validation_done"):
@@ -3101,6 +3735,17 @@ class PrimaryOrchestrator:
             pipeline_state["review_result"] = review_result
             pipeline_state["review_verdict"] = str(review_result.get("verdict") or "")
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+            self._write_task_checkpoint(
+                task,
+                stage="review_post",
+                output_payload=self._task_checkpoint_payload(
+                    task,
+                    pipeline_state=self._load_develop_pipeline_state(task),
+                    review_result=review_result,
+                    plan_json=task.plan_json,
+                ),
+                sandbox_snapshot_id=self._build_develop_sandbox(task).snapshot_id(),
+            )
 
         if str(review_result.get("verdict") or "").casefold() == "block":
             violations = self._format_review_violations(review_result)
@@ -4310,7 +4955,17 @@ class PrimaryOrchestrator:
         )
 
     def _develop_sandbox_dir(self, task: Task) -> Path:
-        base_dir = Path(str(getattr(self.tool_gateway.settings, "sandbox_base_dir", "data/sandboxes")))
+        settings = self.tool_gateway.settings
+        external_root = getattr(settings, "sandbox_external_root", None)
+        if external_root:
+            root_path = Path(external_root)
+            if not root_path.is_absolute():
+                raise ValueError(
+                    "sandbox_external_root must be an absolute path when set "
+                    f"(got {external_root!r})."
+                )
+            return root_path / task.id
+        base_dir = Path(str(getattr(settings, "sandbox_base_dir", "data/sandboxes")))
         return base_dir / task.id
 
     # ----- Compile repair loop --------------------------------------------- #
@@ -5856,6 +6511,17 @@ class PrimaryOrchestrator:
             "result": preview_result,
             "pipeline_state": pipeline_state,
         }
+        self._write_task_checkpoint(
+            task,
+            stage="awaiting_approval",
+            output_payload=self._task_checkpoint_payload(
+                task,
+                approval_id=approval.id,
+                pipeline_state=pipeline_state,
+                plan_json=task.plan_json,
+            ),
+            sandbox_snapshot_id=self._build_develop_sandbox(task).snapshot_id(),
+        )
 
         set_task_status(
             self.db,
@@ -5993,6 +6659,17 @@ class PrimaryOrchestrator:
             "result": approval_payload,
             "pipeline_state": pipeline_state,
         }
+        self._write_task_checkpoint(
+            task,
+            stage="awaiting_approval",
+            output_payload=self._task_checkpoint_payload(
+                task,
+                approval_id=approval.id,
+                pipeline_state=pipeline_state,
+                plan_json=task.plan_json,
+            ),
+            sandbox_snapshot_id=self._build_develop_sandbox(task).snapshot_id(),
+        )
 
         set_task_status(
             self.db,
@@ -6184,6 +6861,16 @@ class PrimaryOrchestrator:
             "approval_id": approval_id,
             "execution_id": execution_id,
         }
+        self._write_task_checkpoint(
+            task,
+            stage="awaiting_approval",
+            output_payload=self._task_checkpoint_payload(
+                task,
+                approval_id=approval_id,
+                execution_id=execution_id,
+                tool_name=tool_name,
+            ),
+        )
         set_task_status(
             self.db,
             task=task,
