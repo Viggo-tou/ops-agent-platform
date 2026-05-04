@@ -4310,7 +4310,17 @@ class PrimaryOrchestrator:
         )
 
     def _develop_sandbox_dir(self, task: Task) -> Path:
-        base_dir = Path(str(getattr(self.tool_gateway.settings, "sandbox_base_dir", "data/sandboxes")))
+        settings = self.tool_gateway.settings
+        external_root = getattr(settings, "sandbox_external_root", None)
+        if external_root:
+            root_path = Path(external_root)
+            if not root_path.is_absolute():
+                raise ValueError(
+                    "sandbox_external_root must be an absolute path when set "
+                    f"(got {external_root!r})."
+                )
+            return root_path / task.id
+        base_dir = Path(str(getattr(settings, "sandbox_base_dir", "data/sandboxes")))
         return base_dir / task.id
 
     # ----- Compile repair loop --------------------------------------------- #
