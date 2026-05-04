@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -83,6 +84,7 @@ PYTHON_FILE_LINE_ERROR = re.compile(r'File "([^"]+)", line (\d+)')
 TS_ERROR = re.compile(r"^([^(]+)\((\d+),(\d+)\):\s+error\s+(\S+):\s+(.*)$", re.MULTILINE)
 RUST_LOCATION = re.compile(r"^\s*-->\s+([^:]+):(\d+):(\d+)", re.MULTILINE)
 GO_ERROR = re.compile(r"^([^:\s]+\.go):(\d+):(?:(\d+):)?\s+(.*)$", re.MULTILINE)
+GRADLE_WRAPPERS = {"gradlew", "gradlew.bat"}
 
 
 def resolve_verification_profile(
@@ -212,7 +214,28 @@ def run_compile_check(
             reason="unknown_repo_type",
         )
 
-    command = subprocess.list2cmdline(profile.compile_command)
+    sandbox_workdir = Path(getattr(sandbox, "work_dir"))
+    resolved_executable = _resolve_executable(profile, sandbox_workdir)
+    if resolved_executable is None:
+        return CompileCheckResult(
+            passed=True,
+            status="skipped",
+            repo_type=profile.repo_type,
+            command=profile.compile_command,
+            output="",
+            errors=[],
+            timed_out=False,
+            duration_ms=0,
+            reason=_missing_executable_reason(profile.compile_command[0]),
+        )
+
+    compile_command = list(profile.compile_command)
+    if _is_windows_batch_wrapper(resolved_executable):
+        compile_command = ["cmd.exe", "/d", "/c", resolved_executable, *compile_command[1:]]
+    else:
+        compile_command[0] = resolved_executable
+
+    command = subprocess.list2cmdline(compile_command)
     env = {"GRADLE_OPTS": "-Dorg.gradle.daemon=false"} if profile.repo_type == "android_gradle" else None
     raw_result = sandbox.run(
         command,
@@ -226,10 +249,9 @@ def run_compile_check(
     exit_code = int(raw_result.get("exit_code", -1))
     timed_out = bool(raw_result.get("timed_out", False))
     passed = exit_code == 0 and not timed_out
-    repo_root = getattr(sandbox, "work_dir", None)
     errors = [
         error.to_dict(profile.repo_type)
-        for error in parse_compiler_errors(output, profile.repo_type, repo_root=repo_root if isinstance(repo_root, Path) else None)
+        for error in parse_compiler_errors(output, profile.repo_type, repo_root=sandbox_workdir)
     ]
     if not passed and not errors:
         excerpt = _first_output_excerpt(output)
@@ -255,6 +277,51 @@ def run_compile_check(
         duration_ms=int(raw_result.get("duration_ms", 0)),
         reason=None,
     )
+
+
+def _resolve_executable(profile: VerificationProfile, sandbox_workdir: Path) -> str | None:
+    command = profile.compile_command
+    if not command:
+        return None
+
+    executable = command[0]
+    if _is_repo_local_executable(executable) or _is_gradle_wrapper(executable):
+        candidate = _repo_local_executable_path(sandbox_workdir, executable)
+        if candidate.exists():
+            return str(candidate.resolve())
+        # Do not fall back to system Gradle for wrapper commands: the wrapper pins
+        # the project toolchain, and a missing wrapper is an environment skip.
+        return None
+
+    return shutil.which(executable)
+
+
+def _is_repo_local_executable(executable: str) -> bool:
+    return (
+        executable.startswith(("./", ".\\", "/", "\\"))
+        or "/" in executable
+        or "\\" in executable
+    )
+
+
+def _repo_local_executable_path(sandbox_workdir: Path, executable: str) -> Path:
+    if executable.startswith(("/", "\\")):
+        executable = executable.lstrip("/\\")
+    return sandbox_workdir / executable
+
+
+def _is_gradle_wrapper(executable: str) -> bool:
+    return Path(executable).name.casefold() in GRADLE_WRAPPERS
+
+
+def _is_windows_batch_wrapper(executable: str) -> bool:
+    return Path(executable).suffix.casefold() == ".bat"
+
+
+def _missing_executable_reason(executable: str) -> Literal["toolchain_missing", "wrapper_missing"]:
+    if _is_repo_local_executable(executable) or _is_gradle_wrapper(executable):
+        return "wrapper_missing"
+    return "toolchain_missing"
 
 
 def _parse_android_kotlin_errors(stdout: str, *, repo_root: Path | None) -> list[CompileError]:
