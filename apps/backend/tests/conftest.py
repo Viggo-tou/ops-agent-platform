@@ -20,6 +20,12 @@ def pytest_configure(config):  # noqa: ANN001
     if os.name != "nt" or _ORIGINAL_MKDIR is not None:
         return
 
+    temp_root = BACKEND_ROOT / ".tmp-pytest"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    os.environ["TMP"] = str(temp_root)
+    os.environ["TEMP"] = str(temp_root)
+    tempfile.tempdir = str(temp_root)
+
     _ORIGINAL_MKDIR = tempfile._os.mkdir
 
     def mkdir_with_write_access(path: str, mode: int = 0o777, *, dir_fd=None) -> None:  # noqa: ANN001

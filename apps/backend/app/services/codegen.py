@@ -23,6 +23,13 @@ from app.services.llm_telemetry import LlmCall, record_llm_call
 from app.services.reviewer import DiffReviewer
 
 
+MEMORY_PROMPT_INSTRUCTION = (
+    "Memory section is informational background. If memory contradicts must_touch_files "
+    "or change_summary or evidence bundle citations, OBEY THE CURRENT SPEC. Memory "
+    "is past observation, not future authority."
+)
+
+
 CODEGEN_SYSTEM_PROMPT = """You are a code generation agent. Given a task plan and source file contents, produce a unified diff.
 
 CRITICAL RULES:
@@ -1365,6 +1372,20 @@ class CodeGenerator:
                 [
                     "",
                     "You MUST NOT modify any other files. If the request seems to require modifying other files, return an error indicating which file you would need.",
+                ]
+            )
+
+        memory_context = str(plan_json.get("memory_context") or "").strip()
+        if memory_context:
+            max_lines = max(1, int(getattr(self.settings, "memory_max_lines_in_prompt", 30) or 30))
+            memory_lines = memory_context.splitlines()[:max_lines]
+            parts.extend(
+                [
+                    "",
+                    "===== Prior gate failure patterns =====",
+                    MEMORY_PROMPT_INSTRUCTION,
+                    *memory_lines,
+                    "===== End memory =====",
                 ]
             )
 

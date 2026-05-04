@@ -143,6 +143,13 @@ class Settings(BaseSettings):
     # bounded, and fails safe to the original retrieval token set.
     knowledge_query_rewrite_enabled: bool = True
     knowledge_query_rewrite_timeout_seconds: float = 15.0
+    memory_enabled: bool = True
+    memory_judge_provider: str = "minimax"
+    memory_judge_model: str = "MiniMax-M2.7"
+    memory_top_n_per_query: int = 3
+    memory_max_lines_in_prompt: int = 30
+    memory_dedup_threshold: float = 0.85
+    memory_judge_timeout_seconds: int = 30
     cc_agentic_enabled: bool = True
     cc_agent_provider_chain: str = "claude_code,codex,minimax"
     cc_agent_max_rounds: int = 3
