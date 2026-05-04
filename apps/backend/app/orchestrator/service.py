@@ -3156,6 +3156,56 @@ class PrimaryOrchestrator:
             )
             return
         pipeline_state.setdefault("diff", diff)
+
+        # Static shape pre-gate (Stage X.1): catches destructive empty patches
+        # (pure-deletion of must_touch files) before any LLM gate runs.
+        # Codex consult verdict on P69-19 dogfood: review gates approved a
+        # patch that deleted package+imports and added 0 lines, claiming
+        # "all goals met". Static line-count check rejects in ms.
+        try:
+            from app.services.diff_shape_check import evaluate_patch_shape
+            must_touch_paths = list(getattr(plan, "must_touch_files", []) or [])
+            task_intent = " ".join([
+                str(getattr(plan, "objective", "") or ""),
+                str(getattr(task, "request_text", "") or ""),
+            ])
+            shape = evaluate_patch_shape(diff, must_touch_files=must_touch_paths, task_intent=task_intent)
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=(
+                    EventType.TOOL_FAILED if shape.destructive else EventType.TOOL_SUCCEEDED
+                ),
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="diff_shape_check.evaluate",
+                message=(
+                    f"diff shape: added={shape.totals['added']} "
+                    f"removed={shape.totals['removed']} destructive={shape.destructive}"
+                ),
+                payload=shape.to_payload(),
+            )
+            if shape.destructive:
+                self._fail_develop_pipeline(
+                    task=task,
+                    event_type=EventType.REVIEW_FAILED,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    message=f"Diff shape pre-gate rejected destructive patch: {shape.reason}",
+                    payload={
+                        "plan_id": plan.plan_id,
+                        "shape_check": shape.to_payload(),
+                    },
+                )
+                return
+        except Exception as exc:  # noqa: BLE001
+            self._workspace_append_audit(
+                task,
+                "diff_shape_check.errored",
+                {"error": str(exc)[:400]},
+            )
+
         files_changed = codegen_result.get("files_changed")
         pipeline_state.setdefault("files_changed", files_changed if isinstance(files_changed, list) else [])
         pipeline_state.setdefault("codegen_provider", str(codegen_result.get("provider_name") or "unknown"))
