@@ -157,7 +157,11 @@ class Settings(BaseSettings):
     tool_permission_overrides: str | None = None
     tool_default_timeout_seconds: float = 15.0
     tool_default_retry_count: int = 1
+    # Default points to a relative path next to backend; can be overridden
+    # via env to escape non-ASCII parent paths (Windows Android Gradle plugin
+    # rejects non-ASCII paths).
     sandbox_base_dir: str = "data/sandboxes"
+    sandbox_external_root: str | None = None
     sandbox_clone_timeout_seconds: float = 120.0
     # Sandbox retention: at startup, delete sandbox dirs whose owning task
     # is in a terminal status AND completed earlier than this many hours
