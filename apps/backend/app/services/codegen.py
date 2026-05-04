@@ -377,12 +377,16 @@ class CodeGenerator:
         # context).
         if shutil.which(self.settings.claude_code_command):
             chain.append("claude_code")
+        # 2026-05-04: DeepSeek-V4-Pro promoted to 2nd-priority fallback after
+        # claude_code, ahead of codex CLI. Subagent experiment Stage 25.6/25.7
+        # showed DeepSeek delivers production-ready commits on small/medium
+        # tasks; codex CLI keeps 3rd slot for full-context worktree work.
+        if getattr(self.settings, "deepseek_api_key", None):
+            chain.append("deepseek")
         if shutil.which(self.settings.codex_command):
             chain.append("codex")
         if getattr(self.settings, "anthropic_api_key", None):
             chain.append("anthropic")
-        if getattr(self.settings, "deepseek_api_key", None):
-            chain.append("deepseek")
         if getattr(self.settings, "openai_api_key", None):
             chain.append("openai")
         if getattr(self.settings, "minimax_api_key", None):
