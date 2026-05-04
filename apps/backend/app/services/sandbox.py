@@ -243,15 +243,23 @@ class ExecutionSandbox:
                 shell=True,
                 capture_output=True,
                 text=True,
+                # Explicit UTF-8 with replacement: on Windows, default text mode
+                # uses GBK which can't decode Gradle / git / other UTF-8 stderr;
+                # the reader thread then raises UnicodeDecodeError and leaves
+                # result.stderr as None, blowing up downstream subscript.
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout_seconds,
                 cwd=str(work_dir),
                 env=run_env,
             )
             duration_ms = int((time.monotonic() - start) * 1000)
+            stdout_text = result.stdout or ""
+            stderr_text = result.stderr or ""
             return {
                 "exit_code": result.returncode,
-                "stdout": result.stdout[:max_output_chars],
-                "stderr": result.stderr[:max_output_chars],
+                "stdout": stdout_text[:max_output_chars],
+                "stderr": stderr_text[:max_output_chars],
                 "duration_ms": duration_ms,
                 "timed_out": False,
                 "command": command,
