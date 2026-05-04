@@ -10,6 +10,7 @@ from app.models.base import Base
 from app.models.knowledge_card import KnowledgeCard
 from app.models.knowledge_document import KnowledgeDocument
 from app.models.knowledge_retrieval_cache import KnowledgeRetrievalCache
+from app.models.memory import AgentMemory
 
 settings = get_settings()
 is_sqlite = settings.database_url.startswith("sqlite")
@@ -76,6 +77,27 @@ def create_knowledge_fts_table(db: Session) -> None:
                 title,
                 content,
                 card_text,
+                tokenize = 'porter unicode61 remove_diacritics 2'
+            )
+            """
+        )
+    )
+
+
+def create_agent_memory_fts_table(db: Session) -> None:
+    if not is_sqlite:
+        return
+    if not hasattr(db, "execute"):
+        return
+    db.execute(
+        text(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS agent_memory_fts USING fts5(
+                memory_id UNINDEXED,
+                scope UNINDEXED,
+                kind UNINDEXED,
+                observation,
+                resolution,
                 tokenize = 'porter unicode61 remove_diacritics 2'
             )
             """
@@ -163,6 +185,10 @@ def ensure_local_schema() -> None:
         llm_usage_table = Base.metadata.tables.get("llm_usage")
         if "llm_usage" not in existing_tables and llm_usage_table is not None:
             llm_usage_table.create(bind=connection, checkfirst=True)
+
+        agent_memory_table = Base.metadata.tables.get("agent_memory")
+        if "agent_memory" not in existing_tables and agent_memory_table is not None:
+            agent_memory_table.create(bind=connection, checkfirst=True)
 
         if "task" in existing_tables:
             task_columns = {column["name"] for column in inspector.get_columns("task")}
@@ -280,3 +306,5 @@ def ensure_local_schema() -> None:
 
     with SessionLocal() as db:
         backfill_knowledge_fts_if_empty(db)
+        create_agent_memory_fts_table(db)
+        db.commit()

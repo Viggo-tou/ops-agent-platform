@@ -8,6 +8,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 
 import httpx
 from sqlalchemy import select
@@ -16,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.agents.schemas import GeneratedPlan, GeneratedSemanticTranslation
 from app.agents.service import ActionAgent, PrimaryAgentPlanner, ReviewerAgent
 from app.agents.translation import SemanticTranslator
+from app.core.config import get_settings
 from app.core.enums import ActorRole, ApprovalStatus, EventSource, EventType, RoleName, TaskStatus, WorkflowStage
 from app.core.jira import extract_jira_issue_reference, looks_like_jira_issue_url
 from app.core.telemetry import get_current_trace_id, get_tracer
@@ -26,10 +28,11 @@ from app.models.task import Task
 from app.models.tool_execution import ToolExecution
 from app.schemas.evidence import EvidenceItem
 from app.schemas.knowledge import KnowledgeClaim
-from app.services.events import commit_checkpoint, record_event, set_task_status
+from app.services.events import commit_checkpoint, record_event as _record_event, set_task_status as _set_task_status
 from app.services.evidence_chain import EvidenceChainReport, check_evidence_chain
 from app.services.failure_diagnosis import FailureKind, run_diagnosis
 from app.services.checkpointing import CheckpointStage, TaskCheckpoint, read_task_checkpoint, write_task_checkpoint
+from app.services.memory import MemoryService
 from app.services.sandbox import ExecutionSandbox, SandboxError
 from app.services.spec_conformance import (
     ConformanceReport,
@@ -40,6 +43,78 @@ from app.services.task_workspace import TaskWorkspace
 from app.tools.gateway import ToolApprovalRequired, ToolGateway, ToolInvocationError
 
 logger = logging.getLogger("orchestrator")
+
+
+def record_event(
+    db: Session,
+    *,
+    task_id: str,
+    event_type: EventType,
+    source: EventSource,
+    message: str,
+    session_id: str | None = None,
+    stage: WorkflowStage | None = None,
+    role: RoleName | None = None,
+    tool_name: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> Event:
+    event = _record_event(
+        db,
+        task_id=task_id,
+        event_type=event_type,
+        source=source,
+        message=message,
+        session_id=session_id,
+        stage=stage,
+        role=role,
+        tool_name=tool_name,
+        payload=payload,
+    )
+    if event_type in {
+        EventType.REVIEW_FAILED,
+        EventType.COMPILE_FAILED,
+        EventType.FAILURE_DIAGNOSIS_GENERATED,
+    }:
+        try:
+            task = db.get(Task, task_id)
+            MemoryService(db, get_settings()).maybe_record_gate_event(event=event, task=task)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "memory gate-failure hook failed",
+                extra={"task_id": task_id, "event_type": str(event_type), "error": str(exc)[:300]},
+            )
+    return event
+
+
+def set_task_status(
+    db: Session,
+    *,
+    task: Task,
+    new_status: TaskStatus,
+    new_stage: WorkflowStage,
+    role: RoleName | None,
+    message: str,
+    source: EventSource = EventSource.SYSTEM,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    _set_task_status(
+        db,
+        task=task,
+        new_status=new_status,
+        new_stage=new_stage,
+        role=role,
+        message=message,
+        source=source,
+        payload=payload,
+    )
+    if new_status in {TaskStatus.COMPLETED, TaskStatus.AWAITING_APPROVAL}:
+        try:
+            MemoryService(db, get_settings()).promote_pending(task_id=task.id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "memory promotion hook failed",
+                extra={"task_id": task.id, "status": str(new_status), "error": str(exc)[:300]},
+            )
 
 
 class RepairRoundTimeout(Exception):
@@ -2784,6 +2859,9 @@ class PrimaryOrchestrator:
             _translation = task.translation_json or {}
             if _translation.get("constraints"):
                 _plan_json_for_codegen["constraints"] = _translation["constraints"]
+            memory_context = self._build_codegen_memory_context(task)
+            if memory_context:
+                _plan_json_for_codegen["memory_context"] = memory_context
 
             parallel_max = getattr(
                 self.tool_gateway.settings, "codegen_parallel_max", 2
@@ -5702,6 +5780,50 @@ class PrimaryOrchestrator:
         "replace", "simplify", "strip", "eliminate", "drop", "disable",
     )
 
+    def _build_codegen_memory_context(self, task: Task) -> str:
+        settings_obj = self.tool_gateway.settings
+        if not bool(getattr(settings_obj, "memory_enabled", True)):
+            return ""
+        try:
+            service = MemoryService(self.db, settings_obj)
+            top_n = int(getattr(settings_obj, "memory_top_n_per_query", 3) or 3)
+            scopes = (
+                "gate:compile_gate",
+                "gate:spec_conformance",
+                "gate:evidence_chain",
+                "gate:runtime_validation",
+                "gate:artifact_existence",
+                "gate:failing_test_gate",
+                "gate:failure_diagnosis",
+                "gate:review",
+            )
+            memories = []
+            seen: set[str] = set()
+            for scope in scopes:
+                for memory in service.query(
+                    scope=scope,
+                    kind="gate_failure_resolution",
+                    text_hint=task.request_text or "",
+                    top_n=top_n,
+                ):
+                    if memory.id in seen:
+                        continue
+                    seen.add(memory.id)
+                    memories.append(memory)
+                    if len(memories) >= top_n:
+                        break
+                if len(memories) >= top_n:
+                    break
+            rendered = service.attach_provenance_lines(memories)
+            max_lines = max(1, int(getattr(settings_obj, "memory_max_lines_in_prompt", 30) or 30))
+            return "\n".join(rendered.splitlines()[:max_lines]).strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "codegen memory query failed",
+                extra={"task_id": task.id, "error": str(exc)[:300]},
+            )
+            return ""
+
     def _build_codegen_task_description(
         self,
         *,
@@ -6763,12 +6885,27 @@ class PrimaryOrchestrator:
 
     def _run_failure_diagnosis(self, task: Task, *, failure_kind: FailureKind) -> None:
         try:
-            run_diagnosis(
+            diagnosis = run_diagnosis(
                 task=task,
                 db=self.db,
                 settings=self.tool_gateway.settings,
                 failure_kind=failure_kind,
             )
+            if diagnosis is not None:
+                event = self.db.scalars(
+                    select(Event)
+                    .where(
+                        Event.task_id == task.id,
+                        Event.event_type == EventType.FAILURE_DIAGNOSIS_GENERATED,
+                    )
+                    .order_by(Event.created_at.desc())
+                    .limit(1)
+                ).first()
+                if event is not None:
+                    MemoryService(self.db, self.tool_gateway.settings).maybe_record_gate_event(
+                        event=event,
+                        task=task,
+                    )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "failure diagnosis hook failed",
