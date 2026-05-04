@@ -217,6 +217,35 @@ def _call_decision_provider(provider: str, *, prompt: str, cwd: Path, timeout_s:
         response.raise_for_status()
         data = response.json()
         return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    if provider == "deepseek":
+        if not getattr(settings, "deepseek_api_key", None):
+            raise CCDecisionError("DeepSeek API key is not configured")
+        # NOTE: settings.deepseek_base_url may be set to the Anthropic-compat
+        # path (e.g. https://api.deepseek.com/anthropic) for the deepseek_agent.py
+        # wrapper. cc_agent uses chat completions which only exists on the
+        # OpenAI-compat path, so we hardcode that here regardless of the
+        # configured deepseek_base_url.
+        deepseek_chat_url = "https://api.deepseek.com/v1/chat/completions"
+        response = httpx.post(
+            deepseek_chat_url,
+            headers={
+                "Authorization": f"Bearer {settings.deepseek_api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": getattr(settings, "deepseek_model", "deepseek-coder"),
+                "messages": [
+                    {"role": "system", "content": "Return only valid JSON for the repository retrieval planner."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.1,
+                "max_tokens": 1000,
+            },
+            timeout=external_http_timeout(timeout_s),
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data.get("choices", [{}])[0].get("message", {}).get("content", "")
     raise CCDecisionError(f"unsupported provider: {provider}")
 
 
