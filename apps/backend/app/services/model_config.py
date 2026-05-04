@@ -31,12 +31,12 @@ DEFAULT_PROVIDER_CATALOG: list[dict[str, object]] = [
         "models": ["DeepSeek V3", "DeepSeek R1"],
     },
     {
-        "name": "阿里云",
+        "name": "Aliyun",
         "note": "Domestic provider compatibility",
         "models": ["Qwen Max"],
     },
     {
-        "name": "智谱 AI",
+        "name": "ZhipuAI AI",
         "note": "Domestic provider compatibility",
         "models": ["GLM-5"],
     },

@@ -567,16 +567,15 @@ class DevelopPipelineTests(unittest.TestCase):
 
         message = task.latest_result_json["message"]
         self.assertEqual(task.latest_result_json["status"], TaskStatus.COMPLETED.value)
-        # Task request_text is Chinese ("把 OPS-123 做了"), so summary is in Chinese
-        self.assertIn("## OPS-123 开发完成", message)
-        self.assertIn("修改了 **1** 个文件", message)
+        self.assertIn("## OPS-123 Development completed", message)
+        self.assertIn("Modified in this run", message)
         self.assertIn("- `app/example.py`", message)
         self.assertIn("```diff\ndiff --git a/app/example.py b/app/example.py", message)
-        self.assertIn("代码生成：mock", message)
-        self.assertIn("补丁应用方式：git_apply", message)
-        self.assertIn("测试：通过", message)
-        self.assertIn("审查：pass", message)
-        self.assertIn("Jira：已转换状态", message)
+        self.assertIn("Codegen: mock", message)
+        self.assertIn("Patch apply method: git_apply", message)
+        self.assertIn("Tests: passed", message)
+        self.assertIn("Review: pass", message)
+        self.assertIn("Jira: status transitioned", message)
         self.assertNotIn("Answer the question with grounded evidence from the repository", message)
         self.assertEqual(task.latest_result_json["result"]["issue_key"], "OPS-123")
         self.assertEqual(task.latest_result_json["result"]["files_changed"], ["app/example.py"])

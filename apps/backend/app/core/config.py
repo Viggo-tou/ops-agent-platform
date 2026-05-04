@@ -240,7 +240,7 @@ def get_settings() -> Settings:
     settings = Settings()
     if not settings.knowledge_source_specs and not settings.knowledge_source_path:
         default_candidates = [
-            Path(r"D:\项目\HostedDashboard\handyman-admin-dashboard"),
+            Path(r"D:\projects\HostedDashboard\handyman-admin-dashboard"),
             Path(r"D:\项目\HandymanApp-master"),
             Path(r"C:\Users\Tomonkyo\handyman-agent-system"),
         ]
