@@ -4384,9 +4384,17 @@ class PrimaryOrchestrator:
         round_timeout = float(
             getattr(settings_obj, "codegen_repair_round_timeout_seconds", 180.0)
         )
-        fail_to_approval = bool(
-            getattr(settings_obj, "codegen_repair_cap_exceeded_to_approval", True)
-        )
+        # Stage 25 contract: when verification_profile is the active compile mode,
+        # cap-exceeded means task FAILED (no silent awaiting_approval). Legacy
+        # codegen-repair path retains the old "send to approval" semantics.
+        if profile_compile_enabled:
+            fail_to_approval = bool(
+                getattr(settings_obj, "verification_compile_fail_to_approval", False)
+            )
+        else:
+            fail_to_approval = bool(
+                getattr(settings_obj, "codegen_repair_cap_exceeded_to_approval", True)
+            )
 
         rounds_summary: list[dict] = []
         compile_passed = False
@@ -4716,10 +4724,14 @@ class PrimaryOrchestrator:
             event_type=EventType.REVIEW_FAILED,
             stage=WorkflowStage.REVIEW,
             role=RoleName.REVIEWER,
-            message=f"Compile gate: {compile_result.summary()}",
+            message=(
+                f"compile_gate_exhausted: {compile_result.summary()}"
+            ),
             payload={
+                "reason": "compile_gate_exhausted",
                 "compile_gate": pipeline_state.get("compile_gate"),
                 "rounds_summary": rounds_summary,
+                "rounds_attempted": max_rounds,
             },
         )
         return "failed"
