@@ -336,8 +336,9 @@ class KnowledgeService:
                 from app.services.events import record_event
                 record_event(
                     self.db,
+                    task_id=task_id or "",
                     event_type=EventType.KNOWLEDGE_CACHE_HIT,
-                    source=EventSource.KNOWLEDGE,
+                    source=EventSource.SYSTEM,
                     message=f"Knowledge retrieval cache hit for source={cache_source}",
                     payload={"source_name": cache_source, "query_len": len(query)},
                 )
