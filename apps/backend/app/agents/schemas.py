@@ -88,7 +88,7 @@ class GeneratedPlan(GeneratedPlanPayload):
 
 class SemanticTranslationPayload(BaseModel):
     normalized_request: str = Field(min_length=1, max_length=600)
-    intent: str = Field(min_length=1, max_length=120)
+    intent: str = Field(min_length=1, max_length=320)
     work_type: Literal["bugfix", "feature", "investigation", "operations", "question", "unknown"]
     objective: str = Field(min_length=1, max_length=240)
     issue_key: str | None = Field(default=None, max_length=32)
