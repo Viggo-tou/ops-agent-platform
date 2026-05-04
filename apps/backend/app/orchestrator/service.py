@@ -147,6 +147,153 @@ def _truncated_traceback(exc: BaseException, *, limit: int = 2000) -> str:
     return text[:limit]
 
 
+def _normalize_diff_path(path: object) -> str:
+    return str(path or "").strip().replace("\\", "/")
+
+
+def _diff_sections_for_path(diff: str, rel_path: str) -> list[str]:
+    target = _normalize_diff_path(rel_path)
+    if not target or not diff.strip():
+        return []
+
+    sections = [
+        section.strip()
+        for section in re.split(r"(?=^diff --git )", diff, flags=re.MULTILINE)
+        if section.strip()
+    ]
+    if not sections:
+        return []
+
+    matched: list[str] = []
+    saw_git_header = False
+    for section in sections:
+        header = re.match(r"diff --git a/(.+?) b/(.+?)(?:\r?\n|$)", section)
+        if header is None:
+            continue
+        saw_git_header = True
+        a_path = _normalize_diff_path(header.group(1))
+        b_path = _normalize_diff_path(header.group(2))
+        if target in {a_path, b_path}:
+            matched.append(section)
+
+    if matched:
+        return matched
+    if not saw_git_header and "diff --git" not in diff:
+        return [diff.strip()]
+    return []
+
+
+def _slice_diff_for_path(diff: str, rel_path: str) -> str:
+    return "\n".join(_diff_sections_for_path(diff, rel_path)).strip()
+
+
+def _diff_sections_by_file(diff: str) -> dict[str, str]:
+    by_file: dict[str, list[str]] = {}
+    for section in re.split(r"(?=^diff --git )", diff or "", flags=re.MULTILINE):
+        section = section.strip()
+        if not section:
+            continue
+        header = re.match(r"diff --git a/(.+?) b/(.+?)(?:\r?\n|$)", section)
+        if header is None:
+            continue
+        path = _normalize_diff_path(header.group(2) or header.group(1))
+        if path:
+            by_file.setdefault(path, []).append(section)
+    return {path: "\n".join(sections).strip() for path, sections in by_file.items()}
+
+
+def _capture_first_attempt_diff(pipeline_state: dict[str, object], diff: object) -> None:
+    diff_text = str(diff or "").strip()
+    if not diff_text or pipeline_state.get("first_attempt_diff"):
+        return
+    pipeline_state["first_attempt_diff"] = diff_text
+    by_file = _diff_sections_by_file(diff_text)
+    if by_file:
+        pipeline_state["first_attempt_diff_by_file"] = by_file
+
+
+def _normalize_intent_line(line: str) -> str:
+    return line.strip()
+
+
+def _is_counted_intent_line(line: str) -> bool:
+    stripped = _normalize_intent_line(line)
+    if not stripped:
+        return False
+    return not (stripped.startswith("//") or stripped.startswith("#"))
+
+
+def _changed_lines_from_diff(diff: str, rel_path: str, marker: str) -> list[str]:
+    if marker not in {"+", "-"}:
+        return []
+    lines: list[str] = []
+    for section in _diff_sections_for_path(diff, rel_path):
+        for raw_line in section.splitlines():
+            if marker == "+" and raw_line.startswith("+++") or marker == "-" and raw_line.startswith("---"):
+                continue
+            if raw_line.startswith(marker):
+                normalized = _normalize_intent_line(raw_line[1:])
+                if _is_counted_intent_line(normalized):
+                    lines.append(normalized)
+    return lines
+
+
+def _intent_lines_from_first_attempt(first_attempt_diff: str, rel_path: str) -> list[str]:
+    return _changed_lines_from_diff(first_attempt_diff, rel_path, "+")
+
+
+def _count_intent_preservation(
+    first_attempt_diff: str,
+    rel_path: str,
+    repair_diff: str,
+    baseline_content: str,
+) -> float:
+    """Return the fraction of first-attempt added lines preserved by repair.
+
+    The repair diff is applied to the already-broken file. If an intent line
+    is not removed by repair, it is presumed preserved. If it is removed, it
+    still counts when repair re-adds the same normalized line or when the line
+    already existed in the original baseline content.
+    """
+    intent_lines = _intent_lines_from_first_attempt(first_attempt_diff, rel_path)
+    if not intent_lines:
+        return 1.0
+
+    repair_added = set(_changed_lines_from_diff(repair_diff, rel_path, "+"))
+    repair_removed = set(_changed_lines_from_diff(repair_diff, rel_path, "-"))
+    baseline_lines = {
+        normalized
+        for normalized in (_normalize_intent_line(line) for line in baseline_content.splitlines())
+        if _is_counted_intent_line(normalized)
+    }
+
+    preserved = 0
+    for line in intent_lines:
+        if line in repair_added or line in baseline_lines or line not in repair_removed:
+            preserved += 1
+    return preserved / len(intent_lines)
+
+
+def _compile_repair_intent_dropped(
+    *,
+    first_attempt_diff: str,
+    rel_path: str,
+    repair_diff: str,
+    baseline_content: str,
+    threshold: float,
+) -> tuple[bool, float, int]:
+    intent_count = len(_intent_lines_from_first_attempt(first_attempt_diff, rel_path))
+    if threshold <= 0 or intent_count == 0:
+        return False, 1.0, intent_count
+    ratio = _count_intent_preservation(
+        first_attempt_diff=first_attempt_diff,
+        rel_path=rel_path,
+        repair_diff=repair_diff,
+        baseline_content=baseline_content,
+    )
+    return ratio < threshold, ratio, intent_count
+
+
 def _set_span_attribute(span: object, key: str, value: object | None) -> None:
     if value is None:
         return
@@ -2730,6 +2877,7 @@ class PrimaryOrchestrator:
                 if codegen_result and codegen_result.get("diff"):
                     pipeline_state["codegen_result"] = codegen_result
                     pipeline_state["diff"] = codegen_result["diff"]
+                    _capture_first_attempt_diff(pipeline_state, codegen_result["diff"])
                     pipeline_state["files_changed"] = codegen_result.get("files_changed", [])
                     pipeline_state["codegen_provider"] = "deterministic_rename"
                     pipeline_state["file_summaries"] = codegen_result.get("file_summaries", [])
@@ -3115,6 +3263,7 @@ class PrimaryOrchestrator:
                 codegen_result["claims"] = merged_claims
             pipeline_state["codegen_result"] = codegen_result
             pipeline_state["diff"] = codegen_result["diff"]
+            _capture_first_attempt_diff(pipeline_state, codegen_result["diff"])
             pipeline_state["files_changed"] = merged_files_changed
             pipeline_state["codegen_provider"] = codegen_provider
             pipeline_state["file_summaries"] = merged_file_summaries
@@ -5413,6 +5562,7 @@ class PrimaryOrchestrator:
                 repaired, files_touched = self._attempt_compile_repair(
                     task=task,
                     actor_name=actor_name,
+                    plan=plan,
                     compile_errors=compile_errors,
                     sandbox_dir=sandbox_dir,
                     pipeline_state=pipeline_state,
@@ -5620,6 +5770,7 @@ class PrimaryOrchestrator:
         *,
         task: Task,
         actor_name: str,
+        plan: GeneratedPlan,
         compile_errors: list[dict],
         sandbox_dir: Path,
         pipeline_state: dict,
@@ -5678,6 +5829,7 @@ class PrimaryOrchestrator:
                 continue
 
             # Load original (pre-patch) version as reference
+            orig_content = ""
             orig_section = ""
             if source_path:
                 orig = self._read_knowledge_source_context_file(
@@ -5685,10 +5837,39 @@ class PrimaryOrchestrator:
                     relative_path=rel_path,
                 )
                 if orig:
+                    orig_content = orig
                     orig_section = (
                         f"\nORIGINAL FILE (before the broken patch was applied):\n"
                         f"=== ORIGINAL {rel_path} ===\n{orig[:4000]}\n=== END ORIGINAL ===\n\n"
                     )
+
+            first_attempt_diff = ""
+            first_attempt_by_file = pipeline_state.get("first_attempt_diff_by_file")
+            if isinstance(first_attempt_by_file, dict):
+                first_attempt_diff = str(first_attempt_by_file.get(rel_path) or "").strip()
+            if not first_attempt_diff:
+                stored_first_attempt = str(pipeline_state.get("first_attempt_diff") or "").strip()
+                if stored_first_attempt:
+                    first_attempt_diff = _slice_diff_for_path(stored_first_attempt, rel_path)
+
+            first_attempt_section = ""
+            if first_attempt_diff:
+                first_attempt_section = (
+                    "FIRST-ATTEMPT DIFF FOR THIS FILE (intent anchor):\n"
+                    "This is what we wanted to add. Do not drop these added "
+                    "lines while fixing syntax; move or restructure them only "
+                    "as needed to preserve the original task intent.\n"
+                    f"=== FIRST ATTEMPT {rel_path} ===\n"
+                    f"{first_attempt_diff[:6000]}\n"
+                    "=== END FIRST ATTEMPT ===\n\n"
+                )
+
+            objective_section = (
+                "ORIGINAL TASK OBJECTIVE:\n"
+                f"- Objective: {_truncate_text(getattr(plan, 'objective', ''), limit=1000)}\n"
+                f"- Request summary: {_truncate_text(getattr(plan, 'request_summary', ''), limit=1000)}\n"
+                f"- Change summary: {_truncate_text(getattr(plan, 'change_summary', ''), limit=1000)}\n\n"
+            )
 
             scope_section = ""
             if allowed_paths:
@@ -5699,8 +5880,9 @@ class PrimaryOrchestrator:
                 )
 
             repair_prompt = (
-                f"STRUCTURAL REPAIR TASK — fix ONE broken file: {rel_path}\n\n"
-                "These compile errors must be fixed without changing task scope.\n"
+                f"STRUCTURAL REPAIR TASK - fix ONE broken file: {rel_path}\n\n"
+                + objective_section
+                + "These compile errors must be fixed without changing task scope.\n"
                 + scope_section
                 + "Common problems include:\n"
                 "- Missing imports or unresolved symbols introduced by the patch\n"
@@ -5720,6 +5902,7 @@ class PrimaryOrchestrator:
                 "the original patch intended\n\n"
                 f"ERROR:\n  {rel_path}: {str(error_msg)[:1000]}\n\n"
                 + orig_section
+                + first_attempt_section
                 + f"Output ONLY valid unified diff hunks that fix {rel_path}.\n"
                 f"Start with 'diff --git a/{rel_path} b/{rel_path}'.\n"
                 "If no fix is needed, output nothing.\n"
@@ -5819,6 +6002,58 @@ class PrimaryOrchestrator:
                     message=f"Repair diff for {rel_path} contained only off-target hunks — skipped.",
                 )
                 continue
+
+            try:
+                intent_threshold = float(
+                    getattr(
+                        self.tool_gateway.settings,
+                        "repair_intent_preservation_threshold",
+                        0.4,
+                    )
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                intent_threshold = 0.4
+            if first_attempt_diff and intent_threshold > 0:
+                intent_dropped, intent_ratio, intent_count = _compile_repair_intent_dropped(
+                    first_attempt_diff=first_attempt_diff,
+                    rel_path=rel_path,
+                    repair_diff=repair_diff,
+                    baseline_content=orig_content,
+                    threshold=intent_threshold,
+                )
+                if intent_dropped:
+                    intent_payload = {
+                        "file": rel_path,
+                        "intent_preservation_ratio": round(intent_ratio, 3),
+                        "threshold": intent_threshold,
+                        "intent_line_count": intent_count,
+                    }
+                    pipeline_state["compile_repair_intent_dropped"] = intent_payload
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.REVIEW_FAILED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="compile_repair.intent_dropped",
+                        message=(
+                            f"Repair for {rel_path} dropped first-attempt intent "
+                            f"({intent_ratio:.0%} preserved; threshold {intent_threshold:.0%})."
+                        ),
+                        payload=intent_payload,
+                    )
+                    self._workspace_append_audit(
+                        task,
+                        "compile_repair.intent_dropped",
+                        intent_payload,
+                    )
+                    self._preserve_develop_pipeline_state(
+                        task=task,
+                        pipeline_state=pipeline_state,
+                    )
+                    continue
 
             # Apply repair diff to sandbox
             try:
