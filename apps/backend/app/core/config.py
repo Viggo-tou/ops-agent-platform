@@ -76,6 +76,7 @@ class Settings(BaseSettings):
     codegen_repair_files_per_round: int = 5
     codegen_repair_round_timeout_seconds: float = 180.0
     codegen_repair_cap_exceeded_to_approval: bool = True
+    verification_compile_fail_to_approval: bool = False  # Stage 25 contract: cap-exceeded -> fail
     verification_profile_enabled: bool = True
     verification_compile_timeout_seconds: int = 240
     verification_max_repair_rounds: int = 3

@@ -279,3 +279,165 @@ def test_compile_success_proceeds_to_diff_reviewer(work_dir: Path) -> None:
         for call in orchestrator._execute_develop_tool.call_args_list
     ]
     assert "diff_reviewer.review" in tool_names
+
+
+def test_compile_cap_exceeded_marks_task_failed_in_verification_path(work_dir: Path) -> None:
+    orchestrator = _make_orchestrator(work_dir)
+    settings = orchestrator.tool_gateway.settings
+    settings.verification_max_repair_rounds = 2
+    settings.codegen_repair_cap_exceeded_to_approval = True
+    settings.verification_compile_fail_to_approval = False
+    task = _task()
+    plan = _plan()
+    sandbox_dir = _ensure_android_sandbox(orchestrator, task)
+    kotlin_error = (
+        f"e: {(sandbox_dir / CUSTOMER_FILE).as_uri()}:155:51 "
+        "Unresolved reference: ImeAction\n"
+    )
+    failed_result = _profile_result(sandbox_dir=sandbox_dir, output=kotlin_error, passed=False)
+    pipeline_state: dict[str, object] = {
+        "files_changed": [CUSTOMER_FILE],
+        "verification_compile_pending": True,
+        "verification_profile": {"repo_type": "android_gradle"},
+    }
+
+    with patch(
+        "app.services.verification_profile.run_compile_check",
+        side_effect=[failed_result, failed_result, failed_result],
+    ) as compile_mock, patch.object(
+        orchestrator, "_attempt_compile_repair", return_value=(False, [])
+    ) as repair_mock, patch.object(
+        orchestrator, "_request_compile_repair_approval"
+    ) as approval_mock, patch.object(
+        orchestrator, "_fail_develop_pipeline", wraps=orchestrator._fail_develop_pipeline
+    ) as fail_mock, patch.object(
+        orchestrator, "_run_failure_diagnosis"
+    ) as diagnosis_mock, patch(
+        "app.orchestrator.service.record_event"
+    ), patch(
+        "app.orchestrator.service.set_task_status"
+    ), patch(
+        "app.orchestrator.service.commit_checkpoint"
+    ):
+        outcome = orchestrator._run_compile_repair_loop(
+            task=task,
+            actor_name="tester",
+            plan=plan,
+            pipeline_state=pipeline_state,
+            approval_id=None,
+        )
+
+    assert outcome == "failed"
+    assert compile_mock.call_count == 3
+    assert repair_mock.call_count == 2
+    approval_mock.assert_not_called()
+    fail_mock.assert_called_once()
+    payload = fail_mock.call_args.kwargs["payload"]
+    assert payload["reason"] == "compile_gate_exhausted"
+    assert payload["rounds_attempted"] == 2
+    assert task.latest_result_json["reason"] == "compile_gate_exhausted"
+    diagnosis_mock.assert_called_once()
+
+
+def test_compile_skipped_does_not_block_continues_passing(work_dir: Path) -> None:
+    orchestrator = _make_orchestrator(work_dir)
+    settings = orchestrator.tool_gateway.settings
+    settings.codegen_repair_cap_exceeded_to_approval = True
+    settings.verification_compile_fail_to_approval = False
+    task = _task()
+    plan = _plan()
+    _ensure_android_sandbox(orchestrator, task)
+    skipped_result = CompileCheckResult(
+        passed=True,
+        status="skipped",
+        repo_type="android_gradle",
+        command=["./gradlew", ":app:compileDebugKotlin", "--quiet", "--no-daemon"],
+        output="",
+        errors=[],
+        timed_out=False,
+        duration_ms=0,
+        reason="toolchain_missing",
+    )
+    pipeline_state: dict[str, object] = {
+        "files_changed": [CUSTOMER_FILE],
+        "verification_compile_pending": True,
+        "verification_profile": {"repo_type": "android_gradle"},
+    }
+
+    with patch(
+        "app.services.verification_profile.run_compile_check",
+        return_value=skipped_result,
+    ) as compile_mock, patch.object(
+        orchestrator, "_attempt_compile_repair"
+    ) as repair_mock, patch(
+        "app.orchestrator.service.record_event"
+    ) as record_event_mock, patch(
+        "app.orchestrator.service.commit_checkpoint"
+    ):
+        outcome = orchestrator._run_compile_repair_loop(
+            task=task,
+            actor_name="tester",
+            plan=plan,
+            pipeline_state=pipeline_state,
+            approval_id=None,
+        )
+
+    assert outcome == "passed"
+    assert compile_mock.call_count == 1
+    repair_mock.assert_not_called()
+    event_types = [call.kwargs.get("event_type") for call in record_event_mock.call_args_list]
+    assert EventType.COMPILE_FAILED not in event_types
+    assert pipeline_state["compile_gate"]["passed"] is True
+    assert pipeline_state["compile_gate_done"] is True
+
+
+def test_legacy_codegen_repair_cap_still_routes_to_approval(work_dir: Path) -> None:
+    orchestrator = _make_orchestrator(work_dir)
+    settings = orchestrator.tool_gateway.settings
+    settings.codegen_max_repair_rounds = 2
+    settings.codegen_repair_cap_exceeded_to_approval = True
+    settings.verification_compile_fail_to_approval = False
+    task = _task()
+    plan = _plan()
+    _ensure_android_sandbox(orchestrator, task)
+    failed_result = CompileCheckResult(
+        passed=False,
+        status="failed",
+        repo_type="legacy",
+        command=None,
+        output="legacy failure",
+        errors=[{"file": CUSTOMER_FILE, "error": "legacy failure"}],
+        timed_out=False,
+        duration_ms=1,
+    )
+    pipeline_state: dict[str, object] = {
+        "files_changed": [CUSTOMER_FILE],
+    }
+
+    with patch(
+        "app.services.compile_gate.run_compile_gate",
+        side_effect=[failed_result, failed_result, failed_result],
+    ) as compile_mock, patch.object(
+        orchestrator, "_attempt_compile_repair", return_value=(False, [])
+    ) as repair_mock, patch.object(
+        orchestrator, "_request_compile_repair_approval"
+    ) as approval_mock, patch.object(
+        orchestrator, "_fail_develop_pipeline"
+    ) as fail_mock, patch(
+        "app.orchestrator.service.record_event"
+    ), patch(
+        "app.orchestrator.service.commit_checkpoint"
+    ):
+        outcome = orchestrator._run_compile_repair_loop(
+            task=task,
+            actor_name="tester",
+            plan=plan,
+            pipeline_state=pipeline_state,
+            approval_id=None,
+        )
+
+    assert outcome == "approval_requested"
+    assert compile_mock.call_count == 3
+    assert repair_mock.call_count == 2
+    approval_mock.assert_called_once()
+    fail_mock.assert_not_called()
