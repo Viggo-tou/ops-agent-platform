@@ -94,6 +94,7 @@ class EventType(str, Enum):
     EXECUTION_COMPLETED = "execution_completed"
     EXECUTION_FAILED = "execution_failed"
     KNOWLEDGE_RETRIEVED = "knowledge_retrieved"
+    KNOWLEDGE_CACHE_HIT = "knowledge_cache_hit"
     TOOL_CALL_REQUESTED = "tool_call_requested"
     TOOL_RETRY_SCHEDULED = "tool_retry_scheduled"
     TOOL_TIMED_OUT = "tool_timed_out"

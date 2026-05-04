@@ -270,6 +270,8 @@ class KnowledgeService:
     def __init__(self, db: Session):
         self.db = db
         self.settings = get_settings()
+        from app.services.knowledge_retrieval_cache import RetrievalCache
+        self._retrieval_cache = RetrievalCache(self.db, self.settings)
         create_knowledge_fts_table(self.db)
         backfill_knowledge_fts_if_empty(self.db)
 
@@ -293,6 +295,9 @@ class KnowledgeService:
             total_removed += removed
 
         self.db.commit()
+        if getattr(self.settings, "knowledge_retrieval_cache_enabled", True):
+            for spec in source_specs:
+                self._retrieval_cache.invalidate_source(spec.name)
         return KnowledgeSyncResponse(
             source_name=primary_source_name if len(source_specs) == 1 else "multiple",
             source_path=primary_source_path if len(source_specs) == 1 else "multiple",
@@ -313,6 +318,40 @@ class KnowledgeService:
                 self.sync_repositories(source_name=spec.name)
 
     def search_repositories(
+        self,
+        *,
+        query: str,
+        top_k: int | None = None,
+        source_name: str | None = None,
+        language: str | None = None,
+        task_id: str | None = None,
+        actor_name: str | None = None,
+    ) -> KnowledgeSearchResult:
+        cache_enabled = bool(getattr(self.settings, "knowledge_retrieval_cache_enabled", True))
+        cache_source = source_name or self.settings.knowledge_source_name
+        if cache_enabled:
+            cached = self._retrieval_cache.get(query, cache_source)
+            if cached is not None:
+                from app.core.enums import EventType, EventSource
+                from app.services.events import record_event
+                record_event(
+                    self.db,
+                    task_id=task_id or "",
+                    event_type=EventType.KNOWLEDGE_CACHE_HIT,
+                    source=EventSource.SYSTEM,
+                    message=f"Knowledge retrieval cache hit for source={cache_source}",
+                    payload={"source_name": cache_source, "query_len": len(query)},
+                )
+                return KnowledgeSearchResult.model_validate(cached)
+        result = self._search_repositories_uncached(
+            query=query, top_k=top_k, source_name=source_name,
+            language=language, task_id=task_id, actor_name=actor_name,
+        )
+        if cache_enabled:
+            self._retrieval_cache.put(query, cache_source, result.model_dump(mode="json"))
+        return result
+
+    def _search_repositories_uncached(
         self,
         *,
         query: str,
