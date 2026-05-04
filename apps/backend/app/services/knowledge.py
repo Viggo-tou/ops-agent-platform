@@ -248,6 +248,7 @@ def _upsert_fts(
 class SourceSpec:
     name: str
     path: Path
+    description: str = ""
 
 
 @dataclass(frozen=True)
@@ -740,11 +741,17 @@ class KnowledgeService:
                 item = raw_item.strip()
                 if not item or "=" not in item:
                     continue
-                name, raw_path = item.split("=", 1)
+                name, raw_path_with_desc = item.split("=", 1)
+                if "|" in raw_path_with_desc:
+                    raw_path, raw_desc = raw_path_with_desc.split("|", 1)
+                    description = raw_desc.strip()
+                else:
+                    raw_path = raw_path_with_desc
+                    description = ""
                 path = Path(raw_path.strip())
                 if path.exists():
                     normalized = name.strip().lower()
-                    specs.append(SourceSpec(name=normalized, path=path))
+                    specs.append(SourceSpec(name=normalized, path=path, description=description))
                     seen_names.add(normalized)
 
         if not specs:
@@ -1015,7 +1022,20 @@ class KnowledgeService:
 
     def _route_query(self, *, query: str, source_specs: list[SourceSpec]) -> QueryRoute:
         lowered = query.lower()
-        source_candidates = tuple(spec.name for spec in source_specs if spec.name in lowered)
+        literal_candidates = tuple(spec.name for spec in source_specs if spec.name in lowered)
+        if literal_candidates:
+            source_candidates = literal_candidates
+        elif getattr(self.settings, "knowledge_source_router_enabled", True) and len(source_specs) > 1:
+            from app.services.knowledge_source_router import select_sources
+            descriptions = {spec.name: spec.description for spec in source_specs}
+            llm_picked = select_sources(
+                query=query,
+                source_descriptions=descriptions,
+                settings=self.settings,
+            )
+            source_candidates = tuple(llm_picked)
+        else:
+            source_candidates = ()
         extension_counts = self._extension_counts(source_specs)
         available_extensions = set(extension_counts)
         dominant_extensions = self._dominant_extensions(extension_counts)

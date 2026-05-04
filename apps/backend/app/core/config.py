@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     knowledge_retrieval_cache_enabled: bool = True
     knowledge_retrieval_cache_ttl_seconds: int = 3600
     knowledge_retrieval_cache_max_entries: int = 1000
+    knowledge_source_router_enabled: bool = True
+    knowledge_source_router_timeout_seconds: float = 15.0
     llm_retry_on_rate_limit: bool = True
     llm_retry_max_attempts: int = 3
     llm_retry_base_delay_sec: float = 2.0
