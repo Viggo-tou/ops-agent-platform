@@ -2559,7 +2559,7 @@ class PrimaryOrchestrator:
 
         # Resolve once — reused throughout the pipeline to avoid repeated
         # disk/config lookups (previously called ~8 times per pipeline run).
-        _pipeline_source_path = self._resolve_knowledge_source_path()
+        _pipeline_source_path = self._resolve_knowledge_source_path(task)
 
         context_files = self._gather_codegen_context(task=task, plan=plan)
         if not context_files:
@@ -4709,7 +4709,7 @@ class PrimaryOrchestrator:
         where the model must produce complete modified files for difflib).
         """
         context_files: dict[str, str] = {}
-        source_path = self._resolve_knowledge_source_path()
+        source_path = self._resolve_knowledge_source_path(task)
         sandbox_dir = self._develop_sandbox_dir(task)
 
         # --- Strategy 1 (priority): grep keywords in source tree ---
@@ -5642,7 +5642,7 @@ class PrimaryOrchestrator:
         if not compile_errors:
             return False, []
 
-        source_path = self._resolve_knowledge_source_path()
+        source_path = self._resolve_knowledge_source_path(task)
         any_applied = False
         all_repair_touched: list[str] = []
 
@@ -6170,7 +6170,7 @@ class PrimaryOrchestrator:
         if not anchors:
             return False
 
-        source_path = self._resolve_knowledge_source_path()
+        source_path = self._resolve_knowledge_source_path(task)
         if source_path is None:
             return False
 
@@ -6206,7 +6206,25 @@ class PrimaryOrchestrator:
             return True
         return False
 
-    def _resolve_knowledge_source_path(self) -> Path | None:
+    def _resolve_knowledge_source_path(self, task: Task | None = None) -> Path | None:
+        """Resolve the active knowledge source path on disk.
+
+        Priority chain (mirrors _resolve_develop_repo_url):
+        1. task.translation_json["source_path"] — set by LLM source router
+           when KB selected a specific source from knowledge_source_specs.
+           This is the SAME path used for sandbox setup, so per-file
+           context lookups must use it too — otherwise context fetches
+           miss and fall back to KB search (cc_agent), wasting 60-180s
+           per file.
+        2. settings.knowledge_source_path — global fallback for
+           single-source setups.
+        """
+        if task is not None and isinstance(task.translation_json, dict):
+            translation_path = str(task.translation_json.get("source_path") or "").strip()
+            if translation_path:
+                p = Path(translation_path)
+                if p.is_dir():
+                    return p
         path_str = str(getattr(self.tool_gateway.settings, "knowledge_source_path", "") or "").strip()
         if not path_str:
             return None
