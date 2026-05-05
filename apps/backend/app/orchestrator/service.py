@@ -3966,6 +3966,121 @@ class PrimaryOrchestrator:
                     {"error": str(exc)[:400]},
                 )
 
+        # --- SymbolGraph ref-validity gate (post-codegen, pre-compile) ---
+        # Catches the v9 P69-17 failure class: codegen adds a reference
+        # (e.g. AndroidManifest @string/google_maps_api_key) without adding
+        # the corresponding declaration (no <string name="google_maps_api_key">
+        # in strings.xml). Generic across languages — uses the SymbolGraph
+        # plug-in registry (currently Python via stdlib ast, Kotlin via
+        # tree-sitter, XML via lxml + regex).
+        if not pipeline_state.get("symbol_graph_done"):
+            try:
+                # Lazy-import the SymbolGraph framework + every registered
+                # extractor. Each extractor module auto-registers itself.
+                from app.services.symbol_graph import (  # noqa: F401
+                    python_extractor,
+                )
+                from app.services.symbol_graph.pipeline_hook import (
+                    check_changed_files,
+                )
+                from app.services.symbol_graph.registry import (
+                    registered_extensions,
+                )
+                # Optional language plug-ins. Wrap in try/except so a
+                # missing tree-sitter wheel doesn't crash the pipeline.
+                try:
+                    from app.services.symbol_graph import kotlin_extractor  # noqa: F401
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    from app.services.symbol_graph import xml_extractor  # noqa: F401
+                except Exception:  # noqa: BLE001
+                    pass
+
+                sg_source_root = _pipeline_source_path
+                if sg_source_root is None or not sg_source_root.exists():
+                    pipeline_state["symbol_graph_done"] = True
+                    pipeline_state["symbol_graph_skipped"] = "no_source_tree"
+                else:
+                    # Enumerate repo files whose extensions have a
+                    # registered extractor. Anything else is skipped.
+                    sg_exts = set(registered_extensions())
+                    sg_all_files: list[str] = []
+                    for fp in sg_source_root.rglob("*"):
+                        if not fp.is_file():
+                            continue
+                        ext = fp.suffix.lstrip(".").lower()
+                        if ext not in sg_exts:
+                            continue
+                        try:
+                            rel = str(fp.relative_to(sg_source_root)).replace("\\", "/")
+                        except ValueError:
+                            continue
+                        sg_all_files.append(rel)
+
+                    sg_changed_files = tuple(
+                        str(p).replace("\\", "/")
+                        for p in (pipeline_state.get("files_changed") or [])
+                    )
+                    if sg_changed_files and sg_all_files:
+                        sg_report = check_changed_files(
+                            repo_root=sg_source_root,
+                            all_repo_files=tuple(sg_all_files),
+                            changed_files=sg_changed_files,
+                        )
+                        sg_payload = sg_report.to_payload()
+                        pipeline_state["symbol_graph"] = sg_payload
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=(
+                                EventType.TOOL_FAILED
+                                if not sg_report.passed
+                                else EventType.TOOL_SUCCEEDED
+                            ),
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            tool_name="symbol_graph.ref_validity",
+                            message=(
+                                f"SymbolGraph ref-validity: "
+                                f"{len(sg_report.violations)} violation(s), "
+                                f"refs_checked={sg_report.refs_checked}, "
+                                f"files_covered={sg_report.files_covered}, "
+                                f"files_skipped={sg_report.files_skipped}"
+                            ),
+                            payload=sg_payload,
+                        )
+                        if not sg_report.passed:
+                            self._fail_develop_pipeline(
+                                task=task,
+                                event_type=EventType.REVIEW_FAILED,
+                                stage=WorkflowStage.REVIEW,
+                                role=RoleName.REVIEWER,
+                                message=(
+                                    f"SymbolGraph rejected diff: "
+                                    f"{len(sg_report.violations)} unresolved "
+                                    f"reference(s) in changed files."
+                                ),
+                                payload={
+                                    "plan_id": plan.plan_id,
+                                    "symbol_graph": sg_payload,
+                                },
+                            )
+                            return
+                    pipeline_state["symbol_graph_done"] = True
+                    self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+            except Exception as exc:  # noqa: BLE001
+                # SymbolGraph is a best-effort gate. Errors must never
+                # block the pipeline — only true unresolved refs do.
+                self._workspace_append_audit(
+                    task,
+                    "symbol_graph.errored",
+                    {"error": str(exc)[:400]},
+                )
+                pipeline_state["symbol_graph_done"] = True
+                pipeline_state["symbol_graph_skipped"] = "errored"
+
         # --- Runtime validation gate (with 1 repair cycle) ---
         if not pipeline_state.get("runtime_validation_done"):
             from app.services.runtime_validation import validate_diff_semantics, build_repair_prompt
