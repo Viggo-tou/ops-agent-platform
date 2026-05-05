@@ -66,7 +66,11 @@ class _RawFinding(BaseModel):
     severity: Literal["high", "medium", "low"]
     category: str = Field(default="general", max_length=64)
     description: str = Field(min_length=1, max_length=600)
-    evidence_quote: str = Field(default="", max_length=400)
+    # Cap raised from 400 to 1500 — DeepSeek + claude-haiku occasionally
+    # cite a multi-line function header as evidence; rejecting the whole
+    # review just because one quote is long is too brittle. The grounding
+    # check still requires the quote to be a real diff substring.
+    evidence_quote: str = Field(default="", max_length=1500)
     suggested_fix: str = Field(default="", max_length=600)
 
 
