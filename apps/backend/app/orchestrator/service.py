@@ -3937,6 +3937,7 @@ class PrimaryOrchestrator:
                     derive_required_tokens_strict,
                     evaluate_feature_presence,
                     extract_added_lines_per_file,
+                    merge_diffs_by_file,
                 )
                 translation = task.translation_json if isinstance(task.translation_json, dict) else {}
                 # G2 — prefer strict tokens (CamelCase / snake_case only,
@@ -4020,6 +4021,15 @@ class PrimaryOrchestrator:
                         sample_unmatched = (
                             presence.unmatched_required_files[:3] if presence else []
                         )
+                        # Include the accumulated diff so codegen can see what
+                        # the previous rounds already produced and only ADD the
+                        # missing pieces — not re-write everything from scratch
+                        # (which is what caused the v14 fix-A-lose-B oscillation).
+                        previous_diff_text = pipeline_state.get("diff") or ""
+                        # Cap at 12KB to fit comfortably in any provider's
+                        # context budget without truncating the prompt itself.
+                        if len(previous_diff_text) > 12_000:
+                            previous_diff_text = previous_diff_text[:12_000] + "\n[truncated]"
                         fp_repair_prompt = (
                             f"FEATURE_PRESENCE REPAIR (round {fp_round + 1}): "
                             f"Your previous diff is INCOMPLETE — the gate rejected "
@@ -4029,13 +4039,20 @@ class PrimaryOrchestrator:
                             f"{sample_unmatched}.\n\n"
                             f"Required spec tokens (derived from grounding terms / "
                             f"objective / file basenames): {required_tokens[:10]}.\n\n"
+                            f"PREVIOUS DIFF (accumulated across earlier rounds — "
+                            f"DO NOT undo any of this; only ADD what's missing):\n"
+                            f"```diff\n{previous_diff_text}\n```\n\n"
                             f"You MUST extend the diff to ADD code that actually "
                             f"USES these symbols (function calls, references, real "
                             f"logic). Do NOT just declare new fields/variables and "
                             f"stop — write the loading / binding / handler logic "
                             f"that connects the spec to running behavior. Adding "
                             f"comments describing what the code 'will do' does NOT "
-                            f"count — only added executable lines do."
+                            f"count — only added executable lines do.\n\n"
+                            f"Output a unified diff covering the missing files. "
+                            f"For files already in the previous diff, reproduce "
+                            f"their existing changes AND add the missing logic on "
+                            f"top. For new files, add fresh blocks."
                         )
                         record_event(
                             self.db,
@@ -4101,8 +4118,14 @@ class PrimaryOrchestrator:
                                 message="Repair codegen produced no diff",
                             )
                             break
-                        # Replace diff and re-evaluate next iteration
-                        pipeline_state["diff"] = repair_diff
+                        # Merge per-file with previous accumulated diff so we
+                        # never lose changes from earlier rounds when this
+                        # round's codegen only produced a partial diff (e.g.
+                        # touched .kt but not the .xml that was already
+                        # changed in the prior round).
+                        previous_diff = pipeline_state.get("diff") or ""
+                        merged_diff = merge_diffs_by_file(previous_diff, repair_diff)
+                        pipeline_state["diff"] = merged_diff
                         record_event(
                             self.db,
                             task_id=task.id,
@@ -4113,8 +4136,16 @@ class PrimaryOrchestrator:
                             tool_name="feature_presence_check.repair",
                             message=(
                                 f"Repair produced new diff "
-                                f"({len(repair_diff)} chars); re-evaluating"
+                                f"({len(repair_diff)} chars); merged with "
+                                f"prior {len(previous_diff)} chars -> "
+                                f"{len(merged_diff)} chars total; re-evaluating"
                             ),
+                            payload={
+                                "round": fp_round + 1,
+                                "previous_diff_size": len(previous_diff),
+                                "new_diff_size": len(repair_diff),
+                                "merged_diff_size": len(merged_diff),
+                            },
                         )
                     # End repair loop. If still feature_absent, fail-close.
                     if presence is not None and presence.feature_absent:

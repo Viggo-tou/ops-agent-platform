@@ -28,7 +28,98 @@ from app.services.feature_presence_check import (  # noqa: E402
     derive_required_tokens_strict,
     evaluate_feature_presence,
     extract_added_lines_per_file,
+    merge_diffs_by_file,
 )
+
+
+# --- merge_diffs_by_file (P69-17 v14 fix) ---------------------------------
+
+def test_merge_diffs_disjoint_files_keeps_both():
+    """Round 1 touched A, round 2 touched B — merged should have both."""
+    a = (
+        "diff --git a/src/A.py b/src/A.py\n"
+        "--- a/src/A.py\n"
+        "+++ b/src/A.py\n"
+        "@@ -1,1 +1,2 @@\n"
+        " x = 1\n"
+        "+y = 2\n"
+    )
+    b = (
+        "diff --git a/src/B.py b/src/B.py\n"
+        "--- a/src/B.py\n"
+        "+++ b/src/B.py\n"
+        "@@ -1,1 +1,2 @@\n"
+        " p = 1\n"
+        "+q = 3\n"
+    )
+    merged = merge_diffs_by_file(a, b)
+    assert "src/A.py" in merged
+    assert "src/B.py" in merged
+    assert "y = 2" in merged
+    assert "q = 3" in merged
+
+
+def test_merge_diffs_same_file_new_wins():
+    """Both diffs touch the same file: new diff replaces old block."""
+    old = (
+        "diff --git a/src/A.py b/src/A.py\n"
+        "--- a/src/A.py\n"
+        "+++ b/src/A.py\n"
+        "@@ -1,1 +1,2 @@\n"
+        " x = 1\n"
+        "+old_change = 1\n"
+    )
+    new = (
+        "diff --git a/src/A.py b/src/A.py\n"
+        "--- a/src/A.py\n"
+        "+++ b/src/A.py\n"
+        "@@ -1,1 +1,2 @@\n"
+        " x = 1\n"
+        "+new_change = 2\n"
+    )
+    merged = merge_diffs_by_file(old, new)
+    assert "new_change" in merged
+    assert "old_change" not in merged  # superseded
+
+
+def test_merge_diffs_empty_previous_returns_new():
+    new = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n+a=1\n"
+    assert merge_diffs_by_file("", new) == new
+    assert merge_diffs_by_file(None, new) == new  # type: ignore[arg-type]
+
+
+def test_merge_diffs_empty_new_returns_previous():
+    prev = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n+a=1\n"
+    assert merge_diffs_by_file(prev, "") == prev
+
+
+def test_merge_diffs_v14_pattern_reproduction():
+    """The exact P69-17 v14 oscillation: round 1 produces only the .kt
+    block; round 2 produces only the .xml block. Without merging, each
+    round drops the other file. With merge, both blocks survive."""
+    round1_kt_only = (
+        "diff --git a/JobPostingFragment.kt b/JobPostingFragment.kt\n"
+        "--- a/JobPostingFragment.kt\n"
+        "+++ b/JobPostingFragment.kt\n"
+        "@@ -1,1 +1,3 @@\n"
+        " class Foo\n"
+        "+val homeAddress: String? = null\n"
+        "+fun loadHomeAddress() {}\n"
+    )
+    round2_xml_only = (
+        "diff --git a/fragment_job_posting.xml b/fragment_job_posting.xml\n"
+        "--- a/fragment_job_posting.xml\n"
+        "+++ b/fragment_job_posting.xml\n"
+        "@@ -1,1 +1,2 @@\n"
+        " <root/>\n"
+        "+<EditText id=\"@+id/etAddress\"/>\n"
+    )
+    merged = merge_diffs_by_file(round1_kt_only, round2_xml_only)
+    # Both files' new content present
+    assert "JobPostingFragment.kt" in merged
+    assert "fragment_job_posting.xml" in merged
+    assert "loadHomeAddress" in merged  # from round 1
+    assert "etAddress" in merged  # from round 2
 
 
 # --- _is_identifier_shaped --------------------------------------------------

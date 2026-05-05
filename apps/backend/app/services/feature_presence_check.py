@@ -208,6 +208,70 @@ def derive_required_tokens_strict(
     return deduped
 
 
+def merge_diffs_by_file(previous_diff: str, new_diff: str) -> str:
+    """Merge two unified diffs at the file granularity.
+
+    Each `diff --git a/PATH b/PATH ... ` block is treated as one unit.
+    For files appearing in both diffs, ``new_diff`` wins (latest version
+    of that file's hunk replaces previous). For files appearing in only
+    one, that block is preserved.
+
+    This is needed for the feature_presence repair loop: each repair
+    round's codegen produces a fresh diff against the pristine source.
+    Without merging, round N's diff for file A overwrites round N-1's
+    diff for file B (we lose B's changes). Result: alternating
+    "fix-A-lose-B / fix-B-lose-A" oscillation observed in P69-17 v14.
+
+    The function is intentionally schema-light — it relies on the
+    `diff --git a/PATH b/PATH` header line as the file boundary. Empty
+    diffs return the other side cleanly.
+    """
+    if not previous_diff and not new_diff:
+        return ""
+    if not previous_diff:
+        return new_diff
+    if not new_diff:
+        return previous_diff
+
+    def _split_into_file_blocks(diff: str) -> dict[str, str]:
+        """Return {b_path: full_block_text}. Order-preserving."""
+        blocks: dict[str, str] = {}
+        current_path: str | None = None
+        current_lines: list[str] = []
+        for line in diff.split("\n"):
+            if line.startswith("diff --git "):
+                if current_path is not None:
+                    blocks[current_path] = "\n".join(current_lines)
+                # Parse `diff --git a/X b/Y` -> Y as canonical key.
+                parts = line.split(" b/", 1)
+                current_path = parts[1].strip() if len(parts) == 2 else line
+                current_lines = [line]
+            else:
+                current_lines.append(line)
+        if current_path is not None:
+            blocks[current_path] = "\n".join(current_lines)
+        return blocks
+
+    prev_blocks = _split_into_file_blocks(previous_diff)
+    new_blocks = _split_into_file_blocks(new_diff)
+
+    merged_paths: list[str] = []
+    for p in prev_blocks:
+        if p not in merged_paths:
+            merged_paths.append(p)
+    for p in new_blocks:
+        if p not in merged_paths:
+            merged_paths.append(p)
+
+    out_blocks: list[str] = []
+    for p in merged_paths:
+        # New diff wins for files it touches; previous preserved otherwise.
+        block = new_blocks.get(p) or prev_blocks.get(p) or ""
+        if block.strip():
+            out_blocks.append(block)
+    return "\n".join(out_blocks)
+
+
 def extract_added_lines_per_file(diff: str) -> dict[str, str]:
     """Parse a unified diff and return {file_path: "added_line_1\\nadded_line_2\\n..."}.
 
