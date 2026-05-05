@@ -4351,11 +4351,40 @@ class PrimaryOrchestrator:
                     task.translation_json
                     if isinstance(task.translation_json, dict) else {}
                 )
-                _sr_spec_text = "\n".join(filter(None, [
+                # Build a rich spec from every available source. Previously
+                # only used plan.objective (often generic boilerplate like
+                # "Implement the Jira issue by generating code...") plus
+                # the bare ticket key, which produced reviews like "no spec
+                # provided". The full ticket body lives in translation.
+                # search_queries[0] (the planner's expanded prompt) and
+                # grounding_terms are also signal-rich. Cap the joined
+                # text to keep the LLM prompt within budget.
+                _sr_search_qs = _sr_translation.get("search_queries") or []
+                _sr_search_q0 = (
+                    str(_sr_search_qs[0])[:3000] if _sr_search_qs else ""
+                )
+                _sr_grounding = _sr_translation.get("grounding_terms") or []
+                _sr_grounding_str = (
+                    "Spec keywords: " + ", ".join(str(g) for g in _sr_grounding[:20])
+                    if _sr_grounding else ""
+                )
+                _sr_spec_parts = [
                     str(getattr(plan, "objective", "") or ""),
+                    _sr_search_q0,
                     str(_sr_translation.get("normalized_request") or ""),
+                    _sr_grounding_str,
                     str(task.request_text or ""),
-                ]))
+                ]
+                # Dedup adjacent duplicates (common when the user request
+                # is just the ticket key and translation echoes it).
+                _seen: set[str] = set()
+                _dedup: list[str] = []
+                for part in _sr_spec_parts:
+                    norm = part.strip()
+                    if norm and norm not in _seen:
+                        _seen.add(norm)
+                        _dedup.append(norm)
+                _sr_spec_text = "\n\n".join(_dedup)
 
                 # Read post-edit content of the changed files for the
                 # reviewer's context.
