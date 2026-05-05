@@ -93,6 +93,36 @@ def test_kotlin_invalid_source_returns_empty_no_crash():
     assert isinstance(res.refs, tuple)
 
 
+def test_kotlin_skips_external_sdk_imports():
+    """Imports from android.* / androidx.* / kotlin.* / java.* are NOT
+    emitted as Refs because their decls live outside the project source
+    tree. Without this filter every Compose file would produce 50+
+    no_decl_found violations from android.util.Log, Toast, Image, etc."""
+    src = b"""package com.example
+
+import android.util.Log
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
+import com.google.firebase.auth.FirebaseAuth
+import kotlin.collections.List
+import java.util.UUID
+import com.example.MyInternalUtil
+
+class A { fun f() {} }
+"""
+    res = KotlinExtractor().extract(path="A.kt", source=src)
+    ref_names = {r.name for r in res.refs}
+    # 5 SDK / library imports are filtered.
+    assert "Log" not in ref_names
+    assert "Image" not in ref_names
+    assert "clickable" not in ref_names
+    assert "FirebaseAuth" not in ref_names
+    assert "List" not in ref_names
+    assert "UUID" not in ref_names
+    # Internal project import IS kept.
+    assert "MyInternalUtil" in ref_names
+
+
 def test_kotlin_realistic_combined():
     """Smoke: a realistic file should produce both class decl and import refs."""
     src = b"""package com.example

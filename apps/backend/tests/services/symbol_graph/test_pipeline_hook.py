@@ -61,7 +61,10 @@ def tmp_repo():
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         (root / "a.py").write_text("def foo(): pass", encoding="utf-8")
-        (root / "b.py").write_text("import os", encoding="utf-8")
+        # `import myproject_internal_pkg` is non-stdlib so it produces a
+        # Ref (used to be `import os` but the external-import filter now
+        # drops stdlib refs by design).
+        (root / "b.py").write_text("import myproject_internal_pkg", encoding="utf-8")
         (root / "c.py").write_text("x = 1", encoding="utf-8")
         (root / "notes.txt").write_text("hello world", encoding="utf-8")
         yield root
@@ -86,7 +89,8 @@ class TestBuildGraphForRepo:
         # graph should have decls from a.py and c.py, refs from b.py
         assert "foo" in graph.decls_by_name
         assert "x" in graph.decls_by_name
-        assert "os" in graph.refs_by_name
+        # b.py imports a non-stdlib pkg -> Ref preserved
+        assert "myproject_internal_pkg" in graph.refs_by_name
 
     def test_skipped_count_for_unregistered_extension(self, tmp_repo):
         graph, skipped = build_graph_for_repo(

@@ -26,6 +26,46 @@ from app.services.symbol_graph.registry import register_extractor
 logger = logging.getLogger(__name__)
 
 
+# Known external (SDK / library) package prefixes — imports starting with
+# any of these are NOT emitted as Refs because their decls live outside
+# the project source tree (in jars / aar / kotlin stdlib). Without this
+# filter the gate produces 50+ false positives per Android Compose file.
+#
+# This is the conservative list. Anything not matching falls through and
+# IS emitted as a Ref — so internal-project cross-file imports
+# (com.example.app.utils.* -> com.example.app.foo.Bar) still get checked.
+_EXTERNAL_IMPORT_PREFIXES: tuple[str, ...] = (
+    "android.",
+    "androidx.",
+    "com.google.",
+    "com.android.",
+    "kotlin.",
+    "kotlinx.",
+    "java.",
+    "javax.",
+    "org.json.",
+    "org.jetbrains.",
+    "org.junit.",
+    "org.mockito.",
+    "org.osmdroid.",
+    "dagger.",
+    "retrofit2.",
+    "okhttp3.",
+    "io.reactivex.",
+    "rxjava.",
+    "io.kotest.",
+    "io.mockk.",
+)
+
+
+def _is_external_import(qualified_path: str) -> bool:
+    """Return True when a Kotlin import's qualified path points to an
+    SDK / library package outside the project. Such imports can never
+    resolve to a Decl in the project source tree, so the gate skips
+    them to avoid false positives."""
+    return any(qualified_path.startswith(p) for p in _EXTERNAL_IMPORT_PREFIXES)
+
+
 def _load_parser():
     """Build a tree-sitter Kotlin parser. Imported lazily so module
     import doesn't crash environments without tree-sitter."""
@@ -109,18 +149,23 @@ class KotlinExtractor:
                 ))
         elif kt == "import":
             # `import a.b.c.Foo` -> Ref to last segment "Foo" with
-            # expected_kind="import" so the gate can flag missing imports.
+            # expected_kind=None (accept any decl kind).
+            # External SDK / library imports (android.*, androidx.*,
+            # kotlin.*, java.*, etc.) are skipped — their decls live
+            # outside the project source tree and can never resolve.
             qid = self._first_child_of_type(node, "qualified_identifier")
             if qid is not None:
-                last_ident = self._last_child_of_type(qid, "identifier")
-                if last_ident is not None:
-                    refs.append(Ref(
-                        name=self._text(last_ident, source),
-                        expected_kind=None,  # could be class/function/object — accept any
-                        file=path,
-                        line=last_ident.start_point[0] + 1,
-                        metadata={"qualified": self._text(qid, source)},
-                    ))
+                qualified = self._text(qid, source)
+                if not _is_external_import(qualified):
+                    last_ident = self._last_child_of_type(qid, "identifier")
+                    if last_ident is not None:
+                        refs.append(Ref(
+                            name=self._text(last_ident, source),
+                            expected_kind=None,
+                            file=path,
+                            line=last_ident.start_point[0] + 1,
+                            metadata={"qualified": qualified},
+                        ))
             # Don't recurse into import body
             return
 

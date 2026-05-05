@@ -73,30 +73,50 @@ class TestVariableAssignment:
 
 
 class TestImport:
-    def test_import_os(self):
+    def test_import_stdlib_NOT_emitted_as_ref(self):
+        """`import os` is stdlib — NOT internal cross-file ref."""
         decls, refs = _extract("import os\n")
         assert decls == []
+        assert refs == []  # filtered by external-import list
+
+    def test_import_internal_module_emitted_as_ref(self):
+        """`import myproject_internal_pkg` is non-stdlib — kept as ref."""
+        decls, refs = _extract("import myproject_internal_pkg\n")
         assert len(refs) == 1
-        assert refs[0].name == "os"
+        assert refs[0].name == "myproject_internal_pkg"
         assert refs[0].expected_kind == "module"
 
-    def test_import_multiple(self):
-        decls, refs = _extract("import os, sys\n")
-        assert len(refs) == 2
+    def test_import_multiple_mixed_filters_stdlib_only(self):
+        """Stdlib names dropped, internal names kept."""
+        decls, refs = _extract("import os, sys, myproject_pkg\n")
         names = {r.name for r in refs}
-        assert names == {"os", "sys"}
+        # os + sys are stdlib (filtered); myproject_pkg kept.
+        assert names == {"myproject_pkg"}
 
 
 class TestImportFrom:
-    def test_from_import_c_d(self):
-        decls, refs = _extract("from a.b import c, d\n")
+    def test_from_internal_module_emits_refs(self):
+        """`from myproject.utils import c, d` -> 2 refs (top-level
+        `myproject` is not in stdlib/3rd-party filter list)."""
+        decls, refs = _extract("from myproject.utils import c, d\n")
         assert len(refs) == 2
         assert refs[0].name == "c"
         assert refs[0].expected_kind is None
         assert refs[1].name == "d"
         assert refs[1].expected_kind is None
 
-    def test_from_import_single(self):
+    def test_from_stdlib_filtered(self):
+        """`from os.path import join` -> NO refs (os is stdlib)."""
+        decls, refs = _extract("from os.path import join\n")
+        assert refs == []
+
+    def test_from_third_party_filtered(self):
+        """`from sqlalchemy import select` -> NO refs (sqlalchemy is in
+        the third-party filter list)."""
+        decls, refs = _extract("from sqlalchemy import select\n")
+        assert refs == []
+
+    def test_from_import_single_internal(self):
         decls, refs = _extract("from foo import bar\n")
         assert len(refs) == 1
         assert refs[0].name == "bar"
@@ -124,15 +144,20 @@ def foo(): pass
 class Bar: pass
 x = 1
 import os
+import myproject_internal
 from a.b import c, d
+from os.path import join
 """
         decls, refs = _extract(source)
-        # 2 declarations: foo (function), Bar (class), x (variable) = 3
+        # 3 declarations: foo (function), Bar (class), x (variable)
         assert len(decls) == 3
         kinds = {d.kind for d in decls}
         assert kinds == {"function", "class", "variable"}
-        # 3 refs: os (module), c (None), d (None)
-        assert len(refs) == 3
+        # Refs: 'os' filtered (stdlib), 'myproject_internal' kept,
+        # 'c'+'d' from internal `a.b` kept, `from os.path` filtered.
+        # = 3 refs (myproject_internal, c, d)
+        names = {r.name for r in refs}
+        assert names == {"myproject_internal", "c", "d"}
 
 
 class TestLanguageProperty:
