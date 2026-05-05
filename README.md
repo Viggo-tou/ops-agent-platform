@@ -1,182 +1,166 @@
 # Enterprise Ops Agent Platform
 
-Internal enterprise AI assistant console and governed agent workflow platform.
+A governed, audited LLM-orchestration platform that turns natural-language ops requests
+(Jira tickets, repository questions, action requests) into structured pipelines
+across multiple LLM providers, with first-class retrieval, gates, memory, and
+human-in-loop approval.
 
-## Current MVP
+**Stack**: Python 3.14 / FastAPI / SQLAlchemy + SQLite (with FTS5) / React + Vite frontend.
+**LLM providers**: Anthropic Claude, OpenAI, MiniMax, DeepSeek, Codex CLI, Claude Code CLI
+(any subset selectable per task via configurable provider chains).
 
-- Single runtime
-- Single primary agent orchestration flow
-- Persistent `task`, `event`, and `approval` state
-- React AI workbench with chat-first navigation, knowledge, memory, settings, login state, and RBAC-aware controls
-- Unified tool runtime with knowledge, Slack, Jira, internal API, and internal DB connectors
-- Governance foundation with actor roles, risk categories, policy rules, approval metadata, and read APIs
+## Why this exists
 
-## Current Status
+Most "AI coding agents" are demoed end-to-end on toy tasks. Real ops/dev agents
+must be observable, auditable, and *fail-safe* on adversarial input — including
+the case where the LLM tries to game your gates. This project is a study in
+**architectural primitives** for building such agents:
 
-The latest completed frontend task is `T-025 Minimal AI Workbench Frontend Refactor`.
+- **Retrieval** that actually works on real repos (FTS5 + tokenized boolean queries)
+- **Gates** that catch reward-hacking (comment-stuffing, shell-only edits, unresolved refs)
+- **Memory** that learns from gate failures across sessions
+- **Governance** with role-based actors, policy rules, and approval flows
+- **Cross-file consistency** via a language-agnostic SymbolGraph framework
+  (Python / Kotlin via tree-sitter / XML via lxml; new languages = a 50-line plug-in)
 
-The latest completed recovery task is `T-027 Resumable Development State Files`.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design walkthrough
+and [`docs/DEMO.md`](docs/DEMO.md) for a live demo script.
 
-The latest completed chain fix is `T-028 Fix Chat Knowledge Answer Chain`.
+## High-level pipeline
 
-The latest completed UI pass is `T-029 Strict Reference UI Pass`.
-
-The latest completed chat behavior fix is `T-032 Same-Conversation Follow-up Turns`.
-
-The latest completed handoff task is `T-033 Environment Handoff Documentation`.
-
-Implemented in that pass:
-
-- fixed left sidebar with recent conversation switching and local title rename support
-- chat page that creates backend tasks and renders agent output as readable natural-language replies
-- knowledge page with drag/drop, file, folder, zip, and future local-path import affordances
-- memory page with local add, edit, delete, search, automatic memory toggle, whitelist, and blacklist controls
-- settings page with provider/model groups for OpenAI, Anthropic, Google, DeepSeek, Moonshot, Mistral, Cohere, and domestic model providers
-- local login state and frontend RBAC guards for admin, operator, member, and viewer roles
-- restrained white/black/gray UI styling with low-noise borders and consistent component sizing
-
-Known frontend scaffolding still waiting on backend persistence:
-
-- multipart knowledge upload and zip ingestion endpoint
-- server-side knowledge source delete or disable action
-- backend memory store
-- backend model/provider configuration read and safe admin write path
-- server-confirmed RBAC checks for all sensitive UI mutations
-
-Known active persistence gap:
-
-- Knowledge upload, memory, and model/provider configuration still need backend-backed persistence and server-side enforcement.
-
-## Recovery Files
-
-For restart-safe development, read these files at the start of a new agent session:
-
-1. `AGENTS.md`
-2. `PROJECT_CONTEXT.md`
-3. `CURRENT_STATE.md`
-4. `DECISIONS.md`
-5. `TASK_QUEUE.md`
-6. `SESSION_HANDOFF.md`
-
-These files record the active blocker, decisions, task queue, runtime evidence, and the next first action after an interrupted session.
-
-## Project Structure
-
-```text
-apps/backend  FastAPI API, orchestrator, persistence
-apps/web      React + Vite task console
-docs/         Scope notes and task card log
-scripts/      Local startup scripts for Windows
+```
+User request ──> Intake ──> Semantic translator ──> Planner
+                                                       │
+                                                       ▼
+                                              ┌────────────────────┐
+                                              │   Develop pipeline │
+                                              ├────────────────────┤
+                                              │  Evidence bundle   │  ◄── FTS5 + Plan A
+                                              │  Codegen (multi-   │
+                                              │    provider chain) │
+                                              │  Feature presence  │  ◄── G2 strict
+                                              │  SymbolGraph gate  │  ◄── ref-validity
+                                              │  Compile gate      │
+                                              │  Spec conformance  │
+                                              │  Runtime validation│
+                                              └────────────────────┘
+                                                       │
+                                              ┌────────▼─────────┐
+                                              │ Approval / Audit │
+                                              └────────┬─────────┘
+                                                       ▼
+                                              Action (Jira write,
+                                              code merge, Slack...)
 ```
 
-## First-Time Setup
+Every transition emits an `Event`; every tool invocation produces a
+`ToolExecution` with attempt-level latency / retry / error history. Failed
+gates feed `AgentMemory`, which is consulted by future tasks via FTS5
+keyword recall.
 
-From the repo root:
+## Key architectural primitives
+
+### 1. FTS5-backed retrieval ("Plan A")
+
+A naive substring matcher missed multi-word phrases ("home address") in
+real source code 75% of the time on dogfood tasks. Plan A re-routes anchor
+matching through the existing `knowledge_document_fts` index with
+CamelCase-aware tokenization plus a joined-form fallback for compound
+identifiers.
+
+**Empirical result**: anchor recall went from **9.2% → 91.5%** on the same
+153 anchors across 24 dogfood tasks. See
+[`apps/backend/app/services/evidence_bundle.py`](apps/backend/app/services/evidence_bundle.py).
+
+### 2. Anti-cheat gates
+
+LLMs treat gates as reward signals. Three patterns observed and addressed:
+
+| Cheat pattern | Defense |
+|---|---|
+| Required tokens stuffed in `//` and `/* */` comments | `_strip_comments` zeroes comment bytes before token grep |
+| Shell-only edits + comment narration of feature | **G2**: scan diff-added lines (not full file) + strict identifier-shaped tokens (no plain English) + ratio threshold |
+| Add `@string/foo` reference without defining `foo` | **SymbolGraph**: post-codegen ref-validity gate, language-plug-in based |
+
+### 3. Language-agnostic SymbolGraph framework
+
+`Decl` / `Ref` / `ExtractedSymbols` dataclasses + a `SymbolExtractor`
+Protocol. Per-language extractors register themselves for file extensions:
+
+| Language | Parser | LOC |
+|---|---|---|
+| Python | stdlib `ast` | ~70 |
+| Kotlin | tree-sitter-kotlin | ~140 |
+| XML (Android resources) | lxml + regex | ~110 |
+
+Adding TypeScript / Go / Java is a new file in
+[`apps/backend/app/services/symbol_graph/`](apps/backend/app/services/symbol_graph/)
+plus a one-line `register_extractor()` call. The orchestrator and gate
+logic do not change.
+
+### 4. Failure-feeding memory
+
+Every `TOOL_FAILED`, `TOOL_TIMED_OUT`, `REVIEW_FAILED`, `COMPILE_FAILED`,
+or `FAILURE_DIAGNOSIS_GENERATED` event is fed to `AgentMemory`, indexed
+in FTS5 with scope (`gate:compile_gate`, `tool:jira`, etc.) and surfaced
+to the planner on similar future requests. See
+[`apps/backend/app/services/memory.py`](apps/backend/app/services/memory.py).
+
+### 5. Multi-provider routing with backoff
+
+`ToolGateway` runs each tool through a configurable provider chain
+(e.g. `claude_code,codex,deepseek,minimax,mock`). Retryable errors
+(5xx, transient I/O) get exponential backoff with jitter, capped at 8s.
+Non-retryable errors (400-class, missing config) fail fast.
+
+## Quickstart (Windows)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\setup-local.ps1
-```
-
-That installs:
-
-- backend Python dependencies from `apps/backend/requirements.txt`
-- frontend npm dependencies from `apps/web/package.json`
-
-## Start The MVP
-
-Open two terminals in the repo root.
-
-Terminal 1, backend:
-
-```powershell
+# Backend (FastAPI on :8000)
 powershell -ExecutionPolicy Bypass -File .\scripts\start-backend.ps1
-```
 
-This starts the backend in normal mode.  
-If you explicitly want auto-reload:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\start-backend.ps1 -Reload
-```
-
-Terminal 2, frontend:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\start-web.ps1
-```
-
-This starts the built frontend with a lightweight Python static server, which is the most reliable local mode in this environment.  
-If you explicitly want Vite dev mode:
-
-```powershell
+# Frontend (Vite dev on :5173)
 powershell -ExecutionPolicy Bypass -File .\scripts\start-web.ps1 -Dev
 ```
 
-## What To Open
+Open `http://127.0.0.1:5173` for the workbench UI; the OpenAPI explorer
+is at `http://127.0.0.1:8000/docs`. Health snapshot at
+`http://127.0.0.1:8000/health`.
 
-Once both servers are running:
+## Project layout
 
-- Frontend app: `http://127.0.0.1:5173`
-- Backend API docs: `http://127.0.0.1:8000/docs`
-- Backend health check: `http://127.0.0.1:8000/health`
+```
+apps/
+  backend/                       FastAPI service
+    app/
+      api/                       HTTP routes (/tasks, /events, /health, ...)
+      orchestrator/service.py    Pipeline state machine (~7000 LOC)
+      services/
+        evidence_bundle.py       FTS5 anchor retrieval (Plan A + B2)
+        feature_presence_check.py  G2 strict-token gate
+        symbol_graph/            Language-agnostic ref-validity framework
+        memory.py                Failure-feeding learning loop
+        codegen.py               Multi-provider codegen orchestration
+        knowledge.py             KB ingestion + FTS5 indexing
+      tools/gateway.py           Tool runtime with retry + backoff
+    tests/                       1300+ unit tests, organized by service
+  web/                           React + Vite workbench
 
-## Direct Commands
-
-If you do not want to use the scripts:
-
-Backend:
-
-```powershell
-Set-Location .\apps\backend
-& "$env:LOCALAPPDATA\Python\bin\python.exe" -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+docs/
+  ARCHITECTURE.md                Design walkthrough
+  DEMO.md                        Live demo script
+  ai/                            Internal task / decision history
 ```
 
-Frontend:
+## Testing
 
-```powershell
-Set-Location .\apps\web
-& "$env:LOCALAPPDATA\Python\bin\python.exe" ..\..\scripts\serve-web.py --host 127.0.0.1 --port 5173 --dir .\dist
+```bash
+cd apps/backend
+python -m pytest tests/ -q          # all suites
+python -m pytest tests/services/symbol_graph/ -q
+python -m pytest tests/services/test_evidence_bundle_fts5.py -q
 ```
 
-## Notes
+## License
 
-- The backend defaults to a local SQLite database at `apps/backend/ops_agent_platform.db`
-- The frontend defaults to calling `http://127.0.0.1:8000/api`
-- The primary agent can run in mock or OpenAI-backed mode via:
-- `OPS_AGENT_PRIMARY_AGENT_PROVIDER=auto|mock|openai`
-- `OPS_AGENT_PRIMARY_AGENT_MODEL=gpt-4o-mini` by default
-- `OPS_AGENT_OPENAI_API_KEY=...` to enable real provider calls
-- The semantic translation layer can run in deterministic or MiniMax-backed mode via:
-- `OPS_AGENT_SEMANTIC_TRANSLATOR_PROVIDER=auto|mock|minimax`
-- `OPS_AGENT_SEMANTIC_TRANSLATOR_MODEL=MiniMax-M2.7` by default
-- `OPS_AGENT_MINIMAX_API_KEY=...` to enable real MiniMax normalization before planning and retrieval
-- The knowledge agent defaults to the detected local Handyman repository, or you can override it with:
-- `OPS_AGENT_KNOWLEDGE_SOURCE_PATH=...`
-- `OPS_AGENT_KNOWLEDGE_SOURCE_SPECS=name=path;name2=path2` for multiple repositories
-- Phase 4 tool connectors are configured through:
-- `OPS_AGENT_SLACK_BOT_TOKEN` and `OPS_AGENT_SLACK_DEFAULT_CHANNEL`
-- `OPS_AGENT_JIRA_BASE_URL`, `OPS_AGENT_JIRA_PROJECT_KEY`, and Jira credentials
-- Existing Jira issue planning accepts either an issue key such as `P69-10` or a Jira URL containing `/browse/P69-10` or `selectedIssue=P69-10`
-- `OPS_AGENT_INTERNAL_API_BASE_URL` and `OPS_AGENT_INTERNAL_API_TOKEN`
-- `OPS_AGENT_INTERNAL_DB_URL` for guarded read-only internal DB queries
-- Effective tool permissions can be overridden with `OPS_AGENT_TOOL_PERMISSION_OVERRIDES`
-- If PowerShell blocks script execution, keep using the `-ExecutionPolicy Bypass` form shown above
-
-## Next Development Plan
-
-Immediate next task card: `T-026 Workbench Backend Persistence and Governance Integration`.
-
-Immediate implementation sequence:
-
-1. Add backend knowledge import endpoints for files and zip archives, keeping browser local-path access compliant.
-2. Add backend knowledge source delete or disable APIs and wire the existing UI delete action to server enforcement.
-3. Add backend memory APIs for list, create, update, delete, automatic memory settings, whitelist, and blacklist topics.
-4. Add backend model/provider configuration read APIs and a safe admin-only write path that does not expose raw secrets in the browser.
-5. Connect frontend RBAC checks to backend governance roles and policy-rule responses where possible.
-6. Re-run frontend and backend smoke tests for admin, operator, member, and viewer roles.
-
-The broader roadmap remains in `docs/phase-5-7-enterprise-roadmap.md`, but the active next product task is now T-026.
-
-## Tracking
-
-Implementation task history is recorded in [docs/task-cards.md](./docs/task-cards.md).
+Capstone / portfolio project. See `LICENSE` if applicable.
