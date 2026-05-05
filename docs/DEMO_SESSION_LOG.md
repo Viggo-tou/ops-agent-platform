@@ -83,6 +83,51 @@ preceding iteration.
   happened to under-implement on this run; the gate caught it
   pre-approval. This is the right outcome.
 
+## P69-19 ("signup + map address") parallel dogfood
+
+A second Jira ticket dogfooded with the full gate stack. Different
+failure modes surfaced new issues — and were fixed architecturally:
+
+### v1 — SymbolGraph SDK-import false positives
+- **Setup**: full gate stack with SymbolGraph wired in; tree-sitter
+  Kotlin extractor.
+- **Codegen**: produced ~11KB of Kotlin across CustomerSignup.kt and
+  CustomerKYCAddressForm.kt — **real implementation, not shell**.
+- **Result**: SymbolGraph rejected with **50 violations**: `Log`,
+  `Toast`, `Image`, `clickable`, `layout`, ... — every Android SDK
+  import being flagged as `no_decl_found`.
+- **Root cause**: extractor was emitting Refs for every import, but
+  Android SDK / androidx / kotlin stdlib decls live in jars, not in
+  the project source tree. Source-tree-only graph cannot resolve them.
+- **Fix**: `_EXTERNAL_IMPORT_PREFIXES` filter in both Kotlin and
+  Python extractors. Skip emitting Refs for `android.* / androidx.* /
+  com.google.* / kotlin.* / java.* / sqlalchemy.* / pytest.* /` etc.
+  Internal cross-package imports (`com.example.app.utils.Foo`)
+  preserved.
+- **Test**: `test_kotlin_skips_external_sdk_imports`.
+
+### v2/v3/v4 — MiniMax service flakiness
+- Multiple retries hit the external translator/synthesis service
+  hanging — not an architecture issue, an availability issue. Used
+  the env's `OPS_AGENT_SEMANTIC_TRANSLATOR_PROVIDER=mock` switch to
+  bypass when needed.
+
+### v3 — Kotlin compile-repair budget exhaustion
+- **Codegen**: 270 lines added across 2 signup files — real,
+  substantive implementation.
+- **Compile gate**: Kotlin syntax errors in CustomerSignup.kt.
+- **Repair loop**: 3 rounds × 180s deadline each. Each round called
+  codegen with the compiler errors as context. Each round timed out.
+  Per-file repair attempts produced 0 successful fixes.
+- **Result**: `compile_gate_exhausted` after exhausting the 3-round
+  budget — pipeline fail-closes cleanly, persists the round-by-round
+  diagnostics in `latest_result_json` for postmortem.
+
+This is the right outcome. Producing valid Kotlin under repair
+pressure on a multi-file Android feature is a frontier problem in
+2026. The platform's value is *fail-safety*: when the codegen LLM
+can't fix its own syntax errors, the diff does not get approved.
+
 ## Anchor recall (Plan A) — independent measurement
 
 | Metric | Before Plan A | After Plan A |
