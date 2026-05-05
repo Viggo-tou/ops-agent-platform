@@ -2811,6 +2811,11 @@ class PrimaryOrchestrator:
             from app.services.spec_conformance import _has_destructive_verb
 
             translation = task.translation_json if isinstance(task.translation_json, dict) else {}
+            _evidence_source_name = (
+                str(translation.get("source_name") or "").strip()
+                or str(getattr(self.tool_gateway.settings, "knowledge_source_name", "") or "").strip()
+                or None
+            )
             try:
                 evidence = build_evidence_bundle(
                     request_text=task.request_text,
@@ -2819,6 +2824,8 @@ class PrimaryOrchestrator:
                     grounding_terms=translation.get("grounding_terms"),
                     planner_must_touch=getattr(plan, "must_touch_files", None) or [],
                     has_destructive_verb=_has_destructive_verb(task.request_text or ""),
+                    db=self.db,
+                    source_name=_evidence_source_name,
                 )
             except Exception as exc:
                 evidence = None
