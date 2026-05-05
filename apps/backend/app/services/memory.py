@@ -177,6 +177,8 @@ class MemoryService:
             EventType.REVIEW_FAILED,
             EventType.COMPILE_FAILED,
             EventType.FAILURE_DIAGNOSIS_GENERATED,
+            EventType.TOOL_FAILED,
+            EventType.TOOL_TIMED_OUT,
         }:
             return None
 
@@ -364,6 +366,8 @@ class MemoryService:
         tool = (event.tool_name or "").strip().split(".")[0]
         if event_type == EventType.REVIEW_FAILED and tool:
             return f"gate:{_slug(tool)}"
+        if event_type in (EventType.TOOL_FAILED, EventType.TOOL_TIMED_OUT) and tool:
+            return f"tool:{_slug(tool)}"
         return f"gate:{_slug(_event_type_value(event_type))}"
 
     def _heuristic_judge(

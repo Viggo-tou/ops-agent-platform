@@ -315,3 +315,58 @@ def test_gate_event_records_compile_scope_and_provenance(db_session: Session) ->
     assert memory.scope == "gate:compile_gate"
     assert memory.provenance_event_id == event.id
     assert memory.provenance_task_id == task.id
+
+
+def test_gate_event_records_tool_failed_with_tool_scope(db_session: Session) -> None:
+    """T1.1: TOOL_FAILED events should be recorded with tool:<name> scope."""
+    task = _task(db_session, status=TaskStatus.EXECUTING)
+    event = Event(
+        task_id=task.id,
+        event_type=EventType.TOOL_FAILED,
+        source=EventSource.TOOL_GATEWAY,
+        stage=WorkflowStage.PLANNING,
+        role=RoleName.PLANNER,
+        tool_name="jira.get_issue",
+        message="Jira issue context fetch failed (HTTP 401).",
+        payload_json={
+            "error_kind": "auth_expired",
+            "http_status": 401,
+            "error_message": "Jira authentication failed (HTTP 401 on /myself).",
+        },
+    )
+    db_session.add(event)
+    db_session.flush()
+    service = MemoryService(db_session, _settings())
+
+    memory = service.maybe_record_gate_event(event=event, task=task)
+
+    assert memory is not None
+    assert memory.scope == "tool:jira"
+    assert memory.provenance_event_id == event.id
+
+
+def test_gate_event_records_tool_timed_out(db_session: Session) -> None:
+    """T1.1: TOOL_TIMED_OUT events should also be recorded."""
+    task = _task(db_session, status=TaskStatus.EXECUTING)
+    event = Event(
+        task_id=task.id,
+        event_type=EventType.TOOL_TIMED_OUT,
+        source=EventSource.TOOL_GATEWAY,
+        stage=WorkflowStage.PLANNING,
+        role=RoleName.PLANNER,
+        tool_name="codegen.generate_patch",
+        message="Codegen exceeded per-call timeout of 30s.",
+        payload_json={
+            "reason": "external_api_timeout",
+            "provider_name": "deepseek",
+            "duration_ms": 30000,
+        },
+    )
+    db_session.add(event)
+    db_session.flush()
+    service = MemoryService(db_session, _settings())
+
+    memory = service.maybe_record_gate_event(event=event, task=task)
+
+    assert memory is not None
+    assert memory.scope == "tool:codegen"

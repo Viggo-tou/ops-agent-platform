@@ -74,6 +74,8 @@ def record_event(
         EventType.REVIEW_FAILED,
         EventType.COMPILE_FAILED,
         EventType.FAILURE_DIAGNOSIS_GENERATED,
+        EventType.TOOL_FAILED,
+        EventType.TOOL_TIMED_OUT,
     }:
         try:
             task = db.get(Task, task_id)
@@ -1662,7 +1664,7 @@ class PrimaryOrchestrator:
                         "request_size_bytes": request_size_bytes,
                         "duration_ms": int((time.perf_counter() - translation_started) * 1000),
                         "error_type": type(exc).__name__,
-                        "error_message": str(exc)[:1000],
+                        "error_message": str(exc)[:5000],
                         "traceback": _truncated_traceback(exc),
                     },
                 )
@@ -1890,7 +1892,7 @@ class PrimaryOrchestrator:
                     "issue_key": issue_key,
                     "http_status": getattr(exc, "http_status", None),
                     "error_type": type(exc).__name__,
-                    "error_message": str(exc)[:1000],
+                    "error_message": str(exc)[:5000],
                     "traceback": _truncated_traceback(exc),
                 },
             )
@@ -4489,7 +4491,7 @@ class PrimaryOrchestrator:
                     stage=WorkflowStage.REVIEW, role=RoleName.REVIEWER,
                     tool_name="artifact_existence.check",
                     message=f"Artifact existence check errored (non-blocking): {exc}",
-                    payload={"error": str(exc)[:500]},
+                    payload={"error": str(exc)[:5000]},
                 )
             if art_report is not None:
                 pipeline_state["artifact_existence"] = art_report.to_payload()
@@ -6991,7 +6993,7 @@ class PrimaryOrchestrator:
                 role=RoleName.REVIEWER,
                 tool_name="reservations.review",
                 message=f"Reservations reviewer failed (non-blocking): {exc}",
-                payload={"error": str(exc)[:500]},
+                payload={"error": str(exc)[:5000]},
             )
 
         preview_result = {
