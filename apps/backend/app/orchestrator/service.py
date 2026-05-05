@@ -4407,7 +4407,7 @@ class PrimaryOrchestrator:
                         sr_report = None
                         break
 
-                    record_event(
+                    sr_event = record_event(
                         self.db, task_id=task.id,
                         event_type=(
                             EventType.TOOL_SUCCEEDED if sr_report.passed
@@ -4429,6 +4429,28 @@ class PrimaryOrchestrator:
                             "sr_repair_round": sr_round,
                         },
                     )
+                    # R3a: persist findings to AgentMemory so future tasks
+                    # with similar code paths see this kind of bug as
+                    # planner context. Only fires when the report has
+                    # actionable (high/medium) findings.
+                    if not sr_report.passed and sr_report.findings:
+                        try:
+                            from app.services.memory import MemoryService
+                            _mem = MemoryService(self.db, self.tool_gateway.settings)
+                            n_recorded = _mem.record_semantic_review_findings(
+                                task=task,
+                                review_payload=sr_report.to_payload(),
+                                provenance_event_id=getattr(sr_event, "id", None),
+                            )
+                            if n_recorded:
+                                logger.info(
+                                    "R3a: persisted %d semantic_review finding(s) to memory",
+                                    n_recorded,
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "R3a memory persist failed: %s", exc,
+                            )
                     if sr_report.passed:
                         break
                     if sr_round >= _SR_MAX_REPAIR:
@@ -4470,6 +4492,53 @@ class PrimaryOrchestrator:
                         ),
                     )
                     time.sleep(10)  # Rate-limit cooldown
+                    # R3b: context expansion — for every file mentioned by
+                    # a grounded finding, ensure the codegen sees the
+                    # POST-EDIT full content (not just the diff). This
+                    # gives the LLM the surrounding code shape so its
+                    # repair patch fits the actual structure rather than
+                    # guessing API surfaces.
+                    sr_expanded_context = dict(
+                        pipeline_state.get("context_files", {}) or {}
+                    )
+                    sr_finding_files: set[str] = set()
+                    for f in sr_report.findings:
+                        fp = (f.file or "").strip().replace("\\", "/")
+                        if fp:
+                            sr_finding_files.add(fp)
+                    sr_added_count = 0
+                    for fp in sr_finding_files:
+                        if fp in sr_expanded_context:
+                            continue  # already in context
+                        try:
+                            full = _sr_sandbox_dir / fp
+                            if full.is_file():
+                                content = full.read_text(
+                                    encoding="utf-8", errors="replace"
+                                )
+                                if len(content) > 30_000:
+                                    content = content[:30_000] + "\n[truncated]"
+                                sr_expanded_context[fp] = content
+                                sr_added_count += 1
+                        except Exception:
+                            pass
+                    if sr_added_count:
+                        record_event(
+                            self.db, task_id=task.id,
+                            event_type=EventType.TOOL_SUCCEEDED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            tool_name="semantic_review.context_expand",
+                            message=(
+                                f"R3b: expanded codegen context with "
+                                f"{sr_added_count} finding-referenced "
+                                f"file(s) (full post-edit content)"
+                            ),
+                            payload={
+                                "files_added": sorted(sr_finding_files),
+                            },
+                        )
                     try:
                         sr_repair_result = self._execute_develop_tool(
                             task=task,
@@ -4480,9 +4549,7 @@ class PrimaryOrchestrator:
                                     "objective": "Address semantic_review findings",
                                     "steps": [],
                                 },
-                                "context_files": pipeline_state.get(
-                                    "context_files", {}
-                                ),
+                                "context_files": sr_expanded_context,
                                 "task_description": sr_repair_prompt,
                             },
                             stage=WorkflowStage.REVIEW,

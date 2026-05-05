@@ -171,6 +171,58 @@ class MemoryService:
             provenance_task_id=provenance_task_id,
         )
 
+    def record_semantic_review_findings(
+        self,
+        *,
+        task: Task,
+        review_payload: dict,
+        provenance_event_id: str | None = None,
+    ) -> int:
+        """R3a: persist each grounded high/medium finding as its own
+        memory entry so future tasks with similar code paths see the
+        kind of bugs the reviewer caught last time.
+
+        Returns the number of memory entries created. Drops low-severity
+        findings (advisory noise) and dedup-collapses near-identical
+        observations against existing scope memories.
+        """
+        if not bool(getattr(self.settings, "memory_enabled", True)):
+            return 0
+        findings = review_payload.get("findings") or []
+        if not findings:
+            return 0
+        recorded = 0
+        for f in findings:
+            severity = (f.get("severity") or "").lower()
+            if severity not in ("high", "medium"):
+                continue  # low = advisory, don't pollute memory
+            file = (f.get("file") or "").strip()
+            description = (f.get("description") or "").strip()
+            suggested = (f.get("suggested_fix") or "").strip()
+            category = (f.get("category") or "general").strip()
+            if not description:
+                continue
+            observation = (
+                f"semantic_review {severity}/{category} in {file}:"
+                f"{f.get('line_start', 0)}-{f.get('line_end', 0)}: "
+                f"{description}"
+            )
+            resolution = suggested or None
+            mem = self.maybe_record(
+                observation_text=observation,
+                resolution_text=resolution,
+                scope=f"gate:semantic_review:{_slug(category)}",
+                kind=GATE_MEMORY_KIND,
+                provenance_event_id=provenance_event_id,
+                provenance_task_id=task.id,
+                # Skip judge for high-severity — they're always worth
+                # remembering; medium goes through the normal judge.
+                skip_judge=(severity == "high"),
+            )
+            if mem is not None:
+                recorded += 1
+        return recorded
+
     def maybe_record_gate_event(self, *, event: Event, task: Task | None = None) -> AgentMemory | None:
         event_type = event.event_type
         if event_type not in {
