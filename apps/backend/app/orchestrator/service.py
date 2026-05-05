@@ -2869,6 +2869,61 @@ class PrimaryOrchestrator:
                     return
                 if evidence.must_touch_files and not getattr(plan, "must_touch_files", None):
                     plan.must_touch_files = evidence.must_touch_files
+                # Option B: pre-codegen source injection.
+                # The evidence_bundle's FTS5 anchor matching surfaced
+                # additional must_touch / candidate files that the planner
+                # didn't pre-commit. Read their actual content and inject
+                # into context_files so codegen sees real method signatures
+                # and existing field shapes, not just file paths. Without
+                # this, the LLM has been hallucinating API surfaces (e.g.
+                # invented SessionManager method names) and producing
+                # patches that don't match the real code's contracts.
+                _inject_paths: list[str] = []
+                _inject_paths.extend(evidence.must_touch_files or [])
+                # Top candidates (capped) — useful supporting context.
+                for cf in (evidence.candidate_files or [])[:5]:
+                    if cf not in _inject_paths:
+                        _inject_paths.append(cf)
+                _injected_count = 0
+                _injected_bytes = 0
+                for rel in _inject_paths:
+                    norm_rel = self._normalize_codegen_path(rel)
+                    if not norm_rel or norm_rel in context_files:
+                        continue
+                    body = self._read_context_file(
+                        source_path=_pipeline_source_path,
+                        sandbox_dir=self._develop_sandbox_dir(task),
+                        relative_path=norm_rel,
+                    )
+                    if body is None:
+                        continue
+                    # 50KB per file cap to avoid prompt bloat
+                    if len(body) > 50_000:
+                        body = body[:50_000]
+                    context_files[norm_rel] = body
+                    _injected_count += 1
+                    _injected_bytes += len(body)
+                if _injected_count > 0:
+                    pipeline_state["context_file_paths"] = list(context_files)
+                    pipeline_state["context_files"] = context_files
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_SUCCEEDED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.KNOWLEDGE,
+                        role=RoleName.KNOWLEDGE,
+                        tool_name="codegen_context.inject_from_evidence",
+                        message=(
+                            f"Injected {_injected_count} file(s) "
+                            f"({_injected_bytes} bytes) from evidence "
+                            f"into codegen context."
+                        ),
+                        payload={
+                            "injected_files": _inject_paths[:_injected_count],
+                            "injected_bytes": _injected_bytes,
+                        },
+                    )
             pipeline_state["evidence_bundle_done"] = True
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
 
@@ -3918,47 +3973,174 @@ class PrimaryOrchestrator:
                     pipeline_state["feature_presence_skipped"] = "no_file_contents"
                     self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
                 else:
-                    # G2: scan diff-added lines (post strip-comments) for the
-                    # tokens, not the full file body. Pre-existing content
-                    # cannot satisfy the gate; only newly added lines can.
-                    diff_text = pipeline_state.get("diff") or ""
-                    diff_added_per_file = extract_added_lines_per_file(diff_text)
-                    presence = evaluate_feature_presence(
-                        must_touch_files=must_touch,
-                        file_contents=file_contents,
-                        required_tokens=required_tokens,
-                        diff_added_per_file=diff_added_per_file or None,
-                        # Require >= 50% of derived tokens to appear in the
-                        # diff additions for the file. Plain >=1 was the v10b
-                        # cheat path: any single common word matched.
-                        min_tokens_per_file_ratio=0.5,
-                    )
-                    record_event(
-                        self.db,
-                        task_id=task.id,
-                        event_type=(
-                            EventType.TOOL_FAILED if presence.feature_absent else EventType.TOOL_SUCCEEDED
-                        ),
-                        source=EventSource.ORCHESTRATOR,
-                        stage=WorkflowStage.REVIEW,
-                        role=RoleName.REVIEWER,
-                        tool_name="feature_presence_check.evaluate",
-                        message=f"feature presence: {presence.reason[:200]}",
-                        payload=presence.to_payload(),
-                    )
-                    if presence.feature_absent:
+                    # Option A: feature_presence repair loop. Mirrors the
+                    # compile-repair pattern — when the gate rejects, build
+                    # a focused repair prompt listing what's missing and
+                    # re-call codegen. Bounded by MAX_FP_REPAIR rounds
+                    # (default 2). After exhaustion, fail-close.
+                    MAX_FP_REPAIR = 2
+                    presence = None
+                    for fp_round in range(MAX_FP_REPAIR + 1):  # initial + N repairs
+                        diff_text = pipeline_state.get("diff") or ""
+                        diff_added_per_file = extract_added_lines_per_file(diff_text)
+                        presence = evaluate_feature_presence(
+                            must_touch_files=must_touch,
+                            file_contents=file_contents,
+                            required_tokens=required_tokens,
+                            diff_added_per_file=diff_added_per_file or None,
+                            min_tokens_per_file_ratio=0.5,
+                        )
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=(
+                                EventType.TOOL_FAILED
+                                if presence.feature_absent
+                                else EventType.TOOL_SUCCEEDED
+                            ),
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            tool_name="feature_presence_check.evaluate",
+                            message=(
+                                f"feature presence (round {fp_round}): "
+                                f"{presence.reason[:200]}"
+                            ),
+                            payload={
+                                **presence.to_payload(),
+                                "fp_repair_round": fp_round,
+                            },
+                        )
+                        if not presence.feature_absent:
+                            break  # gate passed
+                        if fp_round >= MAX_FP_REPAIR:
+                            break  # exhausted; fall through to fail-close
+
+                        # Build a focused repair prompt listing what's missing.
+                        sample_unmatched = (
+                            presence.unmatched_required_files[:3] if presence else []
+                        )
+                        fp_repair_prompt = (
+                            f"FEATURE_PRESENCE REPAIR (round {fp_round + 1}): "
+                            f"Your previous diff is INCOMPLETE — the gate rejected "
+                            f"it because the diff ADDITIONS lack substantive "
+                            f"identifier-shaped tokens implementing the feature.\n\n"
+                            f"Files still missing real implementation: "
+                            f"{sample_unmatched}.\n\n"
+                            f"Required spec tokens (derived from grounding terms / "
+                            f"objective / file basenames): {required_tokens[:10]}.\n\n"
+                            f"You MUST extend the diff to ADD code that actually "
+                            f"USES these symbols (function calls, references, real "
+                            f"logic). Do NOT just declare new fields/variables and "
+                            f"stop — write the loading / binding / handler logic "
+                            f"that connects the spec to running behavior. Adding "
+                            f"comments describing what the code 'will do' does NOT "
+                            f"count — only added executable lines do."
+                        )
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_CALL_REQUESTED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            tool_name="feature_presence_check.repair",
+                            message=(
+                                f"Feature presence repair round {fp_round + 1} "
+                                f"of {MAX_FP_REPAIR}: re-prompting codegen with "
+                                f"missing-implementation feedback"
+                            ),
+                            payload={"unmatched": sample_unmatched},
+                        )
+                        # Cooldown to avoid LLM rate-limit thrash
+                        time.sleep(10)
+                        try:
+                            repair_result = self._execute_develop_tool(
+                                task=task,
+                                actor_name=actor_name,
+                                tool_name="codegen.generate_patch",
+                                payload={
+                                    "plan_json": {
+                                        "objective": "Repair feature_presence rejection",
+                                        "steps": [],
+                                    },
+                                    "context_files": pipeline_state.get(
+                                        "context_files", {}
+                                    ),
+                                    "task_description": fp_repair_prompt,
+                                },
+                                stage=WorkflowStage.REVIEW,
+                                role=RoleName.REVIEWER,
+                                approval_id=approval_id,
+                                pipeline_state=pipeline_state,
+                            )
+                        except Exception as exc:
+                            record_event(
+                                self.db,
+                                task_id=task.id,
+                                event_type=EventType.TOOL_FAILED,
+                                source=EventSource.ORCHESTRATOR,
+                                stage=WorkflowStage.REVIEW,
+                                role=RoleName.REVIEWER,
+                                tool_name="feature_presence_check.repair",
+                                message=f"Repair codegen call failed: {exc}",
+                            )
+                            break
+                        repair_diff = str(
+                            (repair_result or {}).get("diff", "")
+                        ).strip()
+                        if not repair_diff:
+                            record_event(
+                                self.db,
+                                task_id=task.id,
+                                event_type=EventType.TOOL_FAILED,
+                                source=EventSource.ORCHESTRATOR,
+                                stage=WorkflowStage.REVIEW,
+                                role=RoleName.REVIEWER,
+                                tool_name="feature_presence_check.repair",
+                                message="Repair codegen produced no diff",
+                            )
+                            break
+                        # Replace diff and re-evaluate next iteration
+                        pipeline_state["diff"] = repair_diff
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_SUCCEEDED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            tool_name="feature_presence_check.repair",
+                            message=(
+                                f"Repair produced new diff "
+                                f"({len(repair_diff)} chars); re-evaluating"
+                            ),
+                        )
+                    # End repair loop. If still feature_absent, fail-close.
+                    if presence is not None and presence.feature_absent:
                         self._fail_develop_pipeline(
                             task=task,
                             event_type=EventType.REVIEW_FAILED,
                             stage=WorkflowStage.REVIEW,
                             role=RoleName.REVIEWER,
-                            message=f"Feature presence pre-gate rejected: {presence.reason}",
-                            payload={"plan_id": plan.plan_id, "feature_presence": presence.to_payload()},
+                            message=(
+                                f"Feature presence pre-gate rejected after "
+                                f"{MAX_FP_REPAIR} repair attempt(s): "
+                                f"{presence.reason}"
+                            ),
+                            payload={
+                                "plan_id": plan.plan_id,
+                                "feature_presence": presence.to_payload(),
+                            },
                         )
                         return
                     pipeline_state["feature_presence_done"] = True
-                    pipeline_state["feature_presence"] = presence.to_payload()
-                    self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+                    pipeline_state["feature_presence"] = (
+                        presence.to_payload() if presence else {}
+                    )
+                    self._preserve_develop_pipeline_state(
+                        task=task, pipeline_state=pipeline_state
+                    )
             except Exception as exc:
                 self._workspace_append_audit(
                     task,
