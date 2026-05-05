@@ -254,6 +254,74 @@ def test_build_works_without_db(tmp_path: Path):
     assert bundle.anchor_strategy.get("home_address") == "substring"
 
 
+def test_b2_zero_anchor_hits_no_planner_commit_returns_insufficient(
+    db_session: Session, tmp_path: Path
+):
+    """B2 fail-closed: anchors searched but ZERO hits AND planner gave no
+    must-touch -> verdict must be 'insufficient', not 'sufficient'.
+    Pre-B2 this path silently returned 'sufficient' with empty hits, which
+    is how P69-17 v9 wandered into AndroidManifest.xml.
+    """
+    # No documents seeded -> FTS5 will return 0 hits.
+    bundle = build_evidence_bundle(
+        request_text="Add some completely unindexed feature with no anchors",
+        normalized_request=None,
+        source_tree=tmp_path,  # empty disk -> substring also misses
+        grounding_terms=["NonExistentSymbol"],
+        planner_must_touch=[],  # planner provided no commitments
+        has_destructive_verb=False,
+        settings=_settings(),
+        db=db_session,
+        source_name="myapp",
+    )
+    assert bundle.verdict == "insufficient"
+    assert bundle.coverage_score == 0.0
+    assert "Zero anchor hits" in bundle.reason
+
+
+def test_b2_zero_hits_with_planner_commit_still_sufficient(
+    db_session: Session, tmp_path: Path
+):
+    """If anchors all miss BUT the planner pre-committed must-touch files,
+    we trust the planner and don't fail-closed — that's an explicit
+    grounding signal even without anchor evidence."""
+    bundle = build_evidence_bundle(
+        request_text="touch NonExistentSymbol",
+        normalized_request=None,
+        source_tree=tmp_path,
+        grounding_terms=["NonExistentSymbol"],
+        planner_must_touch=["src/Known.kt"],
+        has_destructive_verb=False,
+        settings=_settings(),
+        db=db_session,
+        source_name="myapp",
+    )
+    assert bundle.verdict == "sufficient"
+    assert "src/Known.kt" in bundle.must_touch_files
+
+
+def test_b2_one_anchor_hit_passes_coverage_check(
+    db_session: Session, tmp_path: Path
+):
+    """Even partial coverage (1 of N anchors hits) passes the B2 gate —
+    we only fail-closed on COMPLETE anchor failure."""
+    _seed_doc(db_session, doc_id="d1", source="myapp",
+              rel_path="src/A.kt", content="val homeAddress = ''")
+    bundle = build_evidence_bundle(
+        request_text="touch homeAddress and the FakeSymbol nobody indexed",
+        normalized_request=None,
+        source_tree=tmp_path,
+        grounding_terms=["homeAddress", "FakeSymbol"],
+        planner_must_touch=[],
+        has_destructive_verb=False,
+        settings=_settings(),
+        db=db_session,
+        source_name="myapp",
+    )
+    assert bundle.verdict == "sufficient"
+    assert bundle.coverage_score == 0.5  # 1 of 2 hit
+
+
 def test_build_payload_contains_anchor_strategy(
     db_session: Session, tmp_path: Path
 ):

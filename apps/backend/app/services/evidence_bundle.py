@@ -329,6 +329,32 @@ def build_evidence_bundle(
             anchor_strategy=anchor_strategy,
         )
 
+    # B2 fail-closed: when ZERO anchors hit AND the planner did not pre-commit
+    # any must-touch files, the bundle has no real grounding in source. Pre-
+    # Plan-A this path silently returned "sufficient" with empty anchor_hits,
+    # which let codegen wander to whatever filenames it could guess from the
+    # request text — exactly how P69-17 v9 ended up editing AndroidManifest.xml
+    # for a feature that lives in a Kotlin Fragment.
+    if coverage == 0.0 and not (planner_must_touch or []):
+        return EvidenceBundle(
+            verdict="insufficient",
+            anchors_searched=anchors,
+            anchor_hits=anchor_hits,
+            must_touch_files=must_touch,
+            forbidden_files=forbidden,
+            candidate_files=sorted(all_candidate_files)[:20],
+            coverage_score=coverage,
+            reason=(
+                f"Zero anchor hits across {len(anchors)} term(s) and planner "
+                "did not pre-commit any must-touch files. Bundle cannot ground "
+                "the task in source — refusing to emit 'sufficient'. Refine "
+                "the request with more specific identifiers (CamelCase symbol "
+                "names, file paths) or have the planner produce "
+                "affected_code_locations."
+            ),
+            anchor_strategy=anchor_strategy,
+        )
+
     return EvidenceBundle(
         verdict="sufficient",
         anchors_searched=anchors,
