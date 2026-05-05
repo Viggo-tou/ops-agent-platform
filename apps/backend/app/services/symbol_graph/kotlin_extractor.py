@@ -62,8 +62,23 @@ def _is_external_import(qualified_path: str) -> bool:
     """Return True when a Kotlin import's qualified path points to an
     SDK / library package outside the project. Such imports can never
     resolve to a Decl in the project source tree, so the gate skips
-    them to avoid false positives."""
-    return any(qualified_path.startswith(p) for p in _EXTERNAL_IMPORT_PREFIXES)
+    them to avoid false positives.
+
+    Also catches Android's build-generated resource accessor:
+    `import com.example.app.R` (and `.R.string`, `.R.id`, ...) — the
+    R class is synthesized by Android Gradle at build time from
+    res/* files, never present in the source tree, so it always
+    false-positives in ref-validity."""
+    if any(qualified_path.startswith(p) for p in _EXTERNAL_IMPORT_PREFIXES):
+        return True
+    # Android R class: any import ending in `.R` or with `.R.` mid-path
+    # (e.g. com.example.app.R, com.example.app.R.string).
+    if qualified_path.endswith(".R") or ".R." in qualified_path:
+        return True
+    # Build-config and other Android Gradle synthetics
+    if qualified_path.endswith(".BuildConfig") or ".BuildConfig." in qualified_path:
+        return True
+    return False
 
 
 def _load_parser():

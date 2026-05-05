@@ -135,6 +135,30 @@ def test_kotlin_object_declaration_emits_decl():
     assert ("SessionManager", "object") in decl_names_kinds
 
 
+def test_kotlin_skips_android_r_resource_accessor():
+    """`import com.example.app.R` is a build-time synthetic from Android
+    Gradle (auto-generated from res/* files). It's not in the source
+    tree, so any Ref to `R` always fails ref-validity. Same for
+    BuildConfig. Both must be filtered out at extraction time."""
+    src = b"""package com.example
+
+import com.example.app.R
+import com.example.app.R.string
+import com.example.app.BuildConfig
+import com.example.app.utils.RealClass
+
+class A { fun f() {} }
+"""
+    res = KotlinExtractor().extract(path="A.kt", source=src)
+    ref_names = {r.name for r in res.refs}
+    # R, string (from R.string), BuildConfig — all build-time synthetics
+    assert "R" not in ref_names
+    assert "string" not in ref_names  # R.string sub-import
+    assert "BuildConfig" not in ref_names
+    # Real internal class still kept
+    assert "RealClass" in ref_names
+
+
 def test_kotlin_realistic_combined():
     """Smoke: a realistic file should produce both class decl and import refs."""
     src = b"""package com.example
