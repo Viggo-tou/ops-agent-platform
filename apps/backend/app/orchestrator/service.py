@@ -4215,21 +4215,50 @@ class PrimaryOrchestrator:
                     pipeline_state["symbol_graph_done"] = True
                     pipeline_state["symbol_graph_skipped"] = "no_source_tree"
                 else:
-                    # Enumerate repo files whose extensions have a
-                    # registered extractor. Anything else is skipped.
+                    # Enumerate repo files for the SymbolGraph build:
+                    #   (a) any file whose extension has a registered
+                    #       extractor (Python ast / Kotlin tree-sitter /
+                    #       XML lxml / ...).
+                    #   (b) any file under res/<KIND>[-qualifier]/ whose
+                    #       parent directory matches a known file-based
+                    #       resource kind (drawable, layout, menu,
+                    #       navigation, ...). These contribute Decls by
+                    #       file existence in pipeline_hook even when no
+                    #       extractor is registered for their extension
+                    #       (e.g. PNG / JPG / WebP drawables).
                     sg_exts = set(registered_extensions())
+                    # Match the kinds list in pipeline_hook to keep the
+                    # two in sync. (Importing the constant directly would
+                    # be cleaner but pipeline_hook's import auto-runs
+                    # python_extractor.register; we already imported it.)
+                    _SG_FILE_BASED_KINDS = {
+                        "drawable", "layout", "menu", "navigation",
+                        "anim", "animator", "color", "font",
+                        "interpolator", "mipmap", "raw", "transition",
+                        "xml",
+                    }
                     sg_all_files: list[str] = []
                     for fp in sg_source_root.rglob("*"):
                         if not fp.is_file():
                             continue
                         ext = fp.suffix.lstrip(".").lower()
-                        if ext not in sg_exts:
-                            continue
                         try:
                             rel = str(fp.relative_to(sg_source_root)).replace("\\", "/")
                         except ValueError:
                             continue
-                        sg_all_files.append(rel)
+                        if ext in sg_exts:
+                            sg_all_files.append(rel)
+                            continue
+                        # File-based-resource path check. Any parent
+                        # segment named res/<KIND> or res/<KIND>-qualifier
+                        # qualifies the file for Decl emission.
+                        parts = rel.split("/")
+                        if "res" in parts:
+                            ri = parts.index("res")
+                            if ri + 2 < len(parts):  # res/<KIND>/<file>
+                                kind = parts[ri + 1].split("-", 1)[0]
+                                if kind in _SG_FILE_BASED_KINDS:
+                                    sg_all_files.append(rel)
 
                     sg_changed_files = tuple(
                         str(p).replace("\\", "/")
