@@ -4382,8 +4382,12 @@ class PrimaryOrchestrator:
                             file_contents=_sr_file_contents,
                             settings=self.tool_gateway.settings,
                             pass_threshold=_SR_PASS_THRESHOLD,
-                            provider="anthropic",
-                            timeout_seconds=60.0,
+                            # DeepSeek has working credit; Anthropic key is
+                            # often exhausted in this dogfood env. Both
+                            # providers wrap the same Anthropic-compat
+                            # /v1/messages schema.
+                            provider="deepseek",
+                            timeout_seconds=90.0,
                         )
                     except SemanticReviewError as exc:
                         # LLM call failure is non-blocking — log + skip
