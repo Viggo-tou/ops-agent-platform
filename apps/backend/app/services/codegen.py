@@ -253,7 +253,15 @@ class CodeGenerator:
                 # + parses before returning to caller. Catches hunk drift
                 # at source instead of letting it through to sandbox apply
                 # + compile_gate + repair (wastes 3-5 min per failure).
-                if getattr(self.settings, "codegen_self_validation_enabled", True):
+                #
+                # IMPORTANT: skip during compile_repair calls. Repair patches
+                # are written against the BROKEN sandbox file (not pristine
+                # source), so apply-check vs settings.knowledge_source_path
+                # would falsely reject every legit repair attempt and loop
+                # max_retries before raising. Repair's own validation is
+                # the next compile_gate round.
+                _is_repair_call = isinstance(task_description, str) and task_description.startswith("Fix syntax errors in")
+                if not _is_repair_call and getattr(self.settings, "codegen_self_validation_enabled", True):
                     from app.services.codegen_self_validate import self_validate
                     raw_source = str(getattr(self.settings, "knowledge_source_path", "") or "").strip()
                     source_path = Path(raw_source) if raw_source else None
