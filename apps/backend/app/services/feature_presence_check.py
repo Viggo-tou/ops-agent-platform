@@ -90,6 +90,44 @@ def derive_required_tokens(
     return deduped
 
 
+def _strip_comments(content: str) -> str:
+    """Remove single-line and block comments + XML/HTML comments + YAML
+    hash-comments from content. Whitespace-preserving — replaces comment
+    bytes with spaces so line/column references remain valid (best-effort).
+
+    Strips:
+      - `// line comment` (Java, Kotlin, JS, TS, C, C++, Swift)
+      - `# line comment` (Python, YAML, sh)
+      - `/* block comment */` (C-family, multi-line)
+      - `<!-- xml/html comment -->` (multi-line)
+
+    Does NOT strip docstrings (intentional content).
+    """
+    if not content:
+        return content
+    import re as _re
+
+    # Block comments first (greedy multi-line):
+    out = _re.sub(r"/\*[\s\S]*?\*/", lambda m: " " * len(m.group(0)), content)
+    out = _re.sub(r"<!--[\s\S]*?-->", lambda m: " " * len(m.group(0)), out)
+
+    # Line comments — process line-by-line so we don't strip URLs containing //.
+    lines: list[str] = []
+    for line in out.split("\n"):
+        # Find the position of // not inside a string literal (heuristic):
+        # we use a simple rule — strip from first // to end of line. False
+        # positives on URLs in string literals are acceptable for a
+        # token-presence check (the goal is to prevent comment-stuffing,
+        # not to preserve every legal token).
+        for marker in ("//", "#"):
+            idx = line.find(marker)
+            if idx >= 0:
+                line = line[:idx] + " " * (len(line) - idx)
+                break
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def evaluate_feature_presence(
     *,
     must_touch_files: list[str],
@@ -149,6 +187,9 @@ def evaluate_feature_presence(
             unmatched.append(must_path)
             matched_per_file[must_path] = []
             continue
+        # Stage X.8.b improvement: strip comments before token grep so
+        # codegen can't fool the gate by putting required tokens in `//`.
+        content = _strip_comments(content)
         content_lower = content.lower()
         hits = [tok for tok in required_tokens if tok.lower() in content_lower]
         matched_per_file[must_path] = hits
