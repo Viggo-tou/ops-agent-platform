@@ -58,6 +58,34 @@ diff --git a/app/example.py b/app/example.py
 DO NOT output anything before "diff --git". DO NOT wrap in markdown code fences. DO NOT add explanations."""
 
 
+CODEGEN_KOTLIN_GUIDANCE = """
+
+KOTLIN / COMPOSE SYNTAX CONSTRAINTS (when the diff touches .kt or .kts files):
+
+1. `import` statements MUST be at the top of the file, immediately after `package`. NEVER place an `import` inside a class body, function body, or annotation block (e.g. NOT inside `@Composable`).
+
+2. For a `class`, `object`, `data class`, or function: the opening `{` MUST be on the SAME line as the signature. Do NOT put `{` on a new line:
+   YES:  `data class Job(val x: Int) {`
+   NO:   `data class Job(val x: Int)`
+         `{`
+
+3. Composable navigation `composable("route") { ... }` blocks MUST be balanced. When inserting a new `LaunchedEffect { ... }` inside a composable block, ensure the inner `{` and `}` are paired and the OUTER closing `}` of the `composable("route") {` is preserved.
+
+4. Every `composable("...")` block MUST close with `}` before the next `composable("...")` opens. Do NOT delete or shift the closing `}` of an existing block when adding logic inside it.
+
+5. For data class secondary constructors / companion objects: `companion object { ... }` MUST be inside the class body braces, not after the closing `)` of the primary constructor:
+   YES:  `data class X(val a: Int) { companion object { fun build() = X(1) } }`
+   NO:   `data class X(val a: Int)` followed by ` { companion object { ... } }` on a new line.
+
+6. When generating a unified diff that modifies Kotlin: the hunk's context lines (lines NOT prefixed with `+` or `-`) MUST EXACTLY MATCH the source file. Do NOT paraphrase, reformat, or trim whitespace from context lines. Hunk drift on Kotlin frequently causes structural breakage that compile_gate catches but repair cannot fix.
+
+7. Prefer `LaunchedEffect(Unit) { ... }` for one-shot side effects in Compose; use `remember { ... }` for lifecycle-scoped state.
+
+8. When adding a state read like `val context = LocalContext.current`, put it OUTSIDE any nested lambdas (at the composable's direct scope), not inside `LaunchedEffect` (LocalContext is composition-scope only).
+
+If your diff violates any of these, the post-codegen self-validation OR compile_gate will reject and the task fails. Output a clean diff that compiles."""
+
+
 CODEGEN_SYSTEM_PROMPT_JSON_MODE = """You are a code generation agent. Given a task plan and source file contents, produce the MODIFIED or NEW versions of the files.
 
 CRITICAL RULES:
@@ -137,6 +165,21 @@ class CodeGenerator:
         return False
 
     @staticmethod
+    def _augment_prompt_for_kotlin(
+        base_prompt: str,
+        context_files: dict[str, str] | None,
+    ) -> str:
+        """Append Kotlin-specific syntax guidance when context contains
+        .kt/.kts files. Mitigates recurring Kotlin codegen syntax bugs
+        (import-in-annotation, brace-on-new-line, hunk-drift-removes-brace)
+        at prompt level (Stage B1)."""
+        if not context_files:
+            return base_prompt
+        if any(str(path).lower().endswith((".kt", ".kts")) for path in context_files):
+            return base_prompt + CODEGEN_KOTLIN_GUIDANCE
+        return base_prompt
+
+    @staticmethod
     def _validate_changed_files_within_allowed(
         files_changed: list[str],
         *,
@@ -171,6 +214,11 @@ class CodeGenerator:
         actor_name: str | None = None,
     ) -> CodegenResult:
         """Generate a unified diff from a plan and file context."""
+        # Stage B1: stash current context_files so provider call methods
+        # can augment the system prompt with Kotlin-specific syntax
+        # constraints when .kt/.kts files are involved (without threading
+        # context_files through every provider signature).
+        self._current_context_files = dict(context_files or {})
         providers = self._resolve_provider_chain()
         must_touch_files, expected_new_files, allowed_paths = self._extract_plan_target_paths(plan_json)
         enforce = bool(allowed_paths)
@@ -529,7 +577,7 @@ class CodeGenerator:
         body = {
             "model": model_name,
             "max_tokens": 8192,
-            "system": CODEGEN_SYSTEM_PROMPT,
+            "system": self._augment_prompt_for_kotlin(CODEGEN_SYSTEM_PROMPT, getattr(self, "_current_context_files", None)),
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
         }
@@ -1564,7 +1612,7 @@ class CodeGenerator:
         body = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": CODEGEN_SYSTEM_PROMPT_JSON_MODE},
+                {"role": "system", "content": self._augment_prompt_for_kotlin(CODEGEN_SYSTEM_PROMPT_JSON_MODE, getattr(self, "_current_context_files", None)),},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
@@ -1620,7 +1668,7 @@ class CodeGenerator:
         body = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": CODEGEN_SYSTEM_PROMPT_JSON_MODE},
+                {"role": "system", "content": self._augment_prompt_for_kotlin(CODEGEN_SYSTEM_PROMPT_JSON_MODE, getattr(self, "_current_context_files", None)),},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
@@ -1676,7 +1724,7 @@ class CodeGenerator:
         body = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": CODEGEN_SYSTEM_PROMPT},
+                {"role": "system", "content": self._augment_prompt_for_kotlin(CODEGEN_SYSTEM_PROMPT, getattr(self, "_current_context_files", None)),},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
@@ -1717,7 +1765,7 @@ class CodeGenerator:
         body = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": CODEGEN_SYSTEM_PROMPT},
+                {"role": "system", "content": self._augment_prompt_for_kotlin(CODEGEN_SYSTEM_PROMPT, getattr(self, "_current_context_files", None)),},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
