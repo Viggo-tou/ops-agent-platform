@@ -155,17 +155,79 @@ class SemanticReviewReport:
 
 def _extract_json_object(text: str) -> str:
     """LLMs often wrap JSON in markdown fences. Strip them and return the
-    longest balanced ``{...}`` slice."""
+    longest balanced ``{...}`` slice. Tolerates LLM quirks:
+      - markdown ```json ``` fences
+      - leading/trailing prose
+      - DeepSeek's thinking block embedded before/around JSON
+      - trailing commas (best-effort)
+    """
     if not text:
         return ""
     s = text.strip()
+    # Strip markdown fence
     if s.startswith("```"):
         s = re.sub(r"^```(?:json)?\s*", "", s)
         s = re.sub(r"\s*```$", "", s).strip()
+    # Drop common prose preludes that LLMs prepend even when asked not to
+    for prelude in (
+        "Here is the JSON", "Here's the JSON", "Sure, here's", "The review:",
+        "JSON:", "Output:", "Analysis:",
+    ):
+        if s.lower().startswith(prelude.lower()):
+            s = s.split(":", 1)[-1].lstrip(" \n:")
     if s.startswith("{"):
         return s
-    m = re.search(r"(\{[\s\S]*\})", s)
-    return m.group(1) if m else s
+    # Find the FIRST `{` and return from there to the matching `}`
+    # using brace-depth counting (handles JSON containing strings with `}`).
+    start = s.find("{")
+    if start < 0:
+        return s
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start:i + 1]
+    # Unbalanced — return what we have from `{` onward; json.loads will
+    # complain with a clearer message
+    return s[start:]
+
+
+def _extract_text_with_thinking_fallback(content_blocks: list) -> str:
+    """Pull text from Anthropic-compat /v1/messages content blocks.
+    Prefers `type=="text"` blocks; if none have non-empty text (a real
+    DeepSeek quirk where it returns only a `thinking` block), falls back
+    to the `thinking` content as a last resort. Empirical: DeepSeek's
+    `thinking` field sometimes contains the actual JSON output when the
+    final `text` block is empty."""
+    text_parts = [
+        block.get("text", "") for block in content_blocks
+        if block.get("type") == "text"
+    ]
+    joined = "".join(text_parts).strip()
+    if joined:
+        return joined
+    thinking_parts = [
+        block.get("thinking", "") for block in content_blocks
+        if block.get("type") == "thinking"
+    ]
+    return "".join(thinking_parts).strip()
 
 
 def parse_review_output(content: str) -> _RawReviewOutput:
@@ -305,6 +367,15 @@ def build_user_prompt(
 
 # ---- LLM provider dispatch -------------------------------------------------
 
+# L2 (Awais lesson #2): retry suffix added to the user prompt on a second
+# attempt when the first returned empty / unparsable. Reminds DeepSeek that
+# we want JSON ONLY — no prose, no thinking-only response.
+_RETRY_SUFFIX = (
+    "\n\nIMPORTANT: Output ONLY the raw JSON object. NO prose. NO markdown "
+    "code fences. NO 'thinking' preamble. Start with `{` and end with `}`."
+)
+
+
 def _call_anthropic(prompt: str, *, settings: Settings, timeout: float) -> str:
     if not settings.anthropic_api_key:
         raise SemanticReviewError("OPS_AGENT_ANTHROPIC_API_KEY is not configured.")
@@ -327,11 +398,7 @@ def _call_anthropic(prompt: str, *, settings: Settings, timeout: float) -> str:
     )
     resp.raise_for_status()
     data = resp.json()
-    return "".join(
-        block.get("text", "")
-        for block in data.get("content", [])
-        if block.get("type") == "text"
-    )
+    return _extract_text_with_thinking_fallback(data.get("content", []))
 
 
 def _call_deepseek(prompt: str, *, settings: Settings, timeout: float) -> str:
@@ -339,8 +406,6 @@ def _call_deepseek(prompt: str, *, settings: Settings, timeout: float) -> str:
         raise SemanticReviewError("OPS_AGENT_DEEPSEEK_API_KEY is not configured.")
     base = getattr(settings, "deepseek_base_url",
                    "https://api.deepseek.com/anthropic")
-    # The deepseek_base_url already points at the Anthropic-compat path
-    # in our env, so we hit /v1/messages.
     body = {
         "model": getattr(settings, "deepseek_model", "deepseek-v4-pro"),
         "max_tokens": 4096,
@@ -360,11 +425,64 @@ def _call_deepseek(prompt: str, *, settings: Settings, timeout: float) -> str:
     )
     resp.raise_for_status()
     data = resp.json()
-    return "".join(
-        block.get("text", "")
-        for block in data.get("content", [])
-        if block.get("type") == "text"
-    )
+    # L2: thinking-block fallback for DeepSeek. When DeepSeek returns
+    # ONLY a thinking block (no text), the helper returns the thinking
+    # content; _extract_json_object can still pull the JSON out.
+    return _extract_text_with_thinking_fallback(data.get("content", []))
+
+
+def _call_with_retry(
+    provider_fn: Callable[..., str],
+    prompt: str,
+    *,
+    settings: Settings,
+    timeout: float,
+    max_attempts: int = 2,
+) -> str:
+    """L2: wrap provider_fn with one auto-retry on empty / unparsable
+    response. The retry adds an explicit "JSON ONLY" suffix to the
+    prompt — empirically gets DeepSeek out of "thinking-only" responses
+    after a single retry.
+    """
+    last_err: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        attempt_prompt = prompt if attempt == 1 else (prompt + _RETRY_SUFFIX)
+        try:
+            text = provider_fn(attempt_prompt, settings=settings, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            logger.warning(
+                "semantic_review provider call failed (attempt %d/%d): %s",
+                attempt, max_attempts, exc,
+            )
+            continue
+        # Empty text -> retry
+        if not (text or "").strip():
+            last_err = SemanticReviewError("LLM returned empty response")
+            logger.warning(
+                "semantic_review empty response (attempt %d/%d)",
+                attempt, max_attempts,
+            )
+            continue
+        # Try a quick parse-check; if it fails, retry once.
+        candidate = _extract_json_object(text)
+        try:
+            json.loads(candidate)
+            return text  # parsed cleanly; return original (caller re-extracts)
+        except (json.JSONDecodeError, ValueError) as exc:
+            last_err = SemanticReviewError(
+                f"LLM response not parseable as JSON (attempt {attempt}): {exc}"
+            )
+            logger.warning(
+                "semantic_review unparsable JSON (attempt %d/%d): %s",
+                attempt, max_attempts, exc,
+            )
+            continue
+    # Exhausted
+    if last_err is None:
+        last_err = SemanticReviewError("LLM call failed without specific error")
+    raise last_err if isinstance(last_err, SemanticReviewError) else \
+        SemanticReviewError(str(last_err))
 
 
 _PROVIDERS: dict[str, Callable[..., str]] = {
@@ -417,8 +535,14 @@ def evaluate_semantic_review(
             raise SemanticReviewError(
                 f"Unknown semantic_review provider: {provider!r}"
             )
-        raw_text = provider_fn(
-            prompt, settings=settings, timeout=timeout_seconds
+        # L2: wrap with auto-retry that injects an explicit "JSON only"
+        # suffix on retry, to get DeepSeek out of thinking-only loops.
+        raw_text = _call_with_retry(
+            provider_fn,
+            prompt,
+            settings=settings,
+            timeout=timeout_seconds,
+            max_attempts=2,
         )
 
     raw = parse_review_output(raw_text)
