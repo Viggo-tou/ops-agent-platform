@@ -28,22 +28,58 @@ from app.services.rag_bench.dataset import (
     load_questions,
 )
 from app.services.rag_bench.runner import evaluate_strategy
-from app.services.rag_bench.strategies import FTS5BaselineStrategy
+from app.core.config import get_settings
+from app.services.rag_bench.strategies import (
+    FTS5BaselineStrategy,
+    HybridRRFStrategy,
+    HydeStrategy,
+)
+from app.services.rag_bench.strategies import _HAS_DENSE
 
 
-_STRATEGY_FACTORIES = {
-    "fts5_baseline": lambda db: FTS5BaselineStrategy(db),
-}
+def _build_factory_map(db, settings):
+    factories: dict = {
+        "fts5_baseline": lambda: FTS5BaselineStrategy(db),
+    }
+    if _HAS_DENSE:
+        from app.services.rag_bench.strategies.dense_embedding import (
+            DenseEmbeddingStrategy,
+        )
+        factories["dense_embedding"] = lambda: DenseEmbeddingStrategy(db)
+        factories["hybrid_rrf"] = lambda: HybridRRFStrategy(
+            FTS5BaselineStrategy(db),
+            DenseEmbeddingStrategy(db),
+        )
+    factories["hyde_fts5"] = lambda: HydeStrategy(
+        FTS5BaselineStrategy(db), settings=settings,
+    )
+    if _HAS_DENSE:
+        from app.services.rag_bench.strategies.dense_embedding import (
+            DenseEmbeddingStrategy,
+        )
+        factories["hyde_hybrid"] = lambda: HydeStrategy(
+            HybridRRFStrategy(
+                FTS5BaselineStrategy(db),
+                DenseEmbeddingStrategy(db),
+            ),
+            settings=settings,
+        )
+    return factories
 
 
-def _build_strategies(names: list[str], db) -> list:
+def _build_strategies(names: list[str], db, settings) -> list:
+    factories = _build_factory_map(db, settings)
     out = []
     for n in names:
-        factory = _STRATEGY_FACTORIES.get(n)
+        factory = factories.get(n)
         if factory is None:
-            print(f"WARNING: unknown strategy '{n}' — skipping", file=sys.stderr)
+            print(
+                f"WARNING: unknown strategy '{n}' — available: "
+                f"{sorted(factories)}",
+                file=sys.stderr,
+            )
             continue
-        out.append(factory(db))
+        out.append(factory())
     return out
 
 
@@ -82,10 +118,11 @@ def main(argv: list[str] | None = None) -> int:
     engine = create_engine(args.db)
     SessionLocal = sessionmaker(bind=engine, future=True)
     db = SessionLocal()
+    settings = get_settings()
     try:
         strats = _build_strategies(
             [s.strip() for s in args.strategies.split(",") if s.strip()],
-            db,
+            db, settings,
         )
         if not strats:
             print("ERROR: no strategies to run", file=sys.stderr)
