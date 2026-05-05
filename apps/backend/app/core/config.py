@@ -85,6 +85,10 @@ class Settings(BaseSettings):
     # reviewer can decide what to do; setting it False keeps the legacy
     # fail-fast behaviour.
     codegen_max_repair_rounds: int = 3
+    # Stage A codegen self-validation: validate diff applies + parses
+    # before codegen returns. Catches hunk drift at source.
+    codegen_self_validation_enabled: bool = True
+    codegen_self_validation_max_retries: int = 1
     codegen_repair_files_per_round: int = 5
     codegen_repair_round_timeout_seconds: float = 180.0
     codegen_repair_cap_exceeded_to_approval: bool = True

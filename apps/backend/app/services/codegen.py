@@ -200,6 +200,71 @@ class CodeGenerator:
                         must_touch_files=must_touch_files,
                         expected_new_files=expected_new_files,
                     )
+
+                # Stage A: codegen self-validation — validate diff applies
+                # + parses before returning to caller. Catches hunk drift
+                # at source instead of letting it through to sandbox apply
+                # + compile_gate + repair (wastes 3-5 min per failure).
+                if getattr(self.settings, "codegen_self_validation_enabled", True):
+                    from app.services.codegen_self_validate import self_validate
+                    raw_source = str(getattr(self.settings, "knowledge_source_path", "") or "").strip()
+                    source_path = Path(raw_source) if raw_source else None
+                    # Skip when source_path is unset / non-existent / not a
+                    # real source repo. Test fixtures often leave this unset
+                    # and validation against cwd would surface false failures.
+                    if source_path is not None and source_path.is_absolute() and source_path.is_dir() and (source_path / ".git").exists():
+                        max_retries = int(getattr(self.settings, "codegen_self_validation_max_retries", 1))
+                        for sv_attempt in range(max_retries + 1):
+                            validation = self_validate(result.diff, source_path)
+                            if validation.valid:
+                                break
+                            if sv_attempt >= max_retries:
+                                raise CodegenError(
+                                    f"codegen self-validation failed after "
+                                    f"{sv_attempt + 1} attempt(s): "
+                                    f"{validation.reason}: "
+                                    f"{validation.error_detail[:500]}"
+                                )
+                            # Retry: re-call same provider with validation feedback
+                            sv_prompt = self._build_prompt(
+                                plan_json,
+                                context_files,
+                                task_description,
+                                json_mode=provider in {"minimax", "ollama"},
+                            )
+                            retry_prompt = (
+                                f"{sv_prompt}\n\n"
+                                f"---\n"
+                                f"VALIDATION FEEDBACK (your previous attempt failed):\n"
+                                f"{validation.reason}\n"
+                                f"{validation.error_detail[:1500]}\n\n"
+                                f"Regenerate the diff. Make sure the hunk context "
+                                f"matches the actual file content (no drift). If "
+                                f"parse failed, fix the syntactic error."
+                            )
+                            _logger.info(
+                                "Self-validation retry %d/%d for provider %s",
+                                sv_attempt + 1, max_retries, provider,
+                            )
+                            result = self._try_provider(
+                                provider=provider,
+                                task_id=task_id,
+                                plan_json=plan_json,
+                                context_files=context_files,
+                                task_description=task_description,
+                                source_repo_path=source_repo_path,
+                                actor_name=actor_name,
+                                fallback_step=provider_idx,
+                                override_prompt=retry_prompt,
+                            )
+                            if enforce:
+                                self._validate_changed_files_within_allowed(
+                                    result.files_changed,
+                                    allowed_paths=allowed_paths,
+                                    must_touch_files=must_touch_files,
+                                    expected_new_files=expected_new_files,
+                                )
+
                 _logger.info("Provider %s succeeded: %d files changed", provider, len(result.files_changed))
                 attempts.append({"provider": provider, "status": "succeeded"})
                 try:
@@ -232,17 +297,25 @@ class CodeGenerator:
         source_repo_path: str | None = None,
         actor_name: str | None = None,
         fallback_step: int = 0,
+        override_prompt: str | None = None,
     ) -> CodegenResult:
-        """Attempt codegen with a single provider, with up to 3 retries for parse errors."""
+        """Attempt codegen with a single provider, with up to 3 retries for parse errors.
+
+        When override_prompt is set, use it directly (skip _build_prompt).
+        This is used by generate_patch for self-validation retries.
+        """
         if provider == "ollama":
             context_files = self._trim_context_for_ollama(context_files)
 
-        prompt = self._build_prompt(
-            plan_json,
-            context_files,
-            task_description,
-            json_mode=provider in {"minimax", "ollama"},
-        )
+        if override_prompt is not None:
+            prompt = override_prompt
+        else:
+            prompt = self._build_prompt(
+                plan_json,
+                context_files,
+                task_description,
+                json_mode=provider in {"minimax", "ollama"},
+            )
 
         if provider == "mock":
             return self._mock_generate(plan_json, context_files)
