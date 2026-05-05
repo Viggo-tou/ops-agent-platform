@@ -42,6 +42,50 @@ class FeaturePresenceResult:
 
 _TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
 
+_GENERIC_ENGLISH_STOPWORDS = frozenset({
+    # boilerplate planner-step verbs
+    "implement", "implementing", "generating", "generate", "applying", "apply",
+    "running", "reviewing", "review", "changes", "change", "patches", "patch",
+    "tests", "test", "results", "result",
+    # ticket/process noise
+    "jira", "issue", "ticket", "task", "story",
+    # generic functional words
+    "the", "and", "for", "with", "from", "this", "that", "should", "will",
+    "must", "can", "may", "when", "while", "first", "load", "save", "saved",
+    "default", "create", "creating", "creation", "edit", "allow", "fill",
+    "edit", "manually", "moving", "both", "field",
+    # common UI primitives
+    "view", "screen", "button", "input", "form", "label", "text", "page",
+    "component", "panel", "modal", "dialog",
+    # generic domain-low-signal words
+    "user", "users", "data", "value", "values", "item", "items", "list",
+    "type", "name", "code", "info", "detail", "title", "status", "state",
+    "home", "address", "location", "map", "pin", "profile", "account",
+    "signup", "login", "phone", "email", "date", "time",
+})
+
+
+def _is_identifier_shaped(tok: str) -> bool:
+    """A token is 'specific' enough to count as feature evidence when:
+      - it has a CamelCase boundary (homeAddress, JobPostingFlow), or
+      - it contains an underscore (home_address, save_to_db), or
+      - it is SCREAMING_SNAKE (HOME_ADDRESS).
+
+    Plain English words ('home', 'address', 'user') return False — they
+    pollute feature-presence checks because they appear naturally in
+    pre-existing source code regardless of whether the new feature was
+    implemented.
+    """
+    if not tok:
+        return False
+    # camelCase / PascalCase: lower->upper transition
+    if re.search(r"[a-z][A-Z]", tok):
+        return True
+    # snake_case (and SCREAMING_SNAKE which contains _ too)
+    if "_" in tok:
+        return True
+    return False
+
 
 def _stem_tokens(text: str) -> list[str]:
     """Extract camelCase / snake_case identifiers (>=3 chars) from text."""
@@ -90,6 +134,91 @@ def derive_required_tokens(
     return deduped
 
 
+def derive_required_tokens_strict(
+    *,
+    objective: str = "",
+    grounding_terms: list[str] | None = None,
+    spec_text: str = "",
+    must_touch_files: list[str] | None = None,
+) -> list[str]:
+    """G2: stricter token derivation.
+
+    Returns ONLY identifier-shaped tokens (CamelCase / snake_case) plus
+    any existing identifier-shaped substrings from grounding_terms /
+    must_touch basenames. Generic English words are dropped via
+    `_GENERIC_ENGLISH_STOPWORDS` and the `_is_identifier_shaped`
+    structural filter.
+
+    Rationale: pre-G2 derive_required_tokens collected every word from
+    the planner step descriptions ("Implement / Jira / generating /
+    code / changes ..."), and feature_presence then accepted any 1
+    match — so a file that already contained any of those words pre-
+    edit would pass the gate without the feature being implemented.
+    """
+    pool: list[str] = []
+    pool.extend(_stem_tokens(objective))
+    pool.extend(_stem_tokens(spec_text))
+    for g in (grounding_terms or []):
+        if isinstance(g, str):
+            pool.extend(_stem_tokens(g))
+    for path in (must_touch_files or []):
+        if isinstance(path, str):
+            base = path.replace("\\", "/").rsplit("/", 1)[-1]
+            stem = base.rsplit(".", 1)[0]
+            pool.extend(_stem_tokens(stem))
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for t in pool:
+        if t in seen:
+            continue
+        seen.add(t)
+        # Drop tokens that look like English (no CamelCase / no underscore).
+        if not _is_identifier_shaped(t):
+            continue
+        # Even identifier-shaped tokens can be stopwords ("View", "Page",
+        # "Status") — drop those.
+        if t.lower() in _GENERIC_ENGLISH_STOPWORDS:
+            continue
+        deduped.append(t)
+    return deduped
+
+
+def extract_added_lines_per_file(diff: str) -> dict[str, str]:
+    """Parse a unified diff and return {file_path: "added_line_1\\nadded_line_2\\n..."}.
+
+    'Added' means lines starting with '+' but excluding the file-header
+    '+++' lines. Returns relative paths as they appear in the diff (using
+    'b/' side, with the 'b/' prefix stripped). Used by feature_presence
+    in G2-strict mode to scan only newly added code.
+    """
+    if not diff:
+        return {}
+    out: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in diff.split("\n"):
+        if line.startswith("+++ "):
+            # +++ b/path/to/file
+            tail = line[4:].strip()
+            if tail.startswith("b/"):
+                tail = tail[2:]
+            elif tail == "/dev/null":
+                current = None
+                continue
+            current = tail or None
+            if current is not None:
+                out.setdefault(current, [])
+            continue
+        if line.startswith("--- "):
+            # opening of a hunk file pair; '+++' will set the path
+            continue
+        if current is None:
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            out.setdefault(current, []).append(line[1:])
+    return {p: "\n".join(lines) for p, lines in out.items()}
+
+
 def _strip_comments(content: str) -> str:
     """Remove single-line and block comments + XML/HTML comments + YAML
     hash-comments from content. Whitespace-preserving — replaces comment
@@ -134,6 +263,8 @@ def evaluate_feature_presence(
     file_contents: dict[str, str],
     required_tokens: list[str],
     min_tokens_per_file: int = 1,
+    diff_added_per_file: dict[str, str] | None = None,
+    min_tokens_per_file_ratio: float | None = None,
 ) -> FeaturePresenceResult:
     """Static feature-presence eval.
 
@@ -141,8 +272,17 @@ def evaluate_feature_presence(
         must_touch_files: files the planner said must be modified.
         file_contents: post-apply file content keyed by relative path.
         required_tokens: tokens we expect to see in the must_touch files.
-        min_tokens_per_file: minimum number of required tokens that must
-            appear in EACH must_touch file. Defaults to 1.
+        min_tokens_per_file: absolute minimum count threshold; default 1.
+        diff_added_per_file: G2 — when supplied, the scan runs against
+            ONLY the added lines from this file's diff (post strip-comments)
+            instead of the full post-apply file content. This blocks the
+            "shell-only edit + planner-keyword soup" cheat where pre-
+            existing words in the file satisfied the gate without the
+            new feature actually being implemented.
+        min_tokens_per_file_ratio: G2 — when supplied (e.g. 0.5), the
+            effective threshold becomes
+            ``max(min_tokens_per_file, ceil(ratio * len(required_tokens)))``.
+            Forces real proportional coverage, not "any 1 hit passes".
 
     Returns FeaturePresenceResult with:
         feature_absent: True if any must_touch file lacks required tokens.
@@ -169,51 +309,81 @@ def evaluate_feature_presence(
             unmatched_required_files=[],
         )
 
+    # Compute effective threshold once.
+    threshold = int(min_tokens_per_file)
+    if min_tokens_per_file_ratio is not None and required_tokens:
+        import math as _math
+        ratio_threshold = _math.ceil(min_tokens_per_file_ratio * len(required_tokens))
+        threshold = max(threshold, ratio_threshold)
+    threshold = max(threshold, 1)
+
     matched_per_file: dict[str, list[str]] = {}
     unmatched: list[str] = []
-    lower_tokens = {t.lower() for t in required_tokens}
+    diff_mode = diff_added_per_file is not None
     for must_path in must_touch:
-        # Suffix-tolerant lookup (mirror evidence_chain helper)
-        content = ""
-        for path, body in file_contents.items():
-            if (
-                path == must_path
-                or path.endswith("/" + must_path)
-                or must_path.endswith("/" + path)
-            ):
-                content = body or ""
-                break
-        if not content:
+        # Pick scan source: diff added lines (G2 strict) or full file body.
+        body = ""
+        if diff_mode:
+            body = _suffix_tolerant_get(diff_added_per_file or {}, must_path)
+        else:
+            body = _suffix_tolerant_get(file_contents, must_path)
+
+        if not body:
             unmatched.append(must_path)
             matched_per_file[must_path] = []
             continue
-        # Stage X.8.b improvement: strip comments before token grep so
-        # codegen can't fool the gate by putting required tokens in `//`.
-        content = _strip_comments(content)
-        content_lower = content.lower()
-        hits = [tok for tok in required_tokens if tok.lower() in content_lower]
+
+        # Strip comments BEFORE token grep so the gate cannot be fooled
+        # by tokens parked inside `//` or `/* */` blocks.
+        body_stripped = _strip_comments(body)
+        body_lower = body_stripped.lower()
+        hits = [tok for tok in required_tokens if tok.lower() in body_lower]
         matched_per_file[must_path] = hits
-        if len(hits) < min_tokens_per_file:
+        if len(hits) < threshold:
             unmatched.append(must_path)
 
     if unmatched:
         sample = ", ".join(unmatched[:3])
+        scope = "diff-added lines" if diff_mode else "file content"
         return FeaturePresenceResult(
             feature_absent=True,
             reason=(
-                f"feature presence check: {len(unmatched)} must_touch file(s) "
-                f"lack required tokens (sample: {sample}). Required tokens: "
-                f"{required_tokens[:8]}..."
+                f"feature presence check ({scope}): {len(unmatched)} must_touch "
+                f"file(s) lack >= {threshold} required token(s) (sample: {sample}). "
+                f"Required tokens ({len(required_tokens)}): {required_tokens[:8]}..."
             ),
             required_tokens=list(required_tokens),
             matched_per_file=matched_per_file,
             unmatched_required_files=unmatched,
         )
 
+    scope = "diff-added lines" if diff_mode else "file content"
     return FeaturePresenceResult(
         feature_absent=False,
-        reason="all must_touch files contain at least 1 required token",
+        reason=(
+            f"all must_touch files contain >= {threshold} required token(s) "
+            f"in {scope}"
+        ),
         required_tokens=list(required_tokens),
         matched_per_file=matched_per_file,
         unmatched_required_files=[],
     )
+
+
+def _suffix_tolerant_get(
+    bag: dict[str, str], must_path: str
+) -> str:
+    """Return the value whose key path best matches `must_path`.
+
+    Mirrors the evidence_chain suffix-tolerant lookup so a planner-emitted
+    relative path resolves regardless of whether the writer used the same
+    workdir prefix. Returns empty string if no match.
+    """
+    for path, body in bag.items():
+        if (
+            path == must_path
+            or path.endswith("/" + must_path)
+            or must_path.endswith("/" + path)
+        ):
+            return body or ""
+    return ""

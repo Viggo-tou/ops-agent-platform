@@ -3879,10 +3879,22 @@ class PrimaryOrchestrator:
             try:
                 from app.services.feature_presence_check import (
                     derive_required_tokens,
+                    derive_required_tokens_strict,
                     evaluate_feature_presence,
+                    extract_added_lines_per_file,
                 )
                 translation = task.translation_json if isinstance(task.translation_json, dict) else {}
-                required_tokens = derive_required_tokens(
+                # G2 — prefer strict tokens (CamelCase / snake_case only,
+                # generic English dropped). Fall back to legacy permissive
+                # tokens when strict yields nothing, so tasks with purely
+                # natural-language specs still get a (weaker) check.
+                strict_tokens = derive_required_tokens_strict(
+                    objective=str(getattr(plan, "objective", "") or ""),
+                    grounding_terms=translation.get("grounding_terms") or [],
+                    spec_text=str(translation.get("normalized_request") or ""),
+                    must_touch_files=list(getattr(plan, "must_touch_files", []) or []),
+                )
+                required_tokens = strict_tokens or derive_required_tokens(
                     objective=str(getattr(plan, "objective", "") or ""),
                     search_queries=translation.get("search_queries") or [],
                     must_touch_files=list(getattr(plan, "must_touch_files", []) or []),
@@ -3906,10 +3918,20 @@ class PrimaryOrchestrator:
                     pipeline_state["feature_presence_skipped"] = "no_file_contents"
                     self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
                 else:
+                    # G2: scan diff-added lines (post strip-comments) for the
+                    # tokens, not the full file body. Pre-existing content
+                    # cannot satisfy the gate; only newly added lines can.
+                    diff_text = pipeline_state.get("diff") or ""
+                    diff_added_per_file = extract_added_lines_per_file(diff_text)
                     presence = evaluate_feature_presence(
                         must_touch_files=must_touch,
                         file_contents=file_contents,
                         required_tokens=required_tokens,
+                        diff_added_per_file=diff_added_per_file or None,
+                        # Require >= 50% of derived tokens to appear in the
+                        # diff additions for the file. Plain >=1 was the v10b
+                        # cheat path: any single common word matched.
+                        min_tokens_per_file_ratio=0.5,
                     )
                     record_event(
                         self.db,
