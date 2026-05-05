@@ -108,6 +108,36 @@ class TestBuildGraphForRepo:
         )
         assert skipped == 1
 
+    def test_file_based_android_resources_emit_decls(self, tmp_repo):
+        """Drawables / layouts / menus are file-based resources — every
+        file under res/<kind>/<name>.* implicitly declares <kind>/<name>.
+        Without this, every @drawable/foo / @layout/bar reference would
+        false-positive in ref-validity."""
+        # Synthetic file paths — the content doesn't matter; the
+        # build_graph_for_repo doesn't read these files (no extractor
+        # registered for .png), only their paths matter.
+        graph, _ = build_graph_for_repo(
+            repo_root=tmp_repo,
+            file_paths=(
+                "app/src/main/res/drawable/rounded_box.xml",
+                "app/src/main/res/drawable-hdpi/camera.png",
+                "app/src/main/res/layout/fragment_main.xml",
+                "app/src/main/res/menu/main_menu.xml",
+                "app/src/main/res/navigation/nav_graph.xml",
+            ),
+        )
+        # Each file contributes a Decl.
+        assert "rounded_box" in graph.decls_by_name
+        assert any(d.kind == "drawable" for d in graph.decls_by_name["rounded_box"])
+        assert "camera" in graph.decls_by_name  # from drawable-hdpi/
+        assert any(d.kind == "drawable" for d in graph.decls_by_name["camera"])
+        # layout/fragment_main.xml -> kind=layout. NOTE the .xml is
+        # ALSO read by XmlExtractor if registered; that produces no
+        # decls when content is empty/missing — which is fine.
+        assert "fragment_main" in graph.decls_by_name
+        assert "main_menu" in graph.decls_by_name
+        assert "nav_graph" in graph.decls_by_name
+
 
 # ---------------------------------------------------------------------------
 # check_changed_files

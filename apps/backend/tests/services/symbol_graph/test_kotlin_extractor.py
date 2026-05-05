@@ -123,6 +123,18 @@ class A { fun f() {} }
     assert "MyInternalUtil" in ref_names
 
 
+def test_kotlin_object_declaration_emits_decl():
+    """`object Foo { ... }` is a Kotlin singleton — tree-sitter-kotlin
+    uses node type `object_declaration` (NOT class_declaration). Without
+    handling it, callers writing `import com.x.SessionManager` would
+    false-positive ref-validity because no Decl named `SessionManager`
+    exists in the graph (only its inner members get extracted)."""
+    src = b"package com.example\n\nobject SessionManager {\n  fun getHomeAddress(): String = \"\"\n}\n"
+    res = KotlinExtractor().extract(path="utils/SessionManager.kt", source=src)
+    decl_names_kinds = {(d.name, d.kind) for d in res.decls}
+    assert ("SessionManager", "object") in decl_names_kinds
+
+
 def test_kotlin_realistic_combined():
     """Smoke: a realistic file should produce both class decl and import refs."""
     src = b"""package com.example

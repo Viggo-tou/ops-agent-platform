@@ -111,13 +111,24 @@ class KotlinExtractor:
         if kt == "class_declaration":
             ident = self._find_named_identifier(node)
             if ident is not None:
-                # Object vs class: tree-sitter-kotlin uses "class_declaration"
-                # for both `class Foo` and `object Foo`. The leading keyword
-                # text disambiguates.
                 kind = "object" if self._first_keyword_is(node, source, b"object") else "class"
                 decls.append(Decl(
                     name=self._text(ident, source),
                     kind=kind,
+                    file=path,
+                    line=ident.start_point[0] + 1,
+                ))
+        elif kt == "object_declaration":
+            # tree-sitter-kotlin uses object_declaration for top-level
+            # `object Foo` (singleton) — distinct from class_declaration.
+            # Without this branch, singletons like `object SessionManager`
+            # produce only inner-member decls, never the outer name —
+            # so any `import com.x.SessionManager` ref fails ref-validity.
+            ident = self._find_named_identifier(node)
+            if ident is not None:
+                decls.append(Decl(
+                    name=self._text(ident, source),
+                    kind="object",
                     file=path,
                     line=ident.start_point[0] + 1,
                 ))

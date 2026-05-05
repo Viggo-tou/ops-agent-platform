@@ -105,15 +105,31 @@ def test_drawable_color_layout_refs_carry_their_type():
     assert by_name == {"bg": "drawable", "primary": "color"}
 
 
-def test_android_namespaced_string_ref():
-    """Refs like `@android:string/ok` should still extract the inner type+name."""
+def test_android_namespaced_string_ref_is_filtered():
+    """Refs in the `android:` (SDK) namespace are NOT emitted — their
+    decls live in the platform framework, not the project source tree.
+    Without this filter, every Android XML using @android:color/holo_*
+    or @android:string/ok would false-positive in ref-validity."""
     src = (b"<?xml version=\"1.0\"?>"
            b"<TextView xmlns:android=\"http://schemas.android.com/apk/res/android\""
-           b"          android:text=\"@android:string/ok\"/>")
+           b"          android:text=\"@android:string/ok\""
+           b"          android:textColor=\"@android:color/holo_blue_light\"/>")
     res = XmlExtractor().extract(path="layout/x.xml", source=src)
-    refs = [r for r in res.refs if r.name == "ok"]
-    assert len(refs) == 1
-    assert refs[0].expected_kind == "string"
+    # Both android:* refs filtered.
+    assert not any(r.name == "ok" for r in res.refs)
+    assert not any(r.name == "holo_blue_light" for r in res.refs)
+
+
+def test_project_namespace_refs_still_emitted():
+    """Project-namespace refs (@string/foo, @drawable/bar) are NOT in
+    the android: namespace — they must still be emitted."""
+    src = (b"<?xml version=\"1.0\"?>"
+           b"<TextView xmlns:android=\"http://schemas.android.com/apk/res/android\""
+           b"          android:text=\"@string/welcome\""
+           b"          android:background=\"@drawable/bg\"/>")
+    res = XmlExtractor().extract(path="layout/x.xml", source=src)
+    names = {r.name for r in res.refs}
+    assert names == {"welcome", "bg"}
 
 
 def test_v9_failure_pattern_reproduced():

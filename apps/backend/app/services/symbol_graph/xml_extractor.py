@@ -35,8 +35,12 @@ logger = logging.getLogger(__name__)
 
 
 # `@string/name`, `@drawable/name`, `@+id/name`, `@android:string/name`...
-# We accept letters, digits, underscores in both type and name.
-_REF_RE = re.compile(r"@(?:android:)?(?:\+)?(?P<type>[A-Za-z_]\w*)/(?P<name>[A-Za-z_]\w*)")
+# `_NS` captures whether the ref is in the `android:` (SDK) namespace —
+# we skip those because their decls live in the platform jar, not the
+# project resource tree.
+_REF_RE = re.compile(
+    r"@(?P<ns>android:)?(?:\+)?(?P<type>[A-Za-z_]\w*)/(?P<name>[A-Za-z_]\w*)"
+)
 _DECL_RE = re.compile(r"@\+id/(?P<name>[A-Za-z_]\w*)")
 
 
@@ -103,6 +107,12 @@ class XmlExtractor:
         for m in _REF_RE.finditer(text):
             ref_type = m.group("type")
             ref_name = m.group("name")
+            # Skip Android SDK system resources (@android:color/holo_blue,
+            # @android:string/ok, etc.) — their decls live in the platform
+            # framework, not the project source tree, so the gate would
+            # always false-positive on them.
+            if m.group("ns"):  # "android:" namespace
+                continue
             line = text.count("\n", 0, m.start()) + 1
             refs.append(Ref(
                 name=ref_name,
