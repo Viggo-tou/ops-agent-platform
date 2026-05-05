@@ -65,6 +65,30 @@ _GENERIC_ENGLISH_STOPWORDS = frozenset({
 })
 
 
+def count_unique_identifiers_in_text(text: str) -> int:
+    """Count distinct identifier-shaped tokens (CamelCase / snake_case)
+    in `text`, excluding generic-English stopwords.
+
+    Used by ``evaluate_feature_presence`` as a fallback signal when the
+    spec yields too few strict tokens to anchor a meaningful gate. The
+    rule is "codegen must add at least N distinct structured identifiers",
+    which catches the v10b shell-only-edit pattern (where only English
+    comments + UI primitives like `match_parent` get added) while
+    accepting real implementations that add new fields, classes, or
+    functions.
+    """
+    seen: set[str] = set()
+    if not text:
+        return 0
+    for tok in _TOKEN_RE.findall(text):
+        if not _is_identifier_shaped(tok):
+            continue
+        if tok.lower() in _GENERIC_ENGLISH_STOPWORDS:
+            continue
+        seen.add(tok)
+    return len(seen)
+
+
 def _is_identifier_shaped(tok: str) -> bool:
     """A token is 'specific' enough to count as feature evidence when:
       - it has a CamelCase boundary (homeAddress, JobPostingFlow), or
@@ -265,6 +289,8 @@ def evaluate_feature_presence(
     min_tokens_per_file: int = 1,
     diff_added_per_file: dict[str, str] | None = None,
     min_tokens_per_file_ratio: float | None = None,
+    sparse_token_threshold: int = 3,
+    min_unique_identifiers_fallback: int = 3,
 ) -> FeaturePresenceResult:
     """Static feature-presence eval.
 
@@ -320,6 +346,18 @@ def evaluate_feature_presence(
     matched_per_file: dict[str, list[str]] = {}
     unmatched: list[str] = []
     diff_mode = diff_added_per_file is not None
+
+    # Sparse-token fallback: when the spec produced too few strict
+    # tokens to anchor a meaningful gate (typical for prose-only Jira
+    # tickets), supplement with a "structural diff substance" check —
+    # the diff additions themselves must contain >= N distinct
+    # identifier-shaped tokens. This still catches shell-only edits
+    # (which add only English comments + UI primitives) while accepting
+    # real implementations.
+    use_sparse_fallback = (
+        diff_mode and len(required_tokens) < sparse_token_threshold
+    )
+
     for must_path in must_touch:
         # Pick scan source: diff added lines (G2 strict) or full file body.
         body = ""
@@ -339,18 +377,34 @@ def evaluate_feature_presence(
         body_lower = body_stripped.lower()
         hits = [tok for tok in required_tokens if tok.lower() in body_lower]
         matched_per_file[must_path] = hits
-        if len(hits) < threshold:
-            unmatched.append(must_path)
+
+        if use_sparse_fallback:
+            unique_ids = count_unique_identifiers_in_text(body_stripped)
+            if unique_ids < min_unique_identifiers_fallback:
+                unmatched.append(must_path)
+        else:
+            if len(hits) < threshold:
+                unmatched.append(must_path)
 
     if unmatched:
         sample = ", ".join(unmatched[:3])
         scope = "diff-added lines" if diff_mode else "file content"
+        if use_sparse_fallback:
+            tail = (
+                f"sparse-token fallback active (only {len(required_tokens)} "
+                f"strict token(s); needed >= {min_unique_identifiers_fallback} "
+                f"unique identifier(s) per file in diff)"
+            )
+        else:
+            tail = (
+                f"Required tokens ({len(required_tokens)}): "
+                f"{required_tokens[:8]}..."
+            )
         return FeaturePresenceResult(
             feature_absent=True,
             reason=(
                 f"feature presence check ({scope}): {len(unmatched)} must_touch "
-                f"file(s) lack >= {threshold} required token(s) (sample: {sample}). "
-                f"Required tokens ({len(required_tokens)}): {required_tokens[:8]}..."
+                f"file(s) failed (sample: {sample}). {tail}"
             ),
             required_tokens=list(required_tokens),
             matched_per_file=matched_per_file,
@@ -358,12 +412,20 @@ def evaluate_feature_presence(
         )
 
     scope = "diff-added lines" if diff_mode else "file content"
+    if use_sparse_fallback:
+        success_reason = (
+            f"all must_touch files have >= "
+            f"{min_unique_identifiers_fallback} unique identifier(s) in "
+            f"diff (sparse-token fallback)"
+        )
+    else:
+        success_reason = (
+            f"all must_touch files contain >= {threshold} required "
+            f"token(s) in {scope}"
+        )
     return FeaturePresenceResult(
         feature_absent=False,
-        reason=(
-            f"all must_touch files contain >= {threshold} required token(s) "
-            f"in {scope}"
-        ),
+        reason=success_reason,
         required_tokens=list(required_tokens),
         matched_per_file=matched_per_file,
         unmatched_required_files=[],

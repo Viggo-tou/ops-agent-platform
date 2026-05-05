@@ -253,9 +253,13 @@ def test_legacy_full_file_mode_still_works():
     assert "file content" in res.reason
 
 
-def test_ratio_with_one_token_total_requires_one_hit():
-    """Edge case: only 1 required token, ratio=0.5 → ceil(0.5)=1, so
-    threshold stays at 1 (no division-by-zero / no false-negatives)."""
+def test_ratio_with_one_token_total_triggers_sparse_fallback():
+    """Edge case: only 1 required token (< sparse_token_threshold=3), so
+    the sparse-token fallback fires instead of the ratio check.
+    The fallback requires >=3 unique identifier-shaped tokens in diff.
+    A diff with only 1 identifier ('homeAddress') is rejected — that's
+    the architectural intent: prose-only specs still require substantive
+    structured codegen, not just one token."""
     must_touch = ["src/x.py"]
     res = evaluate_feature_presence(
         must_touch_files=must_touch,
@@ -264,7 +268,112 @@ def test_ratio_with_one_token_total_requires_one_hit():
         diff_added_per_file={must_touch[0]: "homeAddress = 1\n"},
         min_tokens_per_file_ratio=0.5,
     )
+    assert res.feature_absent is True
+    # If we add 2 more identifiers, the fallback now passes.
+    res2 = evaluate_feature_presence(
+        must_touch_files=must_touch,
+        file_contents={must_touch[0]: ""},
+        required_tokens=["homeAddress"],
+        diff_added_per_file={
+            must_touch[0]: "homeAddress = 1\nworkAddress = 2\nsavedAddress = 3\n"
+        },
+        min_tokens_per_file_ratio=0.5,
+    )
+    assert res2.feature_absent is False
+
+
+def test_sparse_token_fallback_accepts_real_implementation():
+    """G2 sparse-token fallback: when the spec yields fewer than 3 strict
+    tokens (prose-only Jira ticket), the gate falls back to "diff added
+    >=3 unique identifier-shaped tokens per file". v12 of P69-17 added
+    workAddress/workLatitude/workLongitude (3 unique CamelCase ids in
+    Job.kt) — real work, must pass even with sparse spec tokens."""
+    must_touch = ["app/src/main/java/Job.kt"]
+    diff_added = (
+        "  val workAddress: String? = null,\n"
+        "  val workLatitude: Double? = null,\n"
+        "  val workLongitude: Double? = null,\n"
+    )
+    res = evaluate_feature_presence(
+        must_touch_files=must_touch,
+        file_contents={must_touch[0]: ""},
+        required_tokens=["fragment_job_posting"],  # only 1 strict token (sparse)
+        diff_added_per_file={must_touch[0]: diff_added},
+        min_tokens_per_file_ratio=0.5,
+    )
     assert res.feature_absent is False
+    assert "sparse-token fallback" in res.reason
+
+
+def test_sparse_token_fallback_rejects_v10b_shell_only():
+    """The sparse-token fallback must STILL block the v10b cheat —
+    only English comments + UI primitives in the diff additions, no
+    structured identifiers."""
+    must_touch = ["app/src/main/java/Job.kt"]
+    diff_added = (
+        "  // Pre-filled from the user's home address on first load.\n"
+        "  // Work location coordinates.\n"
+    )
+    res = evaluate_feature_presence(
+        must_touch_files=must_touch,
+        file_contents={must_touch[0]: ""},
+        required_tokens=["fragment_job_posting"],
+        diff_added_per_file={must_touch[0]: diff_added},
+        min_tokens_per_file_ratio=0.5,
+    )
+    assert res.feature_absent is True
+    assert "sparse-token fallback" in res.reason
+
+
+def test_sparse_token_fallback_rejects_diff_with_only_two_unique_ids():
+    """Threshold is >=3 unique identifiers — exactly 2 should still fail."""
+    must_touch = ["src/x.py"]
+    diff_added = (
+        "userName = 1\n"
+        "userId = 2\n"
+        "x = 3\n"  # 'x' is not identifier-shaped (no Camel/snake)
+    )
+    res = evaluate_feature_presence(
+        must_touch_files=must_touch,
+        file_contents={must_touch[0]: ""},
+        required_tokens=["main"],  # 1 sparse token
+        diff_added_per_file={must_touch[0]: diff_added},
+        min_tokens_per_file_ratio=0.5,
+    )
+    assert res.feature_absent is True
+
+
+def test_sparse_token_fallback_NOT_used_when_spec_is_rich():
+    """When required_tokens >=3, the strict ratio check fires and the
+    fallback path is bypassed — even if the diff has many identifiers."""
+    must_touch = ["src/x.py"]
+    diff_added = "irrelevant_id_one = 1\nirrelevant_id_two = 2\n"
+    res = evaluate_feature_presence(
+        must_touch_files=must_touch,
+        file_contents={must_touch[0]: ""},
+        required_tokens=["loadHomeAddress", "saveHomeAddress",
+                         "getHomeAddress", "SessionManager"],  # 4 strict
+        diff_added_per_file={must_touch[0]: diff_added},
+        min_tokens_per_file_ratio=0.5,
+    )
+    # Strict check runs: needs >=2 of 4 strict tokens. Diff has 0. Fail.
+    assert res.feature_absent is True
+
+
+def test_count_unique_identifiers_camelcase_and_snake_case():
+    from app.services.feature_presence_check import count_unique_identifiers_in_text
+    txt = "homeAddress workAddress save_to_db x = y_value"
+    # 'homeAddress', 'workAddress', 'save_to_db', 'y_value' (4 ids)
+    # 'x' alone is not identifier-shaped
+    assert count_unique_identifiers_in_text(txt) == 4
+
+
+def test_count_unique_identifiers_drops_generic_english():
+    from app.services.feature_presence_check import count_unique_identifiers_in_text
+    # Even though "View" is capitalized, it's in generic stopwords.
+    # 'address_field' is identifier-shaped + not stopword -> counted.
+    txt = "View Page Status address_field"
+    assert count_unique_identifiers_in_text(txt) == 1
 
 
 def test_strip_comments_still_active_in_diff_mode():
