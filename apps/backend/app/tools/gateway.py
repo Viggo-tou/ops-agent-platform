@@ -1,9 +1,28 @@
 from __future__ import annotations
 
+import random
 from collections.abc import Mapping
 from dataclasses import asdict
-from time import perf_counter
+from time import perf_counter, sleep
 from urllib.parse import urlparse
+
+# T2.1: exponential backoff between retries.
+#   attempt 1 fail -> sleep _RETRY_BASE_DELAY_S * 2^0 + jitter -> attempt 2
+#   attempt 2 fail -> sleep _RETRY_BASE_DELAY_S * 2^1 + jitter -> attempt 3
+# Capped at _RETRY_MAX_DELAY_S to prevent pathological waits when a tool is
+# configured with retry_count > 4.
+_RETRY_BASE_DELAY_S = 0.5
+_RETRY_MAX_DELAY_S = 8.0
+_RETRY_JITTER_S = 0.25
+
+
+def _retry_backoff_seconds(attempt: int) -> float:
+    """Exponential backoff with capped jitter. attempt is 1-indexed (the
+    failed attempt number); the returned value is the sleep before the
+    next attempt."""
+    base = _RETRY_BASE_DELAY_S * (2 ** max(attempt - 1, 0))
+    capped = min(base, _RETRY_MAX_DELAY_S)
+    return capped + random.uniform(0.0, _RETRY_JITTER_S)
 
 import httpx
 from sqlalchemy import create_engine, select, text
@@ -239,6 +258,7 @@ class ToolGateway:
 
                 should_retry = exc.retryable and attempt < total_attempts
                 if should_retry:
+                    backoff_s = _retry_backoff_seconds(attempt)
                     record_event(
                         self.db,
                         task_id=task_id,
@@ -247,14 +267,20 @@ class ToolGateway:
                         stage=stage,
                         role=role,
                         tool_name=tool_name,
-                        message="Tool execution attempt failed and will be retried.",
+                        message=(
+                            f"Tool execution attempt failed; retrying after "
+                            f"{backoff_s:.2f}s backoff."
+                        ),
                         payload={
                             "tool_execution_id": execution.id,
                             "attempt": attempt,
                             "max_attempts": total_attempts,
                             "error": str(exc),
+                            "backoff_seconds": round(backoff_s, 3),
                         },
                     )
+                    self.db.flush()
+                    sleep(backoff_s)
                     continue
 
                 duration_ms = int((perf_counter() - started) * 1000)
