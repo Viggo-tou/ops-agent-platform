@@ -4323,6 +4323,232 @@ class PrimaryOrchestrator:
                 pipeline_state["symbol_graph_done"] = True
                 pipeline_state["symbol_graph_skipped"] = "errored"
 
+        # --- R1 semantic_review: LLM completeness + risk reviewer ---
+        # Runs after compile + SymbolGraph pass. Calls a strict reviewer
+        # LLM that scores completeness (0-100) against the original
+        # spec and lists structured findings (orphan UI, hardcoded stubs,
+        # missing routes, unbound fields, race conditions, ...).
+        # Findings are anti-hallucination grounded: every claim must
+        # cite a verbatim diff substring; ungrounded findings are
+        # dropped before the verdict.
+        # Threshold: completeness_pct >= 80 AND zero high-severity
+        # findings to pass. On fail, feeds findings into A-style
+        # repair loop (codegen.generate_patch with structured repair
+        # prompt + accumulated diff).
+        if not pipeline_state.get("semantic_review_done"):
+            try:
+                from app.services.semantic_review import (
+                    SemanticReviewError,
+                    evaluate_semantic_review,
+                )
+                from app.services.feature_presence_check import (
+                    merge_diffs_by_file as _merge_diffs_by_file,
+                )
+
+                _SR_PASS_THRESHOLD = 80
+                _SR_MAX_REPAIR = 2
+                _sr_translation = (
+                    task.translation_json
+                    if isinstance(task.translation_json, dict) else {}
+                )
+                _sr_spec_text = "\n".join(filter(None, [
+                    str(getattr(plan, "objective", "") or ""),
+                    str(_sr_translation.get("normalized_request") or ""),
+                    str(task.request_text or ""),
+                ]))
+
+                # Read post-edit content of the changed files for the
+                # reviewer's context.
+                _sr_sandbox_dir = self._develop_sandbox_dir(task)
+                sr_report = None
+                for sr_round in range(_SR_MAX_REPAIR + 1):
+                    diff_for_review = pipeline_state.get("diff") or ""
+                    _sr_file_contents: dict[str, str] = {}
+                    if _sr_sandbox_dir.exists():
+                        for rel in (pipeline_state.get("files_changed") or []):
+                            try:
+                                full = _sr_sandbox_dir / rel
+                                if full.is_file():
+                                    _sr_file_contents[rel] = full.read_text(
+                                        encoding="utf-8", errors="replace"
+                                    )[:12_000]
+                            except Exception:
+                                pass
+
+                    try:
+                        sr_report = evaluate_semantic_review(
+                            spec_text=_sr_spec_text,
+                            diff=diff_for_review,
+                            file_contents=_sr_file_contents,
+                            settings=self.tool_gateway.settings,
+                            pass_threshold=_SR_PASS_THRESHOLD,
+                            provider="anthropic",
+                            timeout_seconds=60.0,
+                        )
+                    except SemanticReviewError as exc:
+                        # LLM call failure is non-blocking — log + skip
+                        # the gate (do NOT fail the pipeline on infra
+                        # errors of an advisory gate).
+                        record_event(
+                            self.db, task_id=task.id,
+                            event_type=EventType.TOOL_FAILED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            tool_name="semantic_review.evaluate",
+                            message=f"Semantic review errored (skipped): {exc}",
+                            payload={"error": str(exc)[:500]},
+                        )
+                        pipeline_state["semantic_review_skipped"] = "errored"
+                        sr_report = None
+                        break
+
+                    record_event(
+                        self.db, task_id=task.id,
+                        event_type=(
+                            EventType.TOOL_SUCCEEDED if sr_report.passed
+                            else EventType.REVIEW_FAILED
+                        ),
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="semantic_review.evaluate",
+                        message=(
+                            f"semantic_review (round {sr_round}): "
+                            f"completeness={sr_report.completeness_pct}%, "
+                            f"high={sr_report.high_severity_count()}, "
+                            f"findings={len(sr_report.findings)}, "
+                            f"dropped_no_evidence={sr_report.findings_dropped_no_evidence}"
+                        ),
+                        payload={
+                            **sr_report.to_payload(),
+                            "sr_repair_round": sr_round,
+                        },
+                    )
+                    if sr_report.passed:
+                        break
+                    if sr_round >= _SR_MAX_REPAIR:
+                        break
+
+                    # Build repair prompt from grounded findings + previous diff
+                    findings_lines = sr_report.repair_prompt_lines()
+                    previous_diff_text = pipeline_state.get("diff") or ""
+                    if len(previous_diff_text) > 12_000:
+                        previous_diff_text = previous_diff_text[:12_000] + "\n[truncated]"
+                    sr_repair_prompt = (
+                        f"SEMANTIC_REVIEW REPAIR (round {sr_round + 1}): "
+                        f"the reviewer scored completeness "
+                        f"{sr_report.completeness_pct}% (need >= "
+                        f"{_SR_PASS_THRESHOLD}%) and flagged "
+                        f"{sr_report.high_severity_count()} HIGH and "
+                        f"{len(sr_report.findings) - sr_report.high_severity_count()}"
+                        f" non-high finding(s). Address each:\n\n"
+                        + "\n".join(findings_lines)
+                        + "\n\nPREVIOUS DIFF (accumulated — DO NOT undo):\n"
+                        f"```diff\n{previous_diff_text}\n```\n\n"
+                        "Output a unified diff. For files already in the "
+                        "previous diff, reproduce existing changes AND add "
+                        "the missing logic on top. Comments/declarations "
+                        "alone do not satisfy the findings — only added "
+                        "executable lines do."
+                    )
+                    record_event(
+                        self.db, task_id=task.id,
+                        event_type=EventType.TOOL_CALL_REQUESTED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="semantic_review.repair",
+                        message=(
+                            f"Semantic review repair round {sr_round + 1} "
+                            f"of {_SR_MAX_REPAIR}: re-prompting codegen with "
+                            f"{len(sr_report.findings)} grounded finding(s)"
+                        ),
+                    )
+                    time.sleep(10)  # Rate-limit cooldown
+                    try:
+                        sr_repair_result = self._execute_develop_tool(
+                            task=task,
+                            actor_name=actor_name,
+                            tool_name="codegen.generate_patch",
+                            payload={
+                                "plan_json": {
+                                    "objective": "Address semantic_review findings",
+                                    "steps": [],
+                                },
+                                "context_files": pipeline_state.get(
+                                    "context_files", {}
+                                ),
+                                "task_description": sr_repair_prompt,
+                            },
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            approval_id=approval_id,
+                            pipeline_state=pipeline_state,
+                        )
+                    except Exception as exc:
+                        record_event(
+                            self.db, task_id=task.id,
+                            event_type=EventType.TOOL_FAILED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            tool_name="semantic_review.repair",
+                            message=f"Repair codegen call failed: {exc}",
+                        )
+                        break
+                    sr_repair_diff = str(
+                        (sr_repair_result or {}).get("diff", "")
+                    ).strip()
+                    if not sr_repair_diff:
+                        record_event(
+                            self.db, task_id=task.id,
+                            event_type=EventType.TOOL_FAILED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            tool_name="semantic_review.repair",
+                            message="Repair codegen produced no diff",
+                        )
+                        break
+                    sr_merged = _merge_diffs_by_file(
+                        previous_diff_text, sr_repair_diff,
+                    )
+                    pipeline_state["diff"] = sr_merged
+                    record_event(
+                        self.db, task_id=task.id,
+                        event_type=EventType.TOOL_SUCCEEDED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="semantic_review.repair",
+                        message=(
+                            f"Repair produced {len(sr_repair_diff)} chars; "
+                            f"merged with prior {len(previous_diff_text)} -> "
+                            f"{len(sr_merged)} total; re-evaluating"
+                        ),
+                    )
+
+                # End of repair loop. semantic_review is ADVISORY at
+                # the moment — even if not-passed it does NOT fail-close
+                # the pipeline (still sends to AWAITING_APPROVAL with
+                # findings attached). The reviewer sees the report and
+                # decides. To make it strict, set fail_closed=True on a
+                # later iteration.
+                if sr_report is not None:
+                    pipeline_state["semantic_review"] = sr_report.to_payload()
+                pipeline_state["semantic_review_done"] = True
+                self._preserve_develop_pipeline_state(
+                    task=task, pipeline_state=pipeline_state,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._workspace_append_audit(
+                    task, "semantic_review.errored",
+                    {"error": str(exc)[:400]},
+                )
+                pipeline_state["semantic_review_done"] = True
+                pipeline_state["semantic_review_skipped"] = "errored"
+
         # --- Runtime validation gate (with 1 repair cycle) ---
         if not pipeline_state.get("runtime_validation_done"):
             from app.services.runtime_validation import validate_diff_semantics, build_repair_prompt
