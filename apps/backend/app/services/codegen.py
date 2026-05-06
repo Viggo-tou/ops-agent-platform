@@ -212,6 +212,39 @@ class CodeGenerator:
             "cannot reliably fix."
         )
 
+        # L4d — multi-file cross-naming consistency rule. Triggers
+        # when context contains >= 2 source files. Empirical (v27 P69-17
+        # with DeepSeek): codegen renamed `jobLocation` -> `location`
+        # in Job.kt but JobPostingFragment.kt kept the old reference,
+        # producing 'Unresolved reference' compile errors that
+        # oscillated round-to-round (jobLocation -> location -> address
+        # -> jobLocation) without ever converging.
+        if len(kt_files) >= 2:
+            other_paths = ", ".join(p for p, _ in kt_files[:6])
+            out += (
+                "\n\nCROSS-FILE NAMING CONSISTENCY (L4d — repeated "
+                "DeepSeek failure mode in v27):\n"
+                f"You are editing MULTIPLE files in the same module: "
+                f"{other_paths}.\n"
+                "  * If you RENAME a property, function, or class in one "
+                "file (e.g. `jobLocation` -> `location` in Job.kt), you "
+                "MUST update EVERY reference to it in the other file(s) "
+                "in the same patch. Do NOT change a name in one file and "
+                "leave callers in other files referencing the old name.\n"
+                "  * Before emitting your diff, mentally cross-check: "
+                "every property/method/class your patch references in "
+                "file A — does it exist (with that exact name) in the "
+                "definition file B that your patch is also touching?\n"
+                "  * Inconsistent naming across files produces "
+                "'Unresolved reference' errors that the compile_repair "
+                "loop cannot fix because each round renames again "
+                "(jobLocation -> location -> address -> jobLocation), "
+                "never converging.\n"
+                "  * If you are unsure of the canonical name, KEEP THE "
+                "ORIGINAL NAME from the source file — do not rename "
+                "fields gratuitously."
+            )
+
         # L4b — Compose context detection: scan content for @Composable
         any_compose = any(
             "@Composable" in (content or "") for _, content in kt_files

@@ -134,3 +134,47 @@ def test_l4b_added_when_only_one_context_file_uses_compose():
         },
     )
     assert "COMPOSE SCOPE RULES" in out
+
+
+# --- L4d: cross-file naming consistency ------------------------------------
+
+def test_l4d_added_for_multi_kotlin_context():
+    """When >= 2 .kt files in context, append the cross-file naming rule
+    (the v27 oscillation fix)."""
+    out = CodeGenerator._augment_prompt_for_kotlin(
+        CODEGEN_SYSTEM_PROMPT,
+        {
+            "src/main/Job.kt": "data class Job(val jobLocation: String)",
+            "src/main/JobPostingFragment.kt": "class F { val x = job.jobLocation }",
+        },
+    )
+    assert "CROSS-FILE NAMING CONSISTENCY" in out
+    assert "L4d" in out
+    # Specific symbols from the v27 failure should appear
+    assert "jobLocation" in out
+
+
+def test_l4d_NOT_added_for_single_kotlin_file():
+    """Single .kt file context shouldn't trigger the multi-file rule —
+    avoids prompt bloat for small single-file edits."""
+    out = CodeGenerator._augment_prompt_for_kotlin(
+        CODEGEN_SYSTEM_PROMPT,
+        {"src/main/Foo.kt": "package x\nclass Foo"},
+    )
+    assert "CROSS-FILE NAMING CONSISTENCY" not in out
+    # L4a still applies (always for any Kotlin)
+    assert "IMPORT-PRESERVATION RULE" in out
+
+
+def test_l4d_lists_paths_in_prompt():
+    """The prompt should reference the actual file paths so the LLM knows
+    which files are in scope for cross-checking."""
+    out = CodeGenerator._augment_prompt_for_kotlin(
+        CODEGEN_SYSTEM_PROMPT,
+        {
+            "app/src/main/A.kt": "class A",
+            "app/src/main/B.kt": "class B",
+        },
+    )
+    assert "app/src/main/A.kt" in out
+    assert "app/src/main/B.kt" in out
