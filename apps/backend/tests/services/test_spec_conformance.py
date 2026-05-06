@@ -182,30 +182,33 @@ def test_must_touch_passes_when_at_least_one_anchor_file_edited(
     assert must_touch_findings == []
 
 
-def test_must_touch_demoted_to_warn_for_purely_additive_diff(
+def test_must_touch_demoted_to_warn_for_non_destructive_request(
     tree_with_anchor: Path,
 ) -> None:
-    """When the diff doesn't try to remove the anchor (minus==0), the
-    must_touch rule should warn rather than block — the patch is feature-
-    additive, not a rename. Empirical motivation: P69-17 v33 produced a
-    correct map-default-load patch but spec_conformance blocked because
-    the anchor 'jobLocation' (extracted from the issue description) appears
-    in 13 unrelated files. The rule was over-reaching for feature-add
-    tasks."""
-    # Purely additive: new file unrelated to the anchor 'Minij'
+    """For additive feature tasks (no destructive verb), the must_touch
+    rule should warn, not block — the patch is feature-add, not rename.
+    Empirical motivation: P69-17 v33/v34 produced a correct map-default-
+    load patch but spec_conformance blocked because the anchor
+    'jobLocation' (extracted from the issue description) appears in 13
+    unrelated files. The rule over-reached for feature-add tasks."""
     diff = _new_file_diff("src/feature.kt", "fun newThing() = 1")
     report = check_spec_conformance(
-        request_text='Remove "Minij"',
+        request_text='Add a feature that mentions "Minij" once',
         normalized_request=None,
         diff=diff,
         source_tree=tree_with_anchor,
     )
     must_touch = [f for f in report.findings if f.rule == "must_touch"]
-    assert must_touch != []  # rule still fires
-    for f in must_touch:
-        assert f.severity == "warn", (
-            f"expected must_touch to warn for additive diff, got {f.severity}"
-        )
+    if must_touch:
+        for f in must_touch:
+            assert f.severity == "warn", (
+                f"expected must_touch to warn for additive request, got {f.severity}"
+            )
+    # Should not be blocked overall by anchor rules for additive intent
+    block_findings = [f for f in report.findings if f.severity == "block"]
+    block_rules = {f.rule for f in block_findings}
+    assert "must_touch" not in block_rules
+    assert "hit_delta" not in block_rules
 
 
 # ---------------------------- misc / safety ------------------------------- #

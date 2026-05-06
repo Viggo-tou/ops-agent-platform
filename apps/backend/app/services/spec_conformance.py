@@ -160,6 +160,7 @@ def check_spec_conformance(
             source_tree=source_tree,
             diff=diff,
             anchors=removal_anchors,
+            is_destructive=_has_destructive_verb(combined_request),
         )
         findings.extend(anchor_report)
 
@@ -481,6 +482,7 @@ def _anchor_delta_report(
     source_tree: Path,
     diff: str,
     anchors: Iterable[str],
+    is_destructive: bool = True,
 ) -> list[ConformanceFinding]:
     findings: list[ConformanceFinding] = []
     diff_minus_counts, diff_plus_counts = _count_anchor_occurrences_in_diff(
@@ -529,15 +531,14 @@ def _anchor_delta_report(
                 )
             )
 
-        # must_touch — block only when the diff actually tries to remove
-        # the anchor (rename/remove intent). For purely additive patches
-        # (minus == 0), demote to warn: the patch isn't refactoring the
-        # anchor; it's adding new behavior. Forcing it to touch every
-        # anchor-containing file (often 10+ unrelated files) over-reaches
-        # for feature-add tasks like "default the map UI on first open."
+        # must_touch — block only when the request has destructive
+        # intent (remove/rename/delete...). For additive feature-add
+        # tasks ("default the map UI on first open"), the patch isn't
+        # refactoring the anchor; demanding it touch every anchor-
+        # containing file (often 10+ unrelated files) over-reaches.
         hit_paths = set(hit_files.keys())
         if hit_paths.isdisjoint(touched_files):
-            severity = "block" if minus > 0 else "warn"
+            severity = "block" if is_destructive else "warn"
             touch_details.append(
                 ConformanceFinding(
                     rule="must_touch",
@@ -556,8 +557,11 @@ def _anchor_delta_report(
                 )
             )
 
-    # hit_delta: only promote to block when NO anchor decreased at all
-    if not any_anchor_decreased and delta_details:
+    # hit_delta: promote to block ONLY when the request had destructive
+    # intent AND no anchor decreased. For additive feature tasks (no
+    # destructive verb), keep findings at warn — counts not decreasing
+    # is expected when the patch is adding code, not removing it.
+    if is_destructive and not any_anchor_decreased and delta_details:
         delta_details = [
             ConformanceFinding(rule=f.rule, severity="block", message=f.message, evidence=f.evidence)
             for f in delta_details
