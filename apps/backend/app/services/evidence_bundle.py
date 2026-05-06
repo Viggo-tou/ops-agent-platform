@@ -29,6 +29,33 @@ from app.core.config import get_settings
 logger = logging.getLogger(__name__)
 
 
+_INTENT_PHRASE_PATTERN = re.compile(
+    r"\b(?:saved\s+|user\s+|account\s+|profile\s+)?"
+    r"(home\s+address|email\s+address|phone\s+number|user\s+name|"
+    r"display\s+name|profile\s+photo|date\s+of\s+birth|payment\s+method|"
+    r"current\s+location|preferred\s+language)\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_intent_identifiers(request_text: str) -> list[str]:
+    """Return likely identifier-style names extracted from English noun
+    phrases in the request. E.g. "saved home address" -> ["homeaddress"]
+    (lowercased; downstream grep is case-insensitive)."""
+    if not request_text:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for match in _INTENT_PHRASE_PATTERN.finditer(request_text):
+        phrase = match.group(1)
+        ident = re.sub(r"\s+", "", phrase).lower()
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append(ident)
+    return out
+
+
 @dataclass(frozen=True)
 class EvidenceBundle:
     verdict: str  # "sufficient" | "insufficient" | "skip"
@@ -183,6 +210,69 @@ def _find_files_via_fts5(
     return {}, ""
 
 
+def _smart_prefetch_intent_files(
+    *,
+    request_text: str,
+    source_root: Path,
+    existing_anchored_paths: set[str],
+    max_files: int = 5,
+    max_grep_files_scanned: int = 2000,
+) -> list[str]:
+    """Grep the source tree for files matching request intent identifiers."""
+    idents = _extract_intent_identifiers(request_text)
+    if not idents:
+        return []
+    if not source_root or not source_root.is_dir():
+        return []
+
+    pattern = re.compile(
+        r"|".join(re.escape(ident) for ident in idents),
+        re.IGNORECASE,
+    )
+    candidates: list[tuple[str, int]] = []
+    skip_dirs = {".git", "node_modules", "build", ".gradle", ".idea", "dist"}
+    skip_exts = {
+        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico",
+        ".woff", ".woff2", ".ttf", ".otf", ".eot",
+        ".pdf", ".zip", ".tar", ".gz", ".7z",
+        ".mp3", ".mp4", ".mov", ".wav",
+        ".pyc", ".class", ".dll", ".so", ".dylib", ".exe",
+    }
+    scanned = 0
+    for path in source_root.rglob("*"):
+        if scanned >= max_grep_files_scanned:
+            break
+        if not path.is_file():
+            continue
+        if any(part in skip_dirs for part in path.parts):
+            continue
+        if path.suffix.lower() in skip_exts:
+            continue
+        try:
+            if path.stat().st_size > 200_000:
+                continue
+        except OSError:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        scanned += 1
+        matches = pattern.findall(text)
+        if not matches:
+            continue
+        try:
+            rel = str(path.relative_to(source_root)).replace("\\", "/")
+        except ValueError:
+            continue
+        if rel in existing_anchored_paths:
+            continue
+        candidates.append((rel, len(matches)))
+
+    candidates.sort(key=lambda item: -item[1])
+    return [rel for rel, _ in candidates[:max_files]]
+
+
 _PROTECTED_PATTERNS = (
     re.compile(r"\.env"),
     re.compile(r"secrets?/"),
@@ -253,16 +343,27 @@ def build_evidence_bundle(
             anchors.append(a)
 
     if not anchors:
+        must_touch = _filter_must_touch_files(
+            planner_must_touch or [],
+            settings=settings,
+        )
+        candidate_files: list[str] = []
+        try:
+            candidate_files = _smart_prefetch_intent_files(
+                request_text=request_text or "",
+                source_root=source_tree,
+                existing_anchored_paths=set(must_touch),
+                max_files=5,
+            )
+        except Exception:  # noqa: BLE001
+            candidate_files = []
         return EvidenceBundle(
             verdict="skip",
             anchors_searched=[],
             anchor_hits={},
-            must_touch_files=_filter_must_touch_files(
-                planner_must_touch or [],
-                settings=settings,
-            ),
+            must_touch_files=must_touch,
             forbidden_files=[],
-            candidate_files=[],
+            candidate_files=candidate_files,
             coverage_score=0.0,
             reason="No anchors found in request; skipping evidence check.",
             anchor_strategy={},
@@ -299,6 +400,22 @@ def build_evidence_bundle(
     )
 
     forbidden = _derive_forbidden(candidate_files=all_candidate_files)
+    candidate_files = sorted(all_candidate_files)[:20]
+    intent_prefetch_paths: list[str] = []
+    try:
+        intent_prefetch_paths = _smart_prefetch_intent_files(
+            request_text=request_text or "",
+            source_root=source_tree,
+            existing_anchored_paths={
+                *must_touch,
+                *candidate_files,
+            },
+            max_files=5,
+        )
+    except Exception:  # noqa: BLE001
+        intent_prefetch_paths = []
+    if intent_prefetch_paths:
+        candidate_files = list(dict.fromkeys(candidate_files + intent_prefetch_paths))
 
     if has_destructive_verb and coverage == 0.0:
         return EvidenceBundle(
@@ -307,7 +424,7 @@ def build_evidence_bundle(
             anchor_hits=anchor_hits,
             must_touch_files=must_touch,
             forbidden_files=forbidden,
-            candidate_files=sorted(all_candidate_files)[:20],
+            candidate_files=candidate_files,
             coverage_score=coverage,
             reason=(
                 f"Destructive task references {anchors!r} but NONE found in "
@@ -323,7 +440,7 @@ def build_evidence_bundle(
             anchor_hits=anchor_hits,
             must_touch_files=[],
             forbidden_files=forbidden,
-            candidate_files=sorted(all_candidate_files)[:20],
+            candidate_files=candidate_files,
             coverage_score=coverage,
             reason="Destructive task but no must-touch files could be derived.",
             anchor_strategy=anchor_strategy,
@@ -342,7 +459,7 @@ def build_evidence_bundle(
             anchor_hits=anchor_hits,
             must_touch_files=must_touch,
             forbidden_files=forbidden,
-            candidate_files=sorted(all_candidate_files)[:20],
+            candidate_files=candidate_files,
             coverage_score=coverage,
             reason=(
                 f"Zero anchor hits across {len(anchors)} term(s) and planner "
@@ -361,7 +478,7 @@ def build_evidence_bundle(
         anchor_hits=anchor_hits,
         must_touch_files=must_touch,
         forbidden_files=forbidden,
-        candidate_files=sorted(all_candidate_files)[:20],
+        candidate_files=candidate_files,
         coverage_score=coverage,
         reason=f"{anchors_with_hits}/{len(anchors)} anchors found, {len(must_touch)} must-touch files.",
         anchor_strategy=anchor_strategy,
