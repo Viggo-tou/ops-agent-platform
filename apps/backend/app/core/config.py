@@ -100,6 +100,7 @@ class Settings(BaseSettings):
     codegen_max_repair_rounds: int = 2
     # Stage A codegen self-validation: validate diff applies + parses
     # before codegen returns. Catches hunk drift at source.
+    codegen_react_loop_enabled: bool = False
     codegen_self_validation_enabled: bool = True
     codegen_self_validation_max_retries: int = 1
     codegen_repair_files_per_round: int = 5

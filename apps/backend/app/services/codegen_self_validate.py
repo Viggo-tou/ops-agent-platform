@@ -59,13 +59,21 @@ def validate_diff_applies(
     if git is None:
         return True, ""
     try:
+        # BINARY mode: writing the diff in text mode on Windows translates
+        # `\n` → `\r\n` which corrupts patches when the LLM already used
+        # `\r\n` line endings (resulting in `\r\r\n`). Empirical (v41/v42
+        # 2026-05-06): both DeepSeek and claude_code outputs hit
+        # `error: corrupt patch at line N` — same root cause. Normalize
+        # to LF and write bytes directly.
+        normalized_diff = diff.replace("\r\n", "\n").replace("\r", "\n")
+        if normalized_diff and not normalized_diff.endswith("\n"):
+            normalized_diff += "\n"
         with tempfile.NamedTemporaryFile(
-            mode="w",
+            mode="wb",
             suffix=".patch",
-            encoding="utf-8",
             delete=False,
         ) as tmp:
-            tmp.write(diff)
+            tmp.write(normalized_diff.encode("utf-8"))
             patch_path = tmp.name
         try:
             result = subprocess.run(
@@ -132,13 +140,16 @@ def validate_diff_parses(
         except (shutil.Error, OSError) as exc:
             return True, f"validation skipped (copy failed): {exc}"
 
+        # Same Windows CRLF normalization as validate_diff_applies.
+        normalized_diff = diff.replace("\r\n", "\n").replace("\r", "\n")
+        if normalized_diff and not normalized_diff.endswith("\n"):
+            normalized_diff += "\n"
         with tempfile.NamedTemporaryFile(
-            mode="w",
+            mode="wb",
             suffix=".patch",
-            encoding="utf-8",
             delete=False,
         ) as tmp:
-            tmp.write(diff)
+            tmp.write(normalized_diff.encode("utf-8"))
             patch_path = tmp.name
         try:
             apply_result = subprocess.run(

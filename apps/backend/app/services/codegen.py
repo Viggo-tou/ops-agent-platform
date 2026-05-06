@@ -61,7 +61,38 @@ diff --git a/app/example.py b/app/example.py
  def main():
      print(greet("World"))
 
-DO NOT output anything before "diff --git". DO NOT wrap in markdown code fences. DO NOT add explanations."""
+DO NOT output anything before "diff --git". DO NOT wrap in markdown code fences. DO NOT add explanations.
+
+GROUNDING DISCIPLINE (read carefully — errors here cause harness rejection):
+
+A. Symbol grounding: every identifier you reference (field, method, import) MUST already exist in the source files provided to you, OR be added in the same diff. Do NOT invent field names. If the task says "use the saved address field" and the ViewModel only has `locationAddress`, your diff MUST use `locationAddress` (not `jobLocation`, `address`, or any guess).
+
+B. Line-number grounding: hunk headers `@@ -A,B +C,D @@` MUST match the actual file. Count lines from the source content I provided. A 3-line context above + 3 below + the changes is the minimum. If you are uncertain about the exact line, prefer ADDING new code at the END of an existing method (lines easier to count) over modifying mid-method.
+
+C. Output discipline: ONE diff per response. NO header text like "Here's the diff:" or "===". NO trailing summary. Stop after the last hunk.
+
+GOOD EXAMPLE — minimal edit, 5 lines, preserves everything else:
+diff --git a/app/Foo.kt b/app/Foo.kt
+--- a/app/Foo.kt
++++ b/app/Foo.kt
+@@ -22,6 +22,9 @@ class Foo {
+     fun load() {
+         val data = repo.fetch()
++        if (viewModel.locationAddress.isBlank()) {
++            viewModel.locationAddress = SessionManager.getHomeAddress(context)
++        }
+         render(data)
+     }
+
+BAD EXAMPLE — DO NOT DO THIS — full-file replacement:
+diff --git a/app/Foo.kt b/app/Foo.kt
+new file mode 100644
+--- /dev/null
++++ b/app/Foo.kt
+@@ -0,0 +1,90 @@
++...90 lines including the entire original file plus your changes...
+
+The BAD example fails L5 gate and wastes the user's time. ALWAYS prefer the GOOD pattern: tiny hunks targeting the specific lines you need to change."""
 
 
 CODEGEN_KOTLIN_GUIDANCE = """
@@ -127,6 +158,12 @@ If the task requires creating a new config.json file:
 {"files":[{"path":"config.json","content":"{\\n  \\"key\\": \\"value\\"\\n}\\n","summary":"Create new config file"}]}"""
 
 
+CODEGEN_REACT_PLAN_SYSTEM_PROMPT = """You are a code generation planning agent.
+
+Given a task plan and source file contents, output ONLY the requested JSON symbol plan.
+Do not produce a diff, markdown fence, explanation, or any prose."""
+
+
 RAW_DIFF_RETRY_SUFFIX = (
     "\n\nIMPORTANT: Output ONLY the raw unified diff. "
     "Do NOT wrap with === markers, code fences, comments, or "
@@ -152,6 +189,9 @@ class CodeGenerator:
     def __init__(self, settings: Settings | None = None, *, db: Session | None = None):
         self.settings = settings or get_settings()
         self.db = db
+
+    def _react_loop_enabled(self) -> bool:
+        return bool(getattr(self.settings, "codegen_react_loop_enabled", False))
 
     @staticmethod
     def _extract_plan_target_paths(plan_json: dict[str, Any]) -> tuple[list[str], list[str], set[str]]:
@@ -1757,7 +1797,7 @@ class CodeGenerator:
                 {"role": "system", "content": self._augment_prompt_for_kotlin(CODEGEN_SYSTEM_PROMPT_JSON_MODE, getattr(self, "_current_context_files", None)),},
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.2,
+            "temperature": 0.0,
             "max_tokens": 32768,
         }
         try:
@@ -1858,16 +1898,77 @@ class CodeGenerator:
             raise CodegenError("OPS_AGENT_DEEPSEEK_API_KEY is not configured.")
 
         model_name = self.settings.deepseek_model
+        effective_prompt = prompt
+        if self._react_loop_enabled():
+            try:
+                from app.services.codegen_react_loop import react_codegen_call
+
+                effective_prompt = react_codegen_call(
+                    task_description=prompt,
+                    plan_json={},
+                    context_files=getattr(self, "_current_context_files", None) or {},
+                    once_call=lambda p: self._call_deepseek_once_text(p, model_name),
+                )
+            except Exception as exc:  # noqa: BLE001
+                import logging
+
+                logging.getLogger("codegen").warning(
+                    "react_loop.error_falling_back",
+                    extra={
+                        "error_type": type(exc).__name__,
+                        "error": str(exc)[:200],
+                    },
+                )
+                effective_prompt = prompt
+
         try:
-            return self._call_deepseek_once(prompt, model_name)
+            return self._call_deepseek_once(effective_prompt, model_name)
         except CodegenError as exc:
             if _is_minimal_edit_retryable_error_message(str(exc)):
                 return self._call_deepseek_once(
-                    prompt + MINIMAL_EDIT_RETRY_SUFFIX, model_name
+                    effective_prompt + MINIMAL_EDIT_RETRY_SUFFIX, model_name
                 )
             if "valid unified diff" not in str(exc) and "changed file headers" not in str(exc):
                 raise
-            return self._call_deepseek_once(prompt + RAW_DIFF_RETRY_SUFFIX, model_name)
+            return self._call_deepseek_once(effective_prompt + RAW_DIFF_RETRY_SUFFIX, model_name)
+
+    def _call_deepseek_once_text(self, prompt: str, model_name: str) -> str:
+        """Call DeepSeek once and return raw content without parsing."""
+        url = "https://api.deepseek.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.settings.deepseek_api_key}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": self._augment_prompt_for_kotlin(CODEGEN_REACT_PLAN_SYSTEM_PROMPT, getattr(self, "_current_context_files", None)),},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.0,
+            "max_tokens": 8192,
+        }
+        try:
+            response = cached_http_post(
+                url=url,
+                json=body,
+                headers=headers,
+                timeout=external_http_timeout(self.settings.deepseek_timeout_seconds),
+                provider_hint="codegen.deepseek.react_plan",
+            )
+            response.raise_for_status()
+            data = response.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            usage = data.get("usage", {})
+            log_llm_cache_hit(
+                provider="deepseek",
+                model=model_name,
+                purpose="codegen.react_plan",
+                usage=usage,
+            )
+            return content
+        except httpx.HTTPError as exc:
+            raise CodegenError(f"DeepSeek API error: {exc}") from exc
 
     def _call_deepseek_once(self, prompt: str, model_name: str) -> CodegenResult:
         """Call DeepSeek once and parse the raw response."""
@@ -1882,7 +1983,7 @@ class CodeGenerator:
                 {"role": "system", "content": self._augment_prompt_for_kotlin(CODEGEN_SYSTEM_PROMPT, getattr(self, "_current_context_files", None)),},
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.2,
+            "temperature": 0.0,
             "max_tokens": 8192,
         }
         try:
@@ -1943,7 +2044,7 @@ class CodeGenerator:
                 {"role": "system", "content": self._augment_prompt_for_kotlin(CODEGEN_SYSTEM_PROMPT, getattr(self, "_current_context_files", None)),},
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.2,
+            "temperature": 0.0,
             "max_tokens": 8192,
         }
         try:
