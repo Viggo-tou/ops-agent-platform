@@ -21,6 +21,7 @@ from app.services.codegen_self_validate import (  # noqa: E402
     validate_diff_applies,
     validate_diff_parses,
     validate_imports_preserved,
+    validate_no_rewrite_of_existing,
 )
 
 
@@ -117,6 +118,139 @@ def test_import_preserved_replaces_one_for_one_passes():
 
 def test_import_preserved_empty_diff_passes():
     ok, err = validate_imports_preserved("")
+    assert ok is True
+    assert err == ""
+
+
+# ---- L5: no whole-file rewrite of existing must_touch files ----------------
+
+def test_l5_rejects_new_file_mode_for_must_touch():
+    diff = (
+        "diff --git a/app/src/main/JobPostingFragment.kt b/app/src/main/JobPostingFragment.kt\n"
+        "new file mode 100644\n"
+        "index 0000000..1234567\n"
+        "--- /dev/null\n"
+        "+++ b/app/src/main/JobPostingFragment.kt\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+package example\n"
+        "+class JobPostingFragment\n"
+    )
+
+    ok, err = validate_no_rewrite_of_existing(
+        diff, ["app/src/main/JobPostingFragment.kt"]
+    )
+
+    assert ok is False
+    assert "JobPostingFragment.kt" in err
+
+
+def test_l5_allows_minimal_edit_for_must_touch():
+    diff = (
+        "diff --git a/app/src/main/X.kt b/app/src/main/X.kt\n"
+        "--- a/app/src/main/X.kt\n"
+        "+++ b/app/src/main/X.kt\n"
+        "@@ -1,2 +1,2 @@\n"
+        " package example\n"
+        "-class X\n"
+        "+class X(val enabled: Boolean)\n"
+    )
+
+    ok, err = validate_no_rewrite_of_existing(diff, ["app/src/main/X.kt"])
+
+    assert ok is True
+    assert err == ""
+
+
+def test_l5_allows_new_file_mode_for_path_not_in_must_touch():
+    diff = (
+        "diff --git a/app/src/main/NewFile.kt b/app/src/main/NewFile.kt\n"
+        "new file mode 100644\n"
+        "index 0000000..1234567\n"
+        "--- /dev/null\n"
+        "+++ b/app/src/main/NewFile.kt\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+package example\n"
+        "+class NewFile\n"
+    )
+
+    ok, err = validate_no_rewrite_of_existing(diff, ["app/src/main/X.kt"])
+
+    assert ok is True
+    assert err == ""
+
+
+def test_l5_handles_suffix_tolerant_paths():
+    diff = (
+        "diff --git a/X.kt b/X.kt\n"
+        "new file mode 100644\n"
+        "index 0000000..1234567\n"
+        "--- /dev/null\n"
+        "+++ b/X.kt\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+package example\n"
+        "+class X\n"
+    )
+
+    ok, err = validate_no_rewrite_of_existing(diff, ["app/src/main/X.kt"])
+
+    assert ok is False
+    assert "X.kt" in err
+
+
+def test_l5_handles_mixed_diff():
+    diff = (
+        "diff --git a/app/src/main/Bad.kt b/app/src/main/Bad.kt\n"
+        "new file mode 100644\n"
+        "index 0000000..1234567\n"
+        "--- /dev/null\n"
+        "+++ b/app/src/main/Bad.kt\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+package example\n"
+        "+class Bad\n"
+        "diff --git a/app/src/main/Ok.kt b/app/src/main/Ok.kt\n"
+        "--- a/app/src/main/Ok.kt\n"
+        "+++ b/app/src/main/Ok.kt\n"
+        "@@ -1,2 +1,2 @@\n"
+        " package example\n"
+        "-class Ok\n"
+        "+class Ok(val enabled: Boolean)\n"
+    )
+
+    ok, err = validate_no_rewrite_of_existing(
+        diff, ["app/src/main/Bad.kt", "app/src/main/Ok.kt"]
+    )
+
+    assert ok is False
+    assert "Bad.kt" in err
+    assert "Ok.kt" not in err
+
+
+def test_l5_skipped_when_must_touch_empty():
+    diff = (
+        "diff --git a/app/src/main/NewFile.kt b/app/src/main/NewFile.kt\n"
+        "new file mode 100644\n"
+        "index 0000000..1234567\n"
+        "--- /dev/null\n"
+        "+++ b/app/src/main/NewFile.kt\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+package example\n"
+        "+class NewFile\n"
+    )
+
+    ok, err = validate_no_rewrite_of_existing(diff, [])
+    assert ok is True
+    assert err == ""
+
+    ok, err = validate_no_rewrite_of_existing(diff, None)  # type: ignore[arg-type]
+    assert ok is True
+    assert err == ""
+
+
+def test_l5_skipped_for_empty_diff():
+    ok, err = validate_no_rewrite_of_existing(
+        "", ["app/src/main/JobPostingFragment.kt"]
+    )
+
     assert ok is True
     assert err == ""
 
@@ -247,6 +381,30 @@ def test_self_validate_chains_to_l4e():
         or "cross-file" in result.reason
         or "oscillation" in result.reason
     )
+
+
+def test_self_validate_chains_to_l5():
+    diff = (
+        "diff --git a/app/src/main/JobPostingFragment.kt b/app/src/main/JobPostingFragment.kt\n"
+        "new file mode 100644\n"
+        "index 0000000..1234567\n"
+        "--- /dev/null\n"
+        "+++ b/app/src/main/JobPostingFragment.kt\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+package example\n"
+        "+class JobPostingFragment\n"
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        result = self_validate(
+            diff,
+            Path(tmp),
+            must_touch_files=["app/src/main/JobPostingFragment.kt"],
+        )
+
+    assert result.valid is False
+    assert "L5" in result.reason or "new file mode" in result.reason
+    assert "JobPostingFragment.kt" in result.error_detail
 
 
 def _deepseek_settings() -> SimpleNamespace:

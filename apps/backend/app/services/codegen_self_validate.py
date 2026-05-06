@@ -405,9 +405,86 @@ def validate_cross_file_refs(diff: str) -> tuple[bool, str]:
     return True, ""
 
 
+def validate_no_rewrite_of_existing(
+    diff: str,
+    must_touch_files: list[str],
+) -> tuple[bool, str]:
+    """L5: reject diff that rewrites an existing must_touch file as
+    'new file mode 100644'.
+
+    Failure mode (v36 P69-17): DeepSeek emitted
+        diff --git a/.../JobPostingFragment.kt b/.../JobPostingFragment.kt
+        new file mode 100644
+        --- /dev/null
+        +++ b/.../JobPostingFragment.kt
+    for a file already in plan.must_touch_files. The diff "creates"
+    a 100-line replacement that drops the original file's other
+    methods (createImageFileUri, OSMDroid init, etc.). Compile and
+    symbol_graph pass because the new file is internally consistent.
+    Reservations.review flagged 5 items but task still reached
+    AWAITING_APPROVAL with broken code.
+
+    Rule: for each `diff --git` section in the diff:
+      - extract the +++ b/<path>
+      - check if section contains `new file mode 100644` OR
+        `^index 0{7,}\\..` (alternate "all-zero parent" indicator)
+      - if yes AND path matches any entry in must_touch_files
+        (suffix-tolerant: same matching used by L4e), reject.
+
+    Skip cleanly when:
+      - diff is empty
+      - must_touch_files is empty
+      - no new-file sections present
+    """
+    if not diff or not diff.strip():
+        return True, ""
+    if not must_touch_files:
+        return True, ""
+
+    rewritten: list[str] = []
+    for section in re.split(r"(?=^diff --git )", diff, flags=re.MULTILINE):
+        section = section.strip()
+        if not section:
+            continue
+        # Path: prefer +++ b/... ; fall back to diff --git a/... b/...
+        m_path = re.search(r"^\+\+\+ b/(.+?)$", section, flags=re.MULTILINE)
+        if m_path:
+            path = m_path.group(1).strip()
+        else:
+            m_path = re.match(r"diff --git a/(.+?) b/", section)
+            if m_path is None:
+                continue
+            path = m_path.group(1).strip()
+        # /dev/null on the +++ side means deletion, not rewrite
+        if path == "/dev/null":
+            continue
+        is_new_file = (
+            "new file mode " in section
+            or bool(re.search(r"^index 0{7,}\.\.", section, re.MULTILINE))
+        )
+        if not is_new_file:
+            continue
+        for mt in must_touch_files:
+            if not mt:
+                continue
+            if mt == path or mt.endswith("/" + path) or path.endswith("/" + mt):
+                rewritten.append(path)
+                break
+    if rewritten:
+        return False, (
+            "Diff rewrites existing must_touch file(s) as 'new file mode'. "
+            "This drops the original file's behavior. Affected: "
+            + ", ".join(sorted(set(rewritten)))
+            + ". Use minimal --- a/path / +++ b/path hunks instead."
+        )
+    return True, ""
+
+
 def self_validate(
     diff: str,
     source_path: Path,
+    *,
+    must_touch_files: list[str] | None = None,
 ) -> ValidationResult:
     """Run full self-validation: apply check + parse check.
 
@@ -419,6 +496,18 @@ def self_validate(
     """
     apply_ok, apply_err = validate_diff_applies(diff, source_path)
     if not apply_ok:
+        if must_touch_files:
+            no_rewrite_ok, no_rewrite_err = validate_no_rewrite_of_existing(
+                diff, list(must_touch_files)
+            )
+            if not no_rewrite_ok:
+                return ValidationResult(
+                    valid=False,
+                    reason="codegen rewrote an existing must_touch file as 'new file mode' (L5)",
+                    error_detail=no_rewrite_err,
+                    apply_check_passed=False,
+                    parse_check_passed=False,
+                )
         return ValidationResult(
             valid=False,
             reason="git apply --check failed (hunk drift / context mismatch)",
@@ -445,6 +534,18 @@ def self_validate(
             apply_check_passed=True,
             parse_check_passed=False,
         )
+    if must_touch_files:
+        no_rewrite_ok, no_rewrite_err = validate_no_rewrite_of_existing(
+            diff, list(must_touch_files)
+        )
+        if not no_rewrite_ok:
+            return ValidationResult(
+                valid=False,
+                reason="codegen rewrote an existing must_touch file as 'new file mode' (L5)",
+                error_detail=no_rewrite_err,
+                apply_check_passed=True,
+                parse_check_passed=False,
+            )
     parse_ok, parse_err = validate_diff_parses(diff, source_path)
     if not parse_ok:
         return ValidationResult(

@@ -42,6 +42,11 @@ CRITICAL RULES:
 6. For new files, use --- /dev/null.
 7. Include 3 context lines around each change.
 
+MINIMAL-EDIT INVARIANT (L5):
+For any file path in must_touch_files (which always refers to files that already exist), your diff MUST be a line-anchored minimal edit using `--- a/<path>` / `+++ b/<path>` hunks. You are FORBIDDEN to emit `new file mode 100644`, `--- /dev/null`, or any `index 0000000..xxxxxxx` header for these paths - those are reserved for genuinely new files (i.e., paths in expected_new_files that do NOT yet exist). Preserve every line of the original file that is not directly affected by the task: imports, methods, classes, helpers, lifecycle callbacks, navigation routes - keep them character-for-character.
+
+If you find yourself wanting to rewrite the whole file, instead produce hunks that only add/remove the lines you need to change. A 5-line behavior change should be a 5-line diff, not a 100-line file replacement.
+
 EXAMPLE OUTPUT FORMAT (your response must look exactly like this):
 diff --git a/app/example.py b/app/example.py
 --- a/app/example.py
@@ -127,6 +132,15 @@ RAW_DIFF_RETRY_SUFFIX = (
     "Do NOT wrap with === markers, code fences, comments, or "
     "any prose. Start your response with the line "
     "'diff --git a/...' and end at the last hunk line."
+)
+
+MINIMAL_EDIT_RETRY_SUFFIX = (
+    "\n\nIMPORTANT: For files that already exist (i.e., paths in "
+    "must_touch_files), output ONLY a minimal line-anchored unified "
+    "diff. Do NOT use 'new file mode 100644' or '--- /dev/null' for "
+    "an existing file - those are reserved for genuinely new files. "
+    "Preserve every line of the original file that is not directly "
+    "affected by the task."
 )
 
 
@@ -365,7 +379,11 @@ class CodeGenerator:
                 _is_repair_call = isinstance(task_description, str) and task_description.startswith("Fix syntax errors in")
                 if not _is_repair_call and getattr(self.settings, "codegen_self_validation_enabled", True):
                     from app.services.codegen_self_validate import self_validate
-                    raw_source = str(getattr(self.settings, "knowledge_source_path", "") or "").strip()
+                    raw_source = str(
+                        source_repo_path
+                        or getattr(self.settings, "knowledge_source_path", "")
+                        or ""
+                    ).strip()
                     source_path = Path(raw_source) if raw_source else None
                     # Skip when source_path is unset / non-existent / not a
                     # real source repo. Test fixtures often leave this unset
@@ -373,10 +391,22 @@ class CodeGenerator:
                     if source_path is not None and source_path.is_absolute() and source_path.is_dir() and (source_path / ".git").exists():
                         max_retries = int(getattr(self.settings, "codegen_self_validation_max_retries", 1))
                         for sv_attempt in range(max_retries + 1):
-                            validation = self_validate(result.diff, source_path)
+                            validation = self_validate(
+                                result.diff,
+                                source_path,
+                                must_touch_files=must_touch_files,
+                            )
                             if validation.valid:
                                 break
+                            l5_failure = _is_minimal_edit_retryable_error_message(
+                                f"{validation.reason} {validation.error_detail}"
+                            )
                             if sv_attempt >= max_retries:
+                                if l5_failure:
+                                    raise CodegenError(
+                                        f"{validation.reason} :: "
+                                        f"{validation.error_detail[:500]}"
+                                    )
                                 raise CodegenError(
                                     f"codegen self-validation failed after "
                                     f"{sv_attempt + 1} attempt(s): "
@@ -400,6 +430,8 @@ class CodeGenerator:
                                 f"matches the actual file content (no drift). If "
                                 f"parse failed, fix the syntactic error."
                             )
+                            if l5_failure:
+                                retry_prompt += MINIMAL_EDIT_RETRY_SUFFIX
                             _logger.info(
                                 "Self-validation retry %d/%d for provider %s",
                                 sv_attempt + 1, max_retries, provider,
@@ -1829,6 +1861,10 @@ class CodeGenerator:
         try:
             return self._call_deepseek_once(prompt, model_name)
         except CodegenError as exc:
+            if _is_minimal_edit_retryable_error_message(str(exc)):
+                return self._call_deepseek_once(
+                    prompt + MINIMAL_EDIT_RETRY_SUFFIX, model_name
+                )
             if "valid unified diff" not in str(exc) and "changed file headers" not in str(exc):
                 raise
             return self._call_deepseek_once(prompt + RAW_DIFF_RETRY_SUFFIX, model_name)
@@ -1886,6 +1922,10 @@ class CodeGenerator:
         try:
             return self._call_openai_once(prompt, model_name)
         except CodegenError as exc:
+            if _is_minimal_edit_retryable_error_message(str(exc)):
+                return self._call_openai_once(
+                    prompt + MINIMAL_EDIT_RETRY_SUFFIX, model_name
+                )
             if "valid unified diff" not in str(exc) and "changed file headers" not in str(exc):
                 raise
             return self._call_openai_once(prompt + RAW_DIFF_RETRY_SUFFIX, model_name)
@@ -2057,6 +2097,11 @@ def _first_line(content: str) -> str | None:
     return content.splitlines()[0]
 
 
+def _is_minimal_edit_retryable_error_message(message: str) -> bool:
+    lowered = message.lower()
+    return "new file mode" in lowered or "l5" in lowered
+
+
 def _is_retryable_codegen_error(exc: CodegenError) -> bool:
     message = str(exc).lower()
     return any(
@@ -2068,6 +2113,8 @@ def _is_retryable_codegen_error(exc: CodegenError) -> bool:
             "no files",
             "missing path",
             "empty output",
+            "new file mode",
+            "l5",
         )
     )
 
