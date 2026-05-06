@@ -40,6 +40,9 @@ Modes (driven by Settings.llm_cache_mode):
     - Miss: behavior follows Settings.llm_cache_replay_on_miss:
         - "passthrough" (default): fall through to real httpx.post (no record).
         - "raise": raise LLMCacheMissError so dev sees what's missing.
+- "auto": hybrid — cache hit returns cached without HTTP; cache miss
+  calls live AND records. First time a prompt is seen costs full LLM
+  time; every identical retry is instant. Recommended for production.
 
 Scope: ONLY the call sites that pass through cached_http_post. Other
 httpx usage (Jira API, knowledge HTTP, etc.) is unaffected.
@@ -186,12 +189,46 @@ def cached_http_post(
     """
     settings = get_settings()
     mode = (getattr(settings, "llm_cache_mode", "off") or "off").lower().strip()
-    if mode not in ("record", "replay"):
+    if mode not in ("record", "replay", "auto"):
         return httpx.post(url, json=json, headers=headers, timeout=timeout)
 
     cache_dir = _resolve_cache_dir()
     key = _compute_cache_key(url=url, body=json)
     log = logging.getLogger("app.services.llm_cache")
+
+    if mode == "auto":
+        # Hybrid: cache hit returns cached response without HTTP call;
+        # cache miss calls live API AND records the response, so the
+        # next identical call hits cache automatically. Best-of-both:
+        # zero replay cost when prompts repeat, zero correctness risk
+        # because new prompts always go to the real provider.
+        entry = _load_cache_entry(cache_dir=cache_dir, key=key)
+        if entry is not None:
+            log.info(
+                "llm_cache.auto_hit",
+                extra={"key": key, "provider_hint": provider_hint, "url": url[:80]},
+            )
+            return _ReplayedResponse(
+                status=int(entry.get("response_status", 200)),
+                json_data=entry.get("response_json", {}),
+                headers=entry.get("response_headers", {}),
+            )
+        log.info(
+            "llm_cache.auto_miss_recording",
+            extra={"key": key, "provider_hint": provider_hint, "url": url[:80]},
+        )
+        response = httpx.post(url, json=json, headers=headers, timeout=timeout)
+        if 200 <= response.status_code < 300:
+            _save_cache_entry(
+                cache_dir=cache_dir,
+                key=key,
+                url=url,
+                body=json,
+                headers=headers,
+                response=response,
+                provider_hint=provider_hint,
+            )
+        return response
 
     if mode == "replay":
         entry = _load_cache_entry(cache_dir=cache_dir, key=key)

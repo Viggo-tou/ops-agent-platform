@@ -250,3 +250,55 @@ def test_cache_key_changes_with_body(
     cached_http_post(url=url, json={"prompt": "two"})
 
     assert len(list(tmp_path.rglob("*.json"))) == 2
+
+
+def test_auto_mode_miss_calls_live_and_records(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_cache_env(monkeypatch, tmp_path, mode="auto")
+    url = "https://example.test/chat"
+    body = {"prompt": "fresh"}
+    fake_response = _FakeResponse(json_data={"ok": True, "id": "live"})
+    monkeypatch.setattr("app.services.llm_cache.httpx.post", lambda *a, **k: fake_response)
+
+    response = cached_http_post(url=url, json=body)
+
+    assert response.json() == {"ok": True, "id": "live"}
+    # Cache file should now exist
+    assert _cache_file(tmp_path, url=url, body=body).exists()
+
+
+def test_auto_mode_hit_returns_cached_without_http(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Pre-populate cache via record-mode write
+    _set_cache_env(monkeypatch, tmp_path, mode="auto")
+    url = "https://example.test/chat"
+    body = {"prompt": "cached"}
+    cache_path = _cache_file(tmp_path, url=url, body=body)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps(
+            {
+                "url": url,
+                "request_body": body,
+                "response_status": 200,
+                "response_headers": {},
+                "response_json": {"ok": True, "id": "cached"},
+                "recorded_at": "2026-05-06T00:00:00Z",
+                "provider_hint": "test",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_post(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("auto mode should return cached without HTTP call")
+
+    monkeypatch.setattr("app.services.llm_cache.httpx.post", fake_post)
+
+    response = cached_http_post(url=url, json=body)
+
+    assert response.json() == {"ok": True, "id": "cached"}
