@@ -367,6 +367,34 @@ def _has_destructive_verb(text: str) -> bool:
     return any(tok in DESTRUCTIVE_VERBS for tok in tokens)
 
 
+# Tokens that look like filenames (Foo.kt, Bar.java, etc.) are file
+# references in the request text — not code identifiers we should grep
+# for. Empirical (2026-05-06 v34/v36 P69-17): the request mentioned
+# "JobPostingFragment.kt" and "JobPostingViewModel.kt" as files to read,
+# but the PascalCase anchor extractor pulled `JobPostingFragment` and
+# `JobPostingViewModel` as anchors, generating noisy hit_delta findings
+# because those names appear in many files unrelated to the actual edit.
+_CODE_FILE_EXTENSIONS = (
+    "kt", "kts", "java", "py", "ts", "tsx", "js", "jsx", "mjs",
+    "go", "rs", "rb", "swift", "m", "mm", "cs", "cpp", "cc", "c", "h", "hpp",
+    "scala", "lua", "php", "dart", "vue", "html", "css", "scss",
+    "xml", "yaml", "yml", "toml", "json", "md",
+)
+
+
+def _is_filename_reference(token: str, text: str) -> bool:
+    """True when *token* appears in *text* immediately followed by a
+    code-file extension — i.e. the user is referring to a filename
+    rather than a code symbol (`JobPostingFragment.kt` vs. the symbol
+    `JobPostingFragment`)."""
+    pattern = re.compile(
+        r"\b"
+        + re.escape(token)
+        + r"\.(?:" + "|".join(_CODE_FILE_EXTENSIONS) + r")\b"
+    )
+    return bool(pattern.search(text))
+
+
 def _extract_quoted_anchors(text: str) -> list[str]:
     """Extract anchors from the request.
 
@@ -379,6 +407,10 @@ def _extract_quoted_anchors(text: str) -> list[str]:
     Single-word capitalized tokens like "Admin" or proper nouns without
     structural cues are intentionally NOT extracted here — too ambiguous.
     Translation/planner output is the right place to surface those.
+
+    Filtered: tokens that appear in the text immediately followed by a
+    code-file extension (e.g. `Foo.kt`) are filename references, not
+    code symbols, and are excluded.
     """
     seen: set[str] = set()
     anchors: list[str] = []
@@ -392,6 +424,8 @@ def _extract_quoted_anchors(text: str) -> list[str]:
             continue
         if len(raw.split()) > 3:
             continue
+        if _is_filename_reference(raw, text):
+            continue
         seen.add(low)
         anchors.append(raw)
 
@@ -402,6 +436,8 @@ def _extract_quoted_anchors(text: str) -> list[str]:
             if low in seen:
                 continue
             if len(raw) < 4:
+                continue
+            if _is_filename_reference(raw, text):
                 continue
             seen.add(low)
             anchors.append(raw)

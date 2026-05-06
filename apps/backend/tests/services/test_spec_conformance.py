@@ -182,6 +182,49 @@ def test_must_touch_passes_when_at_least_one_anchor_file_edited(
     assert must_touch_findings == []
 
 
+def test_filename_token_not_extracted_as_anchor(
+    tree_with_anchor: Path,
+) -> None:
+    """File-name references like 'JobPostingFragment.kt' should NOT
+    produce 'JobPostingFragment' as an anchor — the user is naming a
+    file, not a code symbol. Empirical motivation (2026-05-06 v36
+    P69-17): the request said 'Read JobPostingViewModel.kt first' and
+    spec_conformance extracted JobPostingViewModel as an anchor, then
+    fired noisy hit_delta findings."""
+    diff = _new_file_diff("src/feature.kt", "fun newThing() = 1")
+    report = check_spec_conformance(
+        request_text=(
+            "Update JobPostingFragment.kt to call something. Look at "
+            "JobPostingViewModel.kt for context."
+        ),
+        normalized_request=None,
+        diff=diff,
+        source_tree=tree_with_anchor,
+    )
+    # Neither filename-stem should produce hit_delta or must_touch findings
+    rules = {(f.rule, f.evidence.get("anchor", "")) for f in report.findings}
+    for rule, anchor in rules:
+        assert anchor not in ("JobPostingFragment", "JobPostingViewModel"), (
+            f"Unexpected filename-stem anchor: rule={rule}, anchor={anchor}"
+        )
+
+
+def test_quoted_filename_also_filtered(
+    tree_with_anchor: Path,
+) -> None:
+    """Even quoted filename references shouldn't become code anchors."""
+    diff = _new_file_diff("src/feature.kt", "fun newThing() = 1")
+    report = check_spec_conformance(
+        request_text='Touch "Foo.kt" and check "Bar.java"',
+        normalized_request=None,
+        diff=diff,
+        source_tree=tree_with_anchor,
+    )
+    rules = {(f.rule, f.evidence.get("anchor", "")) for f in report.findings}
+    for _, anchor in rules:
+        assert anchor not in ("Foo", "Bar"), f"filename-stem leaked: {anchor}"
+
+
 def test_must_touch_demoted_to_warn_for_non_destructive_request(
     tree_with_anchor: Path,
 ) -> None:
