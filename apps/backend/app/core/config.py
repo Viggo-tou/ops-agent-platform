@@ -52,6 +52,13 @@ class Settings(BaseSettings):
     # calls go through and responses are persisted to disk. When "replay",
     # cache hits return immediately without HTTP calls; misses fall
     # through to real call. When "off" (default), bypass entirely.
+    # Hard kill switch for jira_issue_writeback scenario. When True,
+    # _execute_writeback_plan returns immediately without posting any
+    # Jira comment or transitioning issue status. Default True after
+    # 2026-05-07 incident: continuation classifier mis-routed v48/v48b
+    # to writeback and posted spurious comments. Re-enable explicitly
+    # when intentional writeback is needed.
+    jira_writeback_disabled: bool = True
     llm_cache_mode: str = "off"  # off | record | replay
     llm_cache_dir: str = "apps/backend/data/llm_cache"
     llm_cache_replay_on_miss: str = "passthrough"  # passthrough | raise

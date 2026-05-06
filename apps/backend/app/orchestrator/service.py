@@ -8290,6 +8290,31 @@ class PrimaryOrchestrator:
         approval_id: str | None = None,
     ) -> None:
         """Chain Jira comment and transition writes under a single approval."""
+        # Hard kill switch: when OPS_AGENT_JIRA_WRITEBACK_DISABLED=true,
+        # bail before any jira.add_comment / jira.transition_issue call.
+        # User explicitly forbade Jira side-effects on 2026-05-07 after
+        # v48 + v48b mis-classified continuations posted spurious comments.
+        if str(getattr(self.tool_gateway.settings, "jira_writeback_disabled", False)).lower() in ("true", "1", "yes"):
+            set_task_status(
+                self.db,
+                task=task,
+                new_status=TaskStatus.COMPLETED,
+                new_stage=WorkflowStage.DONE,
+                role=RoleName.ACTION,
+                message="Jira writeback skipped (OPS_AGENT_JIRA_WRITEBACK_DISABLED).",
+                payload={"reason": "writeback_disabled_by_config"},
+            )
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.EXECUTION_COMPLETED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.DONE,
+                role=RoleName.ACTION,
+                message="Jira writeback intentionally disabled — no comment/transition posted.",
+                payload={"jira_writeback_disabled": True},
+            )
+            return
         semantic_translation = (
             GeneratedSemanticTranslation.model_validate(task.translation_json or {})
             if task.translation_json
