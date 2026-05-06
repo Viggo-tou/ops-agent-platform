@@ -216,6 +216,70 @@ def _check_js(path: Path) -> tuple[bool, str]:
     return True, ""
 
 
+def validate_imports_preserved(diff: str) -> tuple[bool, str]:
+    """L4a: check that `import` lines are not silently dropped from
+    .kt / .py / .ts / .js files in the diff.
+
+    Empirical: DeepSeek codegen on Kotlin frequently *deletes* the
+    original file's `import` block when re-emitting the file body, then
+    references symbols (rememberNavController, viewModel, ...) that
+    those imports brought in -> compile_gate's "Unresolved reference"
+    explosion (P69-17 v26 round 1: 12+ errors all chained from missing
+    imports).
+
+    Rule: for each per-file diff section, count `- import ...` (deleted)
+    vs `+ import ...` (added) lines. If deleted > added by more than
+    a small slack (e.g. 2 — accommodating intentional unused-import
+    cleanup), reject.
+    """
+    if not diff or not diff.strip():
+        return True, ""
+    # Split into per-file sections
+    file_sections: dict[str, list[str]] = {}
+    current_path: str | None = None
+    current_lines: list[str] = []
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            if current_path is not None:
+                file_sections[current_path] = current_lines
+            current_lines = []
+            parts = line.split(" b/", 1)
+            current_path = parts[1].strip() if len(parts) == 2 else None
+        else:
+            current_lines.append(line)
+    if current_path is not None:
+        file_sections[current_path] = current_lines
+
+    bad_files: list[str] = []
+    for path, lines in file_sections.items():
+        # Only enforce on languages where stale imports = compile error
+        if not path.lower().endswith((".kt", ".kts", ".py", ".ts", ".tsx", ".js", ".jsx", ".java")):
+            continue
+        deleted_imports = 0
+        added_imports = 0
+        for line in lines:
+            stripped = line[1:].lstrip() if line[:1] in "+-" else ""
+            if not stripped.startswith("import "):
+                continue
+            if line.startswith("-"):
+                deleted_imports += 1
+            elif line.startswith("+"):
+                added_imports += 1
+        # Slack: allow up to 2 net deletions (intentional cleanup)
+        if deleted_imports - added_imports > 2:
+            bad_files.append(
+                f"{path} (-{deleted_imports} imports / +{added_imports})"
+            )
+    if bad_files:
+        return False, (
+            "Diff drops existing import statements without replacement. "
+            "DeepSeek-style failure mode — the dropped imports cause "
+            "Unresolved reference errors at compile_gate. Affected files: "
+            + "; ".join(bad_files)
+        )
+    return True, ""
+
+
 def self_validate(
     diff: str,
     source_path: Path,
@@ -235,6 +299,16 @@ def self_validate(
             reason="git apply --check failed (hunk drift / context mismatch)",
             error_detail=apply_err,
             apply_check_passed=False,
+            parse_check_passed=False,
+        )
+    # L4a: import-preservation check before the slower parse step
+    imports_ok, imports_err = validate_imports_preserved(diff)
+    if not imports_ok:
+        return ValidationResult(
+            valid=False,
+            reason="codegen dropped existing imports (likely DeepSeek failure mode)",
+            error_detail=imports_err,
+            apply_check_passed=True,
             parse_check_passed=False,
         )
     parse_ok, parse_err = validate_diff_parses(diff, source_path)

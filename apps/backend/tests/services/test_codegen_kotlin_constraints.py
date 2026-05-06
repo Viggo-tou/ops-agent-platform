@@ -70,3 +70,67 @@ def test_kotlin_guidance_contains_expected_constraints():
     assert "@composable" in g or "annotation" in g
     assert "{" in CODEGEN_KOTLIN_GUIDANCE
     assert "hunk" in g
+
+
+# --- L4a: import-preservation rule emitted for any Kotlin context ----------
+
+def test_l4a_import_preservation_rule_added_for_kt():
+    out = CodeGenerator._augment_prompt_for_kotlin(
+        CODEGEN_SYSTEM_PROMPT,
+        {"src/main/Foo.kt": "package x\nimport a.B\nclass Foo"},
+    )
+    assert "IMPORT-PRESERVATION RULE" in out
+    assert "L4a" in out
+
+
+def test_l4a_NOT_added_when_no_kotlin_files():
+    out = CodeGenerator._augment_prompt_for_kotlin(
+        CODEGEN_SYSTEM_PROMPT, {"foo.py": "x = 1"},
+    )
+    assert "IMPORT-PRESERVATION RULE" not in out
+    assert "L4a" not in out
+
+
+# --- L4b: Compose-aware scope rule -----------------------------------------
+
+def test_l4b_compose_rules_added_when_at_composable_present():
+    """When ANY context file uses @Composable, the prompt gains the
+    Compose-scope clarification."""
+    src = (
+        "package x\n"
+        "import androidx.compose.runtime.Composable\n"
+        "@Composable\n"
+        "fun MyScreen() { Text(\"hi\") }\n"
+    )
+    out = CodeGenerator._augment_prompt_for_kotlin(
+        CODEGEN_SYSTEM_PROMPT,
+        {"src/main/MyScreen.kt": src},
+    )
+    assert "COMPOSE SCOPE RULES" in out
+    assert "L4b" in out
+    # Specific guidance lifted from real v26 failure
+    assert "viewModel()" in out
+
+
+def test_l4b_NOT_added_when_kotlin_lacks_composable():
+    """A regular Kotlin file (no Compose) does NOT get the scope block."""
+    out = CodeGenerator._augment_prompt_for_kotlin(
+        CODEGEN_SYSTEM_PROMPT,
+        {"src/main/Util.kt": "package x\nclass Util { fun foo() {} }"},
+    )
+    assert "COMPOSE SCOPE RULES" not in out
+    # L4a still present (applies to any Kotlin)
+    assert "IMPORT-PRESERVATION RULE" in out
+
+
+def test_l4b_added_when_only_one_context_file_uses_compose():
+    """Multi-file context: as long as ONE file mentions @Composable,
+    the rules apply (since the diff might touch any of them)."""
+    out = CodeGenerator._augment_prompt_for_kotlin(
+        CODEGEN_SYSTEM_PROMPT,
+        {
+            "src/main/Util.kt": "class Util",  # no Compose
+            "src/main/Screen.kt": "@Composable fun S() {}",  # has Compose
+        },
+    )
+    assert "COMPOSE SCOPE RULES" in out

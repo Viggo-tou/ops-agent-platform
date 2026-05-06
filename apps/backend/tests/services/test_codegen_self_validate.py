@@ -13,7 +13,105 @@ from app.services.codegen_self_validate import (  # noqa: E402
     self_validate,
     validate_diff_applies,
     validate_diff_parses,
+    validate_imports_preserved,
 )
+
+
+# ---- L4a: import preservation tests ---------------------------------------
+
+def test_import_preserved_clean_diff_passes():
+    diff = (
+        "diff --git a/Foo.kt b/Foo.kt\n"
+        "--- a/Foo.kt\n"
+        "+++ b/Foo.kt\n"
+        "@@ -1,3 +1,4 @@\n"
+        " package x\n"
+        " import a.B\n"
+        "+import c.D\n"
+        " class Foo\n"
+    )
+    ok, err = validate_imports_preserved(diff)
+    assert ok is True
+    assert err == ""
+
+
+def test_import_preserved_drops_one_import_passes_within_slack():
+    """Single intentional cleanup is within the 2-slack tolerance."""
+    diff = (
+        "diff --git a/Foo.kt b/Foo.kt\n"
+        "--- a/Foo.kt\n"
+        "+++ b/Foo.kt\n"
+        "@@ -1,3 +1,2 @@\n"
+        " package x\n"
+        "-import a.UnusedImport\n"
+        " class Foo\n"
+    )
+    ok, err = validate_imports_preserved(diff)
+    assert ok is True
+
+
+def test_import_preserved_v26_failure_mode_caught():
+    """The exact P69-17 v26 failure: DeepSeek dropped 4+ imports of
+    rememberNavController / JobPostingViewModel / viewModel / etc.
+    Validator must catch this and reject."""
+    diff = (
+        "diff --git a/JobPostingFragment.kt b/JobPostingFragment.kt\n"
+        "--- a/JobPostingFragment.kt\n"
+        "+++ b/JobPostingFragment.kt\n"
+        "@@ -1,8 +1,3 @@\n"
+        " package com.example.handyman\n"
+        "-import androidx.navigation.compose.rememberNavController\n"
+        "-import androidx.lifecycle.viewmodel.compose.viewModel\n"
+        "-import com.example.handyman.ui.JobPostingViewModel\n"
+        "-import androidx.compose.runtime.LaunchedEffect\n"
+        "-import androidx.compose.runtime.remember\n"
+        " class JobPostingFragment {\n"
+        "   fun something() = rememberNavController()\n"
+        " }\n"
+    )
+    ok, err = validate_imports_preserved(diff)
+    assert ok is False
+    assert "JobPostingFragment.kt" in err
+    assert "DeepSeek-style" in err or "import" in err.lower()
+
+
+def test_import_preserved_skips_non_kotlin_files():
+    """Markdown / text files never trigger this check."""
+    diff = (
+        "diff --git a/README.md b/README.md\n"
+        "--- a/README.md\n"
+        "+++ b/README.md\n"
+        "@@ -1,3 +1,2 @@\n"
+        "-import old\n"
+        "-import other\n"
+        "-import third\n"
+        "-import fourth\n"
+        " text\n"
+    )
+    ok, _ = validate_imports_preserved(diff)
+    assert ok is True
+
+
+def test_import_preserved_replaces_one_for_one_passes():
+    """Renaming an import (drop one, add one) nets to zero, OK."""
+    diff = (
+        "diff --git a/Foo.kt b/Foo.kt\n"
+        "--- a/Foo.kt\n"
+        "+++ b/Foo.kt\n"
+        "@@ -1,3 +1,3 @@\n"
+        " package x\n"
+        "-import old.path.SymA\n"
+        "+import new.path.SymA\n"
+        " class Foo\n"
+    )
+    ok, _ = validate_imports_preserved(diff)
+    assert ok is True
+
+
+def test_import_preserved_empty_diff_passes():
+    ok, err = validate_imports_preserved("")
+    assert ok is True
+    assert err == ""
 
 
 def _make_repo_with_file(tmp_root: Path, rel: str, content: str) -> Path:

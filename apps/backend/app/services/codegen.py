@@ -172,12 +172,72 @@ class CodeGenerator:
         """Append Kotlin-specific syntax guidance when context contains
         .kt/.kts files. Mitigates recurring Kotlin codegen syntax bugs
         (import-in-annotation, brace-on-new-line, hunk-drift-removes-brace)
-        at prompt level (Stage B1)."""
+        at prompt level (Stage B1).
+
+        L4b: when ANY context file uses Compose (`@Composable`), append
+        a stricter scope-rules clarification. Empirical (P69-17 v26):
+        DeepSeek calls `viewModel(...)`, `LaunchedEffect{...}`, `remember{}`
+        outside @Composable function bodies, triggering "@Composable
+        invocations can only happen from the context of a @Composable
+        function" compile errors that the repair loop can't reliably fix.
+
+        L4a (companion): the import-preservation guidance is also
+        emphasized so DeepSeek stops dropping the original file's
+        import block when re-emitting bodies (the v26 round-1 failure
+        mode that produced 12 'Unresolved reference' errors).
+        """
         if not context_files:
             return base_prompt
-        if any(str(path).lower().endswith((".kt", ".kts")) for path in context_files):
-            return base_prompt + CODEGEN_KOTLIN_GUIDANCE
-        return base_prompt
+        kt_files = [
+            (path, content)
+            for path, content in context_files.items()
+            if str(path).lower().endswith((".kt", ".kts"))
+        ]
+        if not kt_files:
+            return base_prompt
+
+        out = base_prompt + CODEGEN_KOTLIN_GUIDANCE
+        # L4a — explicit import-preservation guard (general for all .kt files)
+        out += (
+            "\n\nIMPORT-PRESERVATION RULE (L4a — repeated DeepSeek failure mode):\n"
+            "When you emit a unified diff that modifies an existing .kt file, "
+            "you MUST preserve the file's original `import` block. Do NOT "
+            "delete `import` lines unless the symbol is no longer used. "
+            "If your patch references symbols like `rememberNavController`, "
+            "`viewModel`, `LaunchedEffect`, `JobPostingViewModel`, etc., "
+            "the corresponding `import androidx.navigation.compose.rememberNavController`, "
+            "`import androidx.lifecycle.viewmodel.compose.viewModel`, etc. MUST "
+            "exist in the post-patch file. Dropping them produces "
+            "'Unresolved reference' compile errors that the repair loop "
+            "cannot reliably fix."
+        )
+
+        # L4b — Compose context detection: scan content for @Composable
+        any_compose = any(
+            "@Composable" in (content or "") for _, content in kt_files
+        )
+        if any_compose:
+            out += (
+                "\n\nCOMPOSE SCOPE RULES (L4b — repeated misuse seen in v26):\n"
+                "The file you are editing uses Jetpack Compose (@Composable).\n"
+                "  * `viewModel()`, `LaunchedEffect { ... }`, `remember { ... }`,\n"
+                "    `rememberCoroutineScope()`, `LocalContext.current`, and any\n"
+                "    other Compose API call MUST be invoked ONLY from inside a\n"
+                "    function annotated with `@Composable` (or inside a lambda\n"
+                "    that itself runs in a Composable context such as the body\n"
+                "    of `LaunchedEffect`).\n"
+                "  * Do NOT call them from `onCreateView`, `onViewCreated`,\n"
+                "    `apply { }` blocks, or from a regular `fun foo() { ... }`\n"
+                "    that lacks the `@Composable` annotation.\n"
+                "  * If you need to wire a side-effect in a non-Composable\n"
+                "    method, use the existing `setContent { ... }` block or\n"
+                "    create a `@Composable` helper and invoke it from there.\n"
+                "  * Compose API references inserted outside @Composable scope "
+                "produce '@Composable invocations can only happen from the "
+                "context of a @Composable function' and the repair loop "
+                "cannot reliably fix them."
+            )
+        return out
 
     @staticmethod
     def _validate_changed_files_within_allowed(
