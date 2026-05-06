@@ -6516,6 +6516,68 @@ class PrimaryOrchestrator:
             return True
         return file_path in allowed_paths
 
+    @staticmethod
+    def _build_related_files_section(
+        rel_path: str,
+        error_msg: str,
+        allowed_paths: set[str] | None,
+        sandbox_dir: Path,
+    ) -> str:
+        related_files_section = ""
+        if "unresolved reference" in str(error_msg).lower() and allowed_paths:
+            # When compile error is "Unresolved reference X", per-file repair
+            # cannot resolve it without seeing where X is (or should be) declared.
+            # Inject the current sandbox state of other in-scope files so the
+            # LLM can pick option (b) UPDATE-to-current-name from L4f.
+            related_chunks: list[str] = []
+            related_total_bytes = 0
+            MAX_FILES = 5
+            MAX_BYTES_PER_FILE = 3000
+            MAX_TOTAL_BYTES = 12000
+            for related_rel in sorted(p for p in allowed_paths if p != rel_path):
+                if len(related_chunks) >= MAX_FILES:
+                    break
+                if related_total_bytes >= MAX_TOTAL_BYTES:
+                    break
+                related_full = (
+                    sandbox_dir / related_rel.replace("/", "\\")
+                    if "\\" in str(sandbox_dir)
+                    else sandbox_dir / related_rel
+                )
+                if not related_full.exists() or not related_full.is_file():
+                    continue
+                try:
+                    related_content = related_full.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except OSError:
+                    continue
+                if not related_content.strip():
+                    continue
+                truncated = related_content[:MAX_BYTES_PER_FILE]
+                note = (
+                    ""
+                    if len(related_content) <= MAX_BYTES_PER_FILE
+                    else f"\n# ... (truncated, original was {len(related_content)} chars)"
+                )
+                chunk = (
+                    f"=== RELATED {related_rel} (current sandbox state) ===\n"
+                    f"{truncated}{note}\n"
+                    f"=== END RELATED {related_rel} ===\n\n"
+                )
+                related_chunks.append(chunk)
+                related_total_bytes += len(chunk)
+            if related_chunks:
+                related_files_section = (
+                    "\nRELATED IN-SCOPE FILES (current sandbox state — use these "
+                    "to look up symbol declarations referenced by the broken file. "
+                    "Per L4f, you may NOT invent new names; your repair must use a "
+                    "name that already exists in either the broken file's original "
+                    "version or in one of these related files.):\n"
+                    + "".join(related_chunks)
+                )
+        return related_files_section
+
     def _record_compile_failed_event(
         self,
         *,
@@ -6668,11 +6730,40 @@ class PrimaryOrchestrator:
                     + "\n"
                 )
 
+            related_files_section = self._build_related_files_section(
+                rel_path=rel_path,
+                error_msg=str(error_msg),
+                allowed_paths=allowed_paths,
+                sandbox_dir=sandbox_dir,
+            )
+
+            unresolved_lock_rules = ""
+            if "unresolved reference" in str(error_msg).lower():
+                unresolved_lock_rules = (
+                    "\nNAME-LOCK INVARIANT (L4f) — read carefully:\n"
+                    "The error 'Unresolved reference X' means a symbol named X "
+                    "was used but no declaration named X exists. Your ONLY two "
+                    "legal fixes are:\n"
+                    "  (a) RESTORE the original spelling X in the declaring "
+                    "file (revert any rename you introduced).\n"
+                    "  (b) UPDATE this referencing file to use the declaring "
+                    "file's CURRENT name (whatever spelling exists in the "
+                    "declaring file's latest version).\n"
+                    "You are FORBIDDEN to introduce a third name. If the "
+                    "previous round renamed X->Y in the declaring file and the "
+                    "current round still has Unresolved reference X, the only "
+                    "allowed action is option (a) RESTORE — do NOT pick a new "
+                    "name like Z.\n"
+                    "If you cannot decide, prefer (a) RESTORE — preserving the "
+                    "original name is always safe.\n\n"
+                )
+
             repair_prompt = (
                 f"STRUCTURAL REPAIR TASK - fix ONE broken file: {rel_path}\n\n"
                 + objective_section
                 + "These compile errors must be fixed without changing task scope.\n"
                 + scope_section
+                + related_files_section
                 + "Common problems include:\n"
                 "- Missing imports or unresolved symbols introduced by the patch\n"
                 "- Duplicated code blocks (same function/import appears twice)\n"
@@ -6689,7 +6780,8 @@ class PrimaryOrchestrator:
                 "hardcoded values) but fix the broken structure\n"
                 "- Do NOT add new features or change business logic beyond what "
                 "the original patch intended\n\n"
-                f"ERROR:\n  {rel_path}: {str(error_msg)[:1000]}\n\n"
+                + unresolved_lock_rules
+                + f"ERROR:\n  {rel_path}: {str(error_msg)[:1000]}\n\n"
                 + orig_section
                 + first_attempt_section
                 + f"Output ONLY valid unified diff hunks that fix {rel_path}.\n"

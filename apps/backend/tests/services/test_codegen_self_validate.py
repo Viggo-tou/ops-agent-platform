@@ -209,6 +209,39 @@ def test_missing_source_path_skips():
     assert result.valid
 
 
+def test_self_validate_chains_to_l4e():
+    diff = (
+        "diff --git a/Job.kt b/Job.kt\n"
+        "--- a/Job.kt\n"
+        "+++ b/Job.kt\n"
+        "@@ -1,6 +1,6 @@\n"
+        " package example\n"
+        " data class Job(\n"
+        "-    val jobLocation: String,\n"
+        "+    val location: String,\n"
+        "     val title: String,\n"
+        " )\n"
+        "diff --git a/JobPostingFragment.kt b/JobPostingFragment.kt\n"
+        "--- a/JobPostingFragment.kt\n"
+        "+++ b/JobPostingFragment.kt\n"
+        "@@ -1,5 +1,5 @@\n"
+        " package example\n"
+        " fun bind(job: Job) {\n"
+        "     val display = job.jobLocation\n"
+        "     println(display)\n"
+        " }\n"
+    )
+
+    result = self_validate(diff, Path("/nonexistent/path/zzz"))
+
+    assert result.valid is False
+    assert (
+        "L4e" in result.reason
+        or "cross-file" in result.reason
+        or "oscillation" in result.reason
+    )
+
+
 def test_validate_diff_applies_directly():
     with tempfile.TemporaryDirectory() as tmp:
         src = _make_repo_with_file(Path(tmp), "a.py", "x = 1\n")

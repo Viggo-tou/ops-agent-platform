@@ -20,6 +20,7 @@ Returns ValidationResult with status + error context for retry prompt.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -280,6 +281,130 @@ def validate_imports_preserved(diff: str) -> tuple[bool, str]:
     return True, ""
 
 
+def validate_cross_file_refs(diff: str) -> tuple[bool, str]:
+    """L4e: catch DeepSeek cross-file rename oscillation.
+
+    Failure mode (v28 P69-17): file A diff removes `val jobLocation`
+    but file B diff (or unchanged context inside B's hunks) still
+    references `.jobLocation`. Compile_gate then explodes with
+    Unresolved reference, repair invents a third name, loop forever.
+
+    Rule: for each Kotlin/Java file in the diff:
+      removed_props[file] = {names from `-    val X`, `-    var X`,
+                             `-data class Foo(val X`, `-class Foo(val X`,
+                             `-    fun X(`, `-    val X by` patterns}
+    Then: for every other file in the diff, scan all `+` and ` ` (context)
+    lines for `.NAME` token references. If NAME is in the union of
+    removed_props of OTHER files AND NAME is NOT in the union of added_props
+    of any file in diff, flag as oscillation.
+
+    Skip non-Kotlin/Java languages.
+    Same per-file scope rules as validate_imports_preserved.
+    """
+    if not diff or not diff.strip():
+        return True, ""
+
+    file_sections: dict[str, list[str]] = {}
+    current_path: str | None = None
+    current_lines: list[str] = []
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            if current_path is not None:
+                file_sections[current_path] = current_lines
+            current_lines = []
+            parts = line.split(" b/", 1)
+            current_path = parts[1].strip() if len(parts) == 2 else None
+        else:
+            current_lines.append(line)
+    if current_path is not None:
+        file_sections[current_path] = current_lines
+
+    scoped_sections = {
+        path: lines
+        for path, lines in file_sections.items()
+        if path.lower().endswith((".kt", ".kts", ".java"))
+    }
+    if len(scoped_sections) < 2:
+        return True, ""
+
+    prop_re = re.compile(
+        r"^[+-]\s*(?:(?:private|public|internal|protected)\s+)?"
+        r"(?:override\s+)?(?:val|var)\s+(\w+)"
+    )
+    fun_re = re.compile(r"^[+-]\s*(?:override\s+)?fun\s+(\w+)\s*\(")
+    ctor_re = re.compile(r"^[+-]\s*(?:data\s+)?class\s+\w+[^{\n]*\(([^)]*)\)")
+    ctor_prop_re = re.compile(r"(?:val|var)\s+(\w+)")
+    ref_re = re.compile(r"\.(\w+)\b")
+
+    def _extract_declarations(lines: list[str], prefix: str) -> set[str]:
+        names: set[str] = set()
+        header = "+++" if prefix == "+" else "---"
+        for line in lines:
+            if not line.startswith(prefix) or line.startswith(header):
+                continue
+            prop_match = prop_re.match(line)
+            if prop_match:
+                names.add(prop_match.group(1))
+            fun_match = fun_re.match(line)
+            if fun_match:
+                names.add(fun_match.group(1))
+            ctor_match = ctor_re.match(line)
+            if ctor_match:
+                names.update(ctor_prop_re.findall(ctor_match.group(1)))
+        return names
+
+    removed_props = {
+        path: _extract_declarations(lines, "-")
+        for path, lines in scoped_sections.items()
+    }
+    if not any(removed_props.values()):
+        return True, ""
+
+    added_props = {
+        path: _extract_declarations(lines, "+")
+        for path, lines in scoped_sections.items()
+    }
+    added_names = {name for names in added_props.values() for name in names}
+
+    problems: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for ref_path, lines in scoped_sections.items():
+        removed_by_other_file: dict[str, list[str]] = {}
+        for decl_path, names in removed_props.items():
+            if decl_path == ref_path:
+                continue
+            for name in names:
+                if name not in added_names:
+                    removed_by_other_file.setdefault(name, []).append(decl_path)
+        if not removed_by_other_file:
+            continue
+
+        for line in lines:
+            if line.startswith(("+++", "---")):
+                continue
+            if not (line.startswith("+") or line.startswith(" ")):
+                continue
+            for ref_name in ref_re.findall(line):
+                if ref_name not in removed_by_other_file:
+                    continue
+                key = (ref_path, ref_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                declaring_files = ", ".join(sorted(removed_by_other_file[ref_name]))
+                problems.append(
+                    f"{ref_path} references .{ref_name}, but {ref_name} "
+                    f"was removed from {declaring_files} and not re-declared"
+                )
+
+    if problems:
+        return False, (
+            "Cross-file rename oscillation: removed declarations are still "
+            "referenced from other files. " + "; ".join(problems)
+        )
+    return True, ""
+
+
 def self_validate(
     diff: str,
     source_path: Path,
@@ -308,6 +433,15 @@ def self_validate(
             valid=False,
             reason="codegen dropped existing imports (likely DeepSeek failure mode)",
             error_detail=imports_err,
+            apply_check_passed=True,
+            parse_check_passed=False,
+        )
+    refs_ok, refs_err = validate_cross_file_refs(diff)
+    if not refs_ok:
+        return ValidationResult(
+            valid=False,
+            reason="cross-file rename oscillation (L4e — declared name removed in one file but still referenced in another)",
+            error_detail=refs_err,
             apply_check_passed=True,
             parse_check_passed=False,
         )
