@@ -32,6 +32,52 @@ class LlmCall:
 _TELEMETRY_FAILURE_COUNT = 0
 
 
+def log_llm_cache_hit(*, provider: str, model: str, purpose: str, usage: dict[str, Any]) -> None:
+    """Log prompt-cache hit ratio from an LLM API response's usage block.
+
+    DeepSeek and OpenAI both expose `prompt_cache_hit_tokens` /
+    `prompt_cache_miss_tokens` in their /chat/completions usage payload.
+    This helper extracts them and emits a single structured log line so
+    we can later compute aggregate cache hit-rate per provider/purpose
+    without changing schemas or DB writes (P-1 Step 1a — instrumentation
+    only, no behavior change).
+
+    Anthropic uses different key names (cache_read_input_tokens /
+    cache_creation_input_tokens) — pass usage directly and we'll detect
+    whichever shape is present.
+    """
+    log = logging.getLogger("app.services.llm_telemetry.cache")
+    if not isinstance(usage, dict):
+        return
+    hit = int(
+        usage.get("prompt_cache_hit_tokens")
+        or usage.get("cache_read_input_tokens")
+        or 0
+    )
+    miss = int(
+        usage.get("prompt_cache_miss_tokens")
+        or usage.get("cache_creation_input_tokens")
+        or 0
+    )
+    prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+    if hit == 0 and miss == 0 and prompt == 0:
+        return  # no cache info available from this provider
+    denom = prompt or (hit + miss)
+    ratio = (hit / denom) if denom > 0 else 0.0
+    log.info(
+        "llm_cache.hit_ratio",
+        extra={
+            "provider": provider,
+            "model": model,
+            "purpose": purpose,
+            "cache_hit_tokens": hit,
+            "cache_miss_tokens": miss,
+            "prompt_tokens": prompt,
+            "hit_ratio": round(ratio, 3),
+        },
+    )
+
+
 def record_llm_call(db: Session, call: LlmCall) -> None:
     """Record LLM accounting and diagnostics without breaking the caller.
 

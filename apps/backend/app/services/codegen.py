@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from app.agents.schemas import CodegenResult
 from app.core.config import Settings, get_settings
 from app.core.timeouts import external_http_timeout
-from app.services.llm_telemetry import LlmCall, record_llm_call
+from app.services.llm_telemetry import LlmCall, log_llm_cache_hit, record_llm_call
 from app.services.reviewer import DiffReviewer
 
 
@@ -1842,6 +1842,12 @@ class CodeGenerator:
             data = response.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             usage = data.get("usage", {})
+            log_llm_cache_hit(
+                provider="deepseek",
+                model=model_name,
+                purpose="codegen",
+                usage=usage,
+            )
             return self._parse_response(
                 content,
                 provider_name="deepseek",
@@ -1883,6 +1889,12 @@ class CodeGenerator:
             data = response.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             usage = data.get("usage", {})
+            log_llm_cache_hit(
+                provider="openai",
+                model=model_name,
+                purpose="codegen",
+                usage=usage,
+            )
             return self._parse_response(
                 content,
                 provider_name="openai",

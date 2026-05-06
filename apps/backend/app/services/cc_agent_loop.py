@@ -245,6 +245,16 @@ def _call_decision_provider(provider: str, *, prompt: str, cwd: Path, timeout_s:
         )
         response.raise_for_status()
         data = response.json()
+        try:
+            from app.services.llm_telemetry import log_llm_cache_hit
+            log_llm_cache_hit(
+                provider="deepseek",
+                model=str(data.get("model", "")),
+                purpose="cc_agent_loop",
+                usage=data.get("usage", {}) or {},
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return data.get("choices", [{}])[0].get("message", {}).get("content", "")
     raise CCDecisionError(f"unsupported provider: {provider}")
 

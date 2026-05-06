@@ -333,6 +333,16 @@ class KnowledgeSynthesizer:
         message = choice.get("message", {})
         content = message.get("content", "") or ""
         usage = data.get("usage", {})
+        try:
+            from app.services.llm_telemetry import log_llm_cache_hit
+            log_llm_cache_hit(
+                provider="deepseek",
+                model=model_name,
+                purpose="knowledge_synthesis",
+                usage=usage,
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return (
             str(content),
             int(usage.get("prompt_tokens", 0) or 0),

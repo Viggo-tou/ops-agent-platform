@@ -425,6 +425,16 @@ def _call_deepseek(prompt: str, *, settings: Settings, timeout: float) -> str:
     )
     resp.raise_for_status()
     data = resp.json()
+    try:
+        from app.services.llm_telemetry import log_llm_cache_hit
+        log_llm_cache_hit(
+            provider="deepseek",
+            model=str(body.get("model", "")),
+            purpose="semantic_review",
+            usage=data.get("usage", {}) or {},
+        )
+    except Exception:  # noqa: BLE001 — instrumentation must never break flow
+        pass
     # L2: thinking-block fallback for DeepSeek. When DeepSeek returns
     # ONLY a thinking block (no text), the helper returns the thinking
     # content; _extract_json_object can still pull the JSON out.
