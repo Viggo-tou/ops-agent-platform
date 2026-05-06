@@ -15,6 +15,7 @@ class TaskCreateRequest(BaseModel):
     actor_name: str = Field(default="employee", min_length=1, max_length=100)
     actor_role: ActorRole = ActorRole.EMPLOYEE
     session_id: str | None = Field(default=None, min_length=1, max_length=36)
+    previous_task_id: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class TaskRollbackRequest(BaseModel):

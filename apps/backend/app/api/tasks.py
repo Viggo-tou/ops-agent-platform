@@ -25,7 +25,10 @@ def create_task(payload: TaskCreateRequest, db: DbSession, _actor: TaskCreateAct
     """Return the initial CREATED task; clients should poll GET /tasks/{id} for progress."""
     # TODO: task:create_high_risk gate based on risk_level
     service = TaskService(db)
-    task = service.create_task(payload)
+    try:
+        task = service.create_task(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return task
 
 

@@ -158,33 +158,66 @@ class TaskService:
         self.db = db
 
     def create_task(self, payload: TaskCreateRequest) -> Task:
-        intent_text = self._extract_user_intent_text(payload.request)
+        effective_request = payload.request
+        effective_session_id = payload.session_id
+        continuation_meta: dict | None = None
+
+        if payload.previous_task_id:
+            parent = self.db.get(Task, payload.previous_task_id)
+            if parent is None:
+                raise ValueError(f"Parent task {payload.previous_task_id} not found")
+
+            parent_status = parent.status.value if parent.status else "unknown"
+            parent_plan_json = parent.plan_json if isinstance(parent.plan_json, dict) else None
+            parent_result_json = (
+                parent.latest_result_json if isinstance(parent.latest_result_json, dict) else None
+            )
+            effective_request = self._build_continuation_request(
+                parent_request=parent.request_text,
+                parent_plan_json=parent_plan_json,
+                parent_result_json=parent_result_json,
+                parent_id=parent.id,
+                parent_status=parent_status,
+                user_followup=payload.request,
+            )
+            effective_session_id = effective_session_id or parent.session_id
+            continuation_meta = {
+                "previous_task_id": parent.id,
+                "parent_status": parent_status,
+                "parent_scenario": parent.scenario,
+            }
+
+        intent_text = self._extract_user_intent_text(effective_request)
         scenario = classify_request(intent_text)
         risk_level = self._infer_risk_level(intent_text)
         risk_category = self._infer_risk_category(intent_text, scenario=scenario)
+        governance_json = {
+            "actor": {
+                "name": payload.actor_name,
+                "role": payload.actor_role.value,
+            },
+            "risk": {
+                "level": risk_level.value,
+                "category": risk_category.value,
+            },
+            "policy_state": "not_evaluated",
+        }
+        if continuation_meta is not None:
+            governance_json["continuation"] = continuation_meta
+
         task = Task(
-            session_id=payload.session_id or str(uuid4()),
+            session_id=effective_session_id or str(uuid4()),
             actor_name=payload.actor_name,
             actor_role=payload.actor_role,
             title=payload.title or self._build_title(intent_text),
-            request_text=payload.request,
+            request_text=effective_request,
             scenario=scenario,
             status=TaskStatus.CREATED,
             workflow_stage=WorkflowStage.INTAKE,
             current_role=RoleName.PRIMARY,
             risk_level=risk_level,
             risk_category=risk_category,
-            governance_json={
-                "actor": {
-                    "name": payload.actor_name,
-                    "role": payload.actor_role.value,
-                },
-                "risk": {
-                    "level": risk_level.value,
-                    "category": risk_category.value,
-                },
-                "policy_state": "not_evaluated",
-            },
+            governance_json=governance_json,
         )
         self.db.add(task)
         self.db.flush()
@@ -203,6 +236,9 @@ class TaskService:
                 "session_id": task.session_id,
                 "actor_role": task.actor_role.value,
                 "risk_category": task.risk_category.value,
+                "continuation_of": (
+                    continuation_meta.get("previous_task_id") if continuation_meta else None
+                ),
             },
         )
         record_event(
@@ -216,7 +252,9 @@ class TaskService:
             payload={
                 "actor_name": payload.actor_name,
                 "actor_role": payload.actor_role.value,
-                "request": payload.request,
+                "request": effective_request,
+                "user_followup": payload.request,
+                "augmented": continuation_meta is not None,
                 "session_id": task.session_id,
             },
         )
@@ -424,6 +462,32 @@ class TaskService:
             return request_text
         follow_up = request_text[marker_index + len(marker) :].strip()
         return follow_up or request_text
+
+    @staticmethod
+    def _build_continuation_request(
+        parent_request: str,
+        parent_plan_json: dict | None,
+        parent_result_json: dict | None,
+        parent_id: str,
+        parent_status: str,
+        user_followup: str,
+    ) -> str:
+        plan_json = parent_plan_json or {}
+        result_json = parent_result_json or {}
+        plan_objective = str(plan_json.get("objective", "") or "")[:500]
+        failure_reason = str(result_json.get("reason", "") or parent_status or "unknown")
+        failure_message = str(result_json.get("message", "") or "")[:600]
+
+        return (
+            f"[CONTINUATION FROM PARENT TASK {parent_id}]\n\n"
+            "Parent original request:\n"
+            f"{(parent_request or '')[:1500]}\n\n"
+            f"Parent objective: {plan_objective}\n\n"
+            f"Parent failure reason: {failure_reason}\n"
+            f"Parent failure message: {failure_message}\n\n"
+            "[USER FOLLOWUP / NEW REQUEST]:\n"
+            f"{user_followup}"
+        )
 
     @staticmethod
     def _build_title(request_text: str) -> str:
