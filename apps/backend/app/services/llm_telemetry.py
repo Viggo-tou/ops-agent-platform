@@ -37,16 +37,19 @@ def log_llm_cache_hit(*, provider: str, model: str, purpose: str, usage: dict[st
 
     DeepSeek and OpenAI both expose `prompt_cache_hit_tokens` /
     `prompt_cache_miss_tokens` in their /chat/completions usage payload.
-    This helper extracts them and emits a single structured log line so
-    we can later compute aggregate cache hit-rate per provider/purpose
+    This helper extracts them and emits a single structlog line so we
+    can later compute aggregate cache hit-rate per provider/purpose
     without changing schemas or DB writes (P-1 Step 1a — instrumentation
     only, no behavior change).
 
     Anthropic uses different key names (cache_read_input_tokens /
     cache_creation_input_tokens) — pass usage directly and we'll detect
     whichever shape is present.
+
+    Uses structlog (the app's configured logger) so JSON output is
+    captured by the backend's stdout handler. Stdlib logging.info()
+    falls through default WARNING root level and is silently dropped.
     """
-    log = logging.getLogger("app.services.llm_telemetry.cache")
     if not isinstance(usage, dict):
         return
     hit = int(
@@ -64,18 +67,21 @@ def log_llm_cache_hit(*, provider: str, model: str, purpose: str, usage: dict[st
         return  # no cache info available from this provider
     denom = prompt or (hit + miss)
     ratio = (hit / denom) if denom > 0 else 0.0
-    log.info(
-        "llm_cache.hit_ratio",
-        extra={
-            "provider": provider,
-            "model": model,
-            "purpose": purpose,
-            "cache_hit_tokens": hit,
-            "cache_miss_tokens": miss,
-            "prompt_tokens": prompt,
-            "hit_ratio": round(ratio, 3),
-        },
-    )
+    try:
+        from app.core.logging import get_logger
+        logger = get_logger(component="llm_cache")
+        logger.info(
+            "llm_cache.hit_ratio",
+            provider=provider,
+            model=model,
+            purpose=purpose,
+            cache_hit_tokens=hit,
+            cache_miss_tokens=miss,
+            prompt_tokens=prompt,
+            hit_ratio=round(ratio, 3),
+        )
+    except Exception:  # noqa: BLE001 — instrumentation must never break flow
+        pass
 
 
 def record_llm_call(db: Session, call: LlmCall) -> None:
