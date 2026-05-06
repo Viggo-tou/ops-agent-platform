@@ -366,16 +366,15 @@ class KnowledgeSynthesizer:
             "Content-Type": "application/json",
         }
         try:
-            with httpx.Client(
-                timeout=external_http_timeout(self.settings.knowledge_synthesis_timeout_seconds)
-            ) as client:
-                response = client.post(
-                    f"{self.settings.minimax_base_url.rstrip('/')}/v1/text/chatcompletion_v2",
-                    headers=headers,
-                    json=payload,
-                )
-                response.raise_for_status()
-                data = response.json()
+            response = cached_http_post(
+                url=f"{self.settings.minimax_base_url.rstrip('/')}/v1/text/chatcompletion_v2",
+                headers=headers,
+                json=payload,
+                timeout=external_http_timeout(self.settings.knowledge_synthesis_timeout_seconds),
+                provider_hint="knowledge_synthesis.minimax",
+            )
+            response.raise_for_status()
+            data = response.json()
         except (httpx.HTTPError, json.JSONDecodeError) as exc:
             raise KnowledgeSynthesisError(f"MiniMax call failed: {exc}") from exc
 
