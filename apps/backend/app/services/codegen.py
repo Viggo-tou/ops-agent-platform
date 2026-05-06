@@ -122,6 +122,14 @@ If the task requires creating a new config.json file:
 {"files":[{"path":"config.json","content":"{\\n  \\"key\\": \\"value\\"\\n}\\n","summary":"Create new config file"}]}"""
 
 
+RAW_DIFF_RETRY_SUFFIX = (
+    "\n\nIMPORTANT: Output ONLY the raw unified diff. "
+    "Do NOT wrap with === markers, code fences, comments, or "
+    "any prose. Start your response with the line "
+    "'diff --git a/...' and end at the last hunk line."
+)
+
+
 class CodegenError(Exception):
     pass
 
@@ -1818,6 +1826,15 @@ class CodeGenerator:
             raise CodegenError("OPS_AGENT_DEEPSEEK_API_KEY is not configured.")
 
         model_name = self.settings.deepseek_model
+        try:
+            return self._call_deepseek_once(prompt, model_name)
+        except CodegenError as exc:
+            if "valid unified diff" not in str(exc) and "changed file headers" not in str(exc):
+                raise
+            return self._call_deepseek_once(prompt + RAW_DIFF_RETRY_SUFFIX, model_name)
+
+    def _call_deepseek_once(self, prompt: str, model_name: str) -> CodegenResult:
+        """Call DeepSeek once and parse the raw response."""
         url = "https://api.deepseek.com/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.settings.deepseek_api_key}",
@@ -1866,6 +1883,15 @@ class CodeGenerator:
             raise CodegenError("OPS_AGENT_OPENAI_API_KEY is not configured.")
 
         model_name = self._resolve_model_name("openai")
+        try:
+            return self._call_openai_once(prompt, model_name)
+        except CodegenError as exc:
+            if "valid unified diff" not in str(exc) and "changed file headers" not in str(exc):
+                raise
+            return self._call_openai_once(prompt + RAW_DIFF_RETRY_SUFFIX, model_name)
+
+    def _call_openai_once(self, prompt: str, model_name: str) -> CodegenResult:
+        """Call OpenAI once and parse the raw response."""
         url = f"{self.settings.openai_base_url.rstrip('/')}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.settings.openai_api_key}",

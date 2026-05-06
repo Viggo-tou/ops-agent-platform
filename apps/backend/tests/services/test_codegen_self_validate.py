@@ -4,11 +4,18 @@ from __future__ import annotations
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import httpx
+import pytest
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
+from app.services import codegen as codegen_module  # noqa: E402
+from app.services.codegen import CodeGenerator, CodegenError  # noqa: E402
 from app.services.codegen_self_validate import (  # noqa: E402
     self_validate,
     validate_diff_applies,
@@ -240,6 +247,68 @@ def test_self_validate_chains_to_l4e():
         or "cross-file" in result.reason
         or "oscillation" in result.reason
     )
+
+
+def _deepseek_settings() -> SimpleNamespace:
+    return SimpleNamespace(
+        deepseek_api_key="test-key",
+        deepseek_model="deepseek-coder",
+        deepseek_timeout_seconds=30.0,
+    )
+
+
+def _deepseek_response(content: str) -> Mock:
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {
+        "choices": [{"message": {"content": content}}],
+        "usage": {"prompt_tokens": 11, "completion_tokens": 22},
+    }
+    return response
+
+
+def test_deepseek_retry_on_wrapper_markers(monkeypatch: pytest.MonkeyPatch) -> None:
+    wrapped = "=== FILE foo.kt ===\ndiff --git a/foo.kt b/foo.kt\n=== END FILE foo.kt ==="
+    clean = (
+        "diff --git a/foo.kt b/foo.kt\n"
+        "--- a/foo.kt\n"
+        "+++ b/foo.kt\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    calls: list[dict] = []
+    responses = [_deepseek_response(wrapped), _deepseek_response(clean)]
+
+    def fake_post(**kwargs):
+        calls.append(kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(codegen_module, "cached_http_post", fake_post)
+
+    result = CodeGenerator(_deepseek_settings())._call_deepseek("make a change")
+
+    assert result.files_changed == ["foo.kt"]
+    assert result.provider_name == "deepseek"
+    assert len(calls) == 2
+    retry_prompt = calls[1]["json"]["messages"][1]["content"]
+    assert "Output ONLY the raw unified diff" in retry_prompt
+    assert "Do NOT wrap with === markers" in retry_prompt
+
+
+def test_deepseek_no_retry_on_unrelated_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict] = []
+
+    def fake_post(**kwargs):
+        calls.append(kwargs)
+        raise httpx.ReadTimeout("network timed out")
+
+    monkeypatch.setattr(codegen_module, "cached_http_post", fake_post)
+
+    with pytest.raises(CodegenError, match="DeepSeek API error"):
+        CodeGenerator(_deepseek_settings())._call_deepseek("make a change")
+
+    assert len(calls) == 1
 
 
 def test_validate_diff_applies_directly():

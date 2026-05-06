@@ -6,11 +6,21 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
-from app.core.enums import ActorRole, RiskCategory, TaskStatus
+from app.core.enums import (
+    ActorRole,
+    EventSource,
+    EventType,
+    RiskCategory,
+    RoleName,
+    TaskStatus,
+    WorkflowStage,
+)
 from app.core.security import ActorContext, require_permission
+from app.models.task import Task
 from app.schemas.event import EventRead
 from app.schemas.task import TaskCreateRequest, TaskDetail, TaskRollbackRequest, TaskSummary
 from app.schemas.tool import ToolExecutionRead
+from app.services.events import record_event, set_task_status
 from app.services.tasks import TaskService
 from app.services.task_workspace import TaskWorkspace
 
@@ -85,6 +95,46 @@ def get_task_workspace_checkpoint(task_id: str, db: DbSession) -> dict[str, Any]
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
     checkpoint = TaskWorkspace.for_task(task_id).read_checkpoint()
     return checkpoint or {}
+
+
+@router.post("/{task_id}/abandon", response_model=TaskDetail)
+def abandon_task(
+    task_id: str,
+    db: DbSession,
+    _actor: ApprovalDecisionActorCtx,
+) -> TaskDetail:
+    """Force-fail an executing task so operators can recover a stuck slot."""
+    service = TaskService(db)
+    task_model = db.get(Task, task_id)
+    if task_model is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+    if task_model.status not in (TaskStatus.EXECUTING, TaskStatus.CREATED):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Task is in status {task_model.status.value}; cannot abandon.",
+        )
+
+    set_task_status(
+        db,
+        task=task_model,
+        new_status=TaskStatus.FAILED,
+        new_stage=WorkflowStage.DONE,
+        role=RoleName.SYSTEM,
+        message="Task abandoned by admin.",
+        payload={"reason": "abandoned_by_admin"},
+    )
+    record_event(
+        db,
+        task_id=task_id,
+        event_type=EventType.EXECUTION_FAILED,
+        source=EventSource.SYSTEM,
+        stage=WorkflowStage.DONE,
+        role=RoleName.SYSTEM,
+        message="Task abandoned by admin.",
+        payload={"reason": "abandoned_by_admin"},
+    )
+    db.commit()
+    return service.get_task(task_id, raise_if_missing=True)
 
 
 @router.post("/{task_id}/rollback", response_model=TaskDetail)

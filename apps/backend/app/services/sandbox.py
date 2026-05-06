@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import shutil
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 
@@ -35,6 +38,50 @@ def _is_ascii_path(path: Path) -> bool:
         return True
     except UnicodeEncodeError:
         return False
+
+
+def _drain_stream(stream, buffer: list[str], max_chars: int) -> None:
+    """Drain a Popen pipe without allowing unbounded output growth."""
+    if stream is None:
+        return
+    buffered_chars = 0
+    try:
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                break
+            if buffered_chars < max_chars:
+                remaining = max_chars - buffered_chars
+                buffer.append(chunk[:remaining])
+                buffered_chars += min(len(chunk), remaining)
+    except Exception:  # noqa: BLE001 - reader thread must not crash the caller
+        pass
+
+
+def _kill_process_tree(proc: "subprocess.Popen") -> None:
+    """Kill proc and its descendants, best-effort across platforms."""
+    if proc.poll() is not None:
+        return
+    if sys.platform.startswith("win"):
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 class ExecutionSandbox:
@@ -252,46 +299,80 @@ class ExecutionSandbox:
             merged_jto = f"{jvm_locale_opts} {caller_jto}".strip() if caller_jto else jvm_locale_opts
             run_env = {**run_env, **env, "JAVA_TOOL_OPTIONS": merged_jto}
 
+        popen_kwargs: dict[str, object] = {
+            "shell": True,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            # Explicit UTF-8 with replacement: on Windows, default text mode
+            # uses GBK which can't decode Gradle / git / other UTF-8 stderr.
+            "encoding": "utf-8",
+            "errors": "replace",
+            "cwd": str(work_dir),
+            "env": run_env,
+        }
+        if sys.platform.startswith("win"):
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+
         start = time.monotonic()
+        proc = subprocess.Popen(command, **popen_kwargs)
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        t_out = threading.Thread(
+            target=_drain_stream,
+            args=(proc.stdout, stdout_chunks, max_output_chars),
+            daemon=True,
+        )
+        t_err = threading.Thread(
+            target=_drain_stream,
+            args=(proc.stderr, stderr_chunks, max_output_chars),
+            daemon=True,
+        )
+        t_out.start()
+        t_err.start()
+
+        timed_out = False
         try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                # Explicit UTF-8 with replacement: on Windows, default text mode
-                # uses GBK which can't decode Gradle / git / other UTF-8 stderr;
-                # the reader thread then raises UnicodeDecodeError and leaves
-                # result.stderr as None, blowing up downstream subscript.
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout_seconds,
-                cwd=str(work_dir),
-                env=run_env,
-            )
-            duration_ms = int((time.monotonic() - start) * 1000)
-            stdout_text = result.stdout or ""
-            stderr_text = result.stderr or ""
-            return {
-                "exit_code": result.returncode,
-                "stdout": stdout_text[:max_output_chars],
-                "stderr": stderr_text[:max_output_chars],
-                "duration_ms": duration_ms,
-                "timed_out": False,
-                "command": command,
-                "cwd": str(work_dir),
-            }
+            proc.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
-            duration_ms = int((time.monotonic() - start) * 1000)
+            timed_out = True
+            _kill_process_tree(proc)
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+
+        t_out.join(timeout=2)
+        t_err.join(timeout=2)
+
+        duration_ms = int((time.monotonic() - start) * 1000)
+        stdout_text = "".join(stdout_chunks)[:max_output_chars]
+        stderr_text = "".join(stderr_chunks)[:max_output_chars]
+        exit_code = proc.returncode if proc.returncode is not None else -1
+
+        if timed_out:
+            if not stderr_text:
+                stderr_text = f"Command timed out after {timeout_seconds}s (process tree killed)"
             return {
                 "exit_code": -1,
-                "stdout": "",
-                "stderr": f"Command timed out after {timeout_seconds}s",
+                "stdout": stdout_text,
+                "stderr": stderr_text,
                 "duration_ms": duration_ms,
                 "timed_out": True,
                 "command": command,
                 "cwd": str(work_dir),
             }
+        return {
+            "exit_code": exit_code,
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+            "duration_ms": duration_ms,
+            "timed_out": False,
+            "command": command,
+            "cwd": str(work_dir),
+        }
 
     def apply_patch(
         self,
