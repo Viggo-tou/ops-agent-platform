@@ -14,6 +14,7 @@ from app.core.enums import EventSource, EventType, RoleName, WorkflowStage
 from app.core.timeouts import external_http_timeout
 from app.schemas.knowledge import KnowledgeCitation
 from app.services.events import commit_checkpoint, record_event
+from app.services.llm_cache import cached_http_post
 from app.services.llm_telemetry import LlmCall, record_llm_call
 
 
@@ -321,12 +322,15 @@ class KnowledgeSynthesizer:
             "Content-Type": "application/json",
         }
         try:
-            with httpx.Client(
-                timeout=external_http_timeout(self.settings.knowledge_synthesis_timeout_seconds)
-            ) as client:
-                response = client.post(deepseek_chat_url, headers=headers, json=payload)
-                response.raise_for_status()
-                data = response.json()
+            response = cached_http_post(
+                url=deepseek_chat_url,
+                json=payload,
+                headers=headers,
+                timeout=external_http_timeout(self.settings.knowledge_synthesis_timeout_seconds),
+                provider_hint="knowledge_synthesis.deepseek",
+            )
+            response.raise_for_status()
+            data = response.json()
         except (httpx.HTTPError, json.JSONDecodeError) as exc:
             raise KnowledgeSynthesisError(f"DeepSeek synthesis call failed: {exc}") from exc
         choice = (data.get("choices") or [{}])[0]

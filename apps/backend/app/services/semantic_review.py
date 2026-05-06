@@ -45,6 +45,7 @@ import httpx
 from pydantic import BaseModel, Field, ValidationError
 
 from app.core.config import Settings
+from app.services.llm_cache import cached_http_post
 
 
 logger = logging.getLogger("semantic_review")
@@ -413,8 +414,8 @@ def _call_deepseek(prompt: str, *, settings: Settings, timeout: float) -> str:
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
     }
-    resp = httpx.post(
-        f"{base.rstrip('/')}/v1/messages",
+    resp = cached_http_post(
+        url=f"{base.rstrip('/')}/v1/messages",
         json=body,
         headers={
             "x-api-key": settings.deepseek_api_key,
@@ -422,6 +423,7 @@ def _call_deepseek(prompt: str, *, settings: Settings, timeout: float) -> str:
             "content-type": "application/json",
         },
         timeout=timeout,
+        provider_hint="semantic_review.deepseek",
     )
     resp.raise_for_status()
     data = resp.json()

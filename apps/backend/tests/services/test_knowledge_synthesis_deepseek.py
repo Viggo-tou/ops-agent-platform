@@ -59,8 +59,7 @@ def test_deepseek_synth_uses_openai_compat_url():
     settings = _settings()
     synth = KnowledgeSynthesizer(db=MagicMock(), settings=settings)
 
-    with patch("app.services.knowledge_synthesis.httpx.Client") as mock_client:
-        mock_client.return_value.__enter__.return_value.post.side_effect = fake_post
+    with patch("app.services.knowledge_synthesis.cached_http_post", side_effect=fake_post):
         text, in_tok, out_tok = synth._call_deepseek(
             system_prompt="sys", user_prompt="usr"
         )

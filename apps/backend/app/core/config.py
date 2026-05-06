@@ -48,6 +48,13 @@ class Settings(BaseSettings):
     llm_retry_on_rate_limit: bool = True
     llm_retry_max_attempts: int = 3
     llm_retry_base_delay_sec: float = 2.0
+    # Tool 2: LLM HTTP cache for fast iteration. When "record", real LLM
+    # calls go through and responses are persisted to disk. When "replay",
+    # cache hits return immediately without HTTP calls; misses fall
+    # through to real call. When "off" (default), bypass entirely.
+    llm_cache_mode: str = "off"  # off | record | replay
+    llm_cache_dir: str = "apps/backend/data/llm_cache"
+    llm_cache_replay_on_miss: str = "passthrough"  # passthrough | raise
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
     deepseek_api_key: str | None = None

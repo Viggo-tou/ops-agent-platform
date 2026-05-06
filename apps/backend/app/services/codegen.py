@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from app.agents.schemas import CodegenResult
 from app.core.config import Settings, get_settings
 from app.core.timeouts import external_http_timeout
+from app.services.llm_cache import cached_http_post
 from app.services.llm_telemetry import LlmCall, log_llm_cache_hit, record_llm_call
 from app.services.reviewer import DiffReviewer
 
@@ -1832,11 +1833,12 @@ class CodeGenerator:
             "max_tokens": 8192,
         }
         try:
-            response = httpx.post(
-                url,
+            response = cached_http_post(
+                url=url,
                 json=body,
                 headers=headers,
                 timeout=external_http_timeout(self.settings.deepseek_timeout_seconds),
+                provider_hint="codegen.deepseek",
             )
             response.raise_for_status()
             data = response.json()
@@ -1879,11 +1881,12 @@ class CodeGenerator:
             "max_tokens": 8192,
         }
         try:
-            response = httpx.post(
-                url,
+            response = cached_http_post(
+                url=url,
                 json=body,
                 headers=headers,
                 timeout=external_http_timeout(getattr(self.settings, "primary_agent_timeout_seconds", 90)),
+                provider_hint="codegen.openai",
             )
             response.raise_for_status()
             data = response.json()
