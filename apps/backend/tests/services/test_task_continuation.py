@@ -62,7 +62,10 @@ def test_continuation_handles_missing_plan_or_result() -> None:
         user_followup="retry with the missing imports fixed",
     )
 
-    assert "task-missing-context" in output
+    # parent_id dashes are now replaced with spaces in the preamble
+    # to prevent Jira issue regex from matching UUID segments. So the
+    # rendered form is "task missing context".
+    assert "task missing context" in output
     assert "retry with the missing imports fixed" in output
 
 

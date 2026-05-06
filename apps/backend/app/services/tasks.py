@@ -556,8 +556,14 @@ class TaskService:
         except Exception:  # noqa: BLE001 — never break task creation on workspace issues
             pass
 
+        # Wrap parent UUID in spaces around dash-separated segments so the
+        # Jira-issue reference regex doesn't match BD4F-4139 from a UUID
+        # like 13598c9f-bd4f-4139-9c12-... and try to fetch a non-existent
+        # Jira issue. Empirical: v47 failed at intake with HTTP 404 from
+        # Jira because the continuation preamble exposed the raw UUID.
+        safe_parent_id = parent_id.replace("-", " ")
         return (
-            f"[CONTINUATION FROM PARENT TASK {parent_id}]\n\n"
+            f"[CONTINUATION FROM PARENT TASK uuid={safe_parent_id}]\n\n"
             "Parent original request:\n"
             f"{(parent_request or '')[:1500]}\n\n"
             f"Parent objective: {plan_objective}\n\n"
