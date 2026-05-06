@@ -189,6 +189,13 @@ class TaskService:
 
         intent_text = self._extract_user_intent_text(effective_request)
         scenario = classify_request(intent_text)
+        # Continuation should inherit the parent task's scenario by default.
+        # Empirical (v48 P69-17): augmented continuation preamble contains
+        # the parent's status string ("completed") which trips the writeback
+        # classifier ("complete" keyword) and skips the develop pipeline
+        # entirely. The parent's scenario is the truer intent signal.
+        if continuation_meta and continuation_meta.get("parent_scenario"):
+            scenario = continuation_meta["parent_scenario"]
         risk_level = self._infer_risk_level(intent_text)
         risk_category = self._infer_risk_category(intent_text, scenario=scenario)
         governance_json = {
