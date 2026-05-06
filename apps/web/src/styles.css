@@ -913,6 +913,61 @@ dt {
   color: var(--danger);
 }
 
+.continue-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin: 8px 24px 0;
+  padding: 10px 14px;
+  border: 1px solid #f0e0d0;
+  border-radius: var(--radius-md);
+  background: #fffaf2;
+  font-size: 0.85rem;
+  color: var(--muted-strong);
+}
+
+.continue-banner-text code {
+  background: rgba(0, 0, 0, 0.04);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  color: var(--text);
+}
+
+.continue-banner-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.continue-toggle {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.continue-toggle:hover:not(:disabled) {
+  background: #f4f0ea;
+}
+
+.continue-toggle.active {
+  background: var(--text);
+  color: #fff;
+  border-color: var(--text);
+}
+
+.continue-toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .content-page {
   width: min(1120px, calc(100% - 56px));
   margin: 0 auto;

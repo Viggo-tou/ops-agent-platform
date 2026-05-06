@@ -309,6 +309,8 @@ export interface TaskCreateInput {
   actor_name: string;
   actor_role?: ActorRole;
   session_id?: string | null;
+  /** When set, backend prepends parent failure context to request_text and inherits parent's session. */
+  previous_task_id?: string | null;
 }
 
 export interface KnowledgeSourceDescriptor {

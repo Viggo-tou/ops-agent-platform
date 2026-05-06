@@ -62,6 +62,9 @@ export function ChatPage() {
   const { user, backendActorRole, can } = useAuth();
   const chatScrollRef = useRef<HTMLElement | null>(null);
   const [optimisticTask, setOptimisticTask] = useState<TaskDetail | null>(null);
+  // When set, the next submit will dispatch as a continuation of this task.
+  // Activated by the "继续修复" button on a failed task; cleared after submit.
+  const [continueFromTaskId, setContinueFromTaskId] = useState<string | null>(null);
 
   const taskQuery = useQuery({
     queryKey: ["task", taskId],
@@ -125,7 +128,11 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
     });
   }
 
-  async function submitMessage(message: string, files: File[] = []) {
+  async function submitMessage(
+    message: string,
+    files: File[] = [],
+    options: { previousTaskId?: string | null } = {},
+  ) {
     if (!can("task:create")) {
       return;
     }
@@ -134,7 +141,10 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
         ? `\n\nAttached context: ${files.map((file) => `${file.name} (${file.type || "file"})`).join(", ")}`
         : "";
     const userMessage = `${message}${attachmentNote}`;
-    const request = buildThreadRequest(userMessage);
+    // For continuation, send the user's followup as-is so the backend's
+    // CONTINUATION FROM PARENT preamble carries the failure context. For
+    // a fresh thread message, fold prior conversation into the request.
+    const request = options.previousTaskId ? userMessage : buildThreadRequest(userMessage);
     const tempTask = {
       ...buildOptimisticTask(`temp-${Date.now()}`, request),
       actor_name: user?.name ?? "member",
@@ -153,6 +163,7 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
         actor_name: user?.name ?? "member",
         actor_role: backendActorRole,
         session_id: task?.session_id ?? undefined,
+        previous_task_id: options.previousTaskId ?? undefined,
       });
       setOptimisticTask(createdTask);
       scrollToLatestMessage();
@@ -237,8 +248,42 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
         {visibleThreadTasks.length > 0 ? <MessageList tasks={visibleThreadTasks} eventsMap={eventsMap} /> : null}
       </section>
 
+      {(() => {
+        const latest = visibleThreadTasks[visibleThreadTasks.length - 1];
+        if (!latest || latest.status !== "failed") {
+          return null;
+        }
+        const reason =
+          (latest.latest_result_json as { reason?: string } | null)?.reason ??
+          (latest.review_summary || latest.title || "上次任务失败");
+        return (
+          <div className="continue-banner">
+            <div className="continue-banner-text">
+              上次任务失败：<code>{String(reason).slice(0, 80)}</code>
+            </div>
+            <div className="continue-banner-actions">
+              <button
+                type="button"
+                className={`continue-toggle ${continueFromTaskId === latest.id ? "active" : ""}`}
+                onClick={() =>
+                  setContinueFromTaskId(continueFromTaskId === latest.id ? null : latest.id)
+                }
+                disabled={!can("task:create")}
+                title="下一条消息会带上失败上下文一起发"
+              >
+                {continueFromTaskId === latest.id ? "✓ 继续模式已开" : "继续修复"}
+              </button>
+            </div>
+          </div>
+        );
+      })()}
+
       <ChatInput
-        onSubmit={(message, files) => submitMessage(message, files)}
+        onSubmit={(message, files) =>
+          submitMessage(message, files, { previousTaskId: continueFromTaskId }).finally(() =>
+            setContinueFromTaskId(null),
+          )
+        }
         isSubmitting={createTaskMutation.isPending}
         disabled={!can("task:create")}
         permissionDenied={!can("task:create") ? "Your current role can view conversations but cannot create new tasks." : null}
