@@ -3033,9 +3033,25 @@ class PrimaryOrchestrator:
             # planner explicitly committed to modifying). existing_files may
             # include broader grounding from knowledge.search (e.g. package.json,
             # cors.json) that the model needs to see but MUST NOT rewrite.
-            _must_touch = set(getattr(plan, "must_touch_files", None) or [])
+            _must_touch = list(getattr(plan, "must_touch_files", None) or [])
+
+            def _path_in_must_touch(candidate: str) -> bool:
+                # Suffix-tolerant match: evidence anchors sometimes hold
+                # basenames while plan emits full paths (and vice versa).
+                # Without this tolerance, _must_touch_existing comes up
+                # empty and the batcher falls back to "all files in one
+                # batch", letting codegen modify files outside the plan's
+                # allowed_set (caught later by validation, but only after
+                # a wasted DeepSeek call).
+                if candidate in _must_touch:
+                    return True
+                for target in _must_touch:
+                    if target.endswith("/" + candidate) or candidate.endswith("/" + target):
+                        return True
+                return False
+
             _must_touch_existing = [
-                (p, c) for p, c in existing_files if p in _must_touch
+                (p, c) for p, c in existing_files if _path_in_must_touch(p)
             ]
             # expected_new_files from planner → stubs that become their own
             # batches so each new file gets an explicit codegen call scoped

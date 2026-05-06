@@ -529,13 +529,19 @@ def _anchor_delta_report(
                 )
             )
 
-        # must_touch
+        # must_touch — block only when the diff actually tries to remove
+        # the anchor (rename/remove intent). For purely additive patches
+        # (minus == 0), demote to warn: the patch isn't refactoring the
+        # anchor; it's adding new behavior. Forcing it to touch every
+        # anchor-containing file (often 10+ unrelated files) over-reaches
+        # for feature-add tasks like "default the map UI on first open."
         hit_paths = set(hit_files.keys())
         if hit_paths.isdisjoint(touched_files):
+            severity = "block" if minus > 0 else "warn"
             touch_details.append(
                 ConformanceFinding(
                     rule="must_touch",
-                    severity="block",
+                    severity=severity,
                     message=(
                         f"Anchor {anchor!r} exists in the source tree but "
                         "the patch does not touch any file containing it."
@@ -544,6 +550,8 @@ def _anchor_delta_report(
                         "anchor": anchor,
                         "hit_files": sorted(hit_paths)[:20],
                         "touched_files": sorted(touched_files)[:20],
+                        "minus_in_diff": minus,
+                        "plus_in_diff": plus,
                     },
                 )
             )
