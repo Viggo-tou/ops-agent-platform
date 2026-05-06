@@ -442,6 +442,34 @@ class CodeGenerator:
                                 f"{validation.reason} {validation.error_detail}"
                             )
                             if sv_attempt >= max_retries:
+                                # Dump rejected diff for debugging — without
+                                # this, you can't see what DeepSeek actually
+                                # emitted; only the error code reaches the
+                                # operator. Saved to the task workspace so
+                                # it shows up in event timeline + workspace
+                                # browser.
+                                try:
+                                    from datetime import datetime, timezone
+                                    workspace_root = Path(
+                                        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                                    ) / "data" / "agent_workspace" / str(task_id) / "attempts" / "rejected"
+                                    workspace_root.mkdir(parents=True, exist_ok=True)
+                                    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                                    rej_path = workspace_root / f"rejected_{ts}_{validation.reason[:30].replace(' ', '_').replace(':', '')}.patch"
+                                    rej_path.write_text(
+                                        f"# REJECTED by self_validate after {sv_attempt + 1} attempts\n"
+                                        f"# reason: {validation.reason}\n"
+                                        f"# detail: {validation.error_detail[:1000]}\n"
+                                        f"# provider: {result.provider_name}, model: {result.model_name}\n"
+                                        f"# ---- raw diff begins ----\n"
+                                        + (result.diff or "<empty>"),
+                                        encoding="utf-8",
+                                    )
+                                except Exception as _dump_exc:  # noqa: BLE001
+                                    _logger.warning(
+                                        "rejected_diff_dump_failed",
+                                        extra={"err": str(_dump_exc)[:200]},
+                                    )
                                 if l5_failure:
                                     raise CodegenError(
                                         f"{validation.reason} :: "

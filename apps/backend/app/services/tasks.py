@@ -478,14 +478,94 @@ class TaskService:
         failure_reason = str(result_json.get("reason", "") or parent_status or "unknown")
         failure_message = str(result_json.get("message", "") or "")[:600]
 
+        # Pull richer diagnostic context from the parent task's workspace
+        # so DeepSeek (or claude_code) sees specific compile errors and
+        # the rejected diff text — not just the truncated reason string.
+        # Empirical: today's continuation runs with only reason+message
+        # could not see WHY the parent's diff was malformed. Adding the
+        # full file:line:error list and the rejected diff content gives
+        # a much clearer signal of "don't repeat that mistake."
+        compile_errors_block = ""
+        rejected_diff_block = ""
+        try:
+            from pathlib import Path as _P
+            import json as _json
+            backend_root = _P(__file__).resolve().parents[2]
+            workspace_dir = backend_root / "data" / "agent_workspace" / str(parent_id)
+            attempts_dir = workspace_dir / "attempts"
+            if attempts_dir.is_dir():
+                # Latest numeric attempt for compile.json
+                numeric_attempts = sorted(
+                    [d for d in attempts_dir.iterdir() if d.is_dir() and d.name.isdigit()],
+                    key=lambda p: p.name,
+                )
+                if numeric_attempts:
+                    latest = numeric_attempts[-1]
+                    compile_path = latest / "compile.json"
+                    if compile_path.is_file():
+                        try:
+                            cdata = _json.loads(compile_path.read_text(encoding="utf-8"))
+                            errs = cdata.get("errors") or []
+                            if errs:
+                                lines: list[str] = []
+                                for e in errs[:8]:
+                                    if isinstance(e, dict):
+                                        lines.append(
+                                            f"  - {e.get('file','')}:{e.get('line','')}: "
+                                            f"{str(e.get('error') or e.get('message') or '')[:180]}"
+                                        )
+                                if lines:
+                                    compile_errors_block = (
+                                        "\n\nParent compile errors (avoid these specifically):\n"
+                                        + "\n".join(lines)
+                                    )
+                        except Exception:  # noqa: BLE001
+                            pass
+                # Latest rejected diff (self_validate dumps)
+                rejected_dir = attempts_dir / "rejected"
+                if rejected_dir.is_dir():
+                    rejected_files = sorted(
+                        rejected_dir.glob("rejected_*.patch"),
+                        key=lambda p: p.stat().st_mtime,
+                    )
+                    if rejected_files:
+                        try:
+                            text = rejected_files[-1].read_text(encoding="utf-8", errors="replace")
+                            # Strip leading "# rejected ..." header lines so
+                            # the LLM sees the diff body directly. Keep the
+                            # diff portion truncated to keep prompt size sane.
+                            body_lines: list[str] = []
+                            in_body = False
+                            for line in text.splitlines():
+                                if not in_body and line.startswith("# ---- raw diff"):
+                                    in_body = True
+                                    continue
+                                if in_body:
+                                    body_lines.append(line)
+                            diff_text = "\n".join(body_lines).strip() or text
+                            rejected_diff_block = (
+                                "\n\nParent rejected diff (this exact output was REJECTED — do not "
+                                "produce something with the same hunk-line-count or symbol-existence issues):\n"
+                                "```diff\n"
+                                + diff_text[:3000]
+                                + ("\n... [truncated]" if len(diff_text) > 3000 else "")
+                                + "\n```"
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+        except Exception:  # noqa: BLE001 — never break task creation on workspace issues
+            pass
+
         return (
             f"[CONTINUATION FROM PARENT TASK {parent_id}]\n\n"
             "Parent original request:\n"
             f"{(parent_request or '')[:1500]}\n\n"
             f"Parent objective: {plan_objective}\n\n"
             f"Parent failure reason: {failure_reason}\n"
-            f"Parent failure message: {failure_message}\n\n"
-            "[USER FOLLOWUP / NEW REQUEST]:\n"
+            f"Parent failure message: {failure_message}"
+            f"{compile_errors_block}"
+            f"{rejected_diff_block}"
+            "\n\n[USER FOLLOWUP / NEW REQUEST]:\n"
             f"{user_followup}"
         )
 

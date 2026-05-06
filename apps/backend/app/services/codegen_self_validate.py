@@ -76,8 +76,12 @@ def validate_diff_applies(
             tmp.write(normalized_diff.encode("utf-8"))
             patch_path = tmp.name
         try:
+            # --recount lets git auto-recompute @@ -X,Y +Z,W counts, so
+            # an LLM diff with content-correct hunks but wrong line counts
+            # still applies. v37/v40/v41/v42/v44 all hit "corrupt patch
+            # at line N" because DeepSeek emitted wrong Y/W in @@ headers.
             result = subprocess.run(
-                [git, "apply", "--check", "--ignore-whitespace", patch_path],
+                [git, "apply", "--check", "--ignore-whitespace", "--recount", patch_path],
                 cwd=str(source_path),
                 capture_output=True,
                 text=True,
@@ -153,7 +157,7 @@ def validate_diff_parses(
             patch_path = tmp.name
         try:
             apply_result = subprocess.run(
-                [git, "apply", "--ignore-whitespace", patch_path],
+                [git, "apply", "--ignore-whitespace", "--recount", patch_path],
                 cwd=str(scratch_dir),
                 capture_output=True,
                 text=True,

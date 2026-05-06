@@ -400,8 +400,9 @@ class ExecutionSandbox:
         sanitized_patch = _sanitize_diff(repair_result.repaired_diff)
         strategies: list[tuple[str, list[str]]] = [
             ("git_apply", []),
+            ("git_apply_recount", ["--recount"]),
             ("git_apply_3way", ["--3way"]),
-            ("git_apply_relaxed", ["--ignore-whitespace", "--whitespace=nowarn"]),
+            ("git_apply_relaxed", ["--ignore-whitespace", "--whitespace=nowarn", "--recount"]),
         ]
 
         apply_result: dict[str, object] | None = None
