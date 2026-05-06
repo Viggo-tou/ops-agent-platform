@@ -968,6 +968,36 @@ dt {
   cursor: not-allowed;
 }
 
+.conversation-status-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--danger, #c53030);
+  margin-right: 6px;
+  vertical-align: middle;
+}
+
+.conversation-item.failed > .conversation-item-title a > span:not(.conversation-status-dot) {
+  color: var(--text);
+}
+
+.conversation-continue-link {
+  margin-left: 8px;
+  font-size: 0.72rem;
+  color: var(--danger, #c53030);
+  text-decoration: none;
+  border: 1px solid #ead0d0;
+  padding: 1px 7px;
+  border-radius: 4px;
+  background: #fffaf2;
+  transition: background 0.12s ease;
+}
+
+.conversation-continue-link:hover {
+  background: #fff0e6;
+}
+
 .content-page {
   width: min(1120px, calc(100% - 56px));
   margin: 0 auto;

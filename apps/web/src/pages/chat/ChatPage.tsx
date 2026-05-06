@@ -1,6 +1,6 @@
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { startTransition, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { startTransition, useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { ChatInput } from "../../components/chat/ChatInput";
 import { buildAgentReply, FOLLOW_UP_MARKER, MessageList, readDisplayRequestText } from "../../components/chat/MessageList";
@@ -65,6 +65,7 @@ export function ChatPage() {
   // When set, the next submit will dispatch as a continuation of this task.
   // Activated by the "继续修复" button on a failed task; cleared after submit.
   const [continueFromTaskId, setContinueFromTaskId] = useState<string | null>(null);
+  const [searchParams, setSearchParams] = useSearchParams();
 
   const taskQuery = useQuery({
     queryKey: ["task", taskId],
@@ -192,6 +193,24 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
     }
     return [...baseTasks, optimisticTask];
   }, [optimisticTask, task, threadTasks]);
+
+  // When the user navigates here from sidebar's "继续修复 →" link
+  // (?continue=1), pre-activate continuation mode for the latest failed
+  // task in the thread. This lets sidebar quick-action skip the in-chat
+  // toggle click.
+  useEffect(() => {
+    if (searchParams.get("continue") !== "1") {
+      return;
+    }
+    const latest = visibleThreadTasks[visibleThreadTasks.length - 1];
+    if (latest && latest.status === "failed") {
+      setContinueFromTaskId(latest.id);
+    }
+    // Clear the query param so reloading doesn't keep re-activating.
+    const next = new URLSearchParams(searchParams);
+    next.delete("continue");
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams, visibleThreadTasks]);
   const eventQueries = useQueries({
     queries: visibleThreadTasks.map((messageTask) => ({
       queryKey: ["task-events", messageTask.id],

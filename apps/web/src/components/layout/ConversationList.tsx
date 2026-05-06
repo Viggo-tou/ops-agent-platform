@@ -105,13 +105,19 @@ export function ConversationList({ conversations, search }: ConversationListProp
     <div className="conversation-list">
       {filtered.map((conversation) => {
         const title = titleOverrides[conversation.key] ?? conversation.first.title;
+        const isFailed = conversation.latest.status === "failed";
+        const itemClass = [
+          "conversation-item",
+          conversation.key === activeSessionKey ? "active" : "",
+          isFailed ? "failed" : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
         return (
-          <article
-            key={conversation.key}
-            className={conversation.key === activeSessionKey ? "conversation-item active" : "conversation-item"}
-          >
+          <article key={conversation.key} className={itemClass}>
             <div className="conversation-item-title">
               <Link to={`/chat/${conversation.latest.id}`}>
+                {isFailed ? <span className="conversation-status-dot" aria-hidden="true" /> : null}
                 <span>{title}</span>
               </Link>
               <button
@@ -123,7 +129,18 @@ export function ConversationList({ conversations, search }: ConversationListProp
                 Rename
               </button>
             </div>
-            <small>{formatConversationDate(conversation.latest.updated_at)} · {conversation.turns} 条消息</small>
+            <small>
+              {formatConversationDate(conversation.latest.updated_at)} · {conversation.turns} 条消息
+              {isFailed ? (
+                <Link
+                  to={`/chat/${conversation.latest.id}?continue=1`}
+                  className="conversation-continue-link"
+                  title="跳转聊天并预激活继续修复模式"
+                >
+                  继续修复 →
+                </Link>
+              ) : null}
+            </small>
           </article>
         );
       })}
