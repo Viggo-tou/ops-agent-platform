@@ -3914,6 +3914,60 @@ class PrimaryOrchestrator:
             pipeline_state["diff_shape_done"] = True
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
 
+        # --- Diff symbol verifier (post-codegen, pre-compile) ---
+        # Catches "Receiver.member" hallucinations where the receiver is a
+        # PascalCase class declared in the repo but the named member doesn't
+        # exist on it (e.g. v46 P69-17 SessionManager.getHomeAddress, v50
+        # SessionManager.fabricated). Findings are stored in pipeline_state
+        # so compile_repair_loop can fold them into the repair prompt with
+        # actionable signal ("X has these members: [...], your invented name
+        # is not among them"). Provider-agnostic — operates only on diff text.
+        if not pipeline_state.get("diff_symbol_verifier_done"):
+            try:
+                from app.services.diff_symbol_verifier import verify_diff_symbols
+                _diff_text = str(pipeline_state.get("diff") or "")
+                _repo_path = self._resolve_develop_repo_url(task=task, plan=plan)
+                if _diff_text and _repo_path:
+                    _repo_root = Path(_repo_path)
+                    if _repo_root.exists() and _repo_root.is_dir():
+                        _dsv_report = verify_diff_symbols(
+                            diff=_diff_text,
+                            repo_root=_repo_root,
+                        )
+                        pipeline_state["diff_symbol_verifier"] = _dsv_report.to_payload()
+                        if _dsv_report.has_hallucinations:
+                            record_event(
+                                self.db,
+                                task_id=task.id,
+                                event_type=EventType.REVIEW_FAILED,
+                                source=EventSource.ORCHESTRATOR,
+                                stage=WorkflowStage.REVIEW,
+                                role=RoleName.REVIEWER,
+                                tool_name="diff_symbol_verifier.flagged",
+                                message=(
+                                    f"Symbol verifier flagged "
+                                    f"{len(_dsv_report.findings)} hallucinated "
+                                    f"reference(s); compile_repair will receive "
+                                    f"actionable feedback."
+                                ),
+                                payload=_dsv_report.to_payload(),
+                            )
+                            self._workspace_append_audit(
+                                task,
+                                "diff_symbol_verifier.flagged",
+                                _dsv_report.to_payload(),
+                            )
+                pipeline_state["diff_symbol_verifier_done"] = True
+            except Exception as _dsv_exc:  # noqa: BLE001
+                # Verifier MUST be soft — failures fall through to compile_gate.
+                import logging as _log
+                _log.getLogger("orchestrator").warning(
+                    "diff_symbol_verifier.errored: %s", str(_dsv_exc)[:200]
+                )
+                pipeline_state["diff_symbol_verifier_done"] = True
+                pipeline_state["diff_symbol_verifier_skipped"] = "errored"
+            self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+
         # --- Compile gate (T-040 defense line 5) with multi-round repair ---
         # T-PIPELINE-REPAIR-CAP: up to N repair rounds, then either pass,
         # transition to AWAITING_APPROVAL with a structured payload (default),
@@ -6774,9 +6828,44 @@ class PrimaryOrchestrator:
                     "original name is always safe.\n\n"
                 )
 
+            # Surface symbol verifier findings (Leg 2): when the
+            # post-codegen verifier flagged hallucinated Receiver.member
+            # references, fold them into the repair prompt as concrete
+            # actionable signal so the LLM doesn't have to guess what the
+            # compile error actually means.
+            symbol_verifier_section = ""
+            _dsv_payload = pipeline_state.get("diff_symbol_verifier") or {}
+            _dsv_hallucinations = _dsv_payload.get("hallucinations") if isinstance(_dsv_payload, dict) else None
+            if _dsv_hallucinations:
+                _per_file_hits = [
+                    h for h in _dsv_hallucinations
+                    if isinstance(h, dict) and h.get("file") == rel_path
+                ]
+                if _per_file_hits:
+                    _hit_lines = [
+                        "SYMBOL VERIFIER REJECTIONS (these references in your "
+                        "patch do NOT exist in the repository — fix these "
+                        "FIRST):"
+                    ]
+                    for _h in _per_file_hits[:6]:
+                        _avail = ", ".join((_h.get("available_members_sample") or [])[:6]) or "(none discovered)"
+                        _hit_lines.append(
+                            f"  - `{_h.get('receiver')}.{_h.get('member')}` "
+                            f"in {_h.get('file')}: receiver `{_h.get('receiver')}` "
+                            f"is in {_h.get('receiver_in') or '(unknown)'} which has "
+                            f"members [{_avail}]. The named member does not exist."
+                        )
+                    _hit_lines.append(
+                        "Either substitute one of the existing members above, "
+                        "or declare the new symbol in the receiver's source "
+                        "file. Do not invent names.\n"
+                    )
+                    symbol_verifier_section = "\n".join(_hit_lines) + "\n\n"
+
             repair_prompt = (
                 f"STRUCTURAL REPAIR TASK - fix ONE broken file: {rel_path}\n\n"
                 + objective_section
+                + symbol_verifier_section
                 + "These compile errors must be fixed without changing task scope.\n"
                 + scope_section
                 + related_files_section
