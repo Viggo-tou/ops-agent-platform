@@ -6622,6 +6622,52 @@ class PrimaryOrchestrator:
         return file_path in allowed_paths
 
     @staticmethod
+    def _find_declaring_file_for_symbol(
+        symbol: str,
+        sandbox_dir: Path,
+        already_included: set[str],
+        max_files_to_scan: int = 800,
+    ) -> tuple[str | None, str]:
+        """Locate the .kt/.kts/.java file that declares ``symbol`` (a class,
+        object, interface, top-level function, or top-level val/var).
+
+        Returns (relative_path_under_sandbox, content) or (None, "").
+        Skips files already included to avoid duplicates.
+        """
+        if not symbol or not symbol.isidentifier():
+            return None, ""
+        # Symbol-as-class: PascalCase. Symbol-as-method/field: lowercase.
+        decl_patterns = [
+            re.compile(r"\b(?:class|object|interface|data class|sealed class|abstract class|enum class)\s+" + re.escape(symbol) + r"\b"),
+            re.compile(r"\bfun\s+" + re.escape(symbol) + r"\s*[<(]"),
+            re.compile(r"\b(?:val|var)\s+" + re.escape(symbol) + r"\b"),
+        ]
+        scanned = 0
+        for path in sandbox_dir.rglob("*"):
+            if scanned >= max_files_to_scan:
+                break
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in {".kt", ".kts", ".java"}:
+                continue
+            if any(part in {".git", "build", ".gradle", "node_modules", "generated"} for part in path.parts):
+                continue
+            scanned += 1
+            try:
+                rel_str = str(path.relative_to(sandbox_dir)).replace("\\", "/")
+            except ValueError:
+                rel_str = str(path)
+            if rel_str in already_included:
+                continue
+            try:
+                text = path.read_bytes()[:200_000].decode("utf-8", errors="replace")
+            except OSError:
+                continue
+            if any(pat.search(text) for pat in decl_patterns):
+                return rel_str, text
+        return None, ""
+
+    @staticmethod
     def _build_related_files_section(
         rel_path: str,
         error_msg: str,
@@ -6681,6 +6727,62 @@ class PrimaryOrchestrator:
                     "version or in one of these related files.):\n"
                     + "".join(related_chunks)
                 )
+
+            # Leg 3: also pull receiver-class bodies for unresolved
+            # symbols that are NOT in allowed_paths. The user-facing
+            # failure mode (v46 P69-17) is "Unresolved reference
+            # getHomeAddress" where SessionManager.kt isn't in
+            # must_touch — repair guesses without seeing the actual
+            # class body. Now we include up to 3 receiver classes.
+            unresolved_symbols: list[str] = []
+            for m in re.finditer(r"[Uu]nresolved reference\s*'?([A-Za-z_][A-Za-z0-9_]*)'?", str(error_msg)):
+                sym = m.group(1).strip()
+                if sym and sym not in unresolved_symbols:
+                    unresolved_symbols.append(sym)
+            if unresolved_symbols:
+                included_paths: set[str] = set(allowed_paths or set())
+                receiver_chunks: list[str] = []
+                MAX_RECEIVER_FILES = 3
+                MAX_RECEIVER_BYTES_PER_FILE = 4500
+                MAX_RECEIVER_TOTAL_BYTES = 12000
+                receiver_total = 0
+                for sym in unresolved_symbols[:6]:
+                    if len(receiver_chunks) >= MAX_RECEIVER_FILES:
+                        break
+                    if receiver_total >= MAX_RECEIVER_TOTAL_BYTES:
+                        break
+                    decl_path, decl_text = PrimaryOrchestrator._find_declaring_file_for_symbol(
+                        symbol=sym,
+                        sandbox_dir=sandbox_dir,
+                        already_included=included_paths,
+                    )
+                    if not decl_path or not decl_text:
+                        continue
+                    included_paths.add(decl_path)
+                    truncated = decl_text[:MAX_RECEIVER_BYTES_PER_FILE]
+                    note = (
+                        ""
+                        if len(decl_text) <= MAX_RECEIVER_BYTES_PER_FILE
+                        else f"\n# ... (truncated, original was {len(decl_text)} chars)"
+                    )
+                    chunk = (
+                        f"=== RECEIVER CLASS {decl_path} (declares `{sym}`) ===\n"
+                        f"{truncated}{note}\n"
+                        f"=== END RECEIVER CLASS {decl_path} ===\n\n"
+                    )
+                    receiver_chunks.append(chunk)
+                    receiver_total += len(chunk)
+                if receiver_chunks:
+                    receiver_section = (
+                        "\nRECEIVER CLASS BODIES (live sandbox state) — these "
+                        "files declare the symbols flagged 'Unresolved reference' "
+                        "in the compile error. Inspect them to learn the real "
+                        "names of methods, fields, and constructors. DO NOT "
+                        "invent names; either use one of the existing members or "
+                        "add a new declaration to the receiver file:\n"
+                        + "".join(receiver_chunks)
+                    )
+                    related_files_section = (related_files_section or "") + receiver_section
         return related_files_section
 
     def _record_compile_failed_event(
