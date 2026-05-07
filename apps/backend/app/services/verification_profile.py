@@ -6,8 +6,13 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import unquote
+
+from app.core.config import get_settings
+
+if TYPE_CHECKING:
+    from app.services.sandbox import ExecutionSandbox
 
 
 RepoType = Literal["android_gradle", "python", "node_js", "node_ts", "rust_cargo", "go", "unknown"]
@@ -235,6 +240,36 @@ def run_compile_check(
     else:
         compile_command[0] = resolved_executable
 
+    if profile.repo_type == "android_gradle":
+        settings = get_settings()
+        precheck_ok, precheck_msg = _kotlinc_syntax_precheck(
+            sandbox=sandbox,
+            sandbox_workdir=sandbox_workdir,
+            timeout_seconds=int(getattr(settings, "kotlinc_precheck_timeout_seconds", 30)),
+        )
+        if not precheck_ok:
+            return CompileCheckResult(
+                passed=False,
+                status="failed",
+                repo_type=profile.repo_type,
+                command=["kotlinc", "-script", "(precheck)"],
+                output=precheck_msg,
+                errors=[
+                    {
+                        "file": None,
+                        "line": None,
+                        "column": None,
+                        "error": precheck_msg[:500],
+                        "message": precheck_msg[:500],
+                        "severity": "error",
+                        "type": "android_gradle",
+                    }
+                ],
+                timed_out=False,
+                duration_ms=0,
+                reason="kotlinc_syntax_precheck_failed",
+            )
+
     command = subprocess.list2cmdline(compile_command)
     env = {"GRADLE_OPTS": "-Dorg.gradle.daemon=false"} if profile.repo_type == "android_gradle" else None
     raw_result = sandbox.run(
@@ -277,6 +312,57 @@ def run_compile_check(
         duration_ms=int(raw_result.get("duration_ms", 0)),
         reason=None,
     )
+
+
+def _kotlinc_syntax_precheck(
+    *,
+    sandbox: "ExecutionSandbox",
+    sandbox_workdir: Path,
+    timeout_seconds: int = 30,
+) -> tuple[bool, str]:
+    """Fast standalone Kotlin syntax check before the full Gradle compile."""
+    settings = get_settings()
+    if not getattr(settings, "kotlinc_precheck_enabled", True):
+        return True, "precheck disabled by config"
+
+    kotlinc = shutil.which("kotlinc")
+    if kotlinc is None:
+        return True, "skipped: no kotlinc"
+
+    git = shutil.which("git")
+    if git is None:
+        return True, "skipped: no git"
+
+    diff_proc = sandbox.run(
+        f'"{git}" diff --name-only HEAD',
+        timeout_seconds=10,
+    )
+    if diff_proc.get("exit_code") != 0:
+        return True, "skipped: git diff failed"
+
+    changed = (diff_proc.get("stdout") or "").splitlines()
+    kt_files = [file.strip() for file in changed if file.strip().endswith((".kt", ".kts"))]
+    if not kt_files:
+        return True, "skipped: no .kt changes"
+
+    kt_files = kt_files[:10]
+    files_arg = " ".join(f'"{file}"' for file in kt_files)
+    cmd = f'"{kotlinc}" -script -nowarn {files_arg}'
+    raw = sandbox.run(cmd, timeout_seconds=timeout_seconds)
+    exit_code = int(raw.get("exit_code", -1))
+    stderr = str(raw.get("stderr") or raw.get("stdout") or "")[:2000]
+    if exit_code == 0:
+        return True, "kotlinc syntax check passed"
+
+    classpath_noise = (
+        "unresolved reference",
+        "cannot access",
+        "no value passed for parameter",
+    )
+    stderr_lower = stderr.lower()
+    if any(noise in stderr_lower for noise in classpath_noise):
+        return True, f"kotlinc precheck inconclusive (classpath needed): {stderr[:300]}"
+    return False, stderr[:2000]
 
 
 def _resolve_executable(profile: VerificationProfile, sandbox_workdir: Path) -> str | None:

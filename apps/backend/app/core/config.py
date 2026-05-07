@@ -117,6 +117,8 @@ class Settings(BaseSettings):
     verification_compile_fail_to_approval: bool = False  # Stage 25 contract: cap-exceeded -> fail
     verification_profile_enabled: bool = True
     verification_compile_timeout_seconds: int = 240
+    kotlinc_precheck_enabled: bool = True
+    kotlinc_precheck_timeout_seconds: int = 30
     verification_max_repair_rounds: int = 1  # See codegen_max_repair_rounds note
     failure_diagnosis_enabled: bool = True
     failure_diagnosis_timeout_seconds: float = 30.0
