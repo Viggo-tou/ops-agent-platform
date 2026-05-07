@@ -9,9 +9,22 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
+
+# File extensions the disk-grep fallback will scan. Limited to source code
+# files we expect symbols to live in; binary/lockfile/large data ignored.
+_DISK_GREP_EXTENSIONS = {".kt", ".kts", ".java", ".py", ".ts", ".tsx", ".js", ".jsx"}
+# Hard cap on files scanned per disk-grep fallback to keep verification cheap
+# even on a large repo. Sorted by mtime descending → recent files first.
+_DISK_GREP_MAX_FILES = 600
+# Skip these directory names anywhere in the path.
+_DISK_GREP_SKIP_DIRS = {
+    ".git", "node_modules", "build", ".gradle", ".idea", "dist",
+    "__pycache__", ".venv", "venv", "target", "out",
+}
 
 
 @dataclass(frozen=True)
@@ -73,11 +86,60 @@ def _basename(path: str) -> str:
     return path.replace("\\", "/").rsplit("/", 1)[-1]
 
 
+def _disk_grep_symbol(name: str, repo_root: Path) -> list[str]:
+    """Walk repo_root and return relative paths of source files where ``name`` appears as a token.
+
+    Returns an empty list if repo_root is missing or the symbol isn't found.
+    Capped at _DISK_GREP_MAX_FILES candidates and stops at the first 5 hits to
+    keep latency bounded; this is a "does it exist anywhere" check, not an
+    exhaustive index.
+    """
+    if not repo_root or not repo_root.exists() or not repo_root.is_dir():
+        return []
+    token_re = re.compile(r"\b" + re.escape(name) + r"\b")
+    candidates: list[Path] = []
+    for path in repo_root.rglob("*"):
+        if len(candidates) >= _DISK_GREP_MAX_FILES:
+            break
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in _DISK_GREP_EXTENSIONS:
+            continue
+        if any(part in _DISK_GREP_SKIP_DIRS for part in path.parts):
+            continue
+        candidates.append(path)
+
+    hits: list[str] = []
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if token_re.search(text):
+            try:
+                rel = path.relative_to(repo_root).as_posix()
+            except ValueError:
+                rel = str(path)
+            hits.append(rel)
+            if len(hits) >= 5:
+                break
+    return hits
+
+
 def verify_symbol_plan(
     plan: SymbolPlan,
     context_files: dict[str, str],
+    *,
+    repo_root: Path | None = None,
 ) -> SymbolVerification:
-    """Grep each ``(name, source_file)`` pair against context file contents."""
+    """Grep each ``(name, source_file)`` pair against context file contents.
+
+    When ``repo_root`` is provided and a symbol can't be located in
+    ``context_files``, the verifier falls back to a bounded disk-grep over
+    repo source files (see ``_disk_grep_symbol``). This catches the common
+    case where the LLM correctly names a real symbol but the file isn't in
+    the prefetched context bundle.
+    """
     verified: list[dict[str, str]] = []
     hallucinated: list[dict[str, str]] = []
     misattributed: list[dict[str, str]] = []
@@ -113,6 +175,10 @@ def verify_symbol_plan(
             ]
             if found_in:
                 misattributed.append({**sym, "actually_in": ", ".join(found_in[:3])})
+                continue
+            disk_hits = _disk_grep_symbol(name, repo_root) if repo_root else []
+            if disk_hits:
+                misattributed.append({**sym, "actually_in": ", ".join(disk_hits[:3])})
             else:
                 hallucinated.append(sym)
             continue
@@ -127,6 +193,10 @@ def verify_symbol_plan(
         ]
         if found_in:
             misattributed.append({**sym, "actually_in": ", ".join(found_in[:3])})
+            continue
+        disk_hits = _disk_grep_symbol(name, repo_root) if repo_root else []
+        if disk_hits:
+            misattributed.append({**sym, "actually_in": ", ".join(disk_hits[:3])})
         else:
             hallucinated.append(sym)
 
@@ -208,12 +278,18 @@ def react_codegen_call(
     context_files: dict[str, str],
     once_call: Callable[[str], str],
     max_attempts: int = 2,
+    repo_root: Path | None = None,
 ) -> str:
     """Run the two-turn wrapper and return the augmented final codegen prompt.
 
     ``once_call`` executes the Turn-1 plan call and returns raw response text.
     If Turn 1 cannot produce a parsable plan, this function falls back to the
     original task description so DeepSeek codegen degrades gracefully.
+
+    When ``repo_root`` is provided, ``verify_symbol_plan`` uses a bounded
+    disk-grep over repo source files as a fallback for symbols not present in
+    ``context_files`` — reducing false-positive hallucination flags when the
+    LLM correctly names a real symbol that wasn't in the prefetched bundle.
     """
     plan: SymbolPlan | None = None
     for attempt in range(max_attempts):
@@ -238,7 +314,7 @@ def react_codegen_call(
         logger.info("react_codegen.fallback_no_plan")
         return task_description
 
-    verification = verify_symbol_plan(plan, context_files)
+    verification = verify_symbol_plan(plan, context_files, repo_root=repo_root)
     logger.info(
         "react_codegen.verified",
         extra={

@@ -375,6 +375,7 @@ class CodeGenerator:
         # constraints when .kt/.kts files are involved (without threading
         # context_files through every provider signature).
         self._current_context_files = dict(context_files or {})
+        self._current_source_repo_path = source_repo_path
         providers = self._resolve_provider_chain()
         must_touch_files, expected_new_files, allowed_paths = self._extract_plan_target_paths(plan_json)
         enforce = bool(allowed_paths)
@@ -1931,11 +1932,13 @@ class CodeGenerator:
             try:
                 from app.services.codegen_react_loop import react_codegen_call
 
+                _repo_path = getattr(self, "_current_source_repo_path", None)
                 effective_prompt = react_codegen_call(
                     task_description=prompt,
                     plan_json={},
                     context_files=getattr(self, "_current_context_files", None) or {},
                     once_call=lambda p: self._call_deepseek_once_text(p, model_name),
+                    repo_root=Path(_repo_path) if _repo_path else None,
                 )
             except Exception as exc:  # noqa: BLE001
                 import logging
