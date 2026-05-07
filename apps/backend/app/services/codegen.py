@@ -335,6 +335,53 @@ class CodeGenerator:
             )
         return out
 
+    def _library_hints_block(self) -> str:
+        """Return rendered REPO LIBRARY HINTS for the current task's repo.
+
+        Cached per CodeGenerator instance keyed on source_repo_path so a
+        single task doesn't re-scan the repo for each provider attempt.
+        Returns "" when the path can't be resolved or no hints fire.
+        """
+        repo_path = getattr(self, "_current_source_repo_path", None)
+        if not repo_path:
+            return ""
+        cache = getattr(self, "_library_hints_cache", None)
+        if cache is None:
+            cache = {}
+            self._library_hints_cache = cache
+        if repo_path in cache:
+            return cache[repo_path]
+        try:
+            from app.services.repo_library_fingerprint import (
+                fingerprint_repository,
+                render_library_hints_block,
+            )
+            hints = fingerprint_repository(Path(repo_path))
+            block = render_library_hints_block(hints)
+        except Exception:  # noqa: BLE001
+            block = ""
+        cache[repo_path] = block
+        return block
+
+    def _build_system_prompt(
+        self,
+        base_prompt: str,
+        context_files: dict[str, str] | None,
+    ) -> str:
+        """Compose the full codegen system prompt.
+
+        Layers (in order, most-context-bearing last):
+          1. Library hints block (Leg 1: pin OSMDroid vs Google Maps etc.)
+          2. The base prompt (CODEGEN_SYSTEM_PROMPT or variant)
+          3. Kotlin / Compose / multi-file augmentations from
+             ``_augment_prompt_for_kotlin``
+        """
+        hints = self._library_hints_block()
+        kotlin_augmented = self._augment_prompt_for_kotlin(base_prompt, context_files)
+        if hints:
+            return hints + "\n\n" + kotlin_augmented
+        return kotlin_augmented
+
     @staticmethod
     def _validate_changed_files_within_allowed(
         files_changed: list[str],
@@ -788,7 +835,7 @@ class CodeGenerator:
         body = {
             "model": model_name,
             "max_tokens": 8192,
-            "system": self._augment_prompt_for_kotlin(CODEGEN_SYSTEM_PROMPT, getattr(self, "_current_context_files", None)),
+            "system": self._build_system_prompt(CODEGEN_SYSTEM_PROMPT, getattr(self, "_current_context_files", None)),
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
         }
@@ -1823,7 +1870,7 @@ class CodeGenerator:
         body = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": self._augment_prompt_for_kotlin(CODEGEN_SYSTEM_PROMPT_JSON_MODE, getattr(self, "_current_context_files", None)),},
+                {"role": "system", "content": self._build_system_prompt(CODEGEN_SYSTEM_PROMPT_JSON_MODE, getattr(self, "_current_context_files", None)),},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.0,
@@ -1879,7 +1926,7 @@ class CodeGenerator:
         body = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": self._augment_prompt_for_kotlin(CODEGEN_SYSTEM_PROMPT_JSON_MODE, getattr(self, "_current_context_files", None)),},
+                {"role": "system", "content": self._build_system_prompt(CODEGEN_SYSTEM_PROMPT_JSON_MODE, getattr(self, "_current_context_files", None)),},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
@@ -1973,7 +2020,7 @@ class CodeGenerator:
         body = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": self._augment_prompt_for_kotlin(CODEGEN_REACT_PLAN_SYSTEM_PROMPT, getattr(self, "_current_context_files", None)),},
+                {"role": "system", "content": self._build_system_prompt(CODEGEN_REACT_PLAN_SYSTEM_PROMPT, getattr(self, "_current_context_files", None)),},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.0,
@@ -2011,7 +2058,7 @@ class CodeGenerator:
         body = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": self._augment_prompt_for_kotlin(CODEGEN_SYSTEM_PROMPT, getattr(self, "_current_context_files", None)),},
+                {"role": "system", "content": self._build_system_prompt(CODEGEN_SYSTEM_PROMPT, getattr(self, "_current_context_files", None)),},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.0,
@@ -2072,7 +2119,7 @@ class CodeGenerator:
         body = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": self._augment_prompt_for_kotlin(CODEGEN_SYSTEM_PROMPT, getattr(self, "_current_context_files", None)),},
+                {"role": "system", "content": self._build_system_prompt(CODEGEN_SYSTEM_PROMPT, getattr(self, "_current_context_files", None)),},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.0,
