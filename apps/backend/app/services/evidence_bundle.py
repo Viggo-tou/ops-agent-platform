@@ -215,7 +215,7 @@ def _smart_prefetch_intent_files(
     request_text: str,
     source_root: Path,
     existing_anchored_paths: set[str],
-    max_files: int = 5,
+    max_files: int = 3,
     max_grep_files_scanned: int = 2000,
 ) -> list[str]:
     """Grep the source tree for files matching request intent identifiers."""
@@ -353,7 +353,7 @@ def build_evidence_bundle(
                 request_text=request_text or "",
                 source_root=source_tree,
                 existing_anchored_paths=set(must_touch),
-                max_files=5,
+                max_files=3,
             )
         except Exception:  # noqa: BLE001
             candidate_files = []
@@ -410,7 +410,7 @@ def build_evidence_bundle(
                 *must_touch,
                 *candidate_files,
             },
-            max_files=5,
+            max_files=3,
         )
     except Exception:  # noqa: BLE001
         intent_prefetch_paths = []

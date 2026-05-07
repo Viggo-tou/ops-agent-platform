@@ -104,7 +104,7 @@ class Settings(BaseSettings):
     # Lowering 3→2 cuts ~5-10 min off runs that exhaust without success
     # while still allowing one repair attempt for the common "off-by-one"
     # codegen mistake. Override per-task via settings if needed.
-    codegen_max_repair_rounds: int = 2
+    codegen_max_repair_rounds: int = 1  # 2026-05-07: cut 2→1; rounds 2+ rarely converge in practice
     # Stage A codegen self-validation: validate diff applies + parses
     # before codegen returns. Catches hunk drift at source.
     codegen_react_loop_enabled: bool = False
@@ -117,7 +117,7 @@ class Settings(BaseSettings):
     verification_compile_fail_to_approval: bool = False  # Stage 25 contract: cap-exceeded -> fail
     verification_profile_enabled: bool = True
     verification_compile_timeout_seconds: int = 240
-    verification_max_repair_rounds: int = 2  # See codegen_max_repair_rounds note
+    verification_max_repair_rounds: int = 1  # See codegen_max_repair_rounds note
     failure_diagnosis_enabled: bool = True
     failure_diagnosis_timeout_seconds: float = 30.0
     failure_diagnosis_max_events: int = 30
