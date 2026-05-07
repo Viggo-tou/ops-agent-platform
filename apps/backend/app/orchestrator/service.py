@@ -4055,13 +4055,39 @@ class PrimaryOrchestrator:
                     spec_text=str(translation.get("normalized_request") or ""),
                     must_touch_files=list(getattr(plan, "must_touch_files", []) or []),
                 )
-                required_tokens = strict_tokens or derive_required_tokens(
-                    objective=str(getattr(plan, "objective", "") or ""),
-                    search_queries=translation.get("search_queries") or [],
-                    must_touch_files=list(getattr(plan, "must_touch_files", []) or []),
-                    spec_text=str(translation.get("normalized_request") or ""),
-                )
-                must_touch = list(getattr(plan, "must_touch_files", []) or [])
+                # When strict yields no identifier-shaped tokens, the spec is
+                # purely natural-language and the legacy permissive
+                # ``derive_required_tokens`` reverts to splitting the
+                # boilerplate plan.objective ("Implement / Jira / generating /
+                # changes / patches / tests / reviewing / results...") into
+                # required tokens — the v47 P69-17 failure mode where a
+                # functionally-correct compile-passing diff was rejected
+                # because it didn't echo the objective verbiage in code.
+                # Compile_gate + diff_symbol_verifier (Leg 2) are the real
+                # validators; skip feature_presence cleanly when we have no
+                # structural anchor.
+                required_tokens = list(strict_tokens or [])
+                _fp_should_skip = not required_tokens
+                if _fp_should_skip:
+                    pipeline_state["feature_presence_done"] = True
+                    pipeline_state["feature_presence_skipped"] = "no_strict_tokens"
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_SUCCEEDED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="feature_presence_check.skipped",
+                        message=(
+                            "Spec yielded no identifier-shaped tokens; "
+                            "skipping feature_presence pre-gate. "
+                            "compile_gate + diff_symbol_verifier remain "
+                            "active."
+                        ),
+                    )
+                    self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+                must_touch = list(getattr(plan, "must_touch_files", []) or []) if not _fp_should_skip else []
                 file_contents: dict[str, str] = {}
                 fp_sandbox_dir = self._develop_sandbox_dir(task)
                 if fp_sandbox_dir.exists():
