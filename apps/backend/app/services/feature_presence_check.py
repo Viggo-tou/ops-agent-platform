@@ -185,11 +185,13 @@ def derive_required_tokens_strict(
     for g in (grounding_terms or []):
         if isinstance(g, str):
             pool.extend(_stem_tokens(g))
-    for path in (must_touch_files or []):
-        if isinstance(path, str):
-            base = path.replace("\\", "/").rsplit("/", 1)[-1]
-            stem = base.rsplit(".", 1)[0]
-            pool.extend(_stem_tokens(stem))
+    # Empirical (2026-05-07 P69-19): adding must_touch file BASENAMES
+    # (CustomerKYCAddressForm, CustomerSignup, CustomerKYCCaptureID) to
+    # the required-tokens pool causes false rejection on add-new-logic
+    # tasks — code added INSIDE a class doesn't typically mention the
+    # class name. The required tokens should describe the feature
+    # SEMANTICS (objective + grounding terms), not the file location.
+    # File basenames stay out of the pool.
 
     seen: set[str] = set()
     deduped: list[str] = []

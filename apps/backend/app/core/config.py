@@ -79,7 +79,7 @@ class Settings(BaseSettings):
     # Claude Code CLI (planner)
     claude_code_command: str = "npx"
     claude_code_args: str = "--yes @anthropic-ai/claude-code"
-    claude_code_timeout_seconds: float = 240.0
+    claude_code_timeout_seconds: float = 600.0  # bumped 240→600 after P69-19 timeout
     claude_code_git_bash_path: str | None = None
     # Codex CLI (codegen)
     codex_command: str = "codex"
