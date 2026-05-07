@@ -276,6 +276,41 @@ def _count_intent_preservation(
     return preserved / len(intent_lines)
 
 
+def _intent_lines_dropped_by_repair(
+    *,
+    first_attempt_diff: str,
+    rel_path: str,
+    repair_diff: str,
+    baseline_content: str,
+    limit: int = 30,
+) -> list[str]:
+    """Return the specific intent lines repair lost relative to first attempt.
+
+    Mirrors the bookkeeping in ``_count_intent_preservation`` but returns
+    the line list (capped) so the orchestrator can name them in a
+    second-chance repair prompt (Leg 4 — turn silent intent_dropped into
+    actionable feedback for the LLM).
+    """
+    intent_lines = _intent_lines_from_first_attempt(first_attempt_diff, rel_path)
+    if not intent_lines:
+        return []
+    repair_added = set(_changed_lines_from_diff(repair_diff, rel_path, "+"))
+    repair_removed = set(_changed_lines_from_diff(repair_diff, rel_path, "-"))
+    baseline_lines = {
+        normalized
+        for normalized in (_normalize_intent_line(line) for line in baseline_content.splitlines())
+        if _is_counted_intent_line(normalized)
+    }
+    dropped: list[str] = []
+    for line in intent_lines:
+        if line in repair_added or line in baseline_lines or line not in repair_removed:
+            continue
+        dropped.append(line)
+        if len(dropped) >= limit:
+            break
+    return dropped
+
+
 def _compile_repair_intent_dropped(
     *,
     first_attempt_diff: str,
@@ -7035,11 +7070,133 @@ class PrimaryOrchestrator:
                         "compile_repair.intent_dropped",
                         intent_payload,
                     )
-                    self._preserve_develop_pipeline_state(
-                        task=task,
-                        pipeline_state=pipeline_state,
+
+                    # Leg 4: instead of giving up silently, give the LLM
+                    # one explicit second chance with the names of the
+                    # specific lines it dropped. This addresses the v55
+                    # P69-19 failure pattern (claude_code repair generated
+                    # diffs at 0.242 preservation 3 rounds in a row, with
+                    # no feedback channel telling it WHAT it kept dropping).
+                    dropped_lines = _intent_lines_dropped_by_repair(
+                        first_attempt_diff=first_attempt_diff,
+                        rel_path=rel_path,
+                        repair_diff=repair_diff,
+                        baseline_content=orig_content,
                     )
-                    continue
+                    if dropped_lines and not pipeline_state.get(
+                        f"compile_repair_intent_retry_{rel_path}"
+                    ):
+                        pipeline_state[f"compile_repair_intent_retry_{rel_path}"] = True
+                        feedback_lines = "\n".join(
+                            f"  - {line[:200]}" for line in dropped_lines[:15]
+                        )
+                        retry_prompt = (
+                            repair_prompt
+                            + "\n\n## INTENT-DROP RETRY GUIDANCE (you MUST read this) ##\n"
+                            "Your previous repair attempt deleted these specific lines "
+                            "from the first-attempt diff that implement the user's "
+                            "requested feature:\n"
+                            f"{feedback_lines}\n\n"
+                            "Your repair MUST keep these lines in the post-patch file. "
+                            "Only modify the specific line(s) that contain the "
+                            "Unresolved-reference compile error. If a referenced symbol "
+                            "doesn't exist, RENAME it to a real one (or restore an "
+                            "existing one) — do NOT delete the surrounding "
+                            "feature-implementing lines.\n"
+                        )
+                        try:
+                            retry_payload = {
+                                "plan_json": {"objective": f"Re-fix {rel_path} preserving intent", "steps": []},
+                                "context_files": {rel_path: broken_content},
+                                "task_description": retry_prompt,
+                            }
+                            retry_result = self._execute_develop_tool(
+                                task=task,
+                                actor_name=actor_name,
+                                tool_name="codegen.generate_patch",
+                                payload=retry_payload,
+                                stage=WorkflowStage.REVIEW,
+                                role=RoleName.REVIEWER,
+                                approval_id=approval_id,
+                                pipeline_state=pipeline_state,
+                            )
+                            retry_diff = str((retry_result or {}).get("diff") or "").strip()
+                            # Filter to target file only.
+                            _filtered: list[str] = []
+                            for _section in re.split(r"(?=^diff --git )", retry_diff, flags=re.MULTILINE):
+                                _section = _section.strip()
+                                if not _section:
+                                    continue
+                                _hdr = re.match(r"diff --git a/(.+?) b/", _section)
+                                if (_hdr and _hdr.group(1).strip() == rel_path) or not _hdr:
+                                    _filtered.append(_section)
+                            retry_diff = "\n".join(_filtered).strip()
+                            if retry_diff and "diff --git" in retry_diff:
+                                _retry_dropped, _retry_ratio, _ = _compile_repair_intent_dropped(
+                                    first_attempt_diff=first_attempt_diff,
+                                    rel_path=rel_path,
+                                    repair_diff=retry_diff,
+                                    baseline_content=orig_content,
+                                    threshold=intent_threshold,
+                                )
+                                if not _retry_dropped:
+                                    record_event(
+                                        self.db,
+                                        task_id=task.id,
+                                        event_type=EventType.TOOL_SUCCEEDED,
+                                        source=EventSource.ORCHESTRATOR,
+                                        stage=WorkflowStage.REVIEW,
+                                        role=RoleName.REVIEWER,
+                                        tool_name="compile_repair.intent_retry_recovered",
+                                        message=(
+                                            f"Intent-drop retry recovered {rel_path}: "
+                                            f"preservation {_retry_ratio:.0%} now passes."
+                                        ),
+                                    )
+                                    repair_diff = retry_diff
+                                    # Fall through to apply.
+                                else:
+                                    record_event(
+                                        self.db,
+                                        task_id=task.id,
+                                        event_type=EventType.REVIEW_FAILED,
+                                        source=EventSource.ORCHESTRATOR,
+                                        stage=WorkflowStage.REVIEW,
+                                        role=RoleName.REVIEWER,
+                                        tool_name="compile_repair.intent_retry_failed",
+                                        message=(
+                                            f"Intent-drop retry still dropping intent for "
+                                            f"{rel_path} ({_retry_ratio:.0%}); giving up this round."
+                                        ),
+                                    )
+                                    self._preserve_develop_pipeline_state(
+                                        task=task,
+                                        pipeline_state=pipeline_state,
+                                    )
+                                    continue
+                            else:
+                                self._preserve_develop_pipeline_state(
+                                    task=task,
+                                    pipeline_state=pipeline_state,
+                                )
+                                continue
+                        except Exception as _retry_exc:  # noqa: BLE001
+                            import logging as _log
+                            _log.getLogger("orchestrator").warning(
+                                "intent_retry.errored: %s",
+                                str(_retry_exc)[:200],
+                            )
+                            self._preserve_develop_pipeline_state(
+                                task=task,
+                                pipeline_state=pipeline_state,
+                            )
+                            continue
+                    else:
+                        self._preserve_develop_pipeline_state(
+                            task=task,
+                            pipeline_state=pipeline_state,
+                        )
+                        continue
 
             # Apply repair diff to sandbox
             try:
