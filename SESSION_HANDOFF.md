@@ -1,6 +1,62 @@
 # Session Handoff
 
-Last updated: 2026-04-28
+Last updated: 2026-05-07
+
+## Session 2026-05-07: 4-legs hallucination defense + dogfood E2E ✅
+
+**Headline**: P69-17 + P69-19 both completed end-to-end with verified real working code (real symbols, OSMDroid, Firebase, no hallucinations). Demonstrated systematic correctness fix vs. v46-v55's hallucination-or-stuck loop.
+
+### Commits landed (`checkpoint/pre-reclassify` branch)
+
+| Commit | Item | Effect |
+|---|---|---|
+| `60992c0` | Perf 1+2+3 | LLM auto-cache, repair cap 2→1, evidence prefetch 5→3 |
+| `f016737` | Perf 5 | kotlinc syntax pre-check before Gradle (failure path 30s→<1s) |
+| `6645243` | Perf 6 (Tier 1A) | ReAct disk-grep fallback (DeepSeek-only path) |
+| `33560d3` | **Leg 2** | Post-codegen symbol verifier — catches `Receiver.member` hallucinations, feeds repair |
+| `b1b92fa` | **Leg 1** | Repo library fingerprinting in codegen system prompt — kills wrong-library variance |
+| `a853971` | **Leg 4** | Intent-drop feedback retry — explicit dropped-line list, 1 retry per round |
+| `a694a6f` | **Leg 3** | Pull receiver class body into repair prompt on Unresolved reference |
+| `10d415e` | **FP fix** | Skip feature_presence when strict yields no tokens (no fallback to noisy permissive path) |
+
+### Validated tasks
+
+| Task | Status | Verification |
+|---|---|---|
+| **v48 P69-17** | `completed` | 5/5 acceptance, real `viewModel.locationAddress` + Firebase fields + OSMDroid Configuration + Geocoder; all symbols grep-verified in source |
+| **v57 P69-19** | `completed` | 6/6 acceptance, OSMDroid bidirectional sync (forward/reverse Geocoder), 9 address fields + lat/lng saved to user profile; build.gradle has `osmdroid-android:6.1.18` |
+
+### Demo screenshots (in `C:\Users\Tomonkyo\AppData\Local\Temp\`)
+
+- `v48-p69-17-completed.png` — P69-17 final state
+- `v57-p69-19-completed.png` — P69-19 final state
+- `v48-detail-final.png` — earlier intermediate
+
+### Root-cause analysis behind 4 legs
+
+v51 produced excellent OSMDroid code on first try, killed by feature_presence basename bug (since fixed). v52-v55 failed for 4 different reasons each — claude_code high variance, harness too strict on big rewrites, repair fed wrong direction. The 4 legs systematically address each:
+
+- **Leg 1 (library fingerprinting)** kills "wrong library" variance (v52 Google Maps)
+- **Leg 2 (symbol verifier)** catches `Receiver.member` hallucinations (v46 `viewModel.jobAddress`)
+- **Leg 3 (receiver class body)** gives repair prompts the real class members instead of guessing (v55 over-truncated repair)
+- **Leg 4 (intent-drop feedback retry)** turns silent intent_dropped rejection into actionable signal
+- **FP fix** stops feature_presence from falsely rejecting based on plan.objective boilerplate ("Implement / Jira / patches / tests / reviewing / results")
+
+### Known limitations / next-session work
+
+1. **SQLite concurrent-write fragility**: dispatching two tasks in parallel triggers "database is locked" → second task crashes silently. Need WAL journal mode or retry-on-lock in `record_event`.
+2. **claude_code on Windows codex CLI broken**: codex exec hangs on Windows sandbox (`CreateProcessWithLogonW failed: 1056`); 3/3 consult attempts this session returned only echo. Used direct Edit/Write for all 4 legs instead.
+3. **Polish for v57**: text fields don't auto-update map on change (button-trigger only); Geocoder errors silent (no toast); map default center hardcoded (Dhaka).
+4. **Lowercase-receiver symbol verification skipped** (`viewModel.foo` style): Tier 1B would do light type inference — not done. compile_gate is the safety net.
+5. **Codex consult discipline broken** for this session due to Windows codex CLI failures. Decisions made unilaterally (with explicit user authorization "全做").
+
+### Test count
+
+92 total tests pass (incl. new test_diff_symbol_verifier.py, test_repo_library_fingerprint.py, test_kotlinc_precheck.py, existing react_loop / self_validate / feature_presence / etc.).
+
+---
+
+
 
 ## Session 2026-04-28: Phase 3.0 verified ✅ — CC agentic mean 27.06 → 49.65 (+22.59)
 
@@ -554,3 +610,93 @@ P69-10 ("Data and Role Cleanup"):
 > 2. Capability 轴：scope identification 是当前 agent 真瓶颈（P69-4 under-scope / P69-10 漏 analytics 都是这个问题），但工程量大（2-4 周）。Stage 22 级别。
 > 
 > 推荐顺序：先 Tier A 拿便宜的分数提升（baseline 50→60 区间），同时收集更多 dogfood 数据（多跑几个 Jira ticket 量化 scope-identification 失败率），然后再决定是否启动 Tier C。
+
+---
+
+## Session 2026-05-02-0158 - citation prompt second-opinion review
+
+- Session-start tag: attempted `session-start/2026-05-02-0158`, but `git tag` failed with `.git/refs/tags/session-start/2026-05-02-0158.lock` permission denied. Baseline HEAD at start was `2ad7c0d`.
+- Purpose: read-only consultation on whether to proceed with the citation-grounded synthesis prompt lever.
+- Files touched:
+  - `tmp/codex-citation-prompt-review.md` (new review note requested by user; still untracked in working tree)
+  - `SESSION_HANDOFF.md` (this manifest; still dirty in working tree)
+- Diff/stat:
+  - `SESSION_HANDOFF.md`: `SESSION_HANDOFF.md | 15 +++++++++++++++` from `git diff --stat -- SESSION_HANDOFF.md`
+  - `tmp/codex-citation-prompt-review.md`: untracked file, still in working tree; no baseline-tag diff stat available because tag creation failed.
+- Product/source code changes: none.
+- Code changes committed: no. This was a docs-only/session-manifest closeout, and the requested review note remains uncommitted.
+
+---
+
+## Session 2026-05-02-1836 - review-loop consultation
+
+- Session-start tag: attempted `session-start/2026-05-02-1836`, but `git tag` failed with `.git/refs/tags/session-start/2026-05-02-1836.lock` permission denied. Baseline HEAD at start was `dbfd90f`.
+- Purpose: read-only consultation on whether compile gates, same-chat iteration, self-diagnosis, or T-041 gates should be prioritized after P69-19 v4 produced a missing Kotlin import.
+- Files touched:
+  - `tmp/codex-review-loop-review.md` (new review note requested by user; still untracked in working tree)
+  - `SESSION_HANDOFF.md` (this manifest; still dirty in working tree)
+- Diff/stat:
+  - `SESSION_HANDOFF.md`: manifest update in working tree; no baseline-tag diff stat available because tag creation failed.
+  - `tmp/codex-review-loop-review.md`: untracked file, still in working tree; no baseline-tag diff stat available because tag creation failed.
+- Product/source code changes: none.
+- Code changes committed: no. This was a docs-only/session-manifest closeout, and the requested review note remains uncommitted.
+
+---
+
+## Session 2026-05-02-1705 - Stage 24 Run 3 consultation
+
+- Session-start tag: attempted `session-start/2026-05-02-1705`, but `git tag` failed with `.git/refs/tags/session-start/2026-05-02-1705.lock` permission denied. Baseline HEAD at start was `2ad7c0d`.
+- Purpose: read-only consultation on whether to run P69-19 Run 3 or proceed to Stage 24 regression tests.
+- Files touched:
+  - `tmp/codex-stage24-run3-review.md` (new review note requested by user; still untracked in working tree)
+  - `SESSION_HANDOFF.md` (this manifest; still dirty in working tree)
+- Diff/stat:
+  - `SESSION_HANDOFF.md`: manifest update in working tree; no baseline-tag diff stat available because tag creation failed.
+  - `tmp/codex-stage24-run3-review.md`: untracked file, still in working tree; no baseline-tag diff stat available because tag creation failed.
+- Product/source code changes: none.
+- Code changes committed: no. This was a docs-only/session-manifest closeout, and the requested review note remains uncommitted.
+
+---
+
+## Session 2026-05-04-0924 - auto-iteration harness consultation
+
+- Session-start tag: attempted `session-start/2026-05-04-0924`, but `git tag` failed with `.git/refs/tags/session-start/2026-05-04-0924.lock` permission denied. Baseline HEAD at start was `dbfd90f`.
+- Purpose: read-only consultation on Claude's proposed auto-iteration harness.
+- Files touched:
+  - `tmp/codex-harness-review.md` (new review note requested by user; still untracked in working tree)
+  - `SESSION_HANDOFF.md` (this manifest; was already dirty before this session)
+- Diff/stat:
+  - `SESSION_HANDOFF.md`: manifest update in working tree; no baseline-tag diff stat available because tag creation failed and the file was already dirty at session start.
+  - `tmp/codex-harness-review.md`: untracked file, still in working tree; no baseline-tag diff stat available because tag creation failed.
+- Product/source code changes: none.
+- Code changes committed: no. This was a docs-only/session-manifest closeout, and the requested review note remains uncommitted.
+
+---
+
+## Session 2026-05-04-1113 - Stage 25 and subagent consultation
+
+- Session-start tag: attempted `session-start/2026-05-04-1113`, but `git tag` failed with `.git/refs/tags/session-start/2026-05-04-1113.lock` permission denied. Baseline HEAD at start was `dbfd90f`.
+- Purpose: read-only consultation on Stage 25 close verdict and whether to add LLM subagents for parallel work.
+- Files touched:
+  - `tmp/codex-stage25-and-subagent-review.md` (new review note requested by user; still untracked in working tree)
+  - `SESSION_HANDOFF.md` (this manifest; was already dirty before this session)
+- Diff/stat:
+  - `SESSION_HANDOFF.md`: manifest update in working tree; no baseline-tag diff stat available because tag creation failed and the file was already dirty at session start.
+  - `tmp/codex-stage25-and-subagent-review.md`: untracked file, still in working tree; no baseline-tag diff stat available because tag creation failed.
+- Product/source code changes: none.
+- Code changes committed: no. This was a docs-only/session-manifest closeout, and the requested review note remains uncommitted.
+
+---
+
+## Session 2026-05-04-1442 - memory system design consultation
+
+- Session-start tag: attempted `session-start/2026-05-04-1442`, but `git tag` failed with `.git/refs/tags/session-start/2026-05-04-1442.lock` permission denied. Baseline HEAD at start was `be97b03`.
+- Purpose: read-only consultation on Phase 5 memory-system design, specifically gate-failure-first vs user-input-first, storage choices, read/write gaps, bootstrap, and production-readiness.
+- Files touched:
+  - `tmp/codex-memory-system-review.md` (new review note requested by user; still untracked in working tree)
+  - `SESSION_HANDOFF.md` (this manifest; was already dirty before this session)
+- Diff/stat:
+  - `SESSION_HANDOFF.md`: manifest update in working tree; no baseline-tag diff stat available because tag creation failed and the file was already dirty at session start.
+  - `tmp/codex-memory-system-review.md`: untracked file, still in working tree; no baseline-tag diff stat available because tag creation failed.
+- Product/source code changes: none.
+- Code changes committed: no. This was a docs-only/session-manifest closeout, and the requested review note remains uncommitted.
