@@ -771,7 +771,13 @@ async def _stream_from_provider(
         yield ("done", "stop")
         return
     if provider == "anthropic":
-        # Anthropic tool-use is commit 3 — for now stream text only.
+        if mcp_tools:
+            anthropic_tools = _convert_openai_tools_to_anthropic(mcp_tools)
+            async for ev in _stream_anthropic_with_tools(
+                message, settings, model_name, system_prompt, history, anthropic_tools
+            ):
+                yield ev
+            return
         async for ev in _text_stream_to_events(
             _stream_anthropic(message, settings, model_name, system_prompt, history)
         ):
@@ -1021,6 +1027,195 @@ async def _stream_openai_compat_with_tools(
             yield ("done", "stop")
             return
         yield ("done", finish_reason or "unknown")
+        return
+
+    yield ("done", "max_iterations")
+
+
+def _convert_openai_tools_to_anthropic(openai_tools: list[dict]) -> list[dict]:
+    """Anthropic uses {name, description, input_schema} flat shape."""
+    out: list[dict] = []
+    for t in openai_tools:
+        fn = t.get("function") or {}
+        out.append(
+            {
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
+            }
+        )
+    return out
+
+
+async def _stream_anthropic_with_tools(
+    message: str,
+    settings,
+    model_name: str,
+    system_prompt: str,
+    history: list[dict[str, str]],
+    anthropic_tools: list[dict],
+) -> AsyncGenerator[tuple[str, object], None]:
+    """Anthropic Messages API streaming with tool-use loop.
+
+    Anthropic emits tool calls as content blocks (type=tool_use) interleaved
+    with text blocks. We accumulate input_json_delta strings per block index,
+    and on stop_reason=tool_use we execute each, append role=user with
+    tool_result blocks, and re-stream.
+    """
+    if not getattr(settings, "anthropic_api_key", None):
+        raise RuntimeError("OPS_AGENT_ANTHROPIC_API_KEY not set")
+    headers = {
+        "x-api-key": settings.anthropic_api_key,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+
+    # Anthropic rejects two consecutive same-role messages and requires the
+    # conversation to alternate. Existing _stream_anthropic does this; we
+    # reapply the same collapse.
+    msgs: list[dict] = []
+    for entry in history:
+        if msgs and msgs[-1]["role"] == entry["role"]:
+            msgs[-1]["content"] = msgs[-1]["content"] + "\n\n" + entry["content"]
+        else:
+            msgs.append(dict(entry))
+    if msgs and msgs[-1]["role"] == "user":
+        msgs[-1]["content"] = msgs[-1]["content"] + "\n\n" + message
+    else:
+        msgs.append({"role": "user", "content": message})
+
+    for _iteration in range(_CHAT_TOOL_USE_MAX_ITERATIONS):
+        payload = {
+            "model": model_name or "claude-sonnet-4-5",
+            "max_tokens": _DEFAULT_MAX_TOKENS,
+            "system": system_prompt,
+            "stream": True,
+            "messages": msgs,
+            "tools": anthropic_tools,
+        }
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=10.0)) as client:
+            async with client.stream(
+                "POST", "https://api.anthropic.com/v1/messages", headers=headers, json=payload
+            ) as response:
+                if response.status_code >= 400:
+                    err_body = await response.aread()
+                    raise RuntimeError(
+                        f"anthropic {response.status_code}: {err_body.decode('utf-8', 'replace')[:300]}"
+                    )
+
+                # Per-stream block accumulators, keyed by content-block index.
+                blocks: dict[int, dict] = {}
+                stop_reason: str | None = None
+
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].lstrip()
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    ev_type = data.get("type")
+                    if ev_type == "content_block_start":
+                        idx = data.get("index", 0)
+                        block = data.get("content_block") or {}
+                        blocks[idx] = {
+                            "type": block.get("type") or "",
+                            "id": block.get("id") or "",
+                            "name": block.get("name") or "",
+                            "text": "",
+                            "input_json": "",
+                        }
+                    elif ev_type == "content_block_delta":
+                        idx = data.get("index", 0)
+                        delta = data.get("delta") or {}
+                        slot = blocks.setdefault(
+                            idx,
+                            {"type": "", "id": "", "name": "", "text": "", "input_json": ""},
+                        )
+                        if delta.get("type") == "text_delta":
+                            chunk = delta.get("text") or ""
+                            if chunk:
+                                slot["text"] += chunk
+                                yield ("text", chunk)
+                        elif delta.get("type") == "input_json_delta":
+                            slot["input_json"] += delta.get("partial_json") or ""
+                    elif ev_type == "content_block_stop":
+                        # Nothing to yield — the per-block content is already
+                        # collected via the deltas above.
+                        pass
+                    elif ev_type == "message_delta":
+                        delta = data.get("delta") or {}
+                        sr = delta.get("stop_reason")
+                        if sr:
+                            stop_reason = sr
+                    elif ev_type == "message_stop":
+                        break
+
+        tool_use_blocks = [
+            (idx, blocks[idx]) for idx in sorted(blocks) if blocks[idx]["type"] == "tool_use"
+        ]
+        if stop_reason == "tool_use" and tool_use_blocks:
+            # Re-build the assistant turn as a list of content blocks so the
+            # next request can reference each tool_use by id.
+            assistant_content: list[dict] = []
+            for idx in sorted(blocks):
+                slot = blocks[idx]
+                if slot["type"] == "text":
+                    if slot["text"]:
+                        assistant_content.append({"type": "text", "text": slot["text"]})
+                elif slot["type"] == "tool_use":
+                    try:
+                        parsed = json.loads(slot["input_json"]) if slot["input_json"] else {}
+                    except json.JSONDecodeError:
+                        parsed = {}
+                    assistant_content.append(
+                        {
+                            "type": "tool_use",
+                            "id": slot["id"],
+                            "name": slot["name"],
+                            "input": parsed,
+                        }
+                    )
+            msgs.append({"role": "assistant", "content": assistant_content})
+
+            tool_result_blocks: list[dict] = []
+            for _idx, slot in tool_use_blocks:
+                try:
+                    args = json.loads(slot["input_json"]) if slot["input_json"] else {}
+                except json.JSONDecodeError:
+                    args = {}
+                yield (
+                    "tool_call",
+                    {"id": slot["id"], "name": slot["name"], "arguments": args},
+                )
+                result_str = await asyncio.to_thread(
+                    _execute_chat_tool_blocking, slot["name"], args
+                )
+                is_error = result_str.startswith("ERROR: ")
+                yield (
+                    "tool_result",
+                    {
+                        "tool_call_id": slot["id"],
+                        "content": result_str,
+                        "is_error": is_error,
+                    },
+                )
+                tool_result_blocks.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": slot["id"],
+                        "content": result_str,
+                        "is_error": is_error,
+                    }
+                )
+            msgs.append({"role": "user", "content": tool_result_blocks})
+            continue
+
+        if stop_reason in (None, "end_turn", "stop_sequence"):
+            yield ("done", "stop")
+            return
+        yield ("done", stop_reason or "unknown")
         return
 
     yield ("done", "max_iterations")
