@@ -682,6 +682,55 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
     return [...baseTasks, optimisticTask];
   }, [optimisticTask, task, threadTasks]);
 
+  // (Status / milestone watcher moved BELOW eventsMap declaration to
+  // avoid a TDZ "Cannot access 'eventsMap' before initialization" error.)
+
+  // When taskId switches (cross-conversation reset), wipe status updates.
+  useEffect(() => {
+    setStatusUpdates([]);
+    lastStatusByIdRef.current = {};
+    milestonesByIdRef.current = {};
+  }, [taskId]);
+
+  // When the user navigates here from sidebar's "继续修复 →" link
+  // (?continue=1), pre-activate continuation mode for the latest failed
+  // task in the thread. This lets sidebar quick-action skip the in-chat
+  // toggle click.
+  useEffect(() => {
+    if (searchParams.get("continue") !== "1") {
+      return;
+    }
+    const latest = visibleThreadTasks[visibleThreadTasks.length - 1];
+    if (latest && latest.status === "failed") {
+      setContinueFromTaskId(latest.id);
+    }
+    // Clear the query param so reloading doesn't keep re-activating.
+    const next = new URLSearchParams(searchParams);
+    next.delete("continue");
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams, visibleThreadTasks]);
+  const eventQueries = useQueries({
+    queries: visibleThreadTasks.map((messageTask) => ({
+      queryKey: ["task-events", messageTask.id],
+      queryFn: () => api.getTaskEvents(messageTask.id),
+      enabled: !isOptimisticTaskId(messageTask.id),
+      refetchInterval:
+        isOptimisticTaskId(messageTask.id) ||
+        messageTask.status === "completed" ||
+        messageTask.status === "failed" ||
+        messageTask.status === "rolled_back"
+          ? false
+          : 2_000,
+    })),
+  });
+  const eventsMap = visibleThreadTasks.reduce<Record<string, EventRecord[]>>((accumulator, messageTask, index) => {
+    const events = eventQueries[index]?.data;
+    if (events?.length) {
+      accumulator[messageTask.id] = events;
+    }
+    return accumulator;
+  }, {});
+
   // Watch all visible tasks for status transitions AND intermediate
   // pipeline milestones. Two kinds of updates land on `statusUpdates`:
   //   - "status"    — terminal/awaiting transitions (full bubble with
@@ -692,6 +741,8 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
   //                   the user sees the pipeline IS moving in chat,
   //                   without needing to flip to /tasks/{id}.
   // First-seen tasks on initial page load don't notify.
+  // (Lives below eventsMap so the dep array can reference it without
+  // a temporal-dead-zone error.)
   useEffect(() => {
     const interestingStatus = new Set([
       "completed",
@@ -785,52 +836,6 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
       return [...prev, ...additions];
     });
   }, [visibleThreadTasks, eventsMap]);
-
-  // When taskId switches (cross-conversation reset), wipe status updates.
-  useEffect(() => {
-    setStatusUpdates([]);
-    lastStatusByIdRef.current = {};
-    milestonesByIdRef.current = {};
-  }, [taskId]);
-
-  // When the user navigates here from sidebar's "继续修复 →" link
-  // (?continue=1), pre-activate continuation mode for the latest failed
-  // task in the thread. This lets sidebar quick-action skip the in-chat
-  // toggle click.
-  useEffect(() => {
-    if (searchParams.get("continue") !== "1") {
-      return;
-    }
-    const latest = visibleThreadTasks[visibleThreadTasks.length - 1];
-    if (latest && latest.status === "failed") {
-      setContinueFromTaskId(latest.id);
-    }
-    // Clear the query param so reloading doesn't keep re-activating.
-    const next = new URLSearchParams(searchParams);
-    next.delete("continue");
-    setSearchParams(next, { replace: true });
-  }, [searchParams, setSearchParams, visibleThreadTasks]);
-  const eventQueries = useQueries({
-    queries: visibleThreadTasks.map((messageTask) => ({
-      queryKey: ["task-events", messageTask.id],
-      queryFn: () => api.getTaskEvents(messageTask.id),
-      enabled: !isOptimisticTaskId(messageTask.id),
-      refetchInterval:
-        isOptimisticTaskId(messageTask.id) ||
-        messageTask.status === "completed" ||
-        messageTask.status === "failed" ||
-        messageTask.status === "rolled_back"
-          ? false
-          : 2_000,
-    })),
-  });
-  const eventsMap = visibleThreadTasks.reduce<Record<string, EventRecord[]>>((accumulator, messageTask, index) => {
-    const events = eventQueries[index]?.data;
-    if (events?.length) {
-      accumulator[messageTask.id] = events;
-    }
-    return accumulator;
-  }, {});
 
   return (
     <div className="chat-page">
