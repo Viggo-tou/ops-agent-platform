@@ -13,12 +13,17 @@ DEFAULT_PROVIDER_CATALOG: list[dict[str, object]] = [
     {
         "name": "OpenAI",
         "note": "General reasoning and tool use",
-        "models": ["GPT-5.4", "GPT-5.4 Mini", "GPT-4.1"],
+        "models": ["GPT-5.5", "GPT-5.5 Mini", "GPT-5.4", "GPT-5.4 Mini", "GPT-4.1"],
     },
     {
         "name": "Anthropic",
         "note": "Long-context writing and coding",
-        "models": ["Claude Opus 4.6", "Claude Sonnet 4.6", "Claude Haiku 4.5"],
+        "models": [
+            "Claude Opus 4.7",
+            "Claude Sonnet 4.6",
+            "Claude Haiku 4.5",
+            "Claude Opus 4.6",
+        ],
     },
     {
         "name": "Google AI",
@@ -28,22 +33,32 @@ DEFAULT_PROVIDER_CATALOG: list[dict[str, object]] = [
     {
         "name": "DeepSeek",
         "note": "Reasoning and code-oriented tasks",
-        "models": ["DeepSeek V3", "DeepSeek R1"],
+        "models": [
+            "DeepSeek V4 Pro",
+            "DeepSeek V4 Flash",
+            "DeepSeek R1",
+            "DeepSeek V3",
+        ],
     },
     {
         "name": "Aliyun",
         "note": "Domestic provider compatibility",
-        "models": ["Qwen Max"],
+        "models": ["Qwen Max", "Qwen 3 Plus", "Qwen 3 Coder"],
     },
     {
         "name": "ZhipuAI AI",
         "note": "Domestic provider compatibility",
-        "models": ["GLM-5"],
+        "models": ["GLM-5", "GLM-4.5"],
     },
     {
         "name": "Moonshot",
         "note": "Long-context Chinese and mixed-language tasks",
         "models": ["Kimi K2", "Kimi Turbo"],
+    },
+    {
+        "name": "MiniMax",
+        "note": "Streaming-friendly Chinese model with low latency",
+        "models": ["MiniMax-M2.7", "MiniMax-M2.7 Highspeed"],
     },
     {
         "name": "Mistral",
