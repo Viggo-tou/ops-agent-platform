@@ -359,6 +359,78 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ follow_up: followUp, actor_name: actorName ?? null }),
     }),
+  /**
+   * Streaming chat endpoint. Returns an async iterator of typed events:
+   *   { type: "session", session_id, provider }
+   *   { type: "token", text }              — streaming tokens
+   *   { type: "task_created", task_id, scenario, kicked_off_pipeline, summary? }
+   *   { type: "error", message }
+   *   { type: "end", length }
+   */
+  chatSendStream: async function* (body: {
+    message: string;
+    session_id?: string | null;
+    source_name?: string | null;
+    actor_name?: string | null;
+    previous_task_id?: string | null;
+    signal?: AbortSignal;
+  }): AsyncGenerator<
+    | { type: "session"; session_id: string; provider: string }
+    | { type: "token"; text: string }
+    | { type: "task_created"; task_id: string; scenario: string; kicked_off_pipeline: boolean; summary?: string }
+    | { type: "error"; message: string }
+    | { type: "end"; length: number }
+  > {
+    const response = await fetch(`${API_BASE_URL}/chat/send`, {
+      method: "POST",
+      headers: buildHeaders({}, true),
+      body: JSON.stringify({
+        message: body.message,
+        session_id: body.session_id ?? null,
+        source_name: body.source_name ?? null,
+        actor_name: body.actor_name ?? null,
+        previous_task_id: body.previous_task_id ?? null,
+      }),
+      signal: body.signal,
+    });
+    if (!response.ok || !response.body) {
+      const detail = await response.text().catch(() => response.statusText);
+      throw new Error(detail || `chat/send returned ${response.status}`);
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        // Split on the SSE record terminator (blank line).
+        let idx;
+        while ((idx = buffer.indexOf("\n\n")) >= 0) {
+          const record = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          let eventName = "message";
+          const dataLines: string[] = [];
+          for (const line of record.split("\n")) {
+            if (line.startsWith("event: ")) eventName = line.slice(7).trim();
+            else if (line.startsWith("data: ")) dataLines.push(line.slice(6));
+          }
+          if (dataLines.length === 0) continue;
+          const data = dataLines.join("\n");
+          let parsed: any = null;
+          try {
+            parsed = JSON.parse(data);
+          } catch {
+            continue;
+          }
+          yield { type: eventName, ...parsed } as any;
+        }
+      }
+    } finally {
+      try { reader.releaseLock(); } catch { /* noop */ }
+    }
+  },
   getToolUsageStats: (windowDays = 7, top = 10) =>
     request<{
       total_invocations: number;

@@ -62,6 +62,8 @@ export function ChatPage() {
   const { user, backendActorRole, can } = useAuth();
   const chatScrollRef = useRef<HTMLElement | null>(null);
   const [optimisticTask, setOptimisticTask] = useState<TaskDetail | null>(null);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [streamError, setStreamError] = useState<string | null>(null);
   // When set, the next submit will dispatch as a continuation of this task.
   // Activated by the "继续修复" button on a failed task; cleared after submit.
   const [continueFromTaskId, setContinueFromTaskId] = useState<string | null>(null);
@@ -138,18 +140,6 @@ export function ChatPage() {
     })),
   });
 
-  const createTaskMutation = useMutation({
-    mutationFn: api.createTask,
-    onSuccess: async (task) => {
-      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
-      await queryClient.invalidateQueries({ queryKey: ["tasks", "sidebar"] });
-      await queryClient.invalidateQueries({ queryKey: ["tasks", "session"] });
-      startTransition(() => {
-        void navigate(`/chat/${task.id}`);
-      });
-    },
-  });
-
   function buildThreadRequest(message: string) {
     if (!task) {
       return message;
@@ -188,43 +178,190 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
         ? `\n\nAttached context: ${files.map((file) => `${file.name} (${file.type || "file"})`).join(", ")}`
         : "";
     const userMessage = `${message}${attachmentNote}`;
-    // For continuation, send the user's followup as-is so the backend's
-    // CONTINUATION FROM PARENT preamble carries the failure context. For
-    // a fresh thread message, fold prior conversation into the request.
-    const request = options.previousTaskId ? userMessage : buildThreadRequest(userMessage);
-    const tempTask = {
-      ...buildOptimisticTask(`temp-${Date.now()}`, request),
+
+    // Streaming path: every chat message goes through /api/chat/send. The
+    // backend's primary model decides whether it's a question (answer inline)
+    // or a real task (kicks off the heavy pipeline). We stream tokens into
+    // the optimistic task's latest_result_json so MessageList renders the
+    // answer as it arrives.
+    const tempTask: TaskDetail = {
+      ...buildOptimisticTask(`temp-${Date.now()}`, userMessage),
       actor_name: user?.name ?? "member",
       actor_role: backendActorRole,
       session_id: task?.session_id ?? null,
       title: task?.title ?? "New request",
+      status: "running",
+      scenario: "process_question",
     };
 
     setOptimisticTask(tempTask);
+    setIsStreaming(true);
+    setStreamError(null);
     scrollToLatestMessage();
 
+    let answerSoFar = "";
+    let visibleAnswerSoFar = "";
+    let finalTaskCreated = false;
+    let kickedOffPipeline = false;
+    let createdTaskId: string | null = null;
+
+    const stripIntent = (text: string) =>
+      text
+        .split("\n")
+        .filter((line) => !line.trim().startsWith("TASK_INTENT|"))
+        .join("\n")
+        .trim();
+
     try {
-      const createdTask = await createTaskMutation.mutateAsync({
-        title: task?.title,
-        request,
-        actor_name: user?.name ?? "member",
-        actor_role: backendActorRole,
-        session_id: task?.session_id ?? undefined,
-        previous_task_id: options.previousTaskId ?? undefined,
-        // Repository source override; undefined = orchestrator uses env default.
-        source_name: sourceName || undefined,
+      const stream = api.chatSendStream({
+        message: userMessage,
+        session_id: task?.session_id ?? null,
+        source_name: sourceName || null,
+        actor_name: user?.name ?? null,
+        previous_task_id: options.previousTaskId ?? null,
       });
-      setOptimisticTask(createdTask);
-      scrollToLatestMessage();
+
+      for await (const event of stream) {
+        switch (event.type) {
+          case "token":
+            answerSoFar += event.text;
+            visibleAnswerSoFar = stripIntent(answerSoFar);
+            setOptimisticTask((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    status: "running",
+                    latest_result_json: {
+                      kind: "chat_answer",
+                      answer: visibleAnswerSoFar,
+                    },
+                    updated_at: new Date().toISOString(),
+                  }
+                : prev,
+            );
+            scrollToLatestMessage();
+            break;
+          case "task_created":
+            finalTaskCreated = true;
+            kickedOffPipeline = event.kicked_off_pipeline;
+            createdTaskId = event.task_id;
+            break;
+          case "provider_failed":
+            // Transient — chain falls through automatically. No-op.
+            break;
+          case "error":
+            setStreamError(event.message);
+            setOptimisticTask((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    status: "failed",
+                    updated_at: new Date().toISOString(),
+                    latest_result_json: {
+                      kind: "chat_answer",
+                      answer: visibleAnswerSoFar,
+                      message: event.message,
+                    },
+                  }
+                : prev,
+            );
+            setIsStreaming(false);
+            return;
+          case "session":
+          case "end":
+            break;
+        }
+      }
     } catch (error) {
-      setOptimisticTask({
-        ...tempTask,
-        status: "failed",
-        updated_at: new Date().toISOString(),
-        latest_result_json: { message: toErrorMessage(error) },
-      });
+      const msg = toErrorMessage(error);
+      setStreamError(msg);
+      setOptimisticTask((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: "failed",
+              updated_at: new Date().toISOString(),
+              latest_result_json: {
+                kind: "chat_answer",
+                answer: visibleAnswerSoFar,
+                message: msg,
+              },
+            }
+          : prev,
+      );
+      setIsStreaming(false);
+      return;
+    } finally {
+      setIsStreaming(false);
+    }
+
+    if (finalTaskCreated && createdTaskId) {
+      // Refresh task lists so sidebar + thread queries pick up the new task.
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["tasks"] }),
+        queryClient.invalidateQueries({ queryKey: ["tasks", "sidebar"] }),
+        queryClient.invalidateQueries({ queryKey: ["tasks", "session"] }),
+      ]);
+
+      if (kickedOffPipeline) {
+        // Real task: navigate to its detail page so the user can watch the
+        // pipeline run live (SSE-driven).
+        startTransition(() => {
+          void navigate(`/chat/${createdTaskId}`);
+        });
+        return;
+      }
+
+      // Question: fetch the persisted task so the optimistic temp task gets
+      // replaced with the canonical row (preserves on reload).
+      try {
+        const realTask = await api.getTask(createdTaskId);
+        setOptimisticTask({
+          ...realTask,
+          // Merge in case backend's persisted answer is shorter than what we
+          // streamed (rare race).
+          latest_result_json: realTask.latest_result_json ?? {
+            kind: "chat_answer",
+            answer: visibleAnswerSoFar,
+          },
+        });
+        scrollToLatestMessage();
+      } catch {
+        // Keep the optimistic task with status=completed.
+        setOptimisticTask((prev) =>
+          prev
+            ? {
+                ...prev,
+                id: createdTaskId!,
+                status: "completed",
+                updated_at: new Date().toISOString(),
+              }
+            : prev,
+        );
+      }
+    } else {
+      // Stream ended without a task_created event — keep what we have but
+      // mark it completed.
+      setOptimisticTask((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: "completed",
+              latest_result_json: {
+                kind: "chat_answer",
+                answer: visibleAnswerSoFar,
+              },
+            }
+          : prev,
+      );
     }
   }
+
+  // Reference legacy buildThreadRequest only when needed; streaming path no
+  // longer pre-folds previous conversation since SYSTEM_PROMPT + the chat
+  // model handle context naturally. Keeping it referenced silences unused
+  // import warnings during the transition.
+  void buildThreadRequest;
 
   const threadTasks = useMemo(
     () =>
@@ -351,7 +488,7 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
             setContinueFromTaskId(null),
           )
         }
-        isSubmitting={createTaskMutation.isPending}
+        isSubmitting={isStreaming}
         disabled={!can("task:create")}
         permissionDenied={!can("task:create") ? "Your current role can view conversations but cannot create new tasks." : null}
         sources={(sourcesQuery.data?.sources ?? []).map((s) => ({ name: s.name, origin: s.origin }))}
@@ -363,7 +500,7 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
       />
       <div className="chat-footer-hint">AI 生成内容仅供参考</div>
 
-      {createTaskMutation.isError ? <div className="chat-error">{toErrorMessage(createTaskMutation.error)}</div> : null}
+      {streamError ? <div className="chat-error">{streamError}</div> : null}
     </div>
   );
 }

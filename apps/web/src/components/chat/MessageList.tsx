@@ -98,6 +98,15 @@ export function readDisplayRequestText(requestText: string): string {
 }
 
 export function buildAgentReply(task: TaskDetail): string {
+  // Streaming chat path: backend stores { kind: "chat_answer", answer: "..." }
+  // directly on latest_result_json. Check this before the heavier knowledge
+  // path.
+  const directKind = readString(task.latest_result_json?.kind);
+  const directAnswer = readString(task.latest_result_json?.answer);
+  if (directKind === "chat_answer" && directAnswer) {
+    return directAnswer;
+  }
+
   const result = task.latest_result_json?.result;
   const knowledgeResult = readKnowledgeSearchResult(result);
   if (knowledgeResult?.answer) {
