@@ -51,6 +51,80 @@ def create_task(payload: TaskCreateRequest, db: DbSession, _actor: TaskCreateAct
     return task
 
 
+# Iteration / follow-up: spawn a child task linked to the parent.
+# The existing continuation chain in TaskService._build_continuation_request
+# already pulls the parent's plan + diff + compile errors + rejected patches
+# into the new task's prompt, so this endpoint is mostly a thin wrapper
+# that saves the frontend from building the larger TaskCreateRequest.
+
+from pydantic import BaseModel as _PydBaseModel  # noqa: E402
+
+
+class _IterateBody(_PydBaseModel):
+    follow_up: str
+    actor_name: str | None = None
+
+
+# Statuses where the parent is mid-flight; iterating here would race the
+# in-flight pipeline with the new continuation pipeline.
+_ITERATE_BLOCKED_STATUSES = {
+    TaskStatus.PLANNING,
+    TaskStatus.REVIEWING,
+    TaskStatus.EXECUTING,
+    TaskStatus.RUNNING,
+    TaskStatus.QUEUED,
+}
+
+
+@router.post("/{task_id}/iterate", response_model=TaskDetail, status_code=status.HTTP_201_CREATED)
+def iterate_task(
+    task_id: str,
+    body: _IterateBody,
+    db: DbSession,
+    actor: TaskCreateActorCtx,
+) -> TaskDetail:
+    """Create a child task that amends the parent's result with a follow-up instruction.
+
+    Reuses TaskService.create_task() with previous_task_id set, so the new task
+    inherits the parent's scenario, session, and an augmented prompt that
+    contains the parent's plan + result + compile errors + rejected diffs.
+    """
+    parent = db.get(TaskModel, task_id)
+    if parent is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+
+    if parent.status in _ITERATE_BLOCKED_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Parent task is still running. Wait for it to finish or pause "
+                "for approval before iterating."
+            ),
+        )
+
+    follow_up = (body.follow_up or "").strip()
+    if not follow_up:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="follow_up is required.",
+        )
+
+    payload = TaskCreateRequest(
+        request=follow_up,
+        actor_name=body.actor_name or parent.actor_name or "operator",
+        actor_role=parent.actor_role,
+        session_id=parent.session_id,
+        previous_task_id=parent.id,
+        source_name=parent.source_name,
+    )
+
+    service = TaskService(db)
+    try:
+        return service.create_task(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
 @router.get("", response_model=list[TaskSummary])
 def list_tasks(
     db: DbSession,

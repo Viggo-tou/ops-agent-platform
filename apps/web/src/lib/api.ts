@@ -354,6 +354,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ actor_name: actorName, reason }),
     }),
+  iterateTask: (taskId: string, followUp: string, actorName?: string) =>
+    request<TaskDetail>(`/tasks/${taskId}/iterate`, {
+      method: "POST",
+      body: JSON.stringify({ follow_up: followUp, actor_name: actorName ?? null }),
+    }),
   getToolUsageStats: (windowDays = 7, top = 10) =>
     request<{
       total_invocations: number;

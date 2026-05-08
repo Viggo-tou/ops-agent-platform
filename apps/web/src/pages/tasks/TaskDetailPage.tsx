@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { useState } from "react";
 
 import { ApprovalPanel } from "../../components/tasks/ApprovalPanel";
@@ -33,9 +33,12 @@ function readPlanSummary(plan: Record<string, unknown> | null): string | null {
 
 export function TaskDetailPage() {
   const { taskId } = useParams();
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [actionNotes, setActionNotes] = useState("");
   const [rollbackReason, setRollbackReason] = useState("Reset task state for demo follow-up.");
+  const [followUpText, setFollowUpText] = useState("");
+  const [followUpError, setFollowUpError] = useState<string | null>(null);
 
   // SSE: drives invalidations for the queries below; falls back to interval
   // polling when the stream isn't live yet (or has finished).
@@ -87,6 +90,19 @@ export function TaskDetailPage() {
     onSuccess: refreshTaskViews,
   });
 
+  const iterateMutation = useMutation({
+    mutationFn: (followUp: string) => api.iterateTask(taskId!, followUp),
+    onSuccess: (newTask) => {
+      setFollowUpText("");
+      setFollowUpError(null);
+      void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      void navigate(`/tasks/${newTask.id}`);
+    },
+    onError: (err: unknown) => {
+      setFollowUpError(toErrorMessage(err));
+    },
+  });
+
   if (!taskId) {
     return <div className="error-banner">Task id is missing from the route.</div>;
   }
@@ -123,8 +139,53 @@ export function TaskDetailPage() {
   const structuredResult = task.latest_result_json?.result;
   const knowledgeResult = readKnowledgeSearchResult(structuredResult);
 
+  // Continuation metadata (parent link). Lives in governance_json.continuation
+  // when this task was created via /iterate or with previous_task_id.
+  const continuationMeta = (() => {
+    const gov = task.governance_json as Record<string, unknown> | null | undefined;
+    const c = gov?.continuation;
+    if (!c || typeof c !== "object") return null;
+    const cc = c as Record<string, unknown>;
+    return {
+      previousTaskId: typeof cc.previous_task_id === "string" ? cc.previous_task_id : null,
+      parentStatus: typeof cc.parent_status === "string" ? cc.parent_status : null,
+      parentScenario: typeof cc.parent_scenario === "string" ? cc.parent_scenario : null,
+    };
+  })();
+
+  // 迭代入口允许的状态:已完成 / 失败 / 待审批 / 已回滚 / 已拒绝。
+  // 进行中的状态会与新 pipeline 抢任务,后端也会返回 409,所以不显示按钮。
+  const iterateAllowed = ["completed", "failed", "awaiting_approval", "waiting_approval", "rolled_back", "rejected"]
+    .includes(task.status);
+  const submitFollowUp = () => {
+    const text = followUpText.trim();
+    if (!text) {
+      setFollowUpError("请填写改动指令。");
+      return;
+    }
+    setFollowUpError(null);
+    iterateMutation.mutate(text);
+  };
+
   return (
     <div className="stack">
+      {continuationMeta?.previousTaskId ? (
+        <div className="iterate-parent-banner">
+          <span className="iterate-parent-arrow">↩</span>
+          <span>
+            该任务由迭代生成 ·{" "}
+            <Link className="iterate-parent-link" to={`/tasks/${continuationMeta.previousTaskId}`}>
+              查看原任务
+            </Link>
+          </span>
+          {continuationMeta.parentStatus ? (
+            <span className="iterate-parent-status">
+              原任务状态: <code>{continuationMeta.parentStatus}</code>
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+
       <section className="page-header-card">
         <div>
           <div className="eyebrow">Task Detail</div>
@@ -382,6 +443,51 @@ export function TaskDetailPage() {
         </div>
 
         <TaskTimeline events={events} />
+      </section>
+
+      <section className="iterate-section">
+        <header className="iterate-head">
+          <div>
+            <h3>继续改动</h3>
+            <p className="iterate-subtitle">
+              基于本任务的当前结果(plan + diff + 编译错误等)生成一个续写任务,
+              新任务会保留同一会话与场景。
+            </p>
+          </div>
+        </header>
+        {iterateAllowed ? (
+          <>
+            <textarea
+              className="iterate-textarea"
+              value={followUpText}
+              onChange={(e) => setFollowUpText(e.target.value)}
+              placeholder="例如: 把验证规则改严格 / 也加上 firebase.json / 修复编译错误..."
+              rows={3}
+              disabled={iterateMutation.isPending}
+            />
+            {followUpError ? (
+              <p className="iterate-error">{followUpError}</p>
+            ) : null}
+            <div className="iterate-actions">
+              <button
+                type="button"
+                className="iterate-submit"
+                onClick={submitFollowUp}
+                disabled={iterateMutation.isPending || !followUpText.trim()}
+              >
+                {iterateMutation.isPending ? "生成中…" : "继续改动 ↗"}
+              </button>
+              <span className="iterate-hint">
+                生成新任务后会自动跳转到新任务详情页。
+              </span>
+            </div>
+          </>
+        ) : (
+          <p className="iterate-empty">
+            当前状态 <code>{task.status}</code> 不支持继续改动。
+            等任务进入 <code>awaiting_approval</code> / <code>completed</code> / <code>failed</code> 后再试。
+          </p>
+        )}
       </section>
     </div>
   );
