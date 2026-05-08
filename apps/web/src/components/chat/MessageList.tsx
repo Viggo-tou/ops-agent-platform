@@ -11,6 +11,10 @@ import type { EventRecord, TaskDetail } from "../../types";
 
 export const FOLLOW_UP_MARKER = "\n\nFollow-up request:\n";
 
+/** Pipeline-backed scenarios — only these get the inline 继续修复 affordance.
+ *  process_question is a light chat answer and shouldn't show iteration UI. */
+const PIPELINE_SCENARIOS = new Set(["jira_issue_develop", "jira_issue_plan", "jira_issue_writeback"]);
+
 interface MessageListProps {
   task?: TaskDetail | null;
   tasks?: TaskDetail[];
@@ -22,6 +26,12 @@ interface MessageListProps {
    * optimistic task object hasn't been replaced with the completed row yet.
    */
   streaming?: boolean;
+  /** When this id matches a failed pipeline task in the list, that task's
+   *  inline failure block shows '✓ 继续模式已开' instead of '继续修复'. */
+  continueFromTaskId?: string | null;
+  /** Toggle the continue-mode flag from inside the inline failure block. */
+  onToggleContinueMode?: (taskId: string) => void;
+  canCreate?: boolean;
 }
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "rolled_back"]);
@@ -178,7 +188,15 @@ export function buildAgentReply(task: TaskDetail): string {
   return buildDevelopDetail() ?? "I have received the request and am preparing the response.";
 }
 
-export function MessageList({ task, tasks, eventsMap, streaming = false }: MessageListProps) {
+export function MessageList({
+  task,
+  tasks,
+  eventsMap,
+  streaming = false,
+  continueFromTaskId = null,
+  onToggleContinueMode,
+  canCreate = true,
+}: MessageListProps) {
   const visibleTasks = tasks ?? (task ? [task] : []);
 
   if (visibleTasks.length === 0) {
@@ -248,6 +266,20 @@ export function MessageList({ task, tasks, eventsMap, streaming = false }: Messa
                         <DiffViewer diff={developDiff.diff} />
                       </details>
                     ) : null}
+                    {/* Inline 继续修复 affordance — only for failed PIPELINE
+                        tasks, not chat-answer failures. Renders as part of
+                        the assistant bubble so it sits in the conversation
+                        flow (similar to the approval block) instead of being
+                        a global horizontal bar at the page bottom. */}
+                    {messageTask.status === "failed" &&
+                    PIPELINE_SCENARIOS.has(messageTask.scenario || "") ? (
+                      <FailedPipelineActionBlock
+                        task={messageTask}
+                        active={continueFromTaskId === messageTask.id}
+                        canCreate={canCreate}
+                        onToggle={() => onToggleContinueMode?.(messageTask.id)}
+                      />
+                    ) : null}
                   </div>
                 </div>
               )}
@@ -256,5 +288,47 @@ export function MessageList({ task, tasks, eventsMap, streaming = false }: Messa
         );
       })}
     </div>
+  );
+}
+
+
+function FailedPipelineActionBlock({
+  task,
+  active,
+  canCreate,
+  onToggle,
+}: {
+  task: TaskDetail;
+  active: boolean;
+  canCreate: boolean;
+  onToggle: () => void;
+}) {
+  const reasonRaw =
+    (task.latest_result_json as { reason?: string; message?: string } | null)?.reason ??
+    (task.latest_result_json as { message?: string } | null)?.message ??
+    task.review_summary ??
+    task.title ??
+    "上次任务失败";
+  const reason = String(reasonRaw).slice(0, 200);
+  return (
+    <section className="inline-failed-block" aria-label="task failed">
+      <header className="inline-failed-block-head">
+        <span className="inline-failed-block-icon" aria-hidden="true">!</span>
+        <strong>任务执行失败</strong>
+        <span className="inline-failed-block-tag">{task.scenario}</span>
+      </header>
+      <p className="inline-failed-block-reason">{reason}</p>
+      <div className="inline-failed-block-actions">
+        <button
+          type="button"
+          className={`inline-failed-block-btn ${active ? "active" : ""}`}
+          onClick={onToggle}
+          disabled={!canCreate}
+          title="下一条消息会带上失败上下文一起发"
+        >
+          {active ? "✓ 继续模式已开" : "继续修复"}
+        </button>
+      </div>
+    </section>
   );
 }

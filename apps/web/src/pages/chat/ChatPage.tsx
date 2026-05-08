@@ -74,6 +74,24 @@ export function ChatPage() {
   // When set, the next submit will dispatch as a continuation of this task.
   // Activated by the "继续修复" button on a failed task; cleared after submit.
   const [continueFromTaskId, setContinueFromTaskId] = useState<string | null>(null);
+
+  // Reset per-conversation transient state when the URL switches between
+  // /chat/A and /chat/B. Without this, the optimisticTask from the previous
+  // thread bleeds into the new thread and the user sees the message they
+  // just sent appear inside an unrelated conversation. Also clear streaming
+  // and continue-mode flags so the new thread starts clean.
+  useEffect(() => {
+    setOptimisticTask(null);
+    setIsStreaming(false);
+    setStreamError(null);
+    setContinueFromTaskId(null);
+    // Cancel any in-flight stream owned by the previous thread so it can't
+    // mutate state after we've moved on.
+    if (abortRef.current && !abortRef.current.signal.aborted) {
+      try { abortRef.current.abort(); } catch { /* noop */ }
+    }
+    abortRef.current = null;
+  }, [taskId]);
   // Per-conversation source override; persists in localStorage so a user's
   // choice survives navigation. Empty string = use env default.
   const [sourceName, setSourceName] = useState<string>(() => {
@@ -573,39 +591,22 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
           </div>
         ) : null}
         {visibleThreadTasks.length > 0 ? (
-          <MessageList tasks={visibleThreadTasks} eventsMap={eventsMap} streaming={isStreaming} />
+          <MessageList
+            tasks={visibleThreadTasks}
+            eventsMap={eventsMap}
+            streaming={isStreaming}
+            continueFromTaskId={continueFromTaskId}
+            onToggleContinueMode={(id) =>
+              setContinueFromTaskId(continueFromTaskId === id ? null : id)
+            }
+            canCreate={can("task:create")}
+          />
         ) : null}
       </section>
 
-      {(() => {
-        const latest = visibleThreadTasks[visibleThreadTasks.length - 1];
-        if (!latest || latest.status !== "failed") {
-          return null;
-        }
-        const reason =
-          (latest.latest_result_json as { reason?: string } | null)?.reason ??
-          (latest.review_summary || latest.title || "上次任务失败");
-        return (
-          <div className="continue-banner">
-            <div className="continue-banner-text">
-              上次任务失败：<code>{String(reason).slice(0, 80)}</code>
-            </div>
-            <div className="continue-banner-actions">
-              <button
-                type="button"
-                className={`continue-toggle ${continueFromTaskId === latest.id ? "active" : ""}`}
-                onClick={() =>
-                  setContinueFromTaskId(continueFromTaskId === latest.id ? null : latest.id)
-                }
-                disabled={!can("task:create")}
-                title="下一条消息会带上失败上下文一起发"
-              >
-                {continueFromTaskId === latest.id ? "✓ 继续模式已开" : "继续修复"}
-              </button>
-            </div>
-          </div>
-        );
-      })()}
+      {/* Failure-action UI for pipeline tasks now renders inline in
+          MessageList (FailedPipelineActionBlock) — see MessageList.tsx.
+          We just plumb the toggle state + active task id down. */}
 
       <ChatInput
         onSubmit={(message, files) =>

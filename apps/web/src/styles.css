@@ -1864,6 +1864,80 @@ dd {
 .live-dot-paused { background: #f59e0b; }
 .live-dot-done   { background: #94a3b8; }
 
+/* Inline failed-pipeline action block (lives inside the assistant
+   bubble, replaces the old continue-banner that floated above the
+   chat input). */
+.inline-failed-block {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid #fecaca;
+  background: #fef2f2;
+  border-radius: 12px;
+}
+.inline-failed-block-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 13px;
+  color: #991b1b;
+}
+.inline-failed-block-head strong { color: #7f1d1d; font-weight: 600; }
+.inline-failed-block-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #b91c1c;
+  color: #fff;
+  font-weight: 700;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.inline-failed-block-tag {
+  margin-left: auto;
+  font-size: 11px;
+  color: #7f1d1d;
+  background: #fff;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid #fecaca;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.inline-failed-block-reason {
+  margin: 6px 0 10px 0;
+  font-size: 13px;
+  color: #581818;
+  word-break: break-word;
+}
+.inline-failed-block-actions { display: flex; gap: 8px; }
+.inline-failed-block-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 14px;
+  border-radius: 10px;
+  border: 1px solid #fca5a5;
+  background: #fff;
+  color: #b91c1c;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.inline-failed-block-btn:hover:not(:disabled) {
+  background: #fff0f0;
+  border-color: #f87171;
+}
+.inline-failed-block-btn.active {
+  background: #b91c1c;
+  color: #fff;
+  border-color: #b91c1c;
+}
+.inline-failed-block-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
 /* RPG-style typewriter caret on a live-streaming assistant message. */
 .streaming-caret {
   display: inline-block;
