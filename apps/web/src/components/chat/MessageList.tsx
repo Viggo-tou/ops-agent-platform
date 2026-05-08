@@ -1,4 +1,5 @@
 import { EventTimeline } from "./EventTimeline";
+import { MarkdownText } from "./MarkdownText";
 import { ThinkingIndicator } from "./ThinkingIndicator";
 import { TypingText } from "./TypingText";
 import { AwaitingApprovalBlock, readFailureDiagnosis } from "./AwaitingApprovalBlock";
@@ -100,11 +101,13 @@ export function readDisplayRequestText(requestText: string): string {
 export function buildAgentReply(task: TaskDetail): string {
   // Streaming chat path: backend stores { kind: "chat_answer", answer: "..." }
   // directly on latest_result_json. Check this before the heavier knowledge
-  // path.
-  const directKind = readString(task.latest_result_json?.kind);
-  const directAnswer = readString(task.latest_result_json?.answer);
-  if (directKind === "chat_answer" && directAnswer) {
-    return directAnswer;
+  // path. Returns the answer even when empty (still streaming) so the chat
+  // doesn't briefly flash 'I could not produce a grounded repository answer'
+  // from the process_question fallback below.
+  const rawKind = task.latest_result_json?.kind;
+  if (typeof rawKind === "string" && rawKind === "chat_answer") {
+    const ans = task.latest_result_json?.answer;
+    return typeof ans === "string" ? ans : "";
   }
 
   const result = task.latest_result_json?.result;
@@ -216,7 +219,15 @@ export function MessageList({ task, tasks, eventsMap }: MessageListProps) {
                     {failureDiagnosis ? <AwaitingApprovalBlock diagnosis={failureDiagnosis} /> : null}
                     {replyText ? (
                       <>
-                        <TypingText text={replyText} enabled={shouldAnimate} />
+                        {messageTask.scenario === "process_question" ? (
+                          // Chat answer: render as markdown so **bold**, ##,
+                          // numbered lists, code blocks, --- all display
+                          // properly. ChatPage.submitMessage drives the
+                          // typewriter pace by growing replyText char-by-char.
+                          <MarkdownText text={replyText} />
+                        ) : (
+                          <TypingText text={replyText} enabled={shouldAnimate} />
+                        )}
                         {/* Blinking caret while live-streaming a chat answer. */}
                         {isLastTask && isActive ? <span className="streaming-caret" aria-hidden="true">▍</span> : null}
                       </>

@@ -192,6 +192,10 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
       title: task?.title ?? "New request",
       status: "running",
       scenario: "process_question",
+      // Seed empty chat_answer so buildAgentReply takes the chat path
+      // immediately and doesn't flash the process_question fallback
+      // 'I could not produce a grounded repository answer...' message.
+      latest_result_json: { kind: "chat_answer", answer: "" },
     };
 
     setOptimisticTask(tempTask);
