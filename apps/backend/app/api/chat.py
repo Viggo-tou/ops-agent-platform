@@ -63,6 +63,23 @@ class ChatSendRequest(BaseModel):
 
 _BASE_SYSTEM_PROMPT = """你是 **运维代理** (Ops Agent),一个多阶段代码变更平台的对话入口。除非用户先切英文,默认中文回答。
 
+# 何时**立刻**输出 TASK_INTENT(不要再问)
+
+只要满足以下**任意一条**,就直接输出 marker,不要再追问:
+
+1. 用户提到具体 **Jira 单号**(任何符合 `[A-Z]+-\d+` 的 token)+ 动作词(完成 / 实现 / 修 / fix / develop / implement)→ `jira_issue_develop`
+2. 用户给出**具体文件路径**或**报错信息**让你处理 → `jira_issue_develop`
+3. 用户已经在前面说过任务内容,这一轮只是补全细节(如 "开发任务" / "对" / "yes" / "go") → 用前文确定的 scenario,**不要重新问**
+
+只有当**完全没有目标**(没单号、没文件、没问题)时,才用 `process_question` 让用户澄清。
+
+**禁止**(常见 bug,逐条避免):
+- ❌ 用户已经给了 Jira 单号 + 动作词,你还问"是开发还是规划" — 默认开发
+- ❌ 用户回答"开发任务"后,你还继续追问"想做什么" — 这是在循环,**直接 emit marker**
+- ❌ 把已说过的内容当没说过 — 对话历史就在 messages 里,**要回头看 user/assistant 历史 turn 才下一句的判断**
+- ❌ **不要把这份 system 里的示例占位符当成用户真实说过的内容**(这是 prompt,不是用户输入)
+
+
 # 回答风格(硬要求,逐条对照)
 
 1. **结构化优先**:超过 2 个要点必须用 `1.` `2.` `3.` 或 `- ` 列表,不要堆成长句子。
@@ -177,6 +194,80 @@ def _build_system_prompt(db: Session) -> str:
 SYSTEM_PROMPT = _BASE_SYSTEM_PROMPT
 
 
+# Caps prior conversation context. Last N user/assistant pairs, total under
+# ~6KB so we don't blow up the context window on long chats.
+_MAX_HISTORY_PAIRS = 6
+_MAX_HISTORY_CHARS = 6000
+
+
+def _load_session_history(db: Session, session_id: str | None) -> list[dict[str, str]]:
+    """Reconstruct prior chat turns in this session as OpenAI-style messages.
+
+    Each prior Task with the same session_id contributes:
+      { role: "user", content: <task.request_text> }
+    plus, when an answer exists,
+      { role: "assistant", content: <task.latest_result_json.answer or summary> }
+
+    Returned in chronological order (oldest first), capped at the most recent
+    _MAX_HISTORY_PAIRS pairs and ~_MAX_HISTORY_CHARS total. The current
+    incoming message is NOT included — caller appends it.
+    """
+    if not session_id:
+        return []
+
+    rows = (
+        db.query(TaskModel)
+        .filter(TaskModel.session_id == session_id)
+        .order_by(TaskModel.created_at.asc())
+        .all()
+    )
+    if not rows:
+        return []
+
+    pairs: list[tuple[str, str | None]] = []
+    for t in rows:
+        user_text = (t.request_text or "").strip()
+        if not user_text:
+            continue
+        # Strip the long CONTINUATION FROM PARENT preamble from iterated
+        # tasks so the assistant's history view shows the user's actual
+        # follow-up and not the auto-generated context block.
+        if user_text.startswith("[CONTINUATION FROM PARENT TASK"):
+            marker = "[USER FOLLOWUP / NEW REQUEST]:"
+            idx = user_text.find(marker)
+            if idx >= 0:
+                user_text = user_text[idx + len(marker):].strip()
+
+        assistant_text: str | None = None
+        result = t.latest_result_json
+        if isinstance(result, dict):
+            if result.get("kind") == "chat_answer":
+                ans = result.get("answer")
+                if isinstance(ans, str) and ans.strip():
+                    assistant_text = ans.strip()
+            elif "message" in result and isinstance(result.get("message"), str):
+                # Heavy task: summarize as a one-line confirmation rather
+                # than dumping the full plan/diff into context.
+                assistant_text = f"(已创建任务 {t.id[:8]}, 状态: {t.status.value if hasattr(t.status, 'value') else t.status})"
+        pairs.append((user_text, assistant_text))
+
+    pairs = pairs[-_MAX_HISTORY_PAIRS:]
+
+    # Trim from the FRONT until total chars is under the cap.
+    def total_chars(ps: list[tuple[str, str | None]]) -> int:
+        return sum(len(u) + len(a or "") for u, a in ps)
+
+    while pairs and total_chars(pairs) > _MAX_HISTORY_CHARS:
+        pairs.pop(0)
+
+    messages: list[dict[str, str]] = []
+    for user_text, assistant_text in pairs:
+        messages.append({"role": "user", "content": user_text})
+        if assistant_text:
+            messages.append({"role": "assistant", "content": assistant_text})
+    return messages
+
+
 _DEFAULT_MAX_TOKENS = 1024
 
 
@@ -194,6 +285,10 @@ async def chat_send(
     _state_db = SessionLocal()
     try:
         system_prompt = _build_system_prompt(_state_db)
+        # Load prior turns from the same session so the model can resolve
+        # follow-up references like "对" / "开发任务" without forgetting
+        # what the user already said.
+        history = _load_session_history(_state_db, body.session_id)
     finally:
         _state_db.close()
 
@@ -226,7 +321,7 @@ async def chat_send(
                     },
                 )
                 async for chunk in _stream_from_provider(
-                    provider, body.message, settings, model_name, system_prompt
+                    provider, body.message, settings, model_name, system_prompt, history
                 ):
                     if not chunk:
                         continue
@@ -403,26 +498,32 @@ def _resolve_provider_chain(settings) -> list[tuple[str, str]]:
 
 
 async def _stream_from_provider(
-    provider: str, message: str, settings, model_name: str, system_prompt: str
+    provider: str,
+    message: str,
+    settings,
+    model_name: str,
+    system_prompt: str,
+    history: list[dict[str, str]] | None = None,
 ) -> AsyncGenerator[str, None]:
+    history = history or []
     if provider == "mock":
         async for chunk in _stream_mock(message):
             yield chunk
         return
     if provider == "minimax":
-        async for chunk in _stream_minimax(message, settings, model_name, system_prompt):
+        async for chunk in _stream_minimax(message, settings, model_name, system_prompt, history):
             yield chunk
         return
     if provider == "anthropic":
-        async for chunk in _stream_anthropic(message, settings, model_name, system_prompt):
+        async for chunk in _stream_anthropic(message, settings, model_name, system_prompt, history):
             yield chunk
         return
     if provider == "openai":
-        async for chunk in _stream_openai(message, settings, model_name, system_prompt):
+        async for chunk in _stream_openai(message, settings, model_name, system_prompt, history):
             yield chunk
         return
     if provider == "deepseek":
-        async for chunk in _stream_deepseek(message, settings, model_name, system_prompt):
+        async for chunk in _stream_deepseek(message, settings, model_name, system_prompt, history):
             yield chunk
         return
     # Unknown / not yet implemented (claude_code / codex / ollama).
@@ -437,21 +538,21 @@ async def _stream_mock(message: str) -> AsyncGenerator[str, None]:
         await asyncio.sleep(0.005)
 
 
-async def _stream_minimax(message: str, settings, model_name: str, system_prompt: str) -> AsyncGenerator[str, None]:
+async def _stream_minimax(message: str, settings, model_name: str, system_prompt: str, history: list[dict[str, str]]) -> AsyncGenerator[str, None]:
     if not getattr(settings, "minimax_api_key", None):
         raise RuntimeError("OPS_AGENT_MINIMAX_API_KEY not set")
     headers = {
         "Authorization": f"Bearer {settings.minimax_api_key}",
         "Content-Type": "application/json",
     }
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": message})
     payload = {
         "model": model_name or "MiniMax-M2.7-highspeed",
         "stream": True,
         "max_tokens": _DEFAULT_MAX_TOKENS,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": message},
-        ],
+        "messages": messages,
     }
     url = f"{settings.minimax_base_url.rstrip('/')}/v1/text/chatcompletion_v2"
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
@@ -482,7 +583,7 @@ async def _stream_minimax(message: str, settings, model_name: str, system_prompt
                     yield content
 
 
-async def _stream_anthropic(message: str, settings, model_name: str, system_prompt: str) -> AsyncGenerator[str, None]:
+async def _stream_anthropic(message: str, settings, model_name: str, system_prompt: str, history: list[dict[str, str]]) -> AsyncGenerator[str, None]:
     if not getattr(settings, "anthropic_api_key", None):
         raise RuntimeError("OPS_AGENT_ANTHROPIC_API_KEY not set")
     headers = {
@@ -490,12 +591,26 @@ async def _stream_anthropic(message: str, settings, model_name: str, system_prom
         "anthropic-version": "2023-06-01",
         "Content-Type": "application/json",
     }
+    # Anthropic's API rejects two consecutive same-role messages and requires
+    # the conversation alternates user/assistant. The history loader returns
+    # tasks in chronological order; if a task didn't produce an assistant
+    # answer we collapse adjacent user turns.
+    msgs: list[dict[str, str]] = []
+    for entry in history:
+        if msgs and msgs[-1]["role"] == entry["role"]:
+            msgs[-1]["content"] = msgs[-1]["content"] + "\n\n" + entry["content"]
+        else:
+            msgs.append(dict(entry))
+    if msgs and msgs[-1]["role"] == "user":
+        msgs[-1]["content"] = msgs[-1]["content"] + "\n\n" + message
+    else:
+        msgs.append({"role": "user", "content": message})
     payload = {
         "model": model_name or "claude-sonnet-4-5",
         "max_tokens": _DEFAULT_MAX_TOKENS,
         "system": system_prompt,
         "stream": True,
-        "messages": [{"role": "user", "content": message}],
+        "messages": msgs,
     }
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
         async with client.stream(
@@ -521,7 +636,7 @@ async def _stream_anthropic(message: str, settings, model_name: str, system_prom
                         yield text
 
 
-async def _stream_deepseek(message: str, settings, model_name: str, system_prompt: str) -> AsyncGenerator[str, None]:
+async def _stream_deepseek(message: str, settings, model_name: str, system_prompt: str, history: list[dict[str, str]]) -> AsyncGenerator[str, None]:
     """DeepSeek's OpenAI-compatible streaming endpoint.
 
     NOTE: We hardcode the URL to api.deepseek.com/v1/chat/completions instead
@@ -536,13 +651,13 @@ async def _stream_deepseek(message: str, settings, model_name: str, system_promp
         "Authorization": f"Bearer {settings.deepseek_api_key}",
         "Content-Type": "application/json",
     }
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": message})
     payload = {
         "model": model_name or "deepseek-chat",
         "stream": True,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": message},
-        ],
+        "messages": messages,
     }
     url = "https://api.deepseek.com/v1/chat/completions"
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
@@ -576,20 +691,20 @@ async def _stream_deepseek(message: str, settings, model_name: str, system_promp
                     yield content
 
 
-async def _stream_openai(message: str, settings, model_name: str, system_prompt: str) -> AsyncGenerator[str, None]:
+async def _stream_openai(message: str, settings, model_name: str, system_prompt: str, history: list[dict[str, str]]) -> AsyncGenerator[str, None]:
     if not getattr(settings, "openai_api_key", None):
         raise RuntimeError("OPS_AGENT_OPENAI_API_KEY not set")
     headers = {
         "Authorization": f"Bearer {settings.openai_api_key}",
         "Content-Type": "application/json",
     }
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": message})
     payload = {
         "model": model_name or "gpt-4o-mini",
         "stream": True,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": message},
-        ],
+        "messages": messages,
     }
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
         async with client.stream(
