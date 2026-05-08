@@ -34,7 +34,7 @@ interface MessageListProps {
   canCreate?: boolean;
 }
 
-const TERMINAL_STATUSES = new Set(["completed", "failed", "rolled_back"]);
+const TERMINAL_STATUSES = new Set(["completed", "failed", "rolled_back", "stale_failed"]);
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value : null;
@@ -266,11 +266,25 @@ export function MessageList({
                         <DiffViewer diff={developDiff.diff} />
                       </details>
                     ) : null}
+                    {/* Authoritative task-creation status — the single source
+                        of truth for whether a Task row got persisted. Renders
+                        as a 3-state inline block (pending / created / failed)
+                        below the streamed text so the user can never trust
+                        a confidently wrong "已提交" line from the model. */}
+                    {(() => {
+                      const cs = readCreationStatus(messageTask);
+                      if (!cs) return null;
+                      // Heuristic: did the model's reply text actually CLAIM
+                      // creation? If so, show the "downgrade" hint while
+                      // pending so the user knows that text was premature.
+                      const claims = /已经?\s*(提交|创建|启动|开始)|已加入\s*pipeline|task\s+(created|submitted)/i.test(
+                        replyText || "",
+                      );
+                      return <TaskCreationStatusBlock state={cs} modelClaimsCreated={claims} />;
+                    })()}
+
                     {/* Inline 继续修复 affordance — only for failed PIPELINE
-                        tasks, not chat-answer failures. Renders as part of
-                        the assistant bubble so it sits in the conversation
-                        flow (similar to the approval block) instead of being
-                        a global horizontal bar at the page bottom. */}
+                        tasks, not chat-answer failures. */}
                     {messageTask.status === "failed" &&
                     PIPELINE_SCENARIOS.has(messageTask.scenario || "") ? (
                       <FailedPipelineActionBlock
@@ -287,6 +301,109 @@ export function MessageList({
           </div>
         );
       })}
+    </div>
+  );
+}
+
+
+type CreationStatus = "pending" | "created" | "failed";
+
+function readCreationStatus(task: TaskDetail): {
+  status: CreationStatus;
+  task_id?: string;
+  scenario?: string;
+  kicked_off_pipeline?: boolean;
+  failure_reason?: string;
+  failure_advice?: string;
+  failure_kind?: string;
+} | null {
+  const r = task.latest_result_json;
+  if (!r || typeof r !== "object" || Array.isArray(r)) return null;
+  const obj = r as Record<string, unknown>;
+  const cs = obj.creation_status;
+  if (cs !== "pending" && cs !== "created" && cs !== "failed") return null;
+  return {
+    status: cs as CreationStatus,
+    task_id: typeof obj.task_id === "string" ? obj.task_id : undefined,
+    scenario:
+      typeof obj.scenario_created === "string"
+        ? obj.scenario_created
+        : typeof obj.scenario_intended === "string"
+          ? obj.scenario_intended
+          : undefined,
+    kicked_off_pipeline: typeof obj.kicked_off_pipeline === "boolean" ? obj.kicked_off_pipeline : undefined,
+    failure_reason: typeof obj.create_failure_reason === "string" ? obj.create_failure_reason : undefined,
+    failure_advice: typeof obj.create_failure_advice === "string" ? obj.create_failure_advice : undefined,
+    failure_kind: typeof obj.create_failure_kind === "string" ? obj.create_failure_kind : undefined,
+  };
+}
+
+function TaskCreationStatusBlock({
+  state,
+  modelClaimsCreated,
+}: {
+  state: ReturnType<typeof readCreationStatus>;
+  modelClaimsCreated: boolean;
+}) {
+  if (!state) return null;
+  // pending: render only if the model's text contained a "已提交"-style
+  // claim, so the user gets a downgraded grey "creating..." instead of a
+  // false confirmation. If the model behaved (used 我会去创建...), we
+  // can show pending always.
+  if (state.status === "pending") {
+    return (
+      <div className="task-create-status pending">
+        <span className="task-create-spinner" aria-hidden="true" />
+        <span>正在创建任务…</span>
+        {modelClaimsCreated ? (
+          <span className="task-create-hint">(模型描述仅供参考,以这里的最终结果为准)</span>
+        ) : null}
+      </div>
+    );
+  }
+  if (state.status === "created") {
+    const link = state.task_id ? `/tasks/${state.task_id}` : null;
+    const tagline = state.kicked_off_pipeline
+      ? "已加入 pipeline 队列,可在任务详情页跟进"
+      : "已存档,可在任务列表查看";
+    return (
+      <div className="task-create-status created">
+        <span className="task-create-icon" aria-hidden="true">✓</span>
+        <div className="task-create-body">
+          <div className="task-create-title">
+            任务已创建{state.scenario ? <code className="task-create-scenario">{state.scenario}</code> : null}
+          </div>
+          <div className="task-create-sub">
+            {tagline}
+            {link ? (
+              <>
+                {" · "}
+                <a href={link} target="_self" rel="noopener">
+                  打开 #{state.task_id?.slice(0, 8)}
+                </a>
+              </>
+            ) : null}
+          </div>
+        </div>
+      </div>
+    );
+  }
+  // failed
+  return (
+    <div className="task-create-status failed">
+      <span className="task-create-icon" aria-hidden="true">✗</span>
+      <div className="task-create-body">
+        <div className="task-create-title">任务未创建</div>
+        <div className="task-create-sub">
+          {state.failure_advice ?? "请重试或检查后端日志。"}
+        </div>
+        {state.failure_reason ? (
+          <details className="task-create-detail">
+            <summary>技术细节</summary>
+            <code>{state.failure_reason}</code>
+          </details>
+        ) : null}
+      </div>
     </div>
   );
 }

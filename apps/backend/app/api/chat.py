@@ -123,7 +123,15 @@ Pipeline 在沙箱里有 `codegen.generate_patch` / `sandbox.apply_patch` / `san
 TASK_INTENT|<scenario>|<一句话总结>
 ```
 
-之后可以再写 1-2 句对用户的确认。
+之后可以再写 1-2 句**意图描述**,**不能**说成事实。区别:
+
+- ✅ "我**会**去创建一个开发任务" / "我**正在**为你委托给 pipeline" / "**接下来**会让 pipeline 执行"
+- ❌ "我**已经**创建了任务" / "**已**提交 pipeline" / "任务**已经**开始执行"
+- ❌ "Jira 单 P69-XX 的开发**已经**启动"
+
+为什么:你输出 marker 之后,系统才尝试 INSERT Task。可能因 DB 繁忙、参数无效等失败。**真正的成功/失败由系统状态条告诉用户**(前端会渲染绿/红块)。你提前断言"已创建"会让用户被骗。
+
+**用现在进行时 / 将来时,不要用完成时**。
 
 纯问答时,**不要**输出 marker。
 """
@@ -526,9 +534,27 @@ async def chat_send(
                     },
                 )
         except Exception as exc:  # noqa: BLE001
+            # Differentiate persistence failure from a generic stream error.
+            # The frontend renders task_create_failed as an explicit red status
+            # block ("✗ 任务未创建") so the user sees the truth instead of
+            # trusting the model's preceding "已提交" claim. The model's
+            # answer text is preserved (`answer_kept`) — we just couldn't
+            # write the Task row.
+            err_str = str(exc)
+            is_locked = "database is locked" in err_str.lower() or "operationalerror" in err_str.lower()
             yield _sse(
-                "error",
-                {"message": f"persistence failed: {exc}", "answer_kept": True},
+                "task_create_failed",
+                {
+                    "reason": err_str[:300],
+                    "reason_kind": "db_locked" if is_locked else "persistence_error",
+                    "answer_kept": True,
+                    "scenario_intended": (intent[0] if intent else "process_question"),
+                    "user_advice": (
+                        "数据库繁忙(有别的任务正在写),稍后重试一下。"
+                        if is_locked
+                        else "持久化失败,请重试或检查后端日志。"
+                    ),
+                },
             )
 
         yield _sse("end", {"length": len(full_text)})
@@ -917,35 +943,23 @@ def _persist_question_task(
 ) -> str:
     """Lightweight persistence: a single Task row marked completed.
 
-    No pipeline kicked off. This keeps chat history queryable from
-    /api/tasks (the chat sidebar already lists tasks by session_id).
-
-    Retries on 'database is locked' — chat persistence racing the heavy
-    orchestrator's bulk writes is the most common source of dropped chat
-    messages. We try up to 5 times with exponential backoff (50ms, 100ms,
-    200ms, 400ms, 800ms) before giving up. The longest possible wait is
-    ~1.5s which is acceptable for an interactive chat reply.
+    No retry. The previous 5x exponential-backoff retry was a band-aid
+    that hid failures from the user — when DB was locked, the request
+    spent up to 1.5s silently retrying with no UI signal. After the
+    record_event auto-commit fix landed (5810188), the orchestrator no
+    longer holds the write lock for the full pipeline duration, so the
+    common contention case is gone. The remaining locked-failures are
+    real and should propagate as task_create_failed events to the UI
+    immediately, not be papered over.
     """
-    import time as _time
-    last_exc: Exception | None = None
-    for attempt in range(5):
-        try:
-            return _persist_question_task_once(
-                message=message,
-                answer_text=answer_text,
-                session_id=session_id,
-                actor_name=actor_name,
-                actor_role=actor_role,
-                previous_task_id=previous_task_id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            msg = str(exc).lower()
-            if "database is locked" not in msg and "operationalerror" not in msg:
-                raise
-            _time.sleep(0.05 * (2 ** attempt))
-    assert last_exc is not None
-    raise last_exc
+    return _persist_question_task_once(
+        message=message,
+        answer_text=answer_text,
+        session_id=session_id,
+        actor_name=actor_name,
+        actor_role=actor_role,
+        previous_task_id=previous_task_id,
+    )
 
 
 def _persist_question_task_once(
@@ -1013,32 +1027,22 @@ def _persist_task_intent_task(
 ) -> str:
     """Real task: route through TaskService so the pipeline kicks off.
 
-    Same retry-on-locked treatment as the question path.
+    Single attempt — if the INSERT fails (locked DB or otherwise), let it
+    propagate so the chat endpoint can emit task_create_failed instead of
+    silently retrying.
     """
-    import time as _time
     if scenario not in _VALID_SCENARIOS:
         scenario = "jira_issue_develop"
-    last_exc: Exception | None = None
-    for attempt in range(5):
-        try:
-            return _persist_task_intent_task_once(
-                message=message,
-                summary=summary,
-                scenario=scenario,
-                session_id=session_id,
-                actor_name=actor_name,
-                actor_role=actor_role,
-                previous_task_id=previous_task_id,
-                source_name=source_name,
-            )
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            msg = str(exc).lower()
-            if "database is locked" not in msg and "operationalerror" not in msg:
-                raise
-            _time.sleep(0.05 * (2 ** attempt))
-    assert last_exc is not None
-    raise last_exc
+    return _persist_task_intent_task_once(
+        message=message,
+        summary=summary,
+        scenario=scenario,
+        session_id=session_id,
+        actor_name=actor_name,
+        actor_role=actor_role,
+        previous_task_id=previous_task_id,
+        source_name=source_name,
+    )
 
 
 def _persist_task_intent_task_once(

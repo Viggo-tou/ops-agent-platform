@@ -386,9 +386,18 @@ export const api = {
     previous_task_id?: string | null;
     signal?: AbortSignal;
   }): AsyncGenerator<
-    | { type: "session"; session_id: string; provider: string }
+    | { type: "session"; session_id: string; provider: string; model?: string; fallback_attempt?: number }
     | { type: "token"; text: string }
     | { type: "task_created"; task_id: string; scenario: string; kicked_off_pipeline: boolean; summary?: string }
+    | {
+        type: "task_create_failed";
+        reason: string;
+        reason_kind: "db_locked" | "persistence_error" | string;
+        answer_kept: boolean;
+        scenario_intended: string;
+        user_advice: string;
+      }
+    | { type: "provider_failed"; provider: string; model?: string; error: string }
     | { type: "error"; message: string }
     | { type: "end"; length: number }
   > {

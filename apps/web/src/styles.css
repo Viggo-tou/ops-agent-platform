@@ -1864,6 +1864,107 @@ dd {
 .live-dot-paused { background: #f59e0b; }
 .live-dot-done   { background: #94a3b8; }
 
+/* Authoritative task-creation status block (3 states: pending / created /
+   failed). Lives inside the assistant message bubble and is the single
+   source of truth for whether a Task row got persisted, so the user can
+   never trust a premature "已提交" line from the model itself. */
+.task-create-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  border: 1px solid transparent;
+}
+.task-create-status.pending {
+  background: #f8fafc;
+  border-color: #e2e8f0;
+  color: #475569;
+  align-items: center;
+}
+.task-create-status.created {
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+  color: #065f46;
+}
+.task-create-status.failed {
+  background: #fef2f2;
+  border-color: #fca5a5;
+  color: #7f1d1d;
+}
+.task-create-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  font-weight: 700;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+.task-create-status.created .task-create-icon { background: #047857; color: #fff; }
+.task-create-status.failed  .task-create-icon { background: #b91c1c; color: #fff; }
+.task-create-spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid #cbd5e1;
+  border-top-color: #475569;
+  animation: spin 0.9s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.task-create-body { flex: 1; min-width: 0; }
+.task-create-title {
+  font-weight: 600;
+  font-size: 13.5px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.task-create-scenario {
+  background: #fff;
+  border: 1px solid currentColor;
+  opacity: 0.85;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 999px;
+}
+.task-create-status.created .task-create-scenario { color: #047857; border-color: #6ee7b7; }
+.task-create-status.failed  .task-create-scenario { color: #b91c1c; border-color: #fca5a5; }
+.task-create-sub {
+  font-size: 12px;
+  color: inherit;
+  opacity: 0.85;
+  margin-top: 2px;
+  word-break: break-word;
+}
+.task-create-sub a { color: inherit; text-decoration: underline; font-weight: 500; }
+.task-create-hint {
+  margin-left: 6px;
+  font-size: 11px;
+  color: #94a3b8;
+}
+.task-create-detail {
+  margin-top: 6px;
+  font-size: 11px;
+}
+.task-create-detail summary { cursor: pointer; color: inherit; opacity: 0.7; }
+.task-create-detail code {
+  display: block;
+  margin-top: 4px;
+  background: rgba(255, 255, 255, 0.6);
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  word-break: break-all;
+  color: #581818;
+}
+
 /* Inline failed-pipeline action block (lives inside the assistant
    bubble, replaces the old continue-banner that floated above the
    chat input). */
@@ -4921,6 +5022,7 @@ dd {
 .dashboard-task-status.status-completed         { background: #d1fae5; color: #065f46; border-color: #6ee7b7; }
 .dashboard-task-status.status-failed            { background: #fee2e2; color: #991b1b; border-color: #fca5a5; }
 .dashboard-task-status.status-rolled_back       { background: #f3e8ff; color: #6b21a8; border-color: #d8b4fe; }
+.dashboard-task-status.status-stale_failed      { background: #fff7ed; color: #c2410c; border-color: #fed7aa; }
 .dashboard-task-status.status-rejected          { background: #fee2e2; color: #991b1b; border-color: #fca5a5; }
 
 .dashboard-task-title {
@@ -5083,6 +5185,7 @@ dd {
 .dash-task-status.status-completed       { background: #d1fae5; color: #065f46; border-color: #6ee7b7; }
 .dash-task-status.status-failed          { background: #fee2e2; color: #991b1b; border-color: #fca5a5; }
 .dash-task-status.status-rolled_back     { background: #f3e8ff; color: #6b21a8; border-color: #d8b4fe; }
+.dash-task-status.status-stale_failed    { background: #fff7ed; color: #c2410c; border-color: #fed7aa; }
 .dash-task-status.status-rejected        { background: #fee2e2; color: #991b1b; border-color: #fca5a5; }
 .dash-task-status.status-planning,
 .dash-task-status.status-reviewing       { background: #ede9fe; color: #4c1d95; border-color: #c4b5fd; }

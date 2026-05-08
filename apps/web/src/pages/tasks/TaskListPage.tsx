@@ -18,6 +18,7 @@ const STATUS_OPTIONS: Array<{ label: string; value: "all" | TaskStatus }> = [
   { label: "已完成", value: "completed" },
   { label: "失败", value: "failed" },
   { label: "已回滚", value: "rolled_back" },
+  { label: "超时未推进", value: "stale_failed" },
 ];
 
 const SORT_OPTIONS = [
@@ -41,6 +42,8 @@ function statusLabel(status: string): string {
       return "异常";
     case "rolled_back":
       return "已回滚";
+    case "stale_failed":
+      return "超时未推进";
     case "queued":
     case "created":
       return "待启动";
@@ -203,7 +206,11 @@ export function TaskListPage() {
   const m_running = tasks.filter((t) => t.status === "running" || t.status === "executing").length;
   const m_completed = tasks.filter((t) => t.status === "completed").length;
   const m_failed = tasks.filter(
-    (t) => t.status === "failed" || t.status === "rejected" || t.status === "rolled_back",
+    (t) =>
+      t.status === "failed" ||
+      t.status === "rejected" ||
+      t.status === "rolled_back" ||
+      t.status === "stale_failed",
   ).length;
 
   // Pagination.

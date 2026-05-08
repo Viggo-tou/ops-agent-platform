@@ -220,7 +220,14 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
       // Seed empty chat_answer so buildAgentReply takes the chat path
       // immediately and doesn't flash the process_question fallback
       // 'I could not produce a grounded repository answer...' message.
-      latest_result_json: { kind: "chat_answer", answer: "" },
+      // creation_status drives the inline status block (pending → created
+      // / failed). It's "pending" until backend confirms via
+      // task_created / task_create_failed event.
+      latest_result_json: {
+        kind: "chat_answer",
+        answer: "",
+        creation_status: "pending",
+      },
     };
 
     setOptimisticTask(tempTask);
@@ -248,6 +255,32 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
     let finalTaskCreated = false;
     let kickedOffPipeline = false;
     let createdTaskId: string | null = null;
+    let createFailureReason: string | null = null;
+    let createFailureAdvice: string | null = null;
+
+    /** Apply a creation_status block onto the optimistic task so the inline
+     *  TaskCreationStatusBlock renders the right state. The 3 states are:
+     *  - 'pending' (default while we're streaming, before backend persists)
+     *  - 'created' (task_created event arrived)
+     *  - 'failed'  (task_create_failed event arrived) */
+    const setCreationStatus = (
+      status: "pending" | "created" | "failed",
+      extras: Record<string, unknown> = {},
+    ) => {
+      setOptimisticTask((prev) =>
+        prev
+          ? {
+              ...prev,
+              latest_result_json: {
+                ...(prev.latest_result_json ?? {}),
+                creation_status: status,
+                ...extras,
+              },
+              updated_at: new Date().toISOString(),
+            }
+          : prev,
+      );
+    };
 
     const stripIntent = (text: string) =>
       text
@@ -357,6 +390,24 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
             finalTaskCreated = true;
             kickedOffPipeline = event.kicked_off_pipeline;
             createdTaskId = event.task_id;
+            // Render green "✓ 任务已创建" block.
+            setCreationStatus("created", {
+              task_id: event.task_id,
+              scenario_created: event.scenario,
+              kicked_off_pipeline: event.kicked_off_pipeline,
+            });
+            break;
+          case "task_create_failed":
+            // Render red "✗ 任务未创建" block. We still keep the model's
+            // streamed answer text (answer_kept=true).
+            createFailureReason = event.reason ?? null;
+            createFailureAdvice = event.user_advice ?? null;
+            setCreationStatus("failed", {
+              create_failure_reason: event.reason,
+              create_failure_kind: event.reason_kind,
+              create_failure_advice: event.user_advice,
+              scenario_intended: event.scenario_intended,
+            });
             break;
           case "provider_failed":
             // Transient — chain falls through automatically. No-op.

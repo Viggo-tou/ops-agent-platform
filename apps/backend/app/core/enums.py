@@ -15,6 +15,12 @@ class TaskStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     ROLLED_BACK = "rolled_back"
+    # New: terminal failure caused by the watchdog (no progress for too
+    # long). Distinct from FAILED so the UI can label it differently
+    # ('超时未推进') and dashboards can separate model/code failures from
+    # infra hangs. The crash recovery path uses FAILED; only the watchdog
+    # uses STALE_FAILED.
+    STALE_FAILED = "stale_failed"
 
 
 class WorkflowStage(str, Enum):

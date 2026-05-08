@@ -290,9 +290,21 @@ async def lifespan(_: FastAPI):
     _sweep_orphaned_tasks()
     _sweep_old_sandboxes()
     _sweep_old_task_workspaces()
+    # Start the stale-task watchdog. Runs forever in the background until
+    # shutdown cancels it.
+    import asyncio as _asyncio
+    from app.services.stale_watchdog import watchdog_loop as _watchdog_loop
+    watchdog_task = _asyncio.create_task(_watchdog_loop())
     try:
         yield
     finally:
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except _asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001
+            pass
         shutdown_pipeline_executor(wait=True)
 
 

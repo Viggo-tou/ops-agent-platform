@@ -35,6 +35,8 @@ function statusLabel(status: string): string {
       return "异常";
     case "rolled_back":
       return "已回滚";
+    case "stale_failed":
+      return "超时未推进";
     case "queued":
     case "created":
       return "待启动";
@@ -128,7 +130,11 @@ export function DashboardPage() {
   const totalTasks = tasks.length;
   const doneToday = tasks.filter((t) => t.status === "completed" && isToday(t.updated_at)).length;
   const failed = tasks.filter(
-    (t) => t.status === "failed" || t.status === "rejected" || t.status === "rolled_back",
+    (t) =>
+      t.status === "failed" ||
+      t.status === "rejected" ||
+      t.status === "rolled_back" ||
+      t.status === "stale_failed",
   ).length;
 
   const docCount = knowledgeDocsQ.data?.length ?? 0;
