@@ -530,13 +530,20 @@ async def chat_send(
                         "fallback_attempt": idx,
                     },
                 )
-                async for chunk in _stream_from_provider(
+                async for kind, payload in _stream_from_provider(
                     provider, body.message, settings, model_name, system_prompt, history
                 ):
-                    if not chunk:
-                        continue
-                    full_text += chunk
-                    yield _sse("token", {"text": chunk})
+                    if kind == "text":
+                        if not payload:
+                            continue
+                        full_text += payload  # type: ignore[operator]
+                        yield _sse("token", {"text": payload})
+                    elif kind == "tool_call":
+                        yield _sse("tool_call", payload)
+                    elif kind == "tool_result":
+                        yield _sse("tool_result", payload)
+                    elif kind == "done":
+                        break
                 used_provider = provider
                 used_model = model_name
                 break
@@ -740,31 +747,283 @@ async def _stream_from_provider(
     model_name: str,
     system_prompt: str,
     history: list[dict[str, str]] | None = None,
-) -> AsyncGenerator[str, None]:
+) -> AsyncGenerator[tuple[str, object], None]:
+    """Yields (kind, payload) events. Kind ∈ {text, tool_call, tool_result, done}.
+
+    Older callers expected raw text chunks. We changed the contract here
+    (commit B.1/2) so the outer stream() can also surface MCP tool calls
+    to the UI. All text-only provider streams are wrapped via
+    _text_stream_to_events to preserve the tuple shape.
+    """
     history = history or []
+    mcp_tools = _collect_mcp_tools_openai_format()
+
     if provider == "mock":
-        async for chunk in _stream_mock(message):
-            yield chunk
+        async for ev in _text_stream_to_events(_stream_mock(message)):
+            yield ev
+        yield ("done", "stop")
         return
     if provider == "minimax":
-        async for chunk in _stream_minimax(message, settings, model_name, system_prompt, history):
-            yield chunk
+        async for ev in _text_stream_to_events(
+            _stream_minimax(message, settings, model_name, system_prompt, history)
+        ):
+            yield ev
+        yield ("done", "stop")
         return
     if provider == "anthropic":
-        async for chunk in _stream_anthropic(message, settings, model_name, system_prompt, history):
-            yield chunk
+        # Anthropic tool-use is commit 3 — for now stream text only.
+        async for ev in _text_stream_to_events(
+            _stream_anthropic(message, settings, model_name, system_prompt, history)
+        ):
+            yield ev
+        yield ("done", "stop")
         return
     if provider == "openai":
-        async for chunk in _stream_openai(message, settings, model_name, system_prompt, history):
-            yield chunk
+        if mcp_tools:
+            async for ev in _stream_openai_compat_with_tools(
+                "openai", message, settings, model_name, system_prompt, history, mcp_tools
+            ):
+                yield ev
+            return
+        async for ev in _text_stream_to_events(
+            _stream_openai(message, settings, model_name, system_prompt, history)
+        ):
+            yield ev
+        yield ("done", "stop")
         return
     if provider == "deepseek":
-        async for chunk in _stream_deepseek(message, settings, model_name, system_prompt, history):
-            yield chunk
+        if mcp_tools:
+            async for ev in _stream_openai_compat_with_tools(
+                "deepseek", message, settings, model_name, system_prompt, history, mcp_tools
+            ):
+                yield ev
+            return
+        async for ev in _text_stream_to_events(
+            _stream_deepseek(message, settings, model_name, system_prompt, history)
+        ):
+            yield ev
+        yield ("done", "stop")
         return
     # Unknown / not yet implemented (claude_code / codex / ollama).
     # Raise so the chain falls through to the next provider.
     raise RuntimeError(f"streaming not implemented for provider '{provider}'")
+
+
+async def _text_stream_to_events(
+    text_iter: AsyncGenerator[str, None],
+) -> AsyncGenerator[tuple[str, object], None]:
+    async for chunk in text_iter:
+        if chunk:
+            yield ("text", chunk)
+
+
+def _collect_mcp_tools_openai_format() -> list[dict]:
+    """Return MCP tools in OpenAI tools schema, or empty list.
+
+    Empty when no MCP servers connected, when import fails, or when
+    discovery raises. Chat then falls back to the text-only path so a
+    misconfigured MCP doesn't break chat.
+    """
+    try:
+        from app.services.mcp_client import get_mcp_client
+
+        out: list[dict] = []
+        for server_name, tools in get_mcp_client().list_tools().items():
+            for tool in tools:
+                schema = tool.get("input_schema") or {"type": "object", "properties": {}}
+                out.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": f"mcp.{server_name}.{tool['name']}",
+                            "description": tool.get("description") or "",
+                            "parameters": schema,
+                        },
+                    }
+                )
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _execute_chat_tool_blocking(tool_name: str, arguments: dict) -> str:
+    """Sync helper that calls an MCP tool and returns a string for the LLM.
+
+    Bypasses ToolGateway.execute (which requires a Task row for its
+    ToolExecution audit trail — chat tool calls happen before the chat
+    Task is persisted). Direct mcp_client.call_tool covers the same
+    physical dispatch; chat-side audit is a follow-up if needed.
+    """
+    if not tool_name.startswith("mcp."):
+        return f"ERROR: only mcp.* tools are callable from chat; got {tool_name}"
+    parts = tool_name.split(".", 2)
+    if len(parts) != 3:
+        return f"ERROR: malformed mcp tool name: {tool_name}"
+    _, server, name = parts
+    try:
+        from app.services.mcp_client import get_mcp_client
+
+        result = get_mcp_client().call_tool(
+            server=server, tool_name=name, arguments=arguments or {}
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"ERROR: {type(exc).__name__}: {exc}"
+    is_error = bool(result.get("is_error"))
+    text_parts = []
+    for item in result.get("content", []) or []:
+        if isinstance(item, dict):
+            t = item.get("text")
+            if isinstance(t, str):
+                text_parts.append(t)
+                continue
+            text_parts.append(json.dumps(item, ensure_ascii=False))
+        else:
+            text_parts.append(str(item))
+    body = "\n".join(text_parts) or ("(empty result)" if not is_error else "(error, no detail)")
+    return f"ERROR: {body}" if is_error else body
+
+
+_CHAT_TOOL_USE_MAX_ITERATIONS = 5
+
+
+async def _stream_openai_compat_with_tools(
+    provider_id: str,
+    message: str,
+    settings,
+    model_name: str,
+    system_prompt: str,
+    history: list[dict[str, str]],
+    mcp_tools: list[dict],
+) -> AsyncGenerator[tuple[str, object], None]:
+    """OpenAI-format streaming with tool-use loop. Used for openai + deepseek."""
+    if provider_id == "openai":
+        if not getattr(settings, "openai_api_key", None):
+            raise RuntimeError("OPS_AGENT_OPENAI_API_KEY not set")
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {settings.openai_api_key}",
+            "Content-Type": "application/json",
+        }
+        default_model = "gpt-4o-mini"
+    elif provider_id == "deepseek":
+        if not getattr(settings, "deepseek_api_key", None):
+            raise RuntimeError("OPS_AGENT_DEEPSEEK_API_KEY not set")
+        url = "https://api.deepseek.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {settings.deepseek_api_key}",
+            "Content-Type": "application/json",
+        }
+        default_model = "deepseek-chat"
+    else:
+        raise RuntimeError(f"unsupported openai-compat provider: {provider_id}")
+
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": message})
+
+    for _iteration in range(_CHAT_TOOL_USE_MAX_ITERATIONS):
+        payload = {
+            "model": model_name or default_model,
+            "stream": True,
+            "messages": messages,
+            "tools": mcp_tools,
+            "tool_choice": "auto",
+        }
+        # Tool execution can take time; longer body timeout than text-only.
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=10.0)) as client:
+            async with client.stream("POST", url, headers=headers, json=payload) as response:
+                if response.status_code >= 400:
+                    err_body = await response.aread()
+                    raise RuntimeError(
+                        f"{provider_id} {response.status_code}: {err_body.decode('utf-8', 'replace')[:300]}"
+                    )
+
+                # Per-stream accumulators, indexed by tool_call.index from delta.
+                pending_calls: dict[int, dict[str, str]] = {}
+                finish_reason: str | None = None
+
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].lstrip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = data.get("choices") or []
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    delta = choice.get("delta") or {}
+                    fr = choice.get("finish_reason")
+                    if fr:
+                        finish_reason = fr
+
+                    text = delta.get("content")
+                    if text:
+                        yield ("text", text)
+
+                    for tc in delta.get("tool_calls") or []:
+                        idx = tc.get("index", 0)
+                        slot = pending_calls.setdefault(
+                            idx, {"id": "", "name": "", "arguments": ""}
+                        )
+                        if tc.get("id"):
+                            slot["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            slot["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            slot["arguments"] += fn["arguments"]
+
+        if finish_reason == "tool_calls" and pending_calls:
+            # Append the assistant turn that requested these tool calls.
+            assistant_tool_calls = []
+            for idx in sorted(pending_calls):
+                slot = pending_calls[idx]
+                assistant_tool_calls.append(
+                    {
+                        "id": slot["id"] or f"call_{idx}",
+                        "type": "function",
+                        "function": {
+                            "name": slot["name"],
+                            "arguments": slot["arguments"] or "{}",
+                        },
+                    }
+                )
+            messages.append({"role": "assistant", "tool_calls": assistant_tool_calls, "content": ""})
+
+            for idx in sorted(pending_calls):
+                slot = pending_calls[idx]
+                tc_id = slot["id"] or f"call_{idx}"
+                name = slot["name"]
+                try:
+                    args = json.loads(slot["arguments"]) if slot["arguments"] else {}
+                except json.JSONDecodeError:
+                    args = {}
+                yield ("tool_call", {"id": tc_id, "name": name, "arguments": args})
+                result_str = await asyncio.to_thread(
+                    _execute_chat_tool_blocking, name, args
+                )
+                is_error = result_str.startswith("ERROR: ")
+                yield (
+                    "tool_result",
+                    {"tool_call_id": tc_id, "content": result_str, "is_error": is_error},
+                )
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc_id, "content": result_str}
+                )
+            continue
+
+        if finish_reason in (None, "stop"):
+            yield ("done", "stop")
+            return
+        yield ("done", finish_reason or "unknown")
+        return
+
+    yield ("done", "max_iterations")
 
 
 async def _stream_mock(message: str) -> AsyncGenerator[str, None]:
