@@ -1900,6 +1900,83 @@ dd {
   color: #78350f;
 }
 .task-create-status.queued .task-create-scenario { color: #78350f; border-color: #fcd34d; }
+
+/* MCP / tool-use inline pills inside a chat assistant bubble.
+   Rendered above the streamed reply text so the user sees the model's
+   tool activity in real time. */
+.chat-tool-call-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0 10px;
+}
+.chat-tool-call {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+  font-size: 12.5px;
+  color: #334155;
+  overflow: hidden;
+}
+.chat-tool-call.running { background: #f1f5f9; }
+.chat-tool-call.done    { background: #ecfdf5; border-color: #a7f3d0; color: #065f46; }
+.chat-tool-call.error   { background: #fef2f2; border-color: #fca5a5; color: #7f1d1d; }
+.chat-tool-call > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  list-style: none;
+}
+.chat-tool-call > summary::-webkit-details-marker { display: none; }
+.chat-tool-call-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.chat-tool-call-spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid #cbd5e1;
+  border-top-color: #475569;
+  animation: spin 0.9s linear infinite;
+}
+.chat-tool-call-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+.chat-tool-call-status {
+  margin-left: auto;
+  font-size: 11.5px;
+  opacity: 0.8;
+}
+.chat-tool-call-section {
+  padding: 6px 10px 8px;
+  border-top: 1px solid currentColor;
+  border-top-color: rgba(0,0,0,0.06);
+}
+.chat-tool-call-section-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.7;
+  margin-bottom: 3px;
+}
+.chat-tool-call-section pre {
+  margin: 0;
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  max-height: 300px;
+  overflow: auto;
+}
 .task-create-icon {
   display: inline-flex;
   align-items: center;

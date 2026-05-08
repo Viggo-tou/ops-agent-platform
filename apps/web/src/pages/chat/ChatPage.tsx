@@ -369,6 +369,29 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
     let createFailureReason: string | null = null;
     let createFailureAdvice: string | null = null;
 
+    type ChatToolCall = {
+      id: string;
+      name: string;
+      arguments: Record<string, unknown>;
+      status: "running" | "done" | "error";
+      result?: string;
+    };
+    const chatToolCalls: ChatToolCall[] = [];
+    const pushChatToolCalls = () => {
+      setOptimisticTask((prev) =>
+        prev
+          ? {
+              ...prev,
+              latest_result_json: {
+                ...(prev.latest_result_json ?? {}),
+                tool_calls: chatToolCalls.map((c) => ({ ...c })),
+              },
+              updated_at: new Date().toISOString(),
+            }
+          : prev,
+      );
+    };
+
     /** Apply a creation_status block onto the optimistic task so the inline
      *  TaskCreationStatusBlock renders the right state. The 3 states are:
      *  - 'pending' (default while we're streaming, before backend persists)
@@ -497,6 +520,27 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
             answerSoFar += event.text;
             pendingBuffer += event.text;
             break;
+          case "tool_call":
+            chatToolCalls.push({
+              id: event.id,
+              name: event.name,
+              arguments: event.arguments ?? {},
+              status: "running",
+            });
+            pushChatToolCalls();
+            break;
+          case "tool_result": {
+            const idx = chatToolCalls.findIndex((c) => c.id === event.tool_call_id);
+            if (idx !== -1) {
+              chatToolCalls[idx] = {
+                ...chatToolCalls[idx],
+                status: event.is_error ? "error" : "done",
+                result: event.content,
+              };
+              pushChatToolCalls();
+            }
+            break;
+          }
           case "task_created":
             finalTaskCreated = true;
             kickedOffPipeline = event.kicked_off_pipeline;

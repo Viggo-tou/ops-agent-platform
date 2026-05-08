@@ -242,6 +242,7 @@ export function MessageList({
                 <div className="message-bubble">
                   <div className="message-content">
                     {failureDiagnosis ? <AwaitingApprovalBlock diagnosis={failureDiagnosis} /> : null}
+                    <ChatToolCallList task={messageTask} />
                     {replyText ? (
                       <>
                         {messageTask.scenario === "process_question" ? (
@@ -444,6 +445,70 @@ function TaskCreationStatusBlock({
           </details>
         ) : null}
       </div>
+    </div>
+  );
+}
+
+
+type ChatToolCallEntry = {
+  id: string;
+  name: string;
+  arguments?: Record<string, unknown>;
+  status: "running" | "done" | "error";
+  result?: string;
+};
+
+function readChatToolCalls(task: TaskDetail): ChatToolCallEntry[] {
+  const r = task.latest_result_json;
+  if (!r || typeof r !== "object" || Array.isArray(r)) return [];
+  const raw = (r as Record<string, unknown>).tool_calls;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((entry): entry is ChatToolCallEntry => {
+    return (
+      typeof entry === "object" &&
+      entry !== null &&
+      typeof (entry as ChatToolCallEntry).id === "string" &&
+      typeof (entry as ChatToolCallEntry).name === "string"
+    );
+  });
+}
+
+function ChatToolCallList({ task }: { task: TaskDetail }) {
+  const calls = readChatToolCalls(task);
+  if (calls.length === 0) return null;
+  return (
+    <div className="chat-tool-call-list">
+      {calls.map((call) => (
+        <details key={call.id} className={`chat-tool-call ${call.status}`}>
+          <summary>
+            <span className="chat-tool-call-icon" aria-hidden="true">
+              {call.status === "running" ? <span className="chat-tool-call-spinner" /> : null}
+              {call.status === "done" ? "✓" : null}
+              {call.status === "error" ? "✗" : null}
+            </span>
+            <span className="chat-tool-call-name">{call.name}</span>
+            <span className="chat-tool-call-status">
+              {call.status === "running"
+                ? "调用中…"
+                : call.status === "done"
+                  ? "完成"
+                  : "失败"}
+            </span>
+          </summary>
+          {call.arguments && Object.keys(call.arguments).length > 0 ? (
+            <div className="chat-tool-call-section">
+              <div className="chat-tool-call-section-label">参数</div>
+              <pre>{JSON.stringify(call.arguments, null, 2)}</pre>
+            </div>
+          ) : null}
+          {call.result ? (
+            <div className="chat-tool-call-section">
+              <div className="chat-tool-call-section-label">结果</div>
+              <pre>{call.result.length > 4000 ? call.result.slice(0, 4000) + "\n… (truncated)" : call.result}</pre>
+            </div>
+          ) : null}
+        </details>
+      ))}
     </div>
   );
 }

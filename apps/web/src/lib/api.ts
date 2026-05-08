@@ -388,6 +388,8 @@ export const api = {
   }): AsyncGenerator<
     | { type: "session"; session_id: string; provider: string; model?: string; fallback_attempt?: number }
     | { type: "token"; text: string }
+    | { type: "tool_call"; id: string; name: string; arguments: Record<string, unknown> }
+    | { type: "tool_result"; tool_call_id: string; content: string; is_error: boolean }
     | { type: "task_created"; task_id: string; scenario: string; kicked_off_pipeline: boolean; summary?: string }
     | {
         type: "task_create_failed";
