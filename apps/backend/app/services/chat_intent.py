@@ -54,10 +54,18 @@ _FILE_PATH_RE = re.compile(
 )
 
 # Short pure acknowledgements that should inherit prior turn's intent.
+# Matched as exact-string OR via _ACK_REGEX below for tail-particle tolerance.
 _ACK_PHRASES = {
     "对", "好", "好的", "嗯", "可以", "go", "yes", "y", "ok", "okay", "对的",
     "继续", "继续做", "执行", "开发任务", "develop", "implement", "fix",
 }
+# Ack phrases with optional trailing Chinese mood particles
+# (哇/呀/啊/吧/嘛/啦/呢/喽) and English exclamation. Matches whole input
+# so we don't treat 'fix bug X' as a bare ack.
+_ACK_REGEX = re.compile(
+    r"^\s*(对|好|好的|嗯|嗯嗯|可以|go|yes|y|ok|okay|对的|继续|继续做|继续吧|继续哇|继续呀|继续啊|继续嘛|继续啦|继续呢|继续喽|执行|开发任务|develop|implement|fix|go ahead|please continue|carry on)\s*[!.?\s]*$",
+    re.IGNORECASE,
+)
 
 # Action verbs implying "do code work" — combine with a target to upgrade.
 _DEVELOP_VERBS_CN = ("修", "实现", "完成", "做", "写", "改", "加", "添加", "重构", "fix")
@@ -119,14 +127,21 @@ def classify_intent(
     if not text:
         return IntentResult("unknown", "low", ["empty"], [], [])
 
-    # Pure short acknowledgement → inherit prior intent if any.
-    if lower in _ACK_PHRASES or text in _ACK_PHRASES:
+    # Pure short acknowledgement → continuation intent.
+    # Matches exact (set) AND tail-particle regex (so '继续哇' / '好吧' / 'go ahead'
+    # all classify as ack instead of falling through to develop_task low).
+    is_ack = (
+        lower in _ACK_PHRASES
+        or text in _ACK_PHRASES
+        or _ACK_REGEX.match(text) is not None
+    )
+    if is_ack:
         signals.append("ack_phrase")
-        if prior_intent and prior_intent not in ("continuation", "unknown"):
-            return IntentResult(prior_intent, "high", signals + ["inherit"], [], [])
-        # No prior context — guess develop_task because "go / 开发任务" usually
-        # follows a clarification request from the model.
-        return IntentResult("continuation", "medium", signals, [], [])
+        # Continuation NEVER inherits develop_task (which would create a new
+        # heavy pipeline task). The chat handler treats continuation specially
+        # — it surfaces the in-flight session task or directs the user to
+        # /iterate, but does NOT emit TASK_INTENT for ack words.
+        return IntentResult("continuation", "high", signals, [], [])
 
     # Extract structured signals.
     jira_ids = _JIRA_RE.findall(text)

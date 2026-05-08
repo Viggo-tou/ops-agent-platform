@@ -312,6 +312,45 @@ _MAX_HISTORY_PAIRS = 6
 _MAX_HISTORY_CHARS = 6000
 
 
+_ACTIVE_PIPELINE_STATUSES = (
+    TaskStatus.PLANNING,
+    TaskStatus.REVIEWING,
+    TaskStatus.EXECUTING,
+    TaskStatus.RUNNING,
+    TaskStatus.QUEUED,
+    TaskStatus.AWAITING_APPROVAL,
+)
+
+
+def _find_active_session_task(db: Session, session_id: str | None) -> dict | None:
+    """If this session has a pipeline task currently in flight (or paused
+    for approval), return a small dict {id, scenario, status, title}.
+
+    Used by the chat endpoint to:
+      1. Tell the model 'a task is already running, don't create another'.
+      2. Suggest the user open the existing task / use /iterate instead.
+    """
+    if not session_id:
+        return None
+    row = (
+        db.query(TaskModel)
+        .filter(TaskModel.session_id == session_id)
+        .filter(TaskModel.status.in_(_ACTIVE_PIPELINE_STATUSES))
+        .filter(TaskModel.scenario.in_(("jira_issue_develop", "jira_issue_plan", "jira_issue_writeback")))
+        .order_by(TaskModel.updated_at.desc())
+        .first()
+    )
+    if row is None:
+        return None
+    return {
+        "id": row.id,
+        "scenario": row.scenario,
+        "status": row.status.value if hasattr(row.status, "value") else str(row.status),
+        "title": row.title,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
 def _load_session_history(db: Session, session_id: str | None) -> list[dict[str, str]]:
     """Reconstruct prior chat turns in this session as OpenAI-style messages.
 
@@ -401,6 +440,12 @@ async def chat_send(
         # follow-up references like "对" / "开发任务" without forgetting
         # what the user already said.
         history = _load_session_history(_state_db, body.session_id)
+        # Detect any in-flight pipeline task in the same session. If there is
+        # one, the user's "continue" / "继续哇" / "go" most likely means
+        # 'check on that task', not 'create a brand-new task'. We surface
+        # this to the model via the system prompt so it points the user at
+        # the existing task instead of emitting TASK_INTENT.
+        active_session_task = _find_active_session_task(_state_db, body.session_id)
     finally:
         _state_db.close()
 
@@ -431,6 +476,31 @@ async def chat_send(
     system_prompt = _augment_system_prompt(
         base_system_prompt, intent, playbook_matches, knowledge_block
     )
+
+    # Continuation intent: never let the model emit TASK_INTENT. The user's
+    # message is an ack ('对', '继续', '继续哇', 'go') that should NOT spawn
+    # a new heavy pipeline task. If a pipeline task is already running in
+    # this session, surface its id / status / title so the model can point
+    # the user there.
+    if intent.intent == "continuation":
+        guard_block = "\n\n## 重要 — 当前是 continuation 意图\n"
+        guard_block += "用户这一轮只是确认/续连(短词:对、好、继续、go 等),**绝对不要**输出 `TASK_INTENT|...` marker — 不要开新任务。\n\n"
+        if active_session_task:
+            guard_block += (
+                f"本会话里**已经**有一个 pipeline 任务在跑:\n"
+                f"- 任务 ID: `{active_session_task['id']}`\n"
+                f"- 状态: {active_session_task['status']}\n"
+                f"- 标题: {active_session_task['title']}\n\n"
+                "应当回答(用中文,简短):**那个任务还在跑**,告诉用户去任务详情页 "
+                f"(`/tasks/{active_session_task['id']}`) 看进度;如果想改方向,在那边底部的 "
+                "「继续改动」输入框继续,会自动接住前一个任务的上下文。"
+            )
+        else:
+            guard_block += (
+                "本会话没有进行中的 pipeline 任务。礼貌问用户**具体想做什么**(改哪个文件 / "
+                "查什么 / 哪个 Jira 单),引导他给出可路由的具体内容。"
+            )
+        system_prompt = system_prompt + guard_block
 
     # ActorContext exposes actor_role + app_role; "name" isn't on it. Default
     # to body.actor_name (sent by ChatPage) and fall back to "operator".
@@ -487,11 +557,19 @@ async def chat_send(
         # Mark which provider/model produced the answer.
         _ = used_model  # available for future "answered_by" SSE event
 
-        intent = _parse_task_intent(full_text)
+        intent_marker = _parse_task_intent(full_text)
+        # Defensive guard: if classifier said continuation, ignore any
+        # TASK_INTENT marker the model emitted anyway. Continuation NEVER
+        # spawns a new heavy task — the user is acking a previous turn.
+        # `intent` here refers to the outer-scope IntentResult.
+        if intent.intent == "continuation":
+            persistence_intent: tuple[str, str] | None = None
+        else:
+            persistence_intent = intent_marker
 
         # Persist a Task row either way so chat history is queryable.
         try:
-            if intent is None:
+            if persistence_intent is None:
                 # Pure question: lightweight completed Task, no pipeline.
                 task_id = await asyncio.to_thread(
                     _persist_question_task,
@@ -511,7 +589,7 @@ async def chat_send(
                     },
                 )
             else:
-                scenario, summary = intent
+                scenario, summary = persistence_intent
                 # Real task: full pipeline via existing TaskService path.
                 task_id = await asyncio.to_thread(
                     _persist_task_intent_task,
@@ -548,7 +626,7 @@ async def chat_send(
                     "reason": err_str[:300],
                     "reason_kind": "db_locked" if is_locked else "persistence_error",
                     "answer_kept": True,
-                    "scenario_intended": (intent[0] if intent else "process_question"),
+                    "scenario_intended": (persistence_intent[0] if persistence_intent else "process_question"),
                     "user_advice": (
                         "数据库繁忙(有别的任务正在写),稍后重试一下。"
                         if is_locked
