@@ -1965,6 +1965,90 @@ dd {
   color: #581818;
 }
 
+/* Chat-bottom status feed — system-style bubbles appended in time order
+   as background tasks transition. Latest item always at the BOTTOM,
+   matching every chat-app's mental model (Slack/Discord/iMessage). */
+.status-feed {
+  list-style: none;
+  margin: 0;
+  padding: 6px 0 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.status-feed-item {
+  border-radius: 14px;
+  padding: 12px 14px;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+  font-size: 13px;
+}
+.status-feed-item.tone-ok      { border-color: #a7f3d0; background: #ecfdf5; }
+.status-feed-item.tone-warn    { border-color: #fcd34d; background: #fffbeb; }
+.status-feed-item.tone-fail    { border-color: #fecaca; background: #fef2f2; }
+.status-feed-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+.status-feed-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  font-weight: 700;
+  font-size: 13px;
+}
+.tone-ok   .status-feed-icon { background: #047857; color: #fff; }
+.tone-warn .status-feed-icon { background: #d97706; color: #fff; }
+.tone-fail .status-feed-icon { background: #b91c1c; color: #fff; }
+.tone-neutral .status-feed-icon { background: #475569; color: #fff; }
+.status-feed-body { flex: 1; min-width: 0; }
+.status-feed-title { color: #0f172a; word-break: break-word; }
+.status-feed-title strong { font-weight: 700; }
+.status-feed-flag {
+  margin-left: 8px;
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: #fff;
+  border: 1px solid #f59e0b;
+  color: #b45309;
+  font-size: 11px;
+  font-weight: 600;
+}
+.status-feed-actions { margin-top: 4px; }
+.status-feed-link {
+  background: none;
+  border: 0;
+  color: #2563eb;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 0;
+}
+.status-feed-link:hover { text-decoration: underline; }
+.status-feed-reservations {
+  margin-top: 10px;
+  font-size: 12.5px;
+}
+.status-feed-reservations summary {
+  cursor: pointer;
+  color: #92400e;
+  font-weight: 600;
+}
+.status-feed-reservations ol {
+  margin: 8px 0 0 0;
+  padding-left: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: #581818;
+}
+
 /* Inline failed-pipeline action block (lives inside the assistant
    bubble, replaces the old continue-banner that floated above the
    chat input). */

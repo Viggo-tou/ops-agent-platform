@@ -65,6 +65,27 @@ export function ChatPage() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamError, setStreamError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+
+  // Append-only feed of status transitions detected while user is on this
+  // page. When a background task changes status (e.g. P69-21 finishes
+  // codegen → enters awaiting_approval), we push a system bubble onto
+  // this list and render it at the BOTTOM of the chat scroll. That way
+  // the latest event is always at the bottom (matching every other chat
+  // app's mental model) — without it, the EventTimeline of the OLD turn
+  // updates in place and the user has to scroll up to find what changed.
+  type StatusUpdate = {
+    id: string;                     // unique key (task_id + new_status)
+    task_id: string;
+    new_status: string;
+    prev_status: string | null;
+    scenario: string | null;
+    title: string | null;
+    timestamp: number;
+    reservations?: string[];        // populated when entering awaiting_approval
+  };
+  const [statusUpdates, setStatusUpdates] = useState<StatusUpdate[]>([]);
+  // Map of task_id → last-seen status, used to detect transitions.
+  const lastStatusByIdRef = useRef<Record<string, string>>({});
   const stopStreaming = () => {
     const c = abortRef.current;
     if (c && !c.signal.aborted) {
@@ -571,6 +592,66 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
     return [...baseTasks, optimisticTask];
   }, [optimisticTask, task, threadTasks]);
 
+  // Watch all visible tasks for status transitions and append a system row
+  // to statusUpdates whenever a status changes. Skips first-seen tasks to
+  // avoid spamming on initial page load. Only fires for "interesting"
+  // transitions (avoids noisy planning→reviewing churn).
+  useEffect(() => {
+    const interesting = new Set([
+      "completed",
+      "failed",
+      "rolled_back",
+      "rejected",
+      "awaiting_approval",
+      "waiting_approval",
+      "stale_failed",
+    ]);
+    const next: StatusUpdate[] = [];
+    for (const t of visibleThreadTasks) {
+      const prev = lastStatusByIdRef.current[t.id];
+      const cur = t.status;
+      if (prev === undefined) {
+        // First sight — just record, don't notify.
+        lastStatusByIdRef.current[t.id] = cur;
+        continue;
+      }
+      if (prev === cur) continue;
+      lastStatusByIdRef.current[t.id] = cur;
+      if (!interesting.has(cur)) continue;
+      // Skip process_question chat answers — those don't have meaningful
+      // backend transitions (they're created already-completed).
+      if (t.scenario === "process_question") continue;
+      const reservations = (() => {
+        const r = (t.latest_result_json as { result?: { reservations?: unknown } } | null)?.result?.reservations;
+        if (Array.isArray(r)) return r.filter((x): x is string => typeof x === "string");
+        return undefined;
+      })();
+      next.push({
+        id: `${t.id}-${cur}-${t.updated_at}`,
+        task_id: t.id,
+        new_status: cur,
+        prev_status: prev || null,
+        scenario: t.scenario || null,
+        title: t.title || null,
+        timestamp: Date.now(),
+        reservations,
+      });
+    }
+    if (next.length === 0) return;
+    setStatusUpdates((prev) => {
+      const seen = new Set(prev.map((u) => u.id));
+      const additions = next.filter((u) => !seen.has(u.id));
+      if (additions.length === 0) return prev;
+      return [...prev, ...additions];
+    });
+  }, [visibleThreadTasks]);
+
+  // When taskId switches (cross-conversation reset), wipe status updates.
+  useEffect(() => {
+    setStatusUpdates([]);
+    lastStatusByIdRef.current = {};
+  }, [taskId]);
+
   // When the user navigates here from sidebar's "继续修复 →" link
   // (?continue=1), pre-activate continuation mode for the latest failed
   // task in the thread. This lets sidebar quick-action skip the in-chat
@@ -653,6 +734,17 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
             canCreate={can("task:create")}
           />
         ) : null}
+
+        {/* Status feed — system bubbles for tasks that transitioned while
+            the user was scrolled / chatting elsewhere. Always rendered at
+            the BOTTOM so the latest event is the latest visible item. */}
+        {statusUpdates.length > 0 ? (
+          <ul className="status-feed" aria-live="polite">
+            {statusUpdates.map((u) => (
+              <StatusFeedItem key={u.id} update={u} navigate={navigate} />
+            ))}
+          </ul>
+        ) : null}
       </section>
 
       {/* Failure-action UI for pipeline tasks now renders inline in
@@ -680,5 +772,88 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
 
       {streamError ? <div className="chat-error">{streamError}</div> : null}
     </div>
+  );
+}
+
+
+function statusLabel(status: string): string {
+  switch (status) {
+    case "completed":         return "已完成";
+    case "failed":            return "失败";
+    case "rolled_back":       return "已回滚";
+    case "rejected":          return "已拒绝";
+    case "awaiting_approval":
+    case "waiting_approval":  return "待审批";
+    case "stale_failed":      return "超时未推进";
+    default:                  return status;
+  }
+}
+
+
+/**
+ * System-style bubble appended at the chat bottom when a background task
+ * transitions to a new status. Always shows the deep link so user can jump
+ * to the task detail. For awaiting_approval with reservations, expands to
+ * list each reservation inline so the user sees the risks BEFORE clicking
+ * approve.
+ */
+function StatusFeedItem({
+  update,
+  navigate,
+}: {
+  update: {
+    task_id: string;
+    new_status: string;
+    scenario: string | null;
+    title: string | null;
+    reservations?: string[];
+  };
+  navigate: (path: string) => void;
+}) {
+  const tone =
+    update.new_status === "completed"
+      ? "ok"
+      : update.new_status === "awaiting_approval" || update.new_status === "waiting_approval"
+        ? "warn"
+        : update.new_status === "failed" || update.new_status === "rejected" || update.new_status === "stale_failed"
+          ? "fail"
+          : "neutral";
+  const icon = tone === "ok" ? "✓" : tone === "warn" ? "⚠" : tone === "fail" ? "✗" : "•";
+  const reservations = update.reservations ?? [];
+  const hasReservations = reservations.length > 0;
+  return (
+    <li className={`status-feed-item tone-${tone}`}>
+      <div className="status-feed-row">
+        <span className="status-feed-icon" aria-hidden="true">{icon}</span>
+        <div className="status-feed-body">
+          <div className="status-feed-title">
+            {update.title ?? `任务 ${update.task_id.slice(0, 8)}`} —
+            <strong> {statusLabel(update.new_status)}</strong>
+            {hasReservations ? (
+              <span className="status-feed-flag">{reservations.length} 项保留意见</span>
+            ) : null}
+          </div>
+          <div className="status-feed-actions">
+            <button
+              type="button"
+              className="status-feed-link"
+              onClick={() => navigate(`/tasks/${update.task_id}`)}
+            >
+              打开任务详情 #{update.task_id.slice(0, 8)} →
+            </button>
+          </div>
+        </div>
+      </div>
+      {hasReservations ? (
+        <details className="status-feed-reservations">
+          <summary>展开 {reservations.length} 项审查保留意见(审批前请看)</summary>
+          <ol>
+            {reservations.map((r, i) => (
+              <li key={i}>{r}</li>
+            ))}
+          </ol>
+        </details>
+      ) : null}
+    </li>
   );
 }
