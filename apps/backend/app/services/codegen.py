@@ -764,12 +764,18 @@ class CodeGenerator:
 
     def _resolve_provider_chain(self) -> list[str]:
         """Return an ordered list of providers to try. Auto mode returns all configured providers."""
-        # Explicit codegen_provider override takes priority
-        codegen_override = getattr(self.settings, "codegen_provider", None)
+        # UI-set per-stage override (runtime_overrides.json) wins over .env.
+        # When unset, falls through bytewise to the historical .env-driven path.
+        from app.services.runtime_override import effective_provider
+        codegen_override = effective_provider(
+            "codegen", getattr(self.settings, "codegen_provider", None)
+        )
         if codegen_override and codegen_override != "auto":
             return [codegen_override]
 
-        provider = self.settings.primary_agent_provider
+        provider = effective_provider(
+            "primary_agent", self.settings.primary_agent_provider
+        )
         if provider not in ("auto", "claude_code"):
             return [provider]
 

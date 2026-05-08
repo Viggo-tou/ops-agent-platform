@@ -74,7 +74,7 @@ export function TaskListPage() {
         </div>
         <div className="header-actions">
           <div className="live-hint">{formatSyncTime(tasksQuery.dataUpdatedAt)}</div>
-          <Link to="/submit" className="button primary link-button">
+          <Link to="/chat" className="button primary link-button">
             New Request
           </Link>
         </div>

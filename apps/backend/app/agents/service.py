@@ -823,12 +823,18 @@ class PrimaryAgentPlanner:
         issue_context: dict[str, Any] | None = None,
     ) -> PlanGenerationResult:
         """Generate a plan using the provider chain. On failure, cascade to the next provider."""
-        # Explicit planner_provider override takes priority
-        planner_override = getattr(self.settings, "planner_provider", None)
+        # UI-set per-stage override (runtime_overrides.json) wins over .env.
+        # When unset, falls through bytewise to the historical .env-driven path.
+        from app.services.runtime_override import effective_provider
+        planner_override = effective_provider(
+            "planner", getattr(self.settings, "planner_provider", None)
+        )
         if planner_override and planner_override != "auto":
             provider_mode = planner_override
         else:
-            provider_mode = self.settings.primary_agent_provider
+            provider_mode = effective_provider(
+                "primary_agent", self.settings.primary_agent_provider
+            )
 
         anthropic_api_key = getattr(self.settings, "anthropic_api_key", None)
         openai_api_key = getattr(self.settings, "openai_api_key", None)

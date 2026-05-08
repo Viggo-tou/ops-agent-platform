@@ -176,6 +176,18 @@ export const api = {
     request<{ removed: boolean }>(`/repositories/${encodeURIComponent(name)}`, {
       method: "DELETE",
     }),
+  getIntegrationStatus: () =>
+    request<{
+      integrations: {
+        key: string;
+        label: string;
+        description: string;
+        category: string;
+        configured: boolean;
+        status: "connected" | "not_configured" | "coming_soon";
+        config_hint: string;
+      }[];
+    }>("/integrations/status"),
   listRbacRoles: () =>
     request<
       {
@@ -278,6 +290,50 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(payload),
     }),
+  getEffectiveRuntime: () =>
+    request<{
+      detected_mode: "recommended" | "cli" | "api" | "advanced";
+      planner_provider: string | null;
+      codegen_provider: string | null;
+      knowledge_synthesis_provider: string | null;
+      primary_agent_provider: string | null;
+      selected_model_id: string | null;
+      notes: string[];
+    }>("/model-config/runtime"),
+  getRuntimeOverrides: () =>
+    request<{
+      stages: {
+        stage: string;
+        default: string | null;
+        override: string | null;
+        effective: string | null;
+        allowed: string[];
+      }[];
+    }>("/runtime-config/overrides"),
+  patchRuntimeOverride: (body: { stage: string; value: string | null }) =>
+    request<{ stages: any[] }>("/runtime-config/overrides", {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  getAuthStatus: () =>
+    request<{
+      cli: {
+        key: string;
+        label: string;
+        cli_available: boolean;
+        authenticated: boolean;
+        auth_path: string | null;
+        login_command: string;
+        notes: string;
+      }[];
+      api_keys: {
+        key: string;
+        label: string;
+        env_var: string;
+        set: boolean;
+        notes: string;
+      }[];
+    }>("/runtime-config/auth-status"),
   createTask: (input: TaskCreateInput) =>
     request<TaskDetail>("/tasks", {
       method: "POST",

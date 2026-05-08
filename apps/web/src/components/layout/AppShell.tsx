@@ -12,6 +12,7 @@ const navigationItems = [
   { to: "/knowledge", label: "知识库" },
   { to: "/memory", label: "记忆" },
   { to: "/repositories", label: "仓库", permission: "settings:view" as const },
+  { to: "/integrations", label: "集成", permission: "settings:view" as const },
   { to: "/governance", label: "治理", permission: "settings:view" as const },
   { to: "/settings", label: "设置", permission: "settings:view" as const },
 ];
@@ -30,7 +31,7 @@ export function AppShell() {
   const pathname = location.pathname;
   const sidebarVariant = pathname.startsWith("/home")
     ? "minimal"
-    : pathname.startsWith("/knowledge") || pathname.startsWith("/memory") || pathname.startsWith("/settings") || pathname.startsWith("/governance") || pathname.startsWith("/repositories")
+    : pathname.startsWith("/knowledge") || pathname.startsWith("/memory") || pathname.startsWith("/settings") || pathname.startsWith("/governance") || pathname.startsWith("/repositories") || pathname.startsWith("/integrations")
       ? "compact"
       : "chat";
   const visibleNavigationItems =
@@ -87,19 +88,11 @@ export function AppShell() {
             })}
           </nav>
 
-          {sidebarVariant === "chat" ? (
-            <div className="sidebar-toggle-group" aria-label="Workspace feature switches">
-              <div className="sidebar-section-title">功能开关</div>
-              <div className="sidebar-toggle-row">
-                <span>知识库 RAG</span>
-                <strong>On</strong>
-              </div>
-              <div className="sidebar-toggle-row">
-                <span>长期记忆</span>
-                <strong>On</strong>
-              </div>
-            </div>
-          ) : null}
+          {/* Removed hardcoded "知识库 RAG / 长期记忆 = On" labels.
+              They were cosmetic — backend has no per-conversation toggle.
+              Real per-conversation overrides ship in 1.1 (backend support
+              needed first). When they ship, add toggle icons into ChatInput
+              toolbar alongside the source picker. */}
         </div>
 
         {sidebarVariant === "chat" ? (

@@ -65,7 +65,53 @@ export function ChatPage() {
   // When set, the next submit will dispatch as a continuation of this task.
   // Activated by the "继续修复" button on a failed task; cleared after submit.
   const [continueFromTaskId, setContinueFromTaskId] = useState<string | null>(null);
+  // Per-conversation source override; persists in localStorage so a user's
+  // choice survives navigation. Empty string = use env default.
+  const [sourceName, setSourceName] = useState<string>(() => {
+    return window.localStorage.getItem("ops-agent-chat-source") ?? "";
+  });
   const [searchParams, setSearchParams] = useSearchParams();
+
+  useEffect(() => {
+    if (sourceName) {
+      window.localStorage.setItem("ops-agent-chat-source", sourceName);
+    } else {
+      window.localStorage.removeItem("ops-agent-chat-source");
+    }
+  }, [sourceName]);
+
+  const sourcesQuery = useQuery({
+    queryKey: ["repository-sources"],
+    queryFn: () => api.listRepositorySources(),
+    refetchInterval: 60_000,
+  });
+
+  // Model picker (global setting; PATCH affects all future tasks).
+  const modelProvidersQuery = useQuery({
+    queryKey: ["model-providers"],
+    queryFn: () => api.getModelProviders(),
+    refetchInterval: 5 * 60_000,
+  });
+  const selectedModelQuery = useQuery({
+    queryKey: ["selected-model"],
+    queryFn: () => api.getSelectedModel(),
+    refetchInterval: 30_000,
+  });
+  const selectedModelMutation = useMutation({
+    mutationFn: (modelId: string) => api.setSelectedModel({ model_id: modelId }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["selected-model"] });
+    },
+  });
+  const modelOptions = useMemo(() => {
+    const out: { provider: string; id: string; display: string }[] = [];
+    for (const p of modelProvidersQuery.data ?? []) {
+      for (const m of p.models ?? []) {
+        out.push({ provider: p.name, id: m.id, display: m.display_name });
+      }
+    }
+    return out;
+  }, [modelProvidersQuery.data]);
 
   const taskQuery = useQuery({
     queryKey: ["task", taskId],
@@ -165,6 +211,8 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
         actor_role: backendActorRole,
         session_id: task?.session_id ?? undefined,
         previous_task_id: options.previousTaskId ?? undefined,
+        // Repository source override; undefined = orchestrator uses env default.
+        source_name: sourceName || undefined,
       });
       setOptimisticTask(createdTask);
       scrollToLatestMessage();
@@ -306,6 +354,12 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
         isSubmitting={createTaskMutation.isPending}
         disabled={!can("task:create")}
         permissionDenied={!can("task:create") ? "Your current role can view conversations but cannot create new tasks." : null}
+        sources={(sourcesQuery.data?.sources ?? []).map((s) => ({ name: s.name, origin: s.origin }))}
+        sourceValue={sourceName}
+        onSourceChange={setSourceName}
+        models={modelOptions}
+        modelValue={selectedModelQuery.data?.model_id ?? ""}
+        onModelChange={(id) => selectedModelMutation.mutate(id)}
       />
       <div className="chat-footer-hint">AI 生成内容仅供参考</div>
 

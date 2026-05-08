@@ -11,9 +11,11 @@ from app.api.governance import router as governance_router
 from app.api.health import router as health_router
 from app.api.knowledge import router as knowledge_router
 from app.api.memory import router as memory_router
+from app.api.integrations import router as integrations_router
 from app.api.metrics import router as metrics_router
 from app.api.model_config import router as model_config_router
 from app.api.repositories import router as repositories_router
+from app.api.runtime_config import router as runtime_config_router
 from app.api.tasks import router as tasks_router
 from app.api.tools import router as tools_router
 from app.core.config import get_settings
@@ -320,4 +322,6 @@ app.include_router(memory_router, prefix=settings.api_prefix)
 app.include_router(metrics_router)
 app.include_router(model_config_router, prefix=settings.api_prefix)
 app.include_router(repositories_router, prefix=settings.api_prefix)
+app.include_router(integrations_router, prefix=settings.api_prefix)
+app.include_router(runtime_config_router, prefix=settings.api_prefix)
 app.include_router(tools_router, prefix=settings.api_prefix)
