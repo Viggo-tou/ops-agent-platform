@@ -61,6 +61,9 @@ class Task(Base):
     # ``failure_diagnosis`` with DiagnosisOutput-compatible fields.
     latest_result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     latest_checkpoint_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Optional repository source override (multi-origin registry name).
+    # NULL = use environment-configured default (legacy behavior preserved).
+    source_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

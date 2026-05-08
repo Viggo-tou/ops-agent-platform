@@ -311,6 +311,8 @@ export interface TaskCreateInput {
   session_id?: string | null;
   /** When set, backend prepends parent failure context to request_text and inherits parent's session. */
   previous_task_id?: string | null;
+  /** Repository source override (registry name). When undefined, orchestrator uses env default. */
+  source_name?: string | null;
 }
 
 export interface KnowledgeSourceDescriptor {

@@ -16,6 +16,11 @@ class TaskCreateRequest(BaseModel):
     actor_role: ActorRole = ActorRole.EMPLOYEE
     session_id: str | None = Field(default=None, min_length=1, max_length=36)
     previous_task_id: str | None = Field(default=None, min_length=1, max_length=64)
+    # Optional repository source override. When None (the default for all
+    # existing API callers), orchestrator falls back to the pre-existing
+    # path resolution chain (env / settings.knowledge_source_path) and
+    # behaves bytewise-identically to the pre-multi-origin codebase.
+    source_name: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class TaskRollbackRequest(BaseModel):

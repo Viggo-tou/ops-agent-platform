@@ -2978,3 +2978,97 @@ dd {
   margin: 0 0 6px 0;
   color: #806600;
 }
+
+/* ---- Modal (used by Repositories upload/clone) ---- */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 16px;
+}
+
+.modal-card {
+  background: #fff;
+  border-radius: 12px;
+  padding: 24px;
+  max-width: 500px;
+  width: 100%;
+  max-height: 90vh;
+  overflow-y: auto;
+}
+
+.modal-card h2 {
+  font-size: 18px;
+  font-weight: 700;
+  margin: 0 0 8px 0;
+}
+
+.modal-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.modal-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #333;
+}
+
+.modal-form input[type="file"] {
+  font-size: 13px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.button.button-sm {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.repo-actions-row {
+  display: flex;
+  gap: 8px;
+}
+
+.repo-row-meta {
+  font-size: 12px;
+  color: #666;
+  margin: 4px 0;
+}
+
+.repo-row-meta code {
+  background: #f4f4f4;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+/* Origin pills */
+.pill.origin-env {
+  background: #f4f4f4;
+  color: #666;
+  border: 1px solid #ddd;
+}
+.pill.origin-upload {
+  background: #e8eefc;
+  color: #1c4ab8;
+  border: 1px solid #c4d3f5;
+}
+.pill.origin-clone {
+  background: #e6f4ea;
+  color: #1e7a3a;
+  border: 1px solid #c5e3cf;
+}

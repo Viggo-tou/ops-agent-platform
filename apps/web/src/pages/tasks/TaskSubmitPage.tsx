@@ -23,11 +23,18 @@ export function TaskSubmitPage() {
   const [title, setTitle] = useState("");
   const [request, setRequest] = useState(starterPrompts[0]);
   const [actorName, setActorName] = useState("employee");
+  const [sourceName, setSourceName] = useState<string>("");
 
   const tasksQuery = useQuery({
     queryKey: ["tasks"],
     queryFn: () => api.listTasks(),
     refetchInterval: 5_000,
+  });
+
+  const sourcesQuery = useQuery({
+    queryKey: ["repository-sources"],
+    queryFn: () => api.listRepositorySources(),
+    refetchInterval: 30_000,
   });
 
   const registryQuery = useQuery({
@@ -93,6 +100,7 @@ export function TaskSubmitPage() {
               title: title.trim() || undefined,
               request,
               actor_name: actorName,
+              source_name: sourceName || undefined,
             });
           }}
         >
@@ -114,6 +122,26 @@ export function TaskSubmitPage() {
               onChange={(event) => setActorName(event.target.value)}
               placeholder="employee"
             />
+          </label>
+
+          <label className="field">
+            <span>Repository Source</span>
+            <select
+              className="text-input"
+              value={sourceName}
+              onChange={(event) => setSourceName(event.target.value)}
+            >
+              <option value="">— use environment default —</option>
+              {(sourcesQuery.data?.sources ?? []).map((s) => (
+                <option key={s.name} value={s.name}>
+                  {s.name} ({s.origin})
+                </option>
+              ))}
+            </select>
+            <span className="muted-text" style={{ fontSize: 12, marginTop: 4 }}>
+              Pick a repository for codegen / sandbox. Leave blank to use the
+              env-configured default (legacy behavior).
+            </span>
           </label>
 
           <label className="field">

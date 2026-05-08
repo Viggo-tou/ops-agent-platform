@@ -131,10 +131,51 @@ export const api = {
   getToolRegistry: () => request<ToolRegistryEntry[]>("/tools/registry"),
   listRepositorySources: () =>
     request<{
-      sources: { name: string; path: string; description: string; is_active: boolean }[];
-      active: string;
+      sources: {
+        name: string;
+        path: string;
+        description: string;
+        origin: string;
+        git_url: string;
+        added_at: string;
+      }[];
       multi_source_enabled: boolean;
     }>("/repositories/sources"),
+  uploadRepositoryZip: ({
+    name,
+    description,
+    file,
+  }: {
+    name: string;
+    description: string;
+    file: File;
+  }) => {
+    const fd = new FormData();
+    fd.append("name", name);
+    fd.append("description", description);
+    fd.append("file", file);
+    return requestMultipart<{
+      name: string;
+      path: string;
+      origin: string;
+      description: string;
+    }>("/repositories/upload", fd);
+  },
+  cloneRepositoryGit: (body: { name: string; git_url: string; description: string }) =>
+    request<{
+      name: string;
+      path: string;
+      origin: string;
+      description: string;
+      git_url: string;
+    }>("/repositories/clone", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  deleteRepositorySource: (name: string) =>
+    request<{ removed: boolean }>(`/repositories/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    }),
   listRbacRoles: () =>
     request<
       {

@@ -225,6 +225,8 @@ class TaskService:
             risk_level=risk_level,
             risk_category=risk_category,
             governance_json=governance_json,
+            # Optional override; None = orchestrator falls back to env defaults.
+            source_name=getattr(payload, "source_name", None),
         )
         self.db.add(task)
         self.db.flush()

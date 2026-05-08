@@ -9,12 +9,13 @@ interface RepoSource {
   name: string;
   path: string;
   description: string;
-  is_active: boolean;
+  origin: string;
+  git_url: string;
+  added_at: string;
 }
 
 interface SourcesResp {
   sources: RepoSource[];
-  active: string;
   multi_source_enabled: boolean;
 }
 
@@ -168,8 +169,10 @@ function Step2Repository({
       .listRepositorySources()
       .then((data) => {
         setResp(data);
-        if (!selected && data.active) {
-          onSelect(data.active);
+        // Pre-select first env-origin source as default if user hasn't picked.
+        if (!selected) {
+          const def = data.sources.find((s) => s.origin === "env") ?? data.sources[0];
+          if (def) onSelect(def.name);
         }
       })
       .catch((err) => setError(String(err.message ?? err)));
@@ -209,9 +212,7 @@ function Step2Repository({
               >
                 <div className="onboarding-source-head">
                   <strong>{src.name}</strong>
-                  {src.is_active ? (
-                    <span className="pill active">active in backend</span>
-                  ) : null}
+                  <span className={`pill origin-${src.origin}`}>{src.origin}</span>
                   {isSelected ? <span className="pill selected">selected</span> : null}
                 </div>
                 <code className="onboarding-source-path">{src.path}</code>

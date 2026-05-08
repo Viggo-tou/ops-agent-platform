@@ -7930,6 +7930,23 @@ class PrimaryOrchestrator:
         return None
 
     def _resolve_develop_repo_url(self, *, task: Task, plan: GeneratedPlan) -> str | None:
+        # NEW (multi-origin repository registry): if the task carried an
+        # explicit `source_name` override, look it up in the managed
+        # registry FIRST. Strict additive: when source_name is None or the
+        # registry doesn't know the name, fall through to the historical
+        # resolution chain below — pre-existing tasks behave bytewise-
+        # identically.
+        explicit_source = (getattr(task, "source_name", None) or "").strip()
+        if explicit_source:
+            try:
+                from app.services.repository_registry import resolve_path_by_name
+                resolved = resolve_path_by_name(explicit_source)
+                if resolved:
+                    return resolved
+            except Exception:  # noqa: BLE001
+                # Registry lookup must never break legacy resolution.
+                pass
+
         candidate_values: list[object] = []
         if isinstance(task.translation_json, dict):
             candidate_values.extend(
