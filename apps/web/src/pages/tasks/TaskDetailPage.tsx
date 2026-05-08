@@ -18,6 +18,7 @@ import { RiskBadge, TaskStatusBadge } from "../../components/tasks/TaskStatusBad
 import { TaskTimeline } from "../../components/tasks/TaskTimeline";
 import { api } from "../../lib/api";
 import { formatDateTime, formatSyncTime, titleCase, toErrorMessage } from "../../lib/format";
+import { useTaskStream } from "../../lib/useTaskStream";
 
 function readPlanSummary(plan: Record<string, unknown> | null): string | null {
   if (!plan) {
@@ -36,25 +37,30 @@ export function TaskDetailPage() {
   const [actionNotes, setActionNotes] = useState("");
   const [rollbackReason, setRollbackReason] = useState("Reset task state for demo follow-up.");
 
+  // SSE: drives invalidations for the queries below; falls back to interval
+  // polling when the stream isn't live yet (or has finished).
+  const stream = useTaskStream(taskId);
+  const pollInterval = stream.connected && !stream.done ? false : 5_000;
+
   const taskQuery = useQuery({
     queryKey: ["task", taskId],
     queryFn: () => api.getTask(taskId!),
     enabled: Boolean(taskId),
-    refetchInterval: 5_000,
+    refetchInterval: pollInterval,
   });
 
   const eventsQuery = useQuery({
     queryKey: ["task-events", taskId],
     queryFn: () => api.getTaskEvents(taskId!),
     enabled: Boolean(taskId),
-    refetchInterval: 5_000,
+    refetchInterval: pollInterval,
   });
 
   const toolExecutionsQuery = useQuery({
     queryKey: ["task-tool-executions", taskId],
     queryFn: () => api.getTaskToolExecutions(taskId!),
     enabled: Boolean(taskId),
-    refetchInterval: 5_000,
+    refetchInterval: pollInterval,
   });
 
   const refreshTaskViews = async () => {
@@ -126,6 +132,7 @@ export function TaskDetailPage() {
           <p>{task.request_text}</p>
         </div>
         <div className="button-row">
+          <LiveBadge stream={stream} />
           <div className="live-hint">{formatSyncTime(Math.max(taskQuery.dataUpdatedAt, eventsQuery.dataUpdatedAt))}</div>
           <Link to="/tasks" className="button ghost link-button">
             Back to Tasks
@@ -377,5 +384,43 @@ export function TaskDetailPage() {
         <TaskTimeline events={events} />
       </section>
     </div>
+  );
+}
+
+function LiveBadge({ stream }: { stream: ReturnType<typeof useTaskStream> }) {
+  if (stream.done) {
+    return (
+      <span className="live-badge live-badge-done" title="Stream closed at terminal status.">
+        <span className="live-dot live-dot-done" />
+        终止
+      </span>
+    );
+  }
+  if (stream.paused) {
+    return (
+      <span className="live-badge live-badge-paused" title="Task is awaiting human approval.">
+        <span className="live-dot live-dot-paused" />
+        待审批
+      </span>
+    );
+  }
+  if (!stream.connected) {
+    return (
+      <span className="live-badge live-badge-off" title={stream.error ?? "Connecting…"}>
+        <span className="live-dot live-dot-off" />
+        连接中…
+      </span>
+    );
+  }
+  const ago = stream.lastEventAgoMs ?? 0;
+  const fresh = ago < 30_000;
+  return (
+    <span
+      className={`live-badge ${fresh ? "live-badge-live" : "live-badge-stale"}`}
+      title={`Last server message ${Math.round(ago / 1000)}s ago.`}
+    >
+      <span className={`live-dot ${fresh ? "live-dot-live" : "live-dot-stale"}`} />
+      {fresh ? "实时" : `${Math.round(ago / 1000)}s 前`}
+    </span>
   );
 }
