@@ -207,13 +207,20 @@ export function MessageList({ task, tasks, eventsMap }: MessageListProps) {
 
             <article className="message-row assistant">
               <div className="message-avatar assistant-avatar">AI</div>
-              {isLastTask && isActive ? (
+              {isLastTask && isActive && !replyText ? (
+                // Heavy task in flight, no streamed text yet → show pipeline spinner.
                 <ThinkingIndicator status={messageTask.status} events={events} latestEventType={latestEventType} />
               ) : (
                 <div className="message-bubble">
                   <div className="message-content">
                     {failureDiagnosis ? <AwaitingApprovalBlock diagnosis={failureDiagnosis} /> : null}
-                    {replyText ? <TypingText text={replyText} enabled={shouldAnimate} /> : null}
+                    {replyText ? (
+                      <>
+                        <TypingText text={replyText} enabled={shouldAnimate} />
+                        {/* Blinking caret while live-streaming a chat answer. */}
+                        {isLastTask && isActive ? <span className="streaming-caret" aria-hidden="true">▍</span> : null}
+                      </>
+                    ) : null}
                     {developDiff ? (
                       <details className="diff-details" open>
                         <summary>Code Changes ({developDiff.filesChanged} files)</summary>

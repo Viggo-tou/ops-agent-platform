@@ -212,23 +212,43 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
         .join("\n")
         .trim();
 
-    // Smooth-flush animator: backends like MiniMax push coarse chunks (a
-    // sentence or two at a time). To make the UI feel like genuine token
-    // streaming, we keep a buffer of un-rendered characters and drain it at
-    // a fixed rate via setInterval. When the stream ends we flush the rest
-    // immediately so nothing is lost.
-    const FLUSH_RATE_MS = 18;        // ~55 chars/sec
-    const MAX_BURST_CHARS = 6;       // catch up if buffer is large
+    // RPG-style typewriter animator. The base pace is 1 character per tick
+    // so the text genuinely "崩" out one by one. If the buffer grows large
+    // (backend pushed a long chunk), we accelerate to catch up — otherwise
+    // a 200-char paragraph would take ~5s to render which feels sluggish.
+    //
+    // Pacing curve (chars-per-tick by buffer length):
+    //   buffer <  40 chars → 1 char/tick     (~28 chars/sec, RPG feel)
+    //   buffer < 120 chars → 2 chars/tick    (~56 chars/sec)
+    //   buffer < 300 chars → 4 chars/tick    (~112 chars/sec)
+    //   buffer >= 300      → 8 chars/tick    (catch-up, never freezes)
+    //
+    // Plus we add a tiny extra tick of dwell after end-of-sentence punctuation
+    // (。.!?) so periods and pauses feel natural like an RPG dialog box.
+    const TICK_MS = 35;
+    const SENTENCE_END = new Set(["。", ".", "!", "?", "!", "?"]);
     let renderedSoFar = "";
     let pendingBuffer = "";
+    let dwellTicks = 0;
     let streamDone = false;
     const flushTick = window.setInterval(() => {
       if (pendingBuffer.length === 0) return;
-      // Drain MAX_BURST_CHARS characters per tick so big chunks catch up
-      // gracefully without freezing the UI.
-      const take = Math.min(MAX_BURST_CHARS, pendingBuffer.length);
-      renderedSoFar += pendingBuffer.slice(0, take);
+      if (dwellTicks > 0) {
+        dwellTicks -= 1;
+        return;
+      }
+      let burst = 1;
+      if (pendingBuffer.length >= 300) burst = 8;
+      else if (pendingBuffer.length >= 120) burst = 4;
+      else if (pendingBuffer.length >= 40) burst = 2;
+      const take = Math.min(burst, pendingBuffer.length);
+      const chunk = pendingBuffer.slice(0, take);
+      renderedSoFar += chunk;
       pendingBuffer = pendingBuffer.slice(take);
+      // Dwell on sentence endings so periods feel natural.
+      if (SENTENCE_END.has(chunk[chunk.length - 1])) {
+        dwellTicks = 4; // ~140ms pause after a sentence
+      }
       visibleAnswerSoFar = stripIntent(renderedSoFar);
       setOptimisticTask((prev) =>
         prev
@@ -244,7 +264,7 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
           : prev,
       );
       scrollToLatestMessage();
-    }, FLUSH_RATE_MS);
+    }, TICK_MS);
     const drainAndStop = () => {
       streamDone = true;
       // Final flush: dump everything remaining.
