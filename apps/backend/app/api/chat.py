@@ -203,6 +203,42 @@ def _build_system_prompt(db: Session) -> str:
     except Exception:  # noqa: BLE001
         pass
 
+    # 4. Recent agent memories — high-confidence cross-scope items so the
+    #    chat LLM benefits from past gate failures / fixes / patterns the
+    #    pipeline learned. Without this, every conversation starts from a
+    #    blank slate and re-suggests fixes that previously broke.
+    try:
+        from sqlalchemy import select as _select
+        from app.models.memory import AgentMemory
+        stmt = (
+            _select(AgentMemory)
+            .where(AgentMemory.confidence >= 0.6)
+            .order_by(
+                AgentMemory.last_used_at.desc().nullslast(),
+                AgentMemory.confidence.desc(),
+                AgentMemory.usage_count.desc(),
+                AgentMemory.created_at.desc(),
+            )
+            .limit(8)
+        )
+        memories = list(db.scalars(stmt))
+        if memories:
+            lines = ["", "### 历史经验 (近期高置信记忆)"]
+            for m in memories:
+                obs = (m.observation or "").strip().replace("\n", " ")
+                res = (m.resolution or "").strip().replace("\n", " ")
+                if len(obs) > 200:
+                    obs = obs[:200] + "…"
+                if len(res) > 200:
+                    res = res[:200] + "…"
+                scope = m.scope or "general"
+                lines.append(f"- **[{scope}]** 观察: {obs} → 处理: {res}")
+            lines.append("")
+            lines.append("引用上述经验时,先确认它仍然适用当前上下文(代码可能已变),不要照搬。")
+            out.append("\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+
     return "\n".join(out)
 
 
@@ -536,7 +572,7 @@ async def chat_send(
                     if kind == "text":
                         if not payload:
                             continue
-                        full_text += payload  # type: ignore[operator]
+                        full_text += str(payload)
                         yield _sse("token", {"text": payload})
                     elif kind == "tool_call":
                         yield _sse("tool_call", payload)
@@ -771,13 +807,6 @@ async def _stream_from_provider(
         yield ("done", "stop")
         return
     if provider == "anthropic":
-        if mcp_tools:
-            anthropic_tools = _convert_openai_tools_to_anthropic(mcp_tools)
-            async for ev in _stream_anthropic_with_tools(
-                message, settings, model_name, system_prompt, history, anthropic_tools
-            ):
-                yield ev
-            return
         async for ev in _text_stream_to_events(
             _stream_anthropic(message, settings, model_name, system_prompt, history)
         ):
@@ -824,24 +853,27 @@ async def _text_stream_to_events(
 
 
 def _collect_mcp_tools_openai_format() -> list[dict]:
-    """Return MCP tools in OpenAI tools schema, or empty list.
-
-    Empty when no MCP servers connected, when import fails, or when
-    discovery raises. Chat then falls back to the text-only path so a
-    misconfigured MCP doesn't break chat.
-    """
     try:
         from app.services.mcp_client import get_mcp_client
 
         out: list[dict] = []
-        for server_name, tools in get_mcp_client().list_tools().items():
+        for server_name, tools in (get_mcp_client().list_tools() or {}).items():
+            if not isinstance(tools, list):
+                continue
             for tool in tools:
-                schema = tool.get("input_schema") or {"type": "object", "properties": {}}
+                if not isinstance(tool, dict):
+                    continue
+                tool_name = str(tool.get("name") or "").strip()
+                if not tool_name:
+                    continue
+                schema = tool.get("input_schema")
+                if not isinstance(schema, dict):
+                    schema = {"type": "object", "properties": {}}
                 out.append(
                     {
                         "type": "function",
                         "function": {
-                            "name": f"mcp.{server_name}.{tool['name']}",
+                            "name": f"mcp.{server_name}.{tool_name}",
                             "description": tool.get("description") or "",
                             "parameters": schema,
                         },
@@ -852,7 +884,7 @@ def _collect_mcp_tools_openai_format() -> list[dict]:
         return []
 
 
-def _execute_chat_tool_blocking(tool_name: str, arguments: dict) -> str:
+def _execute_chat_tool_blocking_legacy(tool_name: str, arguments: dict) -> str:
     """Sync helper that calls an MCP tool and returns a string for the LLM.
 
     Bypasses ToolGateway.execute (which requires a Task row for its
@@ -890,6 +922,82 @@ def _execute_chat_tool_blocking(tool_name: str, arguments: dict) -> str:
 
 
 _CHAT_TOOL_USE_MAX_ITERATIONS = 5
+
+
+def _execute_chat_tool_blocking(tool_name: str, arguments: dict) -> str:
+    from app.tools.gateway import ToolGateway
+
+    task_id = uuid.uuid4().hex
+    db: Session = SessionLocal()
+    try:
+        synthetic_task = TaskModel(
+            id=task_id,
+            session_id=None,
+            actor_name="chat",
+            actor_role=ActorRole.SYSTEM,
+            title=(f"chat tool {tool_name}")[:255],
+            request_text=json.dumps(arguments or {}, ensure_ascii=False, default=str),
+            scenario="chat_tool_call",
+            status=TaskStatus.RUNNING,
+            workflow_stage=WorkflowStage.ACTION,
+            current_role=RoleName.SYSTEM,
+            risk_level=RiskLevel.LOW,
+            risk_category=RiskCategory.GENERAL,
+            governance_json={"actor": {"name": "chat", "role": ActorRole.SYSTEM.value}},
+            latest_result_json={"kind": "chat_tool_call", "tool_name": tool_name},
+            pending_approval=False,
+        )
+        db.add(synthetic_task)
+        db.flush()
+
+        gateway = ToolGateway(db)
+        try:
+            result = gateway.execute(
+                task_id=task_id,
+                tool_name=tool_name,
+                payload=arguments or {},
+                actor_context={"actor_name": "chat", "task_id": task_id},
+            )
+        except Exception as exc:  # noqa: BLE001
+            synthetic_task.status = TaskStatus.FAILED
+            synthetic_task.workflow_stage = WorkflowStage.DONE
+            synthetic_task.latest_result_json = {
+                "kind": "chat_tool_call",
+                "tool_name": tool_name,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
+            return f"ERROR: {type(exc).__name__}: {exc}"
+
+        text_parts: list[str] = []
+        for item in result.get("content") or []:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    text_parts.append(text)
+        content = "\n".join(text_parts)
+        is_error = bool(result.get("is_error"))
+        synthetic_task.status = TaskStatus.FAILED if is_error else TaskStatus.COMPLETED
+        synthetic_task.workflow_stage = WorkflowStage.DONE
+        synthetic_task.latest_result_json = {
+            "kind": "chat_tool_call",
+            "tool_name": tool_name,
+            "is_error": is_error,
+            "content": content,
+        }
+        try:
+            db.commit()
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            return f"ERROR: {type(exc).__name__}: {exc}"
+        if is_error:
+            return f"ERROR: {content}"
+        return content
+    finally:
+        db.close()
 
 
 async def _stream_openai_compat_with_tools(
@@ -947,11 +1055,14 @@ async def _stream_openai_compat_with_tools(
                 # Per-stream accumulators, indexed by tool_call.index from delta.
                 pending_calls: dict[int, dict[str, str]] = {}
                 finish_reason: str | None = None
+                assistant_text_parts: list[str] = []
 
                 async for line in response.aiter_lines():
-                    if not line.startswith("data:"):
+                    if not line or not line.startswith("data:"):
                         continue
                     data_str = line[5:].lstrip()
+                    if not data_str:
+                        continue
                     if data_str == "[DONE]":
                         break
                     try:
@@ -963,22 +1074,27 @@ async def _stream_openai_compat_with_tools(
                         continue
                     choice = choices[0]
                     delta = choice.get("delta") or {}
-                    fr = choice.get("finish_reason")
-                    if fr:
-                        finish_reason = fr
+                    finish_reason = choice.get("finish_reason")
 
                     text = delta.get("content")
-                    if text:
+                    if isinstance(text, str) and text:
+                        assistant_text_parts.append(text)
                         yield ("text", text)
 
                     for tc in delta.get("tool_calls") or []:
-                        idx = tc.get("index", 0)
+                        if not isinstance(tc, dict):
+                            continue
+                        idx = tc.get("index")
+                        if not isinstance(idx, int):
+                            continue
                         slot = pending_calls.setdefault(
                             idx, {"id": "", "name": "", "arguments": ""}
                         )
                         if tc.get("id"):
                             slot["id"] = tc["id"]
                         fn = tc.get("function") or {}
+                        if not isinstance(fn, dict):
+                            continue
                         if fn.get("name"):
                             slot["name"] = fn["name"]
                         if fn.get("arguments"):
@@ -999,16 +1115,24 @@ async def _stream_openai_compat_with_tools(
                         },
                     }
                 )
-            messages.append({"role": "assistant", "tool_calls": assistant_tool_calls, "content": ""})
+            assistant_message: dict[str, object] = {
+                "role": "assistant",
+                "tool_calls": assistant_tool_calls,
+            }
+            assistant_text = "".join(assistant_text_parts)
+            if assistant_text:
+                assistant_message["content"] = assistant_text
+            messages.append(assistant_message)
 
             for idx in sorted(pending_calls):
                 slot = pending_calls[idx]
                 tc_id = slot["id"] or f"call_{idx}"
                 name = slot["name"]
                 try:
-                    args = json.loads(slot["arguments"]) if slot["arguments"] else {}
+                    parsed = json.loads(slot["arguments"]) if slot["arguments"] else {}
                 except json.JSONDecodeError:
-                    args = {}
+                    parsed = {}
+                args = parsed if isinstance(parsed, dict) else {}
                 yield ("tool_call", {"id": tc_id, "name": name, "arguments": args})
                 result_str = await asyncio.to_thread(
                     _execute_chat_tool_blocking, name, args
@@ -1025,6 +1149,9 @@ async def _stream_openai_compat_with_tools(
 
         if finish_reason in (None, "stop"):
             yield ("done", "stop")
+            return
+        if finish_reason == "tool_calls":
+            yield ("done", "unknown")
             return
         yield ("done", finish_reason or "unknown")
         return
