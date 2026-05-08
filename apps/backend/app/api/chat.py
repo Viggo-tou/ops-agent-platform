@@ -42,7 +42,15 @@ from app.core.enums import (
 from app.core.security import ActorContext, require_permission
 from app.models.task import Task as TaskModel
 from app.schemas.task import TaskCreateRequest
+from app.services.chat_intent import IntentResult, classify_intent
+from app.services.docs_router import (
+    RouterMatch,
+    find_matching as find_matching_playbooks,
+    format_playbooks_for_prompt,
+    record_miss as record_playbook_miss,
+)
 from app.services.events import record_event
+from app.services.knowledge import KnowledgeService
 from app.services.model_config import get_selected_model
 from app.services.runtime_override import effective_provider
 from app.services.tasks import TaskService
@@ -194,6 +202,102 @@ def _build_system_prompt(db: Session) -> str:
 SYSTEM_PROMPT = _BASE_SYSTEM_PROMPT
 
 
+# ---- routing helpers ------------------------------------------------------
+
+
+def _light_fts_retrieve(query: str, top_k: int = 5) -> list[dict[str, str]]:
+    """Lightweight FTS over knowledge_document_fts — no LLM, no rewrite,
+    no synthesis. Aimed at <100ms for chat fast-path.
+
+    Returns list of {source_name, relative_path, title, snippet}.
+    Empty list on any error or no match.
+    """
+    import re as _re
+    db = SessionLocal()
+    try:
+        # Tokenize the query into FTS5-safe terms. Each gets quoted and
+        # joined by OR so partial matches work for symbol-style queries.
+        tokens = [t for t in _re.findall(r"[\w一-鿿]{2,}", query or "")][:8]
+        if not tokens:
+            return []
+        safe = " OR ".join('"{}"'.format(t.replace('"', '""')) for t in tokens)
+        match_expr = (
+            f"(relative_path:({safe}) OR title:({safe}) "
+            f"OR content:({safe}) OR card_text:({safe}))"
+        )
+        from sqlalchemy import text as _text
+        rows = db.execute(
+            _text(
+                """
+                SELECT document_id, source_name, relative_path, title,
+                       snippet(knowledge_document_fts, 4, '<mark>', '</mark>', '...', 32) AS snip
+                FROM knowledge_document_fts
+                WHERE knowledge_document_fts MATCH :match
+                ORDER BY rank
+                LIMIT :limit
+                """
+            ),
+            {"match": match_expr, "limit": top_k},
+        ).fetchall()
+        out: list[dict[str, str]] = []
+        for r in rows:
+            out.append(
+                {
+                    "document_id": str(r[0] or ""),
+                    "source_name": str(r[1] or ""),
+                    "relative_path": str(r[2] or ""),
+                    "title": str(r[3] or ""),
+                    "snippet": str(r[4] or "").replace("<mark>", "**").replace("</mark>", "**"),
+                }
+            )
+        return out
+    except Exception:  # noqa: BLE001 — never break chat over an FTS hiccup
+        return []
+    finally:
+        db.close()
+
+
+def _format_lite_knowledge_for_prompt(rows: list[dict[str, str]], max_chars: int = 3500) -> str:
+    if not rows:
+        return ""
+    parts: list[str] = ["", "## 检索到的代码 / 文档片段(优先依据这些回答,无证据的事实不要说)"]
+    used = 0
+    for i, r in enumerate(rows):
+        block = (
+            f"\n[{i + 1}] `{r.get('source_name','')}:{r.get('relative_path','')}` — "
+            f"{r.get('title','')}\n```\n{r.get('snippet','')[:500]}\n```"
+        )
+        if used + len(block) > max_chars and parts:
+            break
+        parts.append(block)
+        used += len(block)
+    return "\n".join(parts)
+
+
+def _augment_system_prompt(
+    base: str,
+    intent: IntentResult,
+    playbook_matches: list[RouterMatch],
+    knowledge_block: str,
+) -> str:
+    """Layer-on routing context onto the base system prompt.
+
+    Order matters — playbooks first (they tell the model HOW to think),
+    then knowledge snippets (the actual evidence).
+    """
+    layers: list[str] = [base]
+    layers.append(
+        f"\n## 当前消息意图判定\n"
+        f"intent={intent.intent}, confidence={intent.confidence}, "
+        f"signals={','.join(intent.signals[:6])}"
+    )
+    if playbook_matches:
+        layers.append(format_playbooks_for_prompt(playbook_matches))
+    if knowledge_block:
+        layers.append(knowledge_block)
+    return "\n".join(layers)
+
+
 # Caps prior conversation context. Last N user/assistant pairs, total under
 # ~6KB so we don't blow up the context window on long chats.
 _MAX_HISTORY_PAIRS = 6
@@ -284,13 +388,41 @@ async def chat_send(
     # close before the streaming response finishes).
     _state_db = SessionLocal()
     try:
-        system_prompt = _build_system_prompt(_state_db)
+        base_system_prompt = _build_system_prompt(_state_db)
         # Load prior turns from the same session so the model can resolve
         # follow-up references like "对" / "开发任务" without forgetting
         # what the user already said.
         history = _load_session_history(_state_db, body.session_id)
     finally:
         _state_db.close()
+
+    # ---- Routing pipeline (rule-based, no extra LLM call) -----------------
+    intent = classify_intent(body.message, history=history)
+
+    # Docs router: any project-execution intent benefits from a playbook.
+    playbook_matches: list[RouterMatch] = []
+    if intent.intent in ("develop_task", "find_in_docs", "repo_question"):
+        playbook_matches = find_matching_playbooks(body.message, top_k=2)
+        if not playbook_matches and intent.intent == "find_in_docs":
+            # Cold-start signal — log so we know what playbooks to add next.
+            record_playbook_miss(body.message, intent.intent, signals=intent.signals)
+
+    # Knowledge search: only for repo_question (file/symbol/structure lookups).
+    # We use a LIGHT FTS-only path (no LLM rewrite, no synthesis) so it adds
+    # well under 100ms. The full KnowledgeService.search_repositories pipeline
+    # — with rewrite + cc-agent + synthesis — is too slow for an interactive
+    # chat reply.
+    knowledge_block = ""
+    if intent.intent == "repo_question":
+        try:
+            rows = await asyncio.to_thread(_light_fts_retrieve, body.message, 5)
+            knowledge_block = _format_lite_knowledge_for_prompt(rows)
+        except Exception:  # noqa: BLE001
+            knowledge_block = ""
+
+    system_prompt = _augment_system_prompt(
+        base_system_prompt, intent, playbook_matches, knowledge_block
+    )
 
     # ActorContext exposes actor_role + app_role; "name" isn't on it. Default
     # to body.actor_name (sent by ChatPage) and fall back to "operator".
