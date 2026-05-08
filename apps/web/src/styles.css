@@ -2048,6 +2048,65 @@ dd {
   gap: 6px;
   color: #581818;
 }
+.status-feed-reservations ol li.reservation-row {
+  list-style: none;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-left: -22px;
+  padding-left: 0;
+}
+.reservation-tag {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  flex-shrink: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.reservation-tag.tag-fixable    { background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
+.reservation-tag.tag-test       { background: #fff7ed; color: #c2410c; border: 1px solid #fdba74; }
+.reservation-tag.tag-block-sec  { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
+.reservation-tag.tag-block-policy { background: #f3e8ff; color: #6b21a8; border: 1px solid #d8b4fe; }
+.reservation-tag.tag-neutral    { background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; }
+.reservation-row.sev-block-sec,
+.reservation-row.sev-block-policy {
+  font-weight: 500;
+}
+
+.status-feed-autofix {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 12px;
+  padding: 4px 12px;
+  border-radius: 8px;
+  border: 0;
+  background: #2563eb;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s, transform 0.12s;
+}
+.status-feed-autofix:hover:not(:disabled) {
+  background: #1d4ed8;
+  transform: translateY(-1px);
+}
+.status-feed-autofix:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.status-feed-error {
+  margin-top: 6px;
+  color: #b91c1c;
+  font-size: 12px;
+}
 
 /* Inline failed-pipeline action block (lives inside the assistant
    bubble, replaces the old continue-banner that floated above the

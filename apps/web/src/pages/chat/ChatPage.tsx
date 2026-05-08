@@ -73,6 +73,12 @@ export function ChatPage() {
   // the latest event is always at the bottom (matching every other chat
   // app's mental model) — without it, the EventTimeline of the OLD turn
   // updates in place and the user has to scroll up to find what changed.
+  type ReservationDetail = {
+    text: string;
+    severity: "bug" | "missing_test" | "security" | "policy" | "style" | string;
+    auto_fixable?: boolean;
+    blocking?: boolean;
+  };
   type StatusUpdate = {
     id: string;                     // unique key (task_id + new_status)
     task_id: string;
@@ -81,7 +87,8 @@ export function ChatPage() {
     scenario: string | null;
     title: string | null;
     timestamp: number;
-    reservations?: string[];        // populated when entering awaiting_approval
+    reservations?: string[];        // back-compat plain strings
+    reservations_detailed?: ReservationDetail[];  // tagged with severity
   };
   const [statusUpdates, setStatusUpdates] = useState<StatusUpdate[]>([]);
   // Map of task_id → last-seen status, used to detect transitions.
@@ -621,10 +628,24 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
       // Skip process_question chat answers — those don't have meaningful
       // backend transitions (they're created already-completed).
       if (t.scenario === "process_question") continue;
+      const result = (t.latest_result_json as { result?: { reservations?: unknown; reservations_detailed?: unknown } } | null)?.result;
       const reservations = (() => {
-        const r = (t.latest_result_json as { result?: { reservations?: unknown } } | null)?.result?.reservations;
+        const r = result?.reservations;
         if (Array.isArray(r)) return r.filter((x): x is string => typeof x === "string");
         return undefined;
+      })();
+      const reservations_detailed = (() => {
+        const r = result?.reservations_detailed;
+        if (!Array.isArray(r)) return undefined;
+        return r
+          .filter((x): x is Record<string, unknown> => typeof x === "object" && x !== null)
+          .map((x) => ({
+            text: String(x.text ?? ""),
+            severity: String(x.severity ?? "bug"),
+            auto_fixable: Boolean(x.auto_fixable),
+            blocking: Boolean(x.blocking),
+          }))
+          .filter((x) => x.text.length > 0);
       })();
       next.push({
         id: `${t.id}-${cur}-${t.updated_at}`,
@@ -635,6 +656,7 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
         title: t.title || null,
         timestamp: Date.now(),
         reservations,
+        reservations_detailed,
       });
     }
     if (next.length === 0) return;
@@ -790,12 +812,34 @@ function statusLabel(status: string): string {
 }
 
 
+type ReservationDetail = {
+  text: string;
+  severity: "bug" | "missing_test" | "security" | "policy" | "style" | string;
+  auto_fixable?: boolean;
+  blocking?: boolean;
+};
+
+const _SEVERITY_LABEL: Record<string, string> = {
+  bug: "Bug",
+  missing_test: "缺测试",
+  security: "Security",
+  policy: "Policy",
+  style: "Style",
+};
+
+const _SEVERITY_TONE: Record<string, "fixable" | "test" | "block-sec" | "block-policy" | "neutral"> = {
+  bug: "fixable",
+  missing_test: "test",
+  security: "block-sec",
+  policy: "block-policy",
+  style: "neutral",
+};
+
 /**
- * System-style bubble appended at the chat bottom when a background task
- * transitions to a new status. Always shows the deep link so user can jump
- * to the task detail. For awaiting_approval with reservations, expands to
- * list each reservation inline so the user sees the risks BEFORE clicking
- * approve.
+ * System-style bubble at chat bottom for a transitioned task. For
+ * awaiting_approval with tagged reservations, renders each item with a
+ * severity badge AND a one-click "auto-fix N items" button that triggers
+ * /iterate with those items composed into a follow-up prompt.
  */
 function StatusFeedItem({
   update,
@@ -807,9 +851,13 @@ function StatusFeedItem({
     scenario: string | null;
     title: string | null;
     reservations?: string[];
+    reservations_detailed?: ReservationDetail[];
   };
   navigate: (path: string) => void;
 }) {
+  const [iterating, setIterating] = useState(false);
+  const [iterateError, setIterateError] = useState<string | null>(null);
+
   const tone =
     update.new_status === "completed"
       ? "ok"
@@ -819,8 +867,38 @@ function StatusFeedItem({
           ? "fail"
           : "neutral";
   const icon = tone === "ok" ? "✓" : tone === "warn" ? "⚠" : tone === "fail" ? "✗" : "•";
-  const reservations = update.reservations ?? [];
-  const hasReservations = reservations.length > 0;
+
+  // Prefer detailed (tagged) form; fall back to plain strings (older runs).
+  const detailed: ReservationDetail[] =
+    update.reservations_detailed && update.reservations_detailed.length > 0
+      ? update.reservations_detailed
+      : (update.reservations ?? []).map((t) => ({
+          text: t,
+          severity: "bug",
+          auto_fixable: true,
+        }));
+  const hasReservations = detailed.length > 0;
+  const fixable = detailed.filter((r) => r.auto_fixable);
+  const blocking = detailed.filter((r) => r.blocking);
+
+  const submitAutoFix = async () => {
+    if (fixable.length === 0) return;
+    setIterating(true);
+    setIterateError(null);
+    const lines = fixable.map((r, i) => `${i + 1}. (${r.severity}) ${r.text}`).join("\n");
+    const followUp =
+      `请按 reviewer 标记的以下问题逐条修复(都属于自动可修类,不要碰 security/policy 类):\n\n${lines}\n\n` +
+      "维持现有 plan 的 must_touch 文件范围,只补漏不扩需求。";
+    try {
+      const newTask = await api.iterateTask(update.task_id, followUp);
+      navigate(`/tasks/${newTask.id}`);
+    } catch (e) {
+      setIterateError(toErrorMessage(e));
+    } finally {
+      setIterating(false);
+    }
+  };
+
   return (
     <li className={`status-feed-item tone-${tone}`}>
       <div className="status-feed-row">
@@ -830,7 +908,11 @@ function StatusFeedItem({
             {update.title ?? `任务 ${update.task_id.slice(0, 8)}`} —
             <strong> {statusLabel(update.new_status)}</strong>
             {hasReservations ? (
-              <span className="status-feed-flag">{reservations.length} 项保留意见</span>
+              <span className="status-feed-flag">
+                {detailed.length} 项保留意见
+                {fixable.length > 0 ? ` · ${fixable.length} 可自动修` : ""}
+                {blocking.length > 0 ? ` · ${blocking.length} 必须人审` : ""}
+              </span>
             ) : null}
           </div>
           <div className="status-feed-actions">
@@ -841,16 +923,34 @@ function StatusFeedItem({
             >
               打开任务详情 #{update.task_id.slice(0, 8)} →
             </button>
+            {fixable.length > 0 ? (
+              <button
+                type="button"
+                className="status-feed-autofix"
+                onClick={submitAutoFix}
+                disabled={iterating}
+                title="把 auto-fixable 类(bug / 缺测试 / style)合成 follow-up,/iterate 出新任务自动修。Security / policy 类不会被触发。"
+              >
+                {iterating ? "创建迭代中…" : `🔧 一键修复 ${fixable.length} 项`}
+              </button>
+            ) : null}
           </div>
+          {iterateError ? <div className="status-feed-error">{iterateError}</div> : null}
         </div>
       </div>
       {hasReservations ? (
         <details className="status-feed-reservations">
-          <summary>展开 {reservations.length} 项审查保留意见(审批前请看)</summary>
+          <summary>展开 {detailed.length} 项审查保留意见(审批前请看)</summary>
           <ol>
-            {reservations.map((r, i) => (
-              <li key={i}>{r}</li>
-            ))}
+            {detailed.map((r, i) => {
+              const t = _SEVERITY_TONE[r.severity] ?? "neutral";
+              return (
+                <li key={i} className={`reservation-row sev-${t}`}>
+                  <span className={`reservation-tag tag-${t}`}>{_SEVERITY_LABEL[r.severity] ?? r.severity}</span>
+                  <span>{r.text}</span>
+                </li>
+              );
+            })}
           </ol>
         </details>
       ) : null}

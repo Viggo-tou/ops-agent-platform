@@ -5,6 +5,13 @@ Runs AFTER all gate checks pass and BEFORE parking for approval. Emits a list
 of short reviewer notes flagging security trade-offs, missing deploy config,
 untested edge cases, and similar pragmatic concerns that gates don't catch.
 
+Each reservation is tagged with a severity so the UI can route it:
+  - bug          → auto-fixable; safe to feed back into codegen
+  - missing_test → auto-fixable (codegen can add tests)
+  - security     → BLOCK, must be reviewed by a human; auto-fix forbidden
+  - policy       → BLOCK, business judgement required
+  - style        → optional polish; auto-fix allowed but low priority
+
 Fails safe: if MiniMax is not configured or the call fails, returns an empty
 list so the pipeline is not blocked.
 """
@@ -13,7 +20,8 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Literal
 
 import httpx
 
@@ -23,12 +31,58 @@ from app.core.logging import get_logger
 _logger = get_logger(component="reservations")
 
 
+Severity = Literal["bug", "missing_test", "security", "policy", "style"]
+_AUTO_FIXABLE_SEVERITIES: frozenset[Severity] = frozenset({"bug", "missing_test", "style"})
+_BLOCKING_SEVERITIES: frozenset[Severity] = frozenset({"security", "policy"})
+
+
+@dataclass(frozen=True)
+class ReservationItem:
+    text: str
+    severity: Severity
+
+    @property
+    def auto_fixable(self) -> bool:
+        # bug / missing_test / style — safe for codegen to amend
+        return self.severity in _AUTO_FIXABLE_SEVERITIES
+
+    @property
+    def blocking(self) -> bool:
+        # security / policy — must be human-decided; do NOT auto-amend
+        return self.severity in _BLOCKING_SEVERITIES
+
+    def to_dict(self) -> dict[str, str | bool]:
+        return {
+            "text": self.text,
+            "severity": self.severity,
+            "auto_fixable": self.auto_fixable,
+            "blocking": self.blocking,
+        }
+
+
 @dataclass(frozen=True)
 class ReservationsReport:
-    reservations: list[str]
-    provider: str
-    model: str
-    raw_response: str
+    items: list[ReservationItem] = field(default_factory=list)
+    provider: str = "skipped"
+    model: str = "none"
+    raw_response: str = ""
+
+    # Backwards-compatible accessor: existing callers that read
+    # `report.reservations` get a flat list of text strings.
+    @property
+    def reservations(self) -> list[str]:
+        return [item.text for item in self.items]
+
+    @property
+    def auto_fixable(self) -> list[ReservationItem]:
+        return [i for i in self.items if i.auto_fixable]
+
+    @property
+    def blocking(self) -> list[ReservationItem]:
+        return [i for i in self.items if i.blocking]
+
+    def to_dicts(self) -> list[dict[str, str | bool]]:
+        return [item.to_dict() for item in self.items]
 
 
 def build_reservations(
@@ -43,7 +97,7 @@ def build_reservations(
     settings = settings or get_settings()
     if not settings.minimax_api_key:
         return ReservationsReport(
-            reservations=[],
+            items=[],
             provider="skipped",
             model="none",
             raw_response="OPS_AGENT_MINIMAX_API_KEY not configured; reservations skipped.",
@@ -56,27 +110,44 @@ def build_reservations(
 
     system_prompt = (
         "You are a senior engineering reviewer looking at a patch moments before "
-        "it ships. Your job is to list RESERVATIONS — risks, trade-offs, and "
-        "gotchas a human approver should know. Be concrete and practical.\n\n"
-        "What to flag:\n"
-        "- Security/auth choices that could be tightened (e.g., anonymous auth "
-        "where admin-only would be stricter)\n"
-        "- Missing deploy/config artifacts (e.g., firebase.json not updated, "
-        "migration script missing, env var undocumented)\n"
-        "- Edge cases the diff doesn't handle (null values, race conditions, "
-        "empty collections, error states)\n"
-        "- Tests not added for new code paths\n"
-        "- Naming/API surface choices that may surprise callers\n"
-        "- Changes that are cosmetic (comment-only) and don't advance the task\n"
-        "- Operational gotchas (e.g., requires a manual step, breaks existing "
-        "users until they re-login, affects rollback)\n\n"
-        "What NOT to flag:\n"
-        "- Style preferences\n"
-        "- Things the diff handles correctly\n"
-        "- Praise or neutral observations\n\n"
-        "Each item: 1 short sentence (under 200 chars), concrete and actionable.\n"
-        "If the diff has no meaningful reservations, return an empty list.\n"
-        'Output JSON ONLY in this shape: {"reservations": ["...", "..."]}.'
+        "it ships. List RESERVATIONS — risks, trade-offs, and gotchas a human "
+        "approver should know. Be concrete and practical.\n\n"
+        "Tag EVERY item with a `severity`. The downstream system will route\n"
+        "auto-fixable severities back to codegen for an automated amend round, \n"
+        "and surface blocking ones to the human approver. Tag accurately:\n\n"
+        "  - 'bug'           → real defect: scope error, null deref, wrong\n"
+        "                       branch, dangling reference, type mismatch.\n"
+        "                       SAFE to auto-fix.\n"
+        "  - 'missing_test'  → new code path lacks coverage. SAFE to auto-fix\n"
+        "                       (codegen can add a unit test).\n"
+        "  - 'security'      → auth / data-exposure / takeover / privilege\n"
+        "                       trade-off. Tag this and STOP — human MUST\n"
+        "                       decide; do NOT mark security as bug.\n"
+        "  - 'policy'        → business / product judgement: does the change\n"
+        "                       match the user's intent, is the rollback plan\n"
+        "                       acceptable, is a manual ops step ok. Human\n"
+        "                       MUST decide.\n"
+        "  - 'style'         → cosmetic / naming / comment-only. Optional.\n\n"
+        "What to flag (any severity):\n"
+        "- Security/auth choices (severity=security)\n"
+        "- Missing deploy/config artifacts (severity=bug if literally missing,\n"
+        "  policy if it's an ops decision)\n"
+        "- Unhandled edge cases (severity=bug)\n"
+        "- Tests not added for new code paths (severity=missing_test)\n"
+        "- Naming/API surface that may surprise callers (severity=style or bug)\n"
+        "- Comment-only / placebo diffs that don't advance the task\n"
+        "  (severity=bug — they should be removed)\n"
+        "- Operational gotchas requiring manual steps (severity=policy)\n\n"
+        "What NOT to flag: style preferences the team accepts; things the diff\n"
+        "handles correctly; praise.\n\n"
+        "Each item: 1 short sentence (<200 chars), concrete and actionable.\n"
+        "Return JSON ONLY:\n"
+        '{"reservations": [\n'
+        '   {"text": "...", "severity": "bug"},\n'
+        '   {"text": "...", "severity": "security"},\n'
+        '   ...\n'
+        "]}\n\n"
+        "If no reservations, return: {\"reservations\": []}"
     )
 
     user_prompt = (
@@ -111,16 +182,16 @@ def build_reservations(
     except Exception as exc:  # noqa: BLE001
         _logger.warning("reservations_llm_call_failed", error=str(exc)[:300])
         return ReservationsReport(
-            reservations=[],
+            items=[],
             provider="minimax",
             model=settings.semantic_translator_model,
             raw_response=f"error: {str(exc)[:300]}",
         )
 
     content = _extract_content(response_payload)
-    reservations = _parse_reservations(content)
+    items = _parse_reservations(content)
     return ReservationsReport(
-        reservations=reservations,
+        items=items,
         provider="minimax",
         model=settings.semantic_translator_model,
         raw_response=content[:2000],
@@ -140,19 +211,60 @@ def _extract_content(response_payload: dict) -> str:
     return str(content or "")
 
 
-def _parse_reservations(content: str) -> list[str]:
-    """Parse the LLM content into a clean list of reservation strings.
+_VALID_SEVERITIES: tuple[Severity, ...] = ("bug", "missing_test", "security", "policy", "style")
 
-    Accepts the happy-path JSON, but also tolerates stray markdown code fences
-    and leading/trailing prose since reviewer LLMs sometimes add preamble.
+
+def _normalize_severity(raw: object) -> Severity:
+    """Coerce free-form severity strings the model returns into our enum.
+    Default to 'bug' when ambiguous so the item is at least surfaced.
+    """
+    if not isinstance(raw, str):
+        return "bug"
+    s = raw.lower().strip()
+    if s in _VALID_SEVERITIES:
+        return s  # type: ignore[return-value]
+    # Common synonyms the model uses.
+    if "security" in s or "auth" in s or "vulner" in s or "takeover" in s:
+        return "security"
+    if "policy" in s or "ops" in s or "judgement" in s or "judgment" in s:
+        return "policy"
+    if "test" in s or "coverage" in s:
+        return "missing_test"
+    if "style" in s or "cosmetic" in s or "naming" in s:
+        return "style"
+    return "bug"
+
+
+def _heuristic_severity_from_text(text: str) -> Severity:
+    """When the model returned plain strings (legacy format), infer severity."""
+    t = text.lower()
+    if any(k in t for k in ("takeover", "spoof", "auth", "security", "credential", "leak", "expose", "vulner")):
+        return "security"
+    if any(k in t for k in ("test", "coverage", "regression test")):
+        return "missing_test"
+    if any(k in t for k in ("policy", "rollback", "manual step", "ops", "deployment plan")):
+        return "policy"
+    if any(k in t for k in ("naming", "style", "cosmetic", "comment-only", "comment only")):
+        return "style"
+    return "bug"
+
+
+def _parse_reservations(content: str) -> list[ReservationItem]:
+    """Parse the LLM content into ReservationItems.
+
+    Accepts both the new tagged shape:
+      {"reservations": [{"text": "...", "severity": "bug"}, ...]}
+    and the legacy plain-string shape:
+      {"reservations": ["...", "..."]}
+    where severity is inferred heuristically from the text.
+
+    Tolerates markdown code fences and leading/trailing prose.
     """
     if not content:
         return []
     text = content.strip()
-    # Strip common markdown wrappers
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"\s*```\s*$", "", text, flags=re.MULTILINE)
-    # Find the first JSON object in the text
     m = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if m is None:
         return []
@@ -163,22 +275,30 @@ def _parse_reservations(content: str) -> list[str]:
     raw_list = parsed.get("reservations") if isinstance(parsed, dict) else None
     if not isinstance(raw_list, list):
         return []
-    # Normalize: keep strings, trim, cap length, drop empties/duplicates.
-    out: list[str] = []
+
+    out: list[ReservationItem] = []
     seen: set[str] = set()
     for item in raw_list:
-        if not isinstance(item, str):
+        if isinstance(item, str):
+            s = item.strip()
+            if not s:
+                continue
+            severity = _heuristic_severity_from_text(s)
+        elif isinstance(item, dict):
+            s = str(item.get("text") or "").strip()
+            if not s:
+                continue
+            severity = _normalize_severity(item.get("severity"))
+        else:
             continue
-        s = item.strip()
-        if not s:
-            continue
+
         if len(s) > 400:
             s = s[:397] + "..."
         key = s.lower()
         if key in seen:
             continue
         seen.add(key)
-        out.append(s)
+        out.append(ReservationItem(text=s, severity=severity))
         if len(out) >= 15:
-            break  # cap to 15 entries; reviewer shouldn't see a wall of text
+            break  # cap; UI shouldn't show a wall of text
     return out

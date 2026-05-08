@@ -8260,7 +8260,12 @@ class PrimaryOrchestrator:
 
         # Reservations reviewer: LLM flags risks/trade-offs/gotchas a human
         # approver should see before approving. Fails safe to empty list.
+        # Now also tags each item with a severity so the UI can route
+        # auto-fixable items (bug / missing_test / style) to a one-click
+        # iteration button vs blocking items (security / policy) that the
+        # human must decide.
         reservations: list[str] = []
+        reservations_detailed: list[dict] = []
         try:
             from app.services.reservations import build_reservations
             _reservations_report = build_reservations(
@@ -8271,6 +8276,9 @@ class PrimaryOrchestrator:
                 settings=self.tool_gateway.settings,
             )
             reservations = _reservations_report.reservations
+            reservations_detailed = _reservations_report.to_dicts()  # type: ignore[assignment]
+            auto_count = len(_reservations_report.auto_fixable)
+            block_count = len(_reservations_report.blocking)
             record_event(
                 self.db,
                 task_id=task.id,
@@ -8280,12 +8288,16 @@ class PrimaryOrchestrator:
                 role=RoleName.REVIEWER,
                 tool_name="reservations.review",
                 message=(
-                    f"Reservations reviewer flagged {len(reservations)} item(s)."
+                    f"Reservations reviewer flagged {len(reservations)} item(s) "
+                    f"({auto_count} auto-fixable, {block_count} block)."
                     if reservations
                     else "Reservations reviewer found no flags."
                 ),
                 payload={
-                    "reservations": reservations,
+                    "reservations": reservations,                    # back-compat strings
+                    "reservations_detailed": reservations_detailed,  # tagged with severity
+                    "auto_fixable_count": auto_count,
+                    "blocking_count": block_count,
                     "provider": _reservations_report.provider,
                     "model": _reservations_report.model,
                 },
@@ -8316,7 +8328,8 @@ class PrimaryOrchestrator:
             "jira_transitioned": False,
             "conformance_report": pipeline_state.get("conformance_report"),
             "goal_attestation": attestation,
-            "reservations": reservations,
+            "reservations": reservations,                      # back-compat plain text list
+            "reservations_detailed": reservations_detailed,    # [{text, severity, auto_fixable, blocking}]
             "evidence_chain": evidence_chain_payload,
         }
 
@@ -8408,6 +8421,7 @@ class PrimaryOrchestrator:
                 "issue_key": issue_key,
                 "files_changed": list(files_changed),
                 "reservations": reservations,
+                "reservations_detailed": reservations_detailed,
                 "evidence_chain": evidence_chain_payload,
             },
         )
