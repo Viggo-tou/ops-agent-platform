@@ -10,6 +10,7 @@ from app.api.approvals import router as approvals_router
 from app.api.governance import router as governance_router
 from app.api.health import router as health_router
 from app.api.knowledge import router as knowledge_router
+from app.api.llm_usage import router as llm_usage_router
 from app.api.memory import router as memory_router
 from app.api.integrations import router as integrations_router
 from app.api.metrics import router as metrics_router
@@ -325,3 +326,4 @@ app.include_router(repositories_router, prefix=settings.api_prefix)
 app.include_router(integrations_router, prefix=settings.api_prefix)
 app.include_router(runtime_config_router, prefix=settings.api_prefix)
 app.include_router(tools_router, prefix=settings.api_prefix)
+app.include_router(llm_usage_router, prefix=settings.api_prefix)

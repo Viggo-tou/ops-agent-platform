@@ -8,11 +8,13 @@ import { toErrorMessage } from "../../lib/format";
 import { ConversationList } from "./ConversationList";
 
 const navigationItems = [
-  { to: "/home", label: "首页" },
+  { to: "/dashboard", label: "总览" },
+  { to: "/tasks", label: "任务列表" },
   { to: "/knowledge", label: "知识库" },
   { to: "/memory", label: "记忆" },
   { to: "/repositories", label: "仓库", permission: "settings:view" as const },
   { to: "/integrations", label: "集成", permission: "settings:view" as const },
+  { to: "/usage", label: "用量", permission: "settings:view" as const },
   { to: "/governance", label: "治理", permission: "settings:view" as const },
   { to: "/settings", label: "设置", permission: "settings:view" as const },
 ];
@@ -29,15 +31,18 @@ export function AppShell() {
     refetchInterval: 10_000,
   });
   const pathname = location.pathname;
-  const sidebarVariant = pathname.startsWith("/home")
-    ? "minimal"
-    : pathname.startsWith("/knowledge") || pathname.startsWith("/memory") || pathname.startsWith("/settings") || pathname.startsWith("/governance") || pathname.startsWith("/repositories") || pathname.startsWith("/integrations")
-      ? "compact"
-      : "chat";
-  const visibleNavigationItems =
-    sidebarVariant === "compact"
-      ? navigationItems.filter((item) => item.to === "/home" || item.to === pathname)
-      : navigationItems;
+  const isWorkbenchPage =
+    pathname.startsWith("/dashboard") ||
+    pathname.startsWith("/tasks") ||
+    pathname.startsWith("/knowledge") ||
+    pathname.startsWith("/memory") ||
+    pathname.startsWith("/settings") ||
+    pathname.startsWith("/governance") ||
+    pathname.startsWith("/repositories") ||
+    pathname.startsWith("/integrations") ||
+    pathname.startsWith("/usage");
+  const sidebarVariant = isWorkbenchPage ? "minimal" : "chat";
+  const visibleNavigationItems = navigationItems;
   const recentConversationCount = tasksQuery.data?.length ?? 0;
 
   return (
@@ -110,24 +115,20 @@ export function AppShell() {
 
         <div className="account-card">
           <div className="avatar">{user?.name.slice(0, 1).toUpperCase()}</div>
-          {sidebarVariant === "chat" ? (
-            <>
-              <div>
-                <strong>{user?.name}</strong>
-                <span>{user?.role}</span>
-              </div>
-              <button
-                type="button"
-                className="text-button"
-                onClick={() => {
-                  logout();
-                  void navigate("/login");
-                }}
-              >
-                Log out
-              </button>
-            </>
-          ) : null}
+          <div>
+            <strong>{user?.name}</strong>
+            <span>{user?.role}</span>
+          </div>
+          <button
+            type="button"
+            className="text-button"
+            onClick={() => {
+              logout();
+              void navigate("/login");
+            }}
+          >
+            Log out
+          </button>
         </div>
       </aside>
 

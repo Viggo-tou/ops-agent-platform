@@ -354,4 +354,53 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ actor_name: actorName, reason }),
     }),
+  getToolUsageStats: (windowDays = 7, top = 10) =>
+    request<{
+      total_invocations: number;
+      succeeded: number;
+      failed: number;
+      success_rate: number;
+      window_days: number;
+      by_tool: {
+        tool_name: string;
+        total: number;
+        succeeded: number;
+        failed: number;
+        success_rate: number;
+      }[];
+    }>(`/tools/usage-stats?window_days=${windowDays}&top=${top}`),
+  getLlmUsageStats: (windowDays = 30, top = 20) =>
+    request<{
+      window_days: number;
+      total_invocations: number;
+      total_input_tokens: number;
+      total_output_tokens: number;
+      total_tokens: number;
+      total_cost_usd: number;
+      by_model: {
+        model_name: string;
+        provider_name: string;
+        invocations: number;
+        input_tokens: number;
+        output_tokens: number;
+        total_tokens: number;
+        estimated_cost_usd: number;
+      }[];
+      by_purpose: {
+        purpose: string;
+        invocations: number;
+        total_tokens: number;
+        estimated_cost_usd: number;
+      }[];
+    }>(`/llm-usage/stats?window_days=${windowDays}&top=${top}`),
+  getLlmUsageTimeseries: (windowDays = 14) =>
+    request<{
+      window_days: number;
+      points: {
+        date: string;
+        total_tokens: number;
+        total_cost_usd: number;
+        invocations: number;
+      }[];
+    }>(`/llm-usage/timeseries?window_days=${windowDays}`),
 };
