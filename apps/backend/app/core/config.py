@@ -14,7 +14,14 @@ class Settings(BaseSettings):
     debug: bool = True
     api_prefix: str = "/api"
     database_url: str = f"sqlite:///{(BASE_DIR / 'ops_agent_platform.db').as_posix()}"
-    pipeline_max_workers: int = 2
+    # Pipeline worker pool size. Each worker runs one task end-to-end
+    # (planner → knowledge → codegen → sandbox → review). Most of the
+    # time is I/O wait (LLM HTTP, git apply, gradle compile), so 6 is
+    # safe on a typical dev machine. Bumped from 2 — at 2, every backend
+    # restart's _resume_interrupted_tasks would consume both slots and
+    # leave new chat-triggered tasks queued for minutes. Override via
+    # OPS_AGENT_PIPELINE_MAX_WORKERS in .env.
+    pipeline_max_workers: int = 6
     resumability_enabled: bool = True
     resumability_max_age_hours: int = 6
     resumability_orphan_threshold_hours: int = 6
@@ -111,7 +118,14 @@ class Settings(BaseSettings):
     codegen_self_validation_enabled: bool = True
     codegen_self_validation_max_retries: int = 1
     codegen_repair_files_per_round: int = 5
-    codegen_repair_round_timeout_seconds: float = 180.0
+    # Bumped from 180s. Empirically a single codegen.generate_patch call
+    # via Claude Code CLI takes 3-4 min (~180-240s). The 180s deadline
+    # would fire BEFORE codegen returned, so the patch was generated but
+    # the round was marked timed_out and the result discarded — leaving
+    # the task stuck in an infinite "round N timed out → start round N+1
+    # → timed out again" loop. 600s gives one codegen call comfortable
+    # headroom AND room for a second pass when the round queues 2+ files.
+    codegen_repair_round_timeout_seconds: float = 600.0
     codegen_repair_cap_exceeded_to_approval: bool = True
     repair_intent_preservation_threshold: float = 0.4
     verification_compile_fail_to_approval: bool = False  # Stage 25 contract: cap-exceeded -> fail
