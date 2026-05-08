@@ -24,6 +24,50 @@ def list_tool_registry(db: DbSession) -> list[ToolRegistryEntryRead]:
     return gateway.list_registry_entries()
 
 
+class McpToolDescriptor(BaseModel):
+    name: str
+    description: str
+    input_schema: dict
+
+
+class McpServerStatus(BaseModel):
+    name: str
+    connected: bool
+    error: str | None = None
+    tool_count: int
+    tools: list[McpToolDescriptor]
+
+
+@router.get("/mcp/servers", response_model=list[McpServerStatus])
+def list_mcp_servers() -> list[McpServerStatus]:
+    """Snapshot of every configured MCP server: connection state + tools."""
+    from app.services.mcp_client import get_mcp_client
+
+    client = get_mcp_client()
+    states = client.list_servers()
+    tools_by_server = client.list_tools()
+    out: list[McpServerStatus] = []
+    for name, state in states.items():
+        server_tools = tools_by_server.get(name, [])
+        out.append(
+            McpServerStatus(
+                name=name,
+                connected=bool(state.get("connected")),
+                error=state.get("error"),
+                tool_count=int(state.get("tool_count") or 0),
+                tools=[
+                    McpToolDescriptor(
+                        name=t.get("name", ""),
+                        description=t.get("description", ""),
+                        input_schema=t.get("input_schema") or {},
+                    )
+                    for t in server_tools
+                ],
+            )
+        )
+    return out
+
+
 # --- Aggregated tool usage stats (for /tasks dashboard donut) ----------------
 
 

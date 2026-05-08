@@ -13,6 +13,7 @@ import { TaskListPage } from "./pages/tasks/TaskListPage";
 import { UsagePage } from "./pages/usage/UsagePage";
 import { GovernancePage } from "./pages/governance/GovernancePage";
 import { IntegrationsPage } from "./pages/integrations/IntegrationsPage";
+import { SkillsPage } from "./pages/skills/SkillsPage";
 import { OnboardingPage } from "./pages/onboarding/OnboardingPage";
 import { RepositoriesPage } from "./pages/repositories/RepositoriesPage";
 import { WelcomePage } from "./pages/welcome/WelcomePage";
@@ -38,6 +39,7 @@ export default function App() {
           <Route path="/governance" element={<GovernancePage />} />
           <Route path="/repositories" element={<RepositoriesPage />} />
           <Route path="/integrations" element={<IntegrationsPage />} />
+          <Route path="/skills" element={<SkillsPage />} />
           <Route path="/usage" element={<UsagePage />} />
           <Route path="*" element={<Navigate to="/chat" replace />} />
         </Route>

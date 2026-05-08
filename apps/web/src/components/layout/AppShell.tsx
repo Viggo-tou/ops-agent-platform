@@ -21,6 +21,7 @@ const navigationItems: NavItem[] = [
   { to: "/memory", label: "记忆", iconKind: "brain" },
   { to: "/repositories", label: "仓库", iconKind: "folder", permission: "settings:view" },
   { to: "/integrations", label: "集成", iconKind: "wrench", permission: "settings:view" },
+  { to: "/skills", label: "技能", iconKind: "spark", permission: "settings:view" },
   { to: "/usage", label: "用量", iconKind: "chart", permission: "settings:view" },
   { to: "/governance", label: "治理", iconKind: "shield", permission: "settings:view" },
   { to: "/settings", label: "设置", iconKind: "gear", permission: "settings:view" },
@@ -47,6 +48,8 @@ function NavIcon({ kind }: { kind: string }) {
       return <svg {...props}><path d="M12 3 4 6v6c0 5 3.5 9 8 9s8-4 8-9V6Z" /><path d="m9 12 2 2 4-4" /></svg>;
     case "gear":
       return <svg {...props}><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .35 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.35 1.7 1.7 0 0 0-1.04 1.55V21a2 2 0 0 1-4 0v-.1a1.7 1.7 0 0 0-1.04-1.55 1.7 1.7 0 0 0-1.87.35l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .35-1.87 1.7 1.7 0 0 0-1.55-1.04H3a2 2 0 0 1 0-4h.1a1.7 1.7 0 0 0 1.55-1.04 1.7 1.7 0 0 0-.35-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.35h.04a1.7 1.7 0 0 0 1.04-1.55V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1.04 1.55 1.7 1.7 0 0 0 1.87-.35l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.35 1.87v.04a1.7 1.7 0 0 0 1.55 1.04H21a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.55 1.04Z" /></svg>;
+    case "spark":
+      return <svg {...props}><path d="M12 2v6M12 16v6M2 12h6M16 12h6M5 5l4 4M15 15l4 4M5 19l4-4M15 9l4-4" /></svg>;
     case "logout":
       return <svg {...props}><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" /></svg>;
     case "chev-up":

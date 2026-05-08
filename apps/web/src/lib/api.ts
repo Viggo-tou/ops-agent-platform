@@ -129,6 +129,16 @@ export const api = {
   getTaskEvents: (taskId: string) => request<EventRecord[]>(`/tasks/${taskId}/events`),
   getTaskToolExecutions: (taskId: string) => request<ToolExecutionRecord[]>(`/tasks/${taskId}/tool-executions`),
   getToolRegistry: () => request<ToolRegistryEntry[]>("/tools/registry"),
+  getMcpServers: () =>
+    request<
+      {
+        name: string;
+        connected: boolean;
+        error: string | null;
+        tool_count: number;
+        tools: { name: string; description: string; input_schema: Record<string, unknown> }[];
+      }[]
+    >("/tools/mcp/servers"),
   listRepositorySources: () =>
     request<{
       sources: {
