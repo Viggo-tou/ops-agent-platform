@@ -103,6 +103,14 @@ export function TaskDetailPage() {
     },
   });
 
+  const diagnoseMutation = useMutation({
+    mutationFn: () => api.diagnoseTask(taskId!),
+    onSuccess: () => {
+      // Refresh the task so latest_result_json.failure_diagnosis renders.
+      void queryClient.invalidateQueries({ queryKey: ["task", taskId] });
+    },
+  });
+
   if (!taskId) {
     return <div className="error-banner">Task id is missing from the route.</div>;
   }
@@ -444,6 +452,40 @@ export function TaskDetailPage() {
 
         <TaskTimeline events={events} />
       </section>
+
+      {(task.status === "failed" || task.review_verdict === "rejected" || task.review_verdict === "needs_info") ? (
+        <section className="diagnose-section">
+          <header className="diagnose-head">
+            <div>
+              <h3>失败诊断</h3>
+              <p className="diagnose-subtitle">
+                让 AI 读编译错误 / 被拒绝的 diff / review 报告,生成一段中文解释:为什么没成 + 怎么修。
+              </p>
+            </div>
+            <button
+              type="button"
+              className="iterate-submit"
+              onClick={() => diagnoseMutation.mutate()}
+              disabled={diagnoseMutation.isPending}
+              title="重新生成诊断会覆盖现有结果"
+            >
+              {diagnoseMutation.isPending
+                ? "诊断中…"
+                : task.latest_result_json &&
+                  typeof task.latest_result_json === "object" &&
+                  "failure_diagnosis" in (task.latest_result_json as Record<string, unknown>)
+                ? "重新诊断"
+                : "运行诊断 ↗"}
+            </button>
+          </header>
+          {diagnoseMutation.isError ? (
+            <p className="iterate-error">{toErrorMessage(diagnoseMutation.error)}</p>
+          ) : null}
+          {diagnoseMutation.isSuccess && diagnoseMutation.data ? (
+            <p className="diagnose-hint">已生成诊断,详见上方任务结果区。</p>
+          ) : null}
+        </section>
+      ) : null}
 
       <section className="iterate-section">
         <header className="iterate-head">

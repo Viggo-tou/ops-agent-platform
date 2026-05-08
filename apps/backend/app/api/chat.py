@@ -522,14 +522,20 @@ async def _stream_anthropic(message: str, settings, model_name: str, system_prom
 
 
 async def _stream_deepseek(message: str, settings, model_name: str, system_prompt: str) -> AsyncGenerator[str, None]:
-    """DeepSeek's API is OpenAI-compatible at api.deepseek.com/v1."""
+    """DeepSeek's OpenAI-compatible streaming endpoint.
+
+    NOTE: We hardcode the URL to api.deepseek.com/v1/chat/completions instead
+    of using settings.deepseek_base_url. The codebase's existing config sets
+    OPS_AGENT_DEEPSEEK_BASE_URL=https://api.deepseek.com/anthropic for the
+    Anthropic-compatible codegen path; that endpoint returns 404 for
+    OpenAI-style requests. Chat needs the OpenAI-compat URL.
+    """
     if not getattr(settings, "deepseek_api_key", None):
         raise RuntimeError("OPS_AGENT_DEEPSEEK_API_KEY not set")
     headers = {
         "Authorization": f"Bearer {settings.deepseek_api_key}",
         "Content-Type": "application/json",
     }
-    base_url = getattr(settings, "deepseek_base_url", None) or "https://api.deepseek.com"
     payload = {
         "model": model_name or "deepseek-chat",
         "stream": True,
@@ -538,10 +544,7 @@ async def _stream_deepseek(message: str, settings, model_name: str, system_promp
             {"role": "user", "content": message},
         ],
     }
-    # base_url may already include /v1 (e.g. https://api.deepseek.com/v1).
-    # Only prepend /v1 when it doesn't.
-    base = base_url.rstrip("/")
-    url = f"{base}/chat/completions" if base.endswith("/v1") else f"{base}/v1/chat/completions"
+    url = "https://api.deepseek.com/v1/chat/completions"
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
         async with client.stream(
             "POST",

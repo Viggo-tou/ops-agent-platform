@@ -359,6 +359,17 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ follow_up: followUp, actor_name: actorName ?? null }),
     }),
+  diagnoseTask: (taskId: string) =>
+    request<{
+      summary: string;
+      root_cause: string;
+      likely_fix: string;
+      confidence: "high" | "medium" | "low";
+      related_files: string[];
+    }>(`/tasks/${taskId}/diagnose`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
   /**
    * Streaming chat endpoint. Returns an async iterator of typed events:
    *   { type: "session", session_id, provider }

@@ -76,6 +76,38 @@ _ITERATE_BLOCKED_STATUSES = {
 }
 
 
+class _DiagnoseResponse(_PydBaseModel):
+    summary: str
+    root_cause: str
+    likely_fix: str
+    confidence: str
+    related_files: list[str]
+
+
+@router.post("/{task_id}/diagnose", response_model=_DiagnoseResponse)
+def diagnose_task(
+    task_id: str,
+    db: DbSession,
+    actor: TaskCreateActorCtx,
+) -> _DiagnoseResponse:
+    """Run the failure-diagnosis agent on a finished task.
+
+    Reads compile.json + rejected diffs + review findings from the task's
+    workspace, asks the primary LLM to produce a JSON diagnosis, persists
+    it to task.latest_result_json.failure_diagnosis, and returns it.
+    """
+    if not db.get(TaskModel, task_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+
+    from app.services.diagnostic import DiagnosticError, run_diagnostic
+    try:
+        diag = run_diagnostic(task_id)
+    except DiagnosticError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    return _DiagnoseResponse(**diag)
+
+
 @router.post("/{task_id}/iterate", response_model=TaskDetail, status_code=status.HTTP_201_CREATED)
 def iterate_task(
     task_id: str,

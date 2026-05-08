@@ -2108,6 +2108,42 @@ dd {
   color: #334155;
 }
 
+/* ============================================================ */
+/* TaskDetail: failure diagnosis section                        */
+/* ============================================================ */
+.diagnose-section {
+  border: 1px solid #fecaca;
+  background: #fff;
+  border-radius: 24px;
+  padding: 22px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  margin-top: 16px;
+}
+.diagnose-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.diagnose-head h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 700;
+  color: #b91c1c;
+}
+.diagnose-subtitle {
+  margin: 6px 0 0 0;
+  font-size: 13px;
+  color: #64748b;
+  max-width: 720px;
+}
+.diagnose-hint {
+  margin: 12px 0 0 0;
+  font-size: 13px;
+  color: #047857;
+}
+
 .chat-page {
   background: #fff;
   grid-template-rows: auto minmax(0, 1fr) auto auto;
