@@ -129,6 +129,42 @@ export const api = {
   getTaskEvents: (taskId: string) => request<EventRecord[]>(`/tasks/${taskId}/events`),
   getTaskToolExecutions: (taskId: string) => request<ToolExecutionRecord[]>(`/tasks/${taskId}/tool-executions`),
   getToolRegistry: () => request<ToolRegistryEntry[]>("/tools/registry"),
+  listRepositorySources: () =>
+    request<{
+      sources: { name: string; path: string; description: string; is_active: boolean }[];
+      active: string;
+      multi_source_enabled: boolean;
+    }>("/repositories/sources"),
+  listRbacRoles: () =>
+    request<
+      {
+        role_key: string;
+        display_name: string;
+        description: string;
+        is_human: boolean;
+        is_system: boolean;
+        is_active: boolean;
+      }[]
+    >("/governance/roles"),
+  listPolicyRules: () =>
+    request<
+      {
+        id: string;
+        rule_key: string;
+        title: string;
+        description: string;
+        subject_role: string;
+        resource_type: string;
+        action_key: string;
+        tool_name: string | null;
+        decision: string;
+        risk_level: string;
+        risk_category: string;
+        required_approver_role: string | null;
+        priority: number;
+        is_active: boolean;
+      }[]
+    >("/governance/policy-rules"),
   getKnowledgeSources: () => request<KnowledgeSourceDescriptor[]>("/knowledge/sources"),
   getKnowledgeDocuments: (sourceName?: string, limit = 100) => {
     const params = new URLSearchParams({ limit: String(limit) });

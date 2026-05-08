@@ -11,12 +11,18 @@ import { SettingsPage } from "./pages/settings/SettingsPage";
 import { TaskDetailPage } from "./pages/tasks/TaskDetailPage";
 import { TaskListPage } from "./pages/tasks/TaskListPage";
 import { TaskSubmitPage } from "./pages/tasks/TaskSubmitPage";
+import { GovernancePage } from "./pages/governance/GovernancePage";
+import { OnboardingPage } from "./pages/onboarding/OnboardingPage";
+import { RepositoriesPage } from "./pages/repositories/RepositoriesPage";
+import { WelcomePage } from "./pages/welcome/WelcomePage";
 
 export default function App() {
   return (
     <Routes>
+      <Route path="/welcome" element={<WelcomePage />} />
       <Route path="/login" element={<LoginPage />} />
       <Route element={<AuthGuard />}>
+        <Route path="/onboarding" element={<OnboardingPage />} />
         <Route element={<AppShell />}>
           <Route index element={<Navigate to="/chat" replace />} />
           <Route path="/home" element={<HomePage />} />
@@ -28,6 +34,8 @@ export default function App() {
           <Route path="/submit" element={<TaskSubmitPage />} />
           <Route path="/tasks" element={<TaskListPage />} />
           <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
+          <Route path="/governance" element={<GovernancePage />} />
+          <Route path="/repositories" element={<RepositoriesPage />} />
           <Route path="*" element={<Navigate to="/chat" replace />} />
         </Route>
       </Route>

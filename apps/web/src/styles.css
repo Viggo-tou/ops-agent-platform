@@ -2437,3 +2437,544 @@ dd {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+/* ---- Welcome / Landing page (public, pre-auth) ---- */
+.welcome-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 24px;
+  background: #ffffff;
+}
+
+.welcome-hero {
+  max-width: 640px;
+  width: 100%;
+  text-align: left;
+}
+
+.welcome-brand {
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #555;
+  margin-bottom: 8px;
+}
+
+.welcome-title {
+  font-size: 30px;
+  font-weight: 700;
+  color: #111;
+  line-height: 1.25;
+  margin: 0 0 16px 0;
+}
+
+.welcome-tagline {
+  font-size: 15px;
+  color: #4a4a4a;
+  line-height: 1.6;
+  margin: 0 0 24px 0;
+}
+
+.welcome-features {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 28px 0;
+  border: 1px solid #e5e5e5;
+  border-radius: var(--radius-md, 10px);
+}
+
+.welcome-features li {
+  padding: 12px 16px;
+  font-size: 14px;
+  color: #333;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.welcome-features li:last-child {
+  border-bottom: none;
+}
+
+.welcome-features li strong {
+  color: #111;
+  margin-right: 8px;
+}
+
+.welcome-actions {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.welcome-fineprint {
+  font-size: 12px;
+  color: #888;
+  margin: 0;
+}
+
+@media (max-width: 540px) {
+  .welcome-title { font-size: 24px; }
+  .welcome-actions { flex-direction: column; }
+  .welcome-actions .button { width: 100%; }
+}
+
+/* ---- Onboarding wizard (4 steps) ---- */
+.onboarding-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 24px;
+  background: #ffffff;
+}
+
+.onboarding-card {
+  max-width: 720px;
+  width: 100%;
+  border: 1px solid #e5e5e5;
+  border-radius: var(--radius-md, 12px);
+  padding: 32px;
+  background: #fff;
+}
+
+.onboarding-progress {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 24px;
+}
+
+.onboarding-progress-step {
+  flex: 1;
+  height: 4px;
+  background: #e5e5e5;
+  border-radius: 2px;
+  position: relative;
+}
+
+.onboarding-progress-step.active { background: #111; }
+.onboarding-progress-step.done { background: #111; }
+
+.onboarding-progress-num {
+  position: absolute;
+  top: -22px;
+  left: 0;
+  font-size: 11px;
+  color: #888;
+}
+
+.onboarding-step { margin-bottom: 24px; }
+
+.onboarding-step-label {
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #888;
+  margin-bottom: 6px;
+}
+
+.onboarding-step-title {
+  font-size: 22px;
+  font-weight: 700;
+  color: #111;
+  margin: 0 0 8px 0;
+}
+
+.onboarding-step-help {
+  font-size: 13px;
+  color: #666;
+  margin: 0 0 16px 0;
+  line-height: 1.5;
+}
+
+.onboarding-step-help code {
+  background: #f4f4f4;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+
+.onboarding-input {
+  width: 100%;
+  padding: 10px 12px;
+  font-size: 14px;
+  border: 1px solid #ccc;
+  border-radius: var(--radius-sm, 6px);
+}
+
+.onboarding-input:focus {
+  outline: none;
+  border-color: #111;
+}
+
+.onboarding-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid #f0f0f0;
+}
+
+/* Source/preset cards in step 2 + 3 */
+.onboarding-source-list,
+.onboarding-preset-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.onboarding-source-row,
+.onboarding-preset-row {
+  border: 1px solid #e5e5e5;
+  border-radius: var(--radius-sm, 8px);
+  padding: 12px 16px;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+
+.onboarding-source-row:hover,
+.onboarding-preset-row:hover {
+  border-color: #111;
+}
+
+.onboarding-source-row.selected,
+.onboarding-preset-row.selected {
+  border-color: #111;
+  background: #fafafa;
+}
+
+.onboarding-preset-row.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.onboarding-source-head,
+.onboarding-preset-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.onboarding-source-path {
+  display: block;
+  font-size: 12px;
+  color: #555;
+  background: #f9f9f9;
+  padding: 4px 8px;
+  border-radius: 4px;
+  margin: 4px 0;
+  word-break: break-all;
+}
+
+.onboarding-source-desc,
+.onboarding-preset-desc {
+  font-size: 13px;
+  color: #555;
+  margin: 4px 0 0 0;
+  line-height: 1.5;
+}
+
+.onboarding-error {
+  color: #b00020;
+  font-size: 13px;
+  background: #fff5f5;
+  padding: 8px 12px;
+  border: 1px solid #f5c2c2;
+  border-radius: 6px;
+}
+
+.pill.active { background: #e6f4ea; color: #1e7a3a; border: 1px solid #c5e3cf; }
+.pill.selected { background: #e8eefc; color: #1c4ab8; border: 1px solid #c4d3f5; }
+.pill.soon { background: #f4f4f4; color: #888; border: 1px solid #ddd; }
+
+.onboarding-summary {
+  list-style: none;
+  margin: 0 0 16px 0;
+  padding: 0;
+  border: 1px solid #e5e5e5;
+  border-radius: 6px;
+}
+
+.onboarding-summary li {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  padding: 10px 16px;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.onboarding-summary li:last-child { border-bottom: none; }
+
+.onboarding-summary .label {
+  color: #666;
+  font-size: 13px;
+}
+
+.onboarding-summary .value {
+  color: #111;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* ---- Governance page ---- */
+.governance-page {
+  padding: 24px 32px 64px;
+  max-width: 1200px;
+}
+
+.governance-summary {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.governance-stat {
+  border: 1px solid #e5e5e5;
+  border-radius: 8px;
+  padding: 10px 14px;
+  text-align: center;
+  min-width: 84px;
+  background: #fff;
+}
+
+.governance-stat .num {
+  display: block;
+  font-size: 22px;
+  font-weight: 700;
+  color: #111;
+}
+
+.governance-stat .label {
+  display: block;
+  font-size: 11px;
+  color: #888;
+  margin-top: 2px;
+}
+
+.governance-section {
+  margin-top: 32px;
+  border: 1px solid #e5e5e5;
+  border-radius: 12px;
+  padding: 16px 20px;
+  background: #fff;
+}
+
+.governance-section h2 {
+  font-size: 16px;
+  font-weight: 700;
+  margin: 0 0 4px 0;
+}
+
+.governance-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 12px;
+  font-size: 13px;
+}
+
+.governance-table th,
+.governance-table td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid #f0f0f0;
+  vertical-align: top;
+}
+
+.governance-table th {
+  font-weight: 600;
+  color: #666;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.governance-table code {
+  background: #f4f4f4;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+
+.governance-table .cell-desc {
+  color: #555;
+}
+
+.governance-table .cell-title {
+  font-weight: 600;
+  color: #111;
+}
+
+.governance-table .cell-key {
+  font-size: 11px;
+  color: #888;
+  margin-top: 2px;
+}
+
+.cell-muted { color: #aaa; }
+
+.governance-filters {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  margin-top: 8px;
+  font-size: 13px;
+}
+
+.governance-filters select {
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 13px;
+}
+
+.governance-filter-count {
+  margin-left: auto;
+  color: #888;
+  font-size: 12px;
+}
+
+/* Decision pills */
+.pill.decision-allow { background: #e6f4ea; color: #1e7a3a; border: 1px solid #c5e3cf; }
+.pill.decision-approval { background: #fff3e0; color: #b76b00; border: 1px solid #f6d29c; }
+.pill.decision-deny { background: #fdecec; color: #b00020; border: 1px solid #f5c2c2; }
+
+/* Risk pills */
+.pill.risk-low { background: #f4f4f4; color: #666; border: 1px solid #ddd; }
+.pill.risk-medium { background: #fffbe6; color: #806600; border: 1px solid #f4e6a8; }
+.pill.risk-high { background: #fff3e0; color: #b76b00; border: 1px solid #f6d29c; }
+.pill.risk-critical { background: #fdecec; color: #b00020; border: 1px solid #f5c2c2; }
+
+/* Page-shell helpers (also used by Repositories/Integrations later) */
+.page-shell { padding: 24px 32px 64px; }
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.page-header h1 {
+  font-size: 24px;
+  font-weight: 700;
+  margin: 4px 0 0 0;
+}
+.page-section-label {
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #888;
+}
+.page-subtitle {
+  margin: 4px 0 0 0;
+  color: #666;
+  font-size: 13px;
+}
+.page-help {
+  color: #555;
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0 0 8px 0;
+}
+.page-help code {
+  background: #f4f4f4;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+
+/* ---- Repositories page ---- */
+.repo-summary {
+  display: flex;
+  gap: 12px;
+}
+
+.repo-list {
+  list-style: none;
+  margin: 16px 0 0 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.repo-row {
+  border: 1px solid #e5e5e5;
+  border-radius: 8px;
+  padding: 14px 18px;
+  background: #fff;
+}
+
+.repo-row.active {
+  border-color: #111;
+  background: #fafafa;
+}
+
+.repo-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.repo-row-path {
+  display: block;
+  font-size: 12px;
+  color: #444;
+  background: #f4f4f4;
+  padding: 6px 10px;
+  border-radius: 4px;
+  word-break: break-all;
+  margin-bottom: 6px;
+}
+
+.repo-row-desc {
+  font-size: 13px;
+  color: #555;
+  margin: 0;
+  line-height: 1.5;
+}
+
+.repo-empty {
+  border: 1px dashed #ccc;
+  border-radius: 12px;
+  padding: 24px;
+  background: #fafafa;
+  margin-top: 16px;
+}
+
+.repo-empty h2 {
+  font-size: 16px;
+  font-weight: 700;
+  margin: 0 0 8px 0;
+}
+
+.repo-env-example {
+  background: #111;
+  color: #d8e4f1;
+  padding: 12px 16px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: var(--font-mono, monospace);
+  overflow-x: auto;
+  margin: 8px 0;
+}
+
+.repo-switch-help {
+  border: 1px solid #f4e6a8;
+  background: #fffbe6;
+  padding: 12px 18px;
+  border-radius: 8px;
+  margin-top: 24px;
+}
+
+.repo-switch-help h2 {
+  font-size: 14px;
+  font-weight: 700;
+  margin: 0 0 6px 0;
+  color: #806600;
+}

@@ -11,6 +11,8 @@ const navigationItems = [
   { to: "/home", label: "首页" },
   { to: "/knowledge", label: "知识库" },
   { to: "/memory", label: "记忆" },
+  { to: "/repositories", label: "仓库", permission: "settings:view" as const },
+  { to: "/governance", label: "治理", permission: "settings:view" as const },
   { to: "/settings", label: "设置", permission: "settings:view" as const },
 ];
 
@@ -28,7 +30,7 @@ export function AppShell() {
   const pathname = location.pathname;
   const sidebarVariant = pathname.startsWith("/home")
     ? "minimal"
-    : pathname.startsWith("/knowledge") || pathname.startsWith("/memory") || pathname.startsWith("/settings")
+    : pathname.startsWith("/knowledge") || pathname.startsWith("/memory") || pathname.startsWith("/settings") || pathname.startsWith("/governance") || pathname.startsWith("/repositories")
       ? "compact"
       : "chat";
   const visibleNavigationItems =
