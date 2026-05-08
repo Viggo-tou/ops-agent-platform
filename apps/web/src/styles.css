@@ -1651,6 +1651,182 @@ dd {
   font-size: 0.78rem;
 }
 
+/* Unified sidebar — only Chat + Recent + Account ----------- */
+
+.sidebar-variant--unified {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+.sidebar-variant--unified .sidebar-top {
+  align-content: start;
+}
+
+/* Account card v2: avatar + name + gear, with popup menu --- */
+
+.account-card-v2 {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid #e2e2e2;
+  border-radius: 14px;
+  background: #fff;
+}
+
+.account-card-v2 .avatar {
+  width: 36px;
+  height: 36px;
+  font-size: 13px;
+}
+
+.account-card-trigger {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: transparent;
+  border: 0;
+  padding: 4px 6px;
+  border-radius: 10px;
+  cursor: pointer;
+  text-align: left;
+  min-width: 0;
+}
+.account-card-trigger:hover { background: #f4f4f4; }
+
+.account-card-name {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.account-card-name strong {
+  color: #111;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.account-card-name span {
+  color: #777;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.account-gear-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: transparent;
+  border: 0;
+  color: #555;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.12s, color 0.12s;
+}
+.account-gear-btn:hover { background: #f1f5f9; color: #0f172a; }
+.account-gear-btn svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.6; }
+
+/* Popup menu rising above the account card ---------------- */
+
+.account-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  z-index: 80;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  padding: 6px;
+  box-shadow: 0 14px 40px rgba(15, 23, 42, 0.14), 0 2px 8px rgba(15, 23, 42, 0.06);
+  animation: account-menu-in 0.12s ease-out;
+}
+@keyframes account-menu-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.account-menu-section-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #94a3b8;
+  font-weight: 600;
+  padding: 8px 10px 4px;
+}
+
+.account-menu-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.account-menu-list li { margin: 0; }
+
+.account-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 10px;
+  font-size: 13px;
+  color: #334155;
+  text-decoration: none;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.account-menu-item:hover {
+  background: #f1f5f9;
+  color: #0f172a;
+}
+.account-menu-item.active {
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-weight: 600;
+}
+
+.account-menu-icon {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: #94a3b8;
+}
+.account-menu-item:hover .account-menu-icon,
+.account-menu-item.active .account-menu-icon { color: inherit; }
+.account-menu-icon svg {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.6;
+}
+
+.account-menu-divider {
+  height: 1px;
+  background: #f1f5f9;
+  margin: 6px 4px;
+}
+
+.account-menu-logout {
+  color: #b91c1c;
+}
+.account-menu-logout:hover {
+  background: #fef2f2;
+  color: #991b1b;
+}
+.account-menu-logout .account-menu-icon { color: #b91c1c; }
+
 .chat-page {
   background: #fff;
   grid-template-rows: auto minmax(0, 1fr) auto auto;
