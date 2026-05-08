@@ -24,9 +24,32 @@ engine = create_engine(
 
 def set_sqlite_pragmas(dbapi_conn) -> None:  # noqa: ANN001
     cursor = dbapi_conn.cursor()
+    # WAL: readers don't block writers and writers don't block readers as long
+    # as the writer commits in time. Already on.
     cursor.execute("PRAGMA journal_mode=WAL")
+    # NORMAL is the right default with WAL — fsync only on checkpoint, not
+    # every transaction. Crash safe (modulo last commit) without the cost
+    # of FULL.
     cursor.execute("PRAGMA synchronous=NORMAL")
-    cursor.execute("PRAGMA busy_timeout=30000")
+    # 120s before raising 'database is locked'. Was 30s — saw a real failure
+    # where a long-running pipeline write held the lock for >30s and an
+    # incoming POST /api/tasks INSERT got rejected, surfacing as
+    # 'failed to fetch' in the UI. 120s comfortably outlasts any single
+    # write batch in the orchestrator (largest is the per-attempt persistence
+    # which finishes well under a minute).
+    cursor.execute("PRAGMA busy_timeout=120000")
+    # Auto-checkpoint the WAL when it grows past N pages so it doesn't
+    # bloat to multi-GB after long agent runs (each tool call writes
+    # several rows). 1000 pages = ~4MB at default 4KB page size.
+    cursor.execute("PRAGMA wal_autocheckpoint=1000")
+    # 64MB shared cache (default is 2MB). Reduces read pressure on
+    # repository_registry / tool_execution / event hotspots.
+    cursor.execute("PRAGMA cache_size=-64000")
+    # Enforce foreign keys (defaults off in SQLite, on in postgres).
+    cursor.execute("PRAGMA foreign_keys=ON")
+    # Memory-mapped IO speeds up sequential scans on event/tool_execution.
+    # 256MB cap, no-op on systems where mmap isn't available.
+    cursor.execute("PRAGMA mmap_size=268435456")
     cursor.close()
 
 

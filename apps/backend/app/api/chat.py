@@ -385,13 +385,15 @@ def _resolve_provider_chain(settings) -> list[tuple[str, str]]:
     if raw != "auto" and raw in _STREAMABLE_PROVIDERS:
         add(raw, _DEFAULT_MODEL.get(raw, raw))
 
-    # 3. Any other streamable provider with credentials.
+    # 3. Any other streamable provider with credentials. Order is the auto
+    # priority — DeepSeek goes first (per user preference), then the other
+    # API providers, then MiniMax as last resort.
+    if getattr(settings, "deepseek_api_key", None):
+        add("deepseek", _DEFAULT_MODEL["deepseek"])
     if getattr(settings, "anthropic_api_key", None):
         add("anthropic", _DEFAULT_MODEL["anthropic"])
     if getattr(settings, "openai_api_key", None):
         add("openai", _DEFAULT_MODEL["openai"])
-    if getattr(settings, "deepseek_api_key", None):
-        add("deepseek", _DEFAULT_MODEL["deepseek"])
     if getattr(settings, "minimax_api_key", None):
         add("minimax", _DEFAULT_MODEL["minimax"])
 
