@@ -149,6 +149,55 @@ def _truncated_traceback(exc: BaseException, *, limit: int = 2000) -> str:
     return text[:limit]
 
 
+def _semantic_review_high_count(sr_report: object | None) -> int:
+    if sr_report is None:
+        return 0
+    high_count = getattr(sr_report, "high_severity_count", 0)
+    if callable(high_count):
+        high_count = high_count()
+    return int(high_count or 0)
+
+
+def _semantic_review_should_block_on_exhausted(
+    sr_report: object | None,
+    settings: object,
+) -> bool:
+    if sr_report is None:
+        return False
+    sr_high_count = _semantic_review_high_count(sr_report)
+    sr_completeness = int(getattr(sr_report, "completeness_pct", 0) or 0)
+    sr_blocks = bool(
+        getattr(settings, "semantic_review_high_blocks_on_exhausted", True)
+    )
+    sr_threshold = int(getattr(settings, "semantic_review_pass_threshold", 80) or 80)
+    return sr_blocks and sr_high_count > 0 and sr_completeness < sr_threshold
+
+
+def _semantic_review_high_findings(sr_report: object | None) -> list[dict[str, object]]:
+    if sr_report is None:
+        return []
+    out: list[dict[str, object]] = []
+    for finding in getattr(sr_report, "findings", None) or []:
+        if isinstance(finding, dict):
+            severity = str(finding.get("severity", "")).lower()
+            payload = dict(finding)
+        else:
+            severity = str(getattr(finding, "severity", "")).lower()
+            payload = {
+                "file": getattr(finding, "file", None),
+                "line_start": getattr(finding, "line_start", None),
+                "line_end": getattr(finding, "line_end", None),
+                "severity": getattr(finding, "severity", None),
+                "category": getattr(finding, "category", None),
+                "description": getattr(finding, "description", None),
+                "evidence_quote": getattr(finding, "evidence_quote", None),
+                "suggested_fix": getattr(finding, "suggested_fix", None),
+            }
+        if severity == "high":
+            out.append(payload)
+    return out
+
+
 def _normalize_diff_path(path: object) -> str:
     return str(path or "").strip().replace("\\", "/")
 
@@ -1211,6 +1260,24 @@ class PrimaryOrchestrator:
                 pipeline_state.pop("evidence_chain_validated", None)
                 pipeline_state.pop("evidence_chain", None)
                 self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+                self._execute_develop_pipeline(
+                    task=task, actor_name=actor_name, plan=plan_document, approval_id=approval_id
+                )
+                return
+            pending_semantic_id = pipeline_state.get("pending_semantic_review_approval_id")
+            if pending_semantic_id == approval_id:
+                pipeline_state.pop("pending_semantic_review_approval_id", None)
+                pipeline_state["semantic_review_acknowledged"] = True
+                pipeline_state["semantic_review_done"] = True
+                pipeline_state.pop("evidence_chain_validated", None)
+                pipeline_state.pop("evidence_chain", None)
+                self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+                self._workspace_write_checkpoint(
+                    task,
+                    stage_completed="approval",
+                    next_stage="review_post",
+                    resume_args={"approval_id": approval_id},
+                )
                 self._execute_develop_pipeline(
                     task=task, actor_name=actor_name, plan=plan_document, approval_id=approval_id
                 )
@@ -4760,14 +4827,44 @@ class PrimaryOrchestrator:
                         ),
                     )
 
-                # End of repair loop. semantic_review is ADVISORY at
-                # the moment — even if not-passed it does NOT fail-close
-                # the pipeline (still sends to AWAITING_APPROVAL with
-                # findings attached). The reviewer sees the report and
-                # decides. To make it strict, set fail_closed=True on a
-                # later iteration.
+                # End of repair loop. Unresolved high findings can now
+                # hard-block into AWAITING_APPROVAL when configured.
                 if sr_report is not None:
                     pipeline_state["semantic_review"] = sr_report.to_payload()
+                if _semantic_review_should_block_on_exhausted(
+                    sr_report,
+                    self.tool_gateway.settings,
+                ):
+                    sr_high_count = _semantic_review_high_count(sr_report)
+                    sr_completeness = int(
+                        getattr(sr_report, "completeness_pct", 0) or 0
+                    )
+                    sr_threshold = int(
+                        getattr(
+                            self.tool_gateway.settings,
+                            "semantic_review_pass_threshold",
+                            80,
+                        )
+                        or 80
+                    )
+                    message = (
+                        "semantic_review exhausted with "
+                        f"{sr_high_count} high-severity finding(s) unresolved "
+                        f"(completeness {sr_completeness}% < {sr_threshold}%); "
+                        "hard-blocking on awaiting_approval per "
+                        "semantic_review_high_blocks_on_exhausted=True"
+                    )
+                    self._request_semantic_review_approval(
+                        task=task,
+                        plan=plan,
+                        pipeline_state=pipeline_state,
+                        message=message,
+                        sr_report=sr_report,
+                        sr_high_count=sr_high_count,
+                        sr_completeness=sr_completeness,
+                        sr_threshold=sr_threshold,
+                    )
+                    return
                 pipeline_state["semantic_review_done"] = True
                 self._preserve_develop_pipeline_state(
                     task=task, pipeline_state=pipeline_state,
@@ -8455,6 +8552,135 @@ class PrimaryOrchestrator:
         )
         self._run_failure_diagnosis(task, failure_kind="compile_repair_cap_exceeded")
         commit_checkpoint(self.db, label="awaiting_approval_compile_repair_cap")
+
+    def _request_semantic_review_approval(
+        self,
+        *,
+        task: Task,
+        plan: GeneratedPlan,
+        pipeline_state: dict[str, object],
+        message: str,
+        sr_report: object,
+        sr_high_count: int,
+        sr_completeness: int,
+        sr_threshold: int,
+    ) -> None:
+        """Park the task for human ACK when semantic_review exhausts with high findings."""
+        findings_high = _semantic_review_high_findings(sr_report)[:8]
+        approval_payload = {
+            "reason": "semantic_review_unresolved_high",
+            "plan_id": getattr(plan, "plan_id", None),
+            "high_severity_count": sr_high_count,
+            "completeness_pct": sr_completeness,
+            "threshold": sr_threshold,
+            "findings_high": findings_high,
+            "semantic_review": (
+                sr_report.to_payload() if hasattr(sr_report, "to_payload") else None
+            ),
+            "message": message,
+        }
+
+        approval = Approval(
+            task_id=task.id,
+            action_name="semantic_review_unresolved_high",
+            status=ApprovalStatus.PENDING,
+            requested_by_role=RoleName.REVIEWER,
+            approver_role=ActorRole.TEAM_LEAD.value,
+            requested_by_actor_name=task.actor_name,
+            risk_level=task.risk_level,
+            risk_category=task.risk_category,
+            reason=(
+                "Semantic review repair budget exhausted with unresolved "
+                "high-severity findings; human acknowledgement is required."
+            ),
+            request_payload_json=approval_payload,
+            policy_snapshot_json={
+                "decision": "require_approval",
+                "source": "develop_semantic_review_unresolved_high",
+                "tool_name": "semantic_review_unresolved_high",
+                "actor_name": task.actor_name,
+                "actor_role": task.actor_role.value,
+                "risk_level": task.risk_level.value,
+                "risk_category": task.risk_category.value,
+                "required_approver_role": ActorRole.TEAM_LEAD.value,
+            },
+        )
+        self.db.add(approval)
+        self.db.flush()
+
+        pipeline_state["pending_semantic_review_approval_id"] = approval.id
+        pipeline_state["semantic_review_blocked"] = approval_payload
+        self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+
+        task.pending_approval = True
+        task.latest_result_json = {
+            "status": TaskStatus.AWAITING_APPROVAL.value,
+            "message": message,
+            "approval_id": approval.id,
+            "result": approval_payload,
+            "pipeline_state": pipeline_state,
+        }
+        self._write_task_checkpoint(
+            task,
+            stage="awaiting_approval",
+            output_payload=self._task_checkpoint_payload(
+                task,
+                approval_id=approval.id,
+                pipeline_state=pipeline_state,
+                plan_json=task.plan_json,
+            ),
+            sandbox_snapshot_id=self._build_develop_sandbox(task).snapshot_id(),
+        )
+
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.REVIEW_FAILED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            tool_name="semantic_review.evaluate",
+            message=message,
+            payload=approval_payload,
+        )
+        set_task_status(
+            self.db,
+            task=task,
+            new_status=TaskStatus.AWAITING_APPROVAL,
+            new_stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            source=EventSource.ORCHESTRATOR,
+            message="Awaiting human acknowledgement after semantic_review exhausted.",
+        )
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.APPROVAL_REQUESTED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            tool_name="semantic_review.unresolved_high",
+            message="Approval requested after semantic_review exhausted with high findings.",
+            payload={
+                "approval_id": approval.id,
+                "action_name": approval.action_name,
+                "approver_role": approval.approver_role,
+                "high_severity_count": sr_high_count,
+                "completeness_pct": sr_completeness,
+                "threshold": sr_threshold,
+            },
+        )
+        self._workspace_append_audit(
+            task,
+            "semantic_review.unresolved_high",
+            {
+                "approval_id": approval.id,
+                "high_severity_count": sr_high_count,
+                "completeness_pct": sr_completeness,
+                "threshold": sr_threshold,
+            },
+        )
+        commit_checkpoint(self.db, label="awaiting_approval_semantic_review_high")
 
     def _fail_develop_pipeline(
         self,
