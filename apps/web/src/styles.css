@@ -2281,6 +2281,15 @@ dd {
   padding: 0;
   font-size: 1.2rem;
 }
+.send-button-stop {
+  background: #b91c1c;
+  color: #fff;
+  border: 0;
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: background 0.12s, transform 0.12s;
+}
+.send-button-stop:hover { background: #991b1b; transform: scale(1.04); }
 
 .icon-button {
   display: grid;

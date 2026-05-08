@@ -18,6 +18,8 @@ interface ChatInputProps {
   disabled?: boolean;
   isSubmitting?: boolean;
   onSubmit: (message: string, files: File[]) => void;
+  /** When provided + isSubmitting=true, replaces the send button with a Stop button. */
+  onStop?: () => void;
   permissionDenied?: string | null;
   /** Repository sources available for per-conversation override. */
   sources?: SourceOption[];
@@ -37,6 +39,7 @@ export function ChatInput({
   disabled,
   isSubmitting,
   onSubmit,
+  onStop,
   permissionDenied,
   sources = [],
   sourceValue = "",
@@ -182,15 +185,27 @@ export function ChatInput({
             </svg>
           </button>
 
-          <button
-            className="send-button"
-            type="submit"
-            disabled={disabled || isSubmitting || !message.trim()}
-            aria-label="Send"
-            title="发送 (Enter) | 换行 (Shift+Enter)"
-          >
-            {isSubmitting ? "..." : "↑"}
-          </button>
+          {isSubmitting && onStop ? (
+            <button
+              type="button"
+              className="send-button send-button-stop"
+              onClick={(e) => { e.preventDefault(); onStop(); }}
+              aria-label="Stop"
+              title="停止生成"
+            >
+              ■
+            </button>
+          ) : (
+            <button
+              className="send-button"
+              type="submit"
+              disabled={disabled || isSubmitting || !message.trim()}
+              aria-label="Send"
+              title="发送 (Enter) | 换行 (Shift+Enter)"
+            >
+              {isSubmitting ? "..." : "↑"}
+            </button>
+          )}
         </div>
       </div>
 

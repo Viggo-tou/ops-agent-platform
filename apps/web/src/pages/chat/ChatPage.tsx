@@ -64,6 +64,13 @@ export function ChatPage() {
   const [optimisticTask, setOptimisticTask] = useState<TaskDetail | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamError, setStreamError] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const stopStreaming = () => {
+    const c = abortRef.current;
+    if (c && !c.signal.aborted) {
+      try { c.abort(); } catch { /* noop */ }
+    }
+  };
   // When set, the next submit will dispatch as a continuation of this task.
   // Activated by the "继续修复" button on a failed task; cleared after submit.
   const [continueFromTaskId, setContinueFromTaskId] = useState<string | null>(null);
@@ -203,6 +210,21 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
     setStreamError(null);
     scrollToLatestMessage();
 
+    // Abort plumbing: lets the user click "停止" mid-stream AND auto-aborts
+    // if no event arrives within 30s (handles backend hangs — e.g.
+    // 'database is locked' on persistence — without leaving the input
+    // permanently disabled).
+    const abortController = new AbortController();
+    abortRef.current = abortController;
+    let watchdog: number | null = null;
+    const armWatchdog = () => {
+      if (watchdog !== null) window.clearTimeout(watchdog);
+      watchdog = window.setTimeout(() => {
+        try { abortController.abort(); } catch { /* noop */ }
+      }, 30_000);
+    };
+    armWatchdog();
+
     let answerSoFar = "";
     let visibleAnswerSoFar = "";
     let finalTaskCreated = false;
@@ -300,9 +322,12 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
         source_name: sourceName || null,
         actor_name: user?.name ?? null,
         previous_task_id: options.previousTaskId ?? null,
+        signal: abortController.signal,
       });
 
       for await (const event of stream) {
+        // Reset the inactivity watchdog on every event from the backend.
+        armWatchdog();
         switch (event.type) {
           case "token":
             // Push raw text into the smoother buffer; the interval ticker
@@ -346,7 +371,12 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
       drainAndStop();
     } catch (error) {
       drainAndStop();
-      const msg = toErrorMessage(error);
+      const wasAborted =
+        abortController.signal.aborted ||
+        (error instanceof Error && (error.name === "AbortError" || /aborted/i.test(error.message)));
+      const msg = wasAborted
+        ? "响应超时或被取消(后端可能 DB 锁住或网络中断)。再发一次就行。"
+        : toErrorMessage(error);
       setStreamError(msg);
       setOptimisticTask((prev) =>
         prev
@@ -365,6 +395,17 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
       setIsStreaming(false);
       return;
     } finally {
+      // Defensive cleanup — ensures the input is always re-enabled and
+      // background timers are released even if the for-await above bails
+      // out via an unexpected path.
+      if (watchdog !== null) {
+        window.clearTimeout(watchdog);
+        watchdog = null;
+      }
+      try { window.clearInterval(flushTick); } catch { /* noop */ }
+      if (abortRef.current === abortController) {
+        abortRef.current = null;
+      }
       setIsStreaming(false);
     }
 
@@ -572,6 +613,7 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
             setContinueFromTaskId(null),
           )
         }
+        onStop={stopStreaming}
         isSubmitting={isStreaming}
         disabled={!can("task:create")}
         permissionDenied={!can("task:create") ? "Your current role can view conversations but cannot create new tasks." : null}

@@ -919,7 +919,44 @@ def _persist_question_task(
 
     No pipeline kicked off. This keeps chat history queryable from
     /api/tasks (the chat sidebar already lists tasks by session_id).
+
+    Retries on 'database is locked' — chat persistence racing the heavy
+    orchestrator's bulk writes is the most common source of dropped chat
+    messages. We try up to 5 times with exponential backoff (50ms, 100ms,
+    200ms, 400ms, 800ms) before giving up. The longest possible wait is
+    ~1.5s which is acceptable for an interactive chat reply.
     """
+    import time as _time
+    last_exc: Exception | None = None
+    for attempt in range(5):
+        try:
+            return _persist_question_task_once(
+                message=message,
+                answer_text=answer_text,
+                session_id=session_id,
+                actor_name=actor_name,
+                actor_role=actor_role,
+                previous_task_id=previous_task_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            msg = str(exc).lower()
+            if "database is locked" not in msg and "operationalerror" not in msg:
+                raise
+            _time.sleep(0.05 * (2 ** attempt))
+    assert last_exc is not None
+    raise last_exc
+
+
+def _persist_question_task_once(
+    *,
+    message: str,
+    answer_text: str,
+    session_id: str,
+    actor_name: str,
+    actor_role: ActorRole,
+    previous_task_id: str | None,
+) -> str:
     visible_answer = _sse_strip_intent(answer_text)
     db: Session = SessionLocal()
     try:
@@ -974,9 +1011,47 @@ def _persist_task_intent_task(
     previous_task_id: str | None,
     source_name: str | None,
 ) -> str:
-    """Real task: route through TaskService so the pipeline kicks off."""
+    """Real task: route through TaskService so the pipeline kicks off.
+
+    Same retry-on-locked treatment as the question path.
+    """
+    import time as _time
     if scenario not in _VALID_SCENARIOS:
-        scenario = "jira_issue_develop"  # safe default for "do work"
+        scenario = "jira_issue_develop"
+    last_exc: Exception | None = None
+    for attempt in range(5):
+        try:
+            return _persist_task_intent_task_once(
+                message=message,
+                summary=summary,
+                scenario=scenario,
+                session_id=session_id,
+                actor_name=actor_name,
+                actor_role=actor_role,
+                previous_task_id=previous_task_id,
+                source_name=source_name,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            msg = str(exc).lower()
+            if "database is locked" not in msg and "operationalerror" not in msg:
+                raise
+            _time.sleep(0.05 * (2 ** attempt))
+    assert last_exc is not None
+    raise last_exc
+
+
+def _persist_task_intent_task_once(
+    *,
+    message: str,
+    summary: str,
+    scenario: str,
+    session_id: str,
+    actor_name: str,
+    actor_role: ActorRole,
+    previous_task_id: str | None,
+    source_name: str | None,
+) -> str:
     db: Session = SessionLocal()
     try:
         service = TaskService(db)
