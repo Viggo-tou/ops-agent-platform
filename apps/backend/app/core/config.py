@@ -274,6 +274,18 @@ class Settings(BaseSettings):
         "http://127.0.0.1:5173",
         "http://localhost:5173",
     ]
+    # MCP (Model Context Protocol) client config. Format matches Claude
+    # Desktop's claude_desktop_config.json mcpServers block, e.g.:
+    #   {"filesystem":{"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/tmp"]}}
+    # Tools from connected servers surface as mcp.<server>.<tool> in the
+    # ToolRegistry. Empty = MCP disabled, backend boots normally.
+    mcp_servers_json: str = ""
+    # Per-server initialize handshake timeout (seconds). Some servers spawn
+    # slowly via npx/uvx/etc. on first run while caching the package.
+    mcp_init_timeout_seconds: float = 30.0
+    # Per-tool-call default timeout (seconds). Individual tools may override
+    # via ToolDefinition.timeout_seconds in the registry.
+    mcp_call_timeout_seconds: float = 60.0
 
     model_config = SettingsConfigDict(
         env_file=str(Path(__file__).resolve().parents[2] / ".env"),

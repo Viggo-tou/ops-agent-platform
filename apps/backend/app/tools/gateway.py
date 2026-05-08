@@ -381,6 +381,8 @@ class ToolGateway:
             return self._execute_internal_api_request(definition=definition, payload=payload)
         if definition.name == "internal_db.query":
             return self._execute_internal_db_query(payload)
+        if definition.name.startswith("mcp."):
+            return self._execute_mcp_tool(definition=definition, payload=payload)
 
         raise ToolInvocationError(f"Unsupported tool: {definition.name}")
 
@@ -1117,6 +1119,68 @@ class ToolGateway:
             "provider": "internal_db",
             "row_count": len(serialized_rows),
             "rows": serialized_rows,
+        }
+
+    def _execute_mcp_tool(
+        self,
+        *,
+        definition: ToolDefinition,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Dispatch a registered ``mcp.<server>.<tool>`` call to the MCP client.
+
+        Raises ToolInvocationError if the server is not connected or the
+        underlying call_tool raises. The payload is passed through as the
+        tool's arguments dict, so codegen / chat callers can JSON-encode
+        arbitrary kwargs.
+        """
+        from app.services.mcp_client import (
+            MCPNotRunningError,
+            MCPServerError,
+            get_mcp_client,
+        )
+
+        # Parse "mcp.<server>.<tool_name>" — server names cannot contain
+        # dots in practice (they're keys in a JSON config) but tool names
+        # might, so we split off only the leading two segments.
+        parts = definition.name.split(".", 2)
+        if len(parts) != 3 or parts[0] != "mcp":
+            raise ToolInvocationError(
+                f"Malformed MCP tool name: {definition.name}"
+            )
+        _, server_name, tool_name = parts
+
+        arguments = dict(payload) if isinstance(payload, Mapping) else {}
+        client = get_mcp_client()
+        try:
+            result = client.call_tool(
+                server=server_name,
+                tool_name=tool_name,
+                arguments=arguments,
+                timeout=definition.timeout_seconds,
+            )
+        except MCPNotRunningError as exc:
+            raise ToolInvocationError(f"MCP client not running: {exc}") from exc
+        except MCPServerError as exc:
+            raise ToolInvocationError(str(exc)) from exc
+        except TimeoutError as exc:
+            raise ToolInvocationError(
+                f"MCP tool '{definition.name}' timed out after {definition.timeout_seconds}s",
+                retryable=True,
+                timed_out=True,
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise ToolInvocationError(
+                f"MCP tool '{definition.name}' failed: {exc}",
+                retryable=False,
+            ) from exc
+
+        return {
+            "status": "completed" if not result.get("is_error") else "failed",
+            "tool_name": definition.name,
+            "provider": definition.provider_name,
+            "is_error": bool(result.get("is_error")),
+            "content": result.get("content", []),
         }
 
     @staticmethod

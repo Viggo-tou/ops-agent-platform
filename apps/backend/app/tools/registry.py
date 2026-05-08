@@ -138,7 +138,7 @@ class ToolRegistry:
             )
         )
 
-        return {
+        definitions: dict[str, ToolDefinition] = {
             "knowledge.search": ToolDefinition(
                 name="knowledge.search",
                 display_name="Knowledge Search",
@@ -364,3 +364,35 @@ class ToolRegistry:
                 tags=("internal", "database", "read_only"),
             ),
         }
+        # Append MCP tools from any connected server. We default each to
+        # WRITE permission (between READ_ONLY and APPROVAL_REQUIRED) so
+        # the gateway logs every call but doesn't block on approval —
+        # users who need approval-gating per MCP tool can override via
+        # OPS_AGENT_TOOL_PERMISSION_OVERRIDES.
+        try:
+            from app.services.mcp_client import get_mcp_client
+
+            mcp_call_timeout = float(getattr(self.settings, "mcp_call_timeout_seconds", 60.0))
+            for server_name, tools in get_mcp_client().list_tools().items():
+                for tool in tools:
+                    full_name = f"mcp.{server_name}.{tool['name']}"
+                    description = tool.get("description") or f"MCP tool from server '{server_name}'."
+                    definitions[full_name] = ToolDefinition(
+                        name=full_name,
+                        display_name=f"MCP · {server_name} · {tool['name']}",
+                        description=description,
+                        provider_name=f"mcp:{server_name}",
+                        permission_category=ToolPermissionCategory.WRITE,
+                        enabled=True,
+                        status_message=f"Available via MCP server '{server_name}'.",
+                        missing_configuration=(),
+                        requires_network=True,
+                        timeout_seconds=mcp_call_timeout,
+                        retry_count=0,
+                        tags=("mcp", server_name),
+                    )
+        except Exception:  # noqa: BLE001
+            # MCP discovery is best-effort; never let it break the
+            # registry build for the static tools.
+            pass
+        return definitions

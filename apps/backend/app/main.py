@@ -285,6 +285,27 @@ async def lifespan(_: FastAPI):
     with SessionLocal() as db:
         bootstrap_model_catalog(db)
     _log_interrupted_task_workspaces()
+    # MCP servers come up before the pipeline executor so the tool
+    # registry sees mcp.* tools by the time the first task picks up
+    # work. Failures here are logged but never block boot.
+    from app.services.mcp_client import get_mcp_client as _get_mcp
+    _mcp = _get_mcp()
+    try:
+        _mcp.start(
+            settings.mcp_servers_json,
+            init_timeout=settings.mcp_init_timeout_seconds,
+            call_timeout=settings.mcp_call_timeout_seconds,
+        )
+        # Bounded wait so a slow npx-spawned server can't stall startup.
+        # Servers that don't finish in this window will appear with
+        # connected=False in the registry and can be retried/inspected
+        # later via /api/tools/registry.
+        _mcp.wait_ready(timeout=min(15.0, settings.mcp_init_timeout_seconds))
+    except Exception:  # noqa: BLE001
+        # Defensive: any failure inside MCP setup must not prevent the
+        # rest of the backend from coming up.
+        import logging as _logging
+        _logging.getLogger("mcp").exception("mcp_startup_unexpected_failure")
     init_pipeline_executor(settings.pipeline_max_workers)
     _resume_interrupted_tasks()
     _sweep_orphaned_tasks()
@@ -306,6 +327,10 @@ async def lifespan(_: FastAPI):
         except Exception:  # noqa: BLE001
             pass
         shutdown_pipeline_executor(wait=True)
+        try:
+            _mcp.stop()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 settings = get_settings()
