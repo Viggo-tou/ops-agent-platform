@@ -61,28 +61,103 @@ class ChatSendRequest(BaseModel):
     previous_task_id: str | None = Field(default=None, min_length=1, max_length=64)
 
 
-# Kept short so it streams predictably and the model rarely fakes the marker.
-SYSTEM_PROMPT = """You are an Ops Agent. Read the user message and decide:
+_BASE_SYSTEM_PROMPT = """You are 运维代理 (Ops Agent), the conversation interface to a multi-stage code-change platform. You answer the user in Chinese unless they switch to English first.
 
-1. QUESTION (info / status / "what's available" / "how do I..."): just answer
-   directly and conversationally. Be concise; use markdown when helpful.
+## 你能直接回答的(从下面的"当前平台状态"取数据,不要假装看不见)
+- 已注册的代码库有哪些、最近添加哪个、上次同步时间
+- 当前任务列表、待审批数量、运行中数量、最近活动
+- 工具就绪度 / 集成连接状态
+- 解释概念、查文档、对话上下文里的代码片段
 
-2. TASK that requires real action (modify code, deploy, create or transition
-   Jira issues, run CI, etc.): respond with EXACTLY one line of marker, then
-   stop:
+## 你能通过 TASK_INTENT 委托给后端 pipeline 完成的
+- 修改代码 / 实现功能 / 修复编译错误 → 用 jira_issue_develop
+- 制定开发计划但暂不写代码 → 用 jira_issue_plan
+- 不确定要做什么、需要让用户澄清 → 用 process_question
 
-       TASK_INTENT|<scenario>|<short one-line summary>
+后端 pipeline 在沙箱里有这些工具可用: codegen.generate_patch / sandbox.apply_patch / sandbox.run_command / diff_reviewer.review / knowledge.search / test_pipeline.run / jira.create_issue / jira.transition_issue / jira.add_comment / 其他。
+**重要: 你本身不要假装"没有终端 / 没有文件系统访问权限"。你直接没有,但你委托的 pipeline 有。** 有用户问"能不能帮我 clone 仓库 / 改代码 / 跑测试"时,告诉用户"我会创建一个任务由 pipeline 执行",然后输出 TASK_INTENT。
 
-   where <scenario> is one of:
-     - jira_issue_develop  (write or modify code)
-     - jira_issue_plan     (plan only, no code yet)
-     - process_question    (ambiguous — let the user clarify)
+## TASK_INTENT 输出格式 (一行,然后再写 1-2 句对用户的确认)
+TASK_INTENT|<scenario>|<一句话总结>
 
-   You may follow the marker line with at most 1-2 sentences of natural
-   confirmation to the user (e.g. "I'll set up a task to do this").
+scenario 取值: jira_issue_develop / jira_issue_plan / process_question
 
-When in doubt, treat as a question and answer normally.
+## 风格
+回答简洁。代码 / 路径用 markdown。本身是问答时不要加 marker。
 """
+
+
+def _build_system_prompt(db: Session) -> str:
+    """Inject live platform state into the system prompt so the model can
+    answer factual 'what's currently available?' questions without hallucinating
+    'I can't see your environment'.
+    """
+    out = [_BASE_SYSTEM_PROMPT]
+
+    # 1. Registered repositories.
+    try:
+        from app.services.repository_registry import list_all_sources_for_api
+        sources = list_all_sources_for_api() or []
+        if sources:
+            lines = ["", "## 当前平台状态", "", f"### 已注册代码库 ({len(sources)} 个)"]
+            for s in sources:
+                desc = (s.get("description") or "").strip()
+                origin = s.get("origin") or ""
+                name = s.get("name") or "(unnamed)"
+                lines.append(f"- **{name}** [{origin}]" + (f" — {desc}" if desc else ""))
+            out.append("\n".join(lines))
+        else:
+            out.append("\n## 当前平台状态\n\n### 已注册代码库\n(暂无)")
+    except Exception:  # noqa: BLE001 — never let a stale state break chat
+        pass
+
+    # 2. Tasks: counts only — full list goes via the /tasks page.
+    try:
+        from app.models.task import Task as _Task
+        from sqlalchemy import func, select
+        running_count = db.scalar(
+            select(func.count(_Task.id)).where(
+                _Task.status.in_([TaskStatus.RUNNING, TaskStatus.EXECUTING])
+            )
+        ) or 0
+        pending_count = db.scalar(
+            select(func.count(_Task.id)).where(_Task.pending_approval == True)  # noqa: E712
+        ) or 0
+        total_count = db.scalar(select(func.count(_Task.id))) or 0
+        out.append(
+            f"\n### 任务概况\n"
+            f"- 总任务: {total_count}\n"
+            f"- 运行中: {running_count}\n"
+            f"- 待审批: {pending_count}"
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 3. Tool readiness.
+    try:
+        from app.tools.gateway import ToolGateway
+        gateway = ToolGateway(db)
+        entries = gateway.list_registry_entries()
+        ready = sum(1 for e in entries if getattr(e, "enabled", False) and not getattr(e, "missing_configuration", []))
+        partial = sum(
+            1 for e in entries
+            if getattr(e, "enabled", False) and getattr(e, "missing_configuration", [])
+        )
+        unavailable = sum(1 for e in entries if not getattr(e, "enabled", True))
+        out.append(
+            f"\n### 工具就绪度 (总 {len(entries)} 个)\n"
+            f"- 就绪: {ready}\n"
+            f"- 部分可用 (缺配置): {partial}\n"
+            f"- 不可用: {unavailable}"
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    return "\n".join(out)
+
+
+# Backwards-compat: some helper code references the bare SYSTEM_PROMPT name.
+SYSTEM_PROMPT = _BASE_SYSTEM_PROMPT
 
 
 _DEFAULT_MAX_TOKENS = 1024
@@ -95,6 +170,15 @@ async def chat_send(
 ) -> StreamingResponse:
     settings = get_settings()
     chain = _resolve_provider_chain(settings)
+
+    # Build the system prompt once with live platform state. Uses a short-lived
+    # DB session because the request handler doesn't have one (Depends would
+    # close before the streaming response finishes).
+    _state_db = SessionLocal()
+    try:
+        system_prompt = _build_system_prompt(_state_db)
+    finally:
+        _state_db.close()
 
     # ActorContext exposes actor_role + app_role; "name" isn't on it. Default
     # to body.actor_name (sent by ChatPage) and fall back to "operator".
@@ -125,7 +209,7 @@ async def chat_send(
                     },
                 )
                 async for chunk in _stream_from_provider(
-                    provider, body.message, settings, model_name
+                    provider, body.message, settings, model_name, system_prompt
                 ):
                     if not chunk:
                         continue
@@ -300,26 +384,26 @@ def _resolve_provider_chain(settings) -> list[tuple[str, str]]:
 
 
 async def _stream_from_provider(
-    provider: str, message: str, settings, model_name: str
+    provider: str, message: str, settings, model_name: str, system_prompt: str
 ) -> AsyncGenerator[str, None]:
     if provider == "mock":
         async for chunk in _stream_mock(message):
             yield chunk
         return
     if provider == "minimax":
-        async for chunk in _stream_minimax(message, settings, model_name):
+        async for chunk in _stream_minimax(message, settings, model_name, system_prompt):
             yield chunk
         return
     if provider == "anthropic":
-        async for chunk in _stream_anthropic(message, settings, model_name):
+        async for chunk in _stream_anthropic(message, settings, model_name, system_prompt):
             yield chunk
         return
     if provider == "openai":
-        async for chunk in _stream_openai(message, settings, model_name):
+        async for chunk in _stream_openai(message, settings, model_name, system_prompt):
             yield chunk
         return
     if provider == "deepseek":
-        async for chunk in _stream_deepseek(message, settings, model_name):
+        async for chunk in _stream_deepseek(message, settings, model_name, system_prompt):
             yield chunk
         return
     # Unknown / not yet implemented (claude_code / codex / ollama).
@@ -334,7 +418,7 @@ async def _stream_mock(message: str) -> AsyncGenerator[str, None]:
         await asyncio.sleep(0.005)
 
 
-async def _stream_minimax(message: str, settings, model_name: str) -> AsyncGenerator[str, None]:
+async def _stream_minimax(message: str, settings, model_name: str, system_prompt: str) -> AsyncGenerator[str, None]:
     if not getattr(settings, "minimax_api_key", None):
         raise RuntimeError("OPS_AGENT_MINIMAX_API_KEY not set")
     headers = {
@@ -346,7 +430,7 @@ async def _stream_minimax(message: str, settings, model_name: str) -> AsyncGener
         "stream": True,
         "max_tokens": _DEFAULT_MAX_TOKENS,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": message},
         ],
     }
@@ -379,7 +463,7 @@ async def _stream_minimax(message: str, settings, model_name: str) -> AsyncGener
                     yield content
 
 
-async def _stream_anthropic(message: str, settings, model_name: str) -> AsyncGenerator[str, None]:
+async def _stream_anthropic(message: str, settings, model_name: str, system_prompt: str) -> AsyncGenerator[str, None]:
     if not getattr(settings, "anthropic_api_key", None):
         raise RuntimeError("OPS_AGENT_ANTHROPIC_API_KEY not set")
     headers = {
@@ -390,7 +474,7 @@ async def _stream_anthropic(message: str, settings, model_name: str) -> AsyncGen
     payload = {
         "model": model_name or "claude-sonnet-4-5",
         "max_tokens": _DEFAULT_MAX_TOKENS,
-        "system": SYSTEM_PROMPT,
+        "system": system_prompt,
         "stream": True,
         "messages": [{"role": "user", "content": message}],
     }
@@ -418,7 +502,7 @@ async def _stream_anthropic(message: str, settings, model_name: str) -> AsyncGen
                         yield text
 
 
-async def _stream_deepseek(message: str, settings, model_name: str) -> AsyncGenerator[str, None]:
+async def _stream_deepseek(message: str, settings, model_name: str, system_prompt: str) -> AsyncGenerator[str, None]:
     """DeepSeek's API is OpenAI-compatible at api.deepseek.com/v1."""
     if not getattr(settings, "deepseek_api_key", None):
         raise RuntimeError("OPS_AGENT_DEEPSEEK_API_KEY not set")
@@ -431,7 +515,7 @@ async def _stream_deepseek(message: str, settings, model_name: str) -> AsyncGene
         "model": model_name or "deepseek-chat",
         "stream": True,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": message},
         ],
     }
@@ -470,7 +554,7 @@ async def _stream_deepseek(message: str, settings, model_name: str) -> AsyncGene
                     yield content
 
 
-async def _stream_openai(message: str, settings, model_name: str) -> AsyncGenerator[str, None]:
+async def _stream_openai(message: str, settings, model_name: str, system_prompt: str) -> AsyncGenerator[str, None]:
     if not getattr(settings, "openai_api_key", None):
         raise RuntimeError("OPS_AGENT_OPENAI_API_KEY not set")
     headers = {
@@ -481,7 +565,7 @@ async def _stream_openai(message: str, settings, model_name: str) -> AsyncGenera
         "model": model_name or "gpt-4o-mini",
         "stream": True,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": message},
         ],
     }

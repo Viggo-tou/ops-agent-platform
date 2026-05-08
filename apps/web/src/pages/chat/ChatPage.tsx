@@ -212,6 +212,63 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
         .join("\n")
         .trim();
 
+    // Smooth-flush animator: backends like MiniMax push coarse chunks (a
+    // sentence or two at a time). To make the UI feel like genuine token
+    // streaming, we keep a buffer of un-rendered characters and drain it at
+    // a fixed rate via setInterval. When the stream ends we flush the rest
+    // immediately so nothing is lost.
+    const FLUSH_RATE_MS = 18;        // ~55 chars/sec
+    const MAX_BURST_CHARS = 6;       // catch up if buffer is large
+    let renderedSoFar = "";
+    let pendingBuffer = "";
+    let streamDone = false;
+    const flushTick = window.setInterval(() => {
+      if (pendingBuffer.length === 0) return;
+      // Drain MAX_BURST_CHARS characters per tick so big chunks catch up
+      // gracefully without freezing the UI.
+      const take = Math.min(MAX_BURST_CHARS, pendingBuffer.length);
+      renderedSoFar += pendingBuffer.slice(0, take);
+      pendingBuffer = pendingBuffer.slice(take);
+      visibleAnswerSoFar = stripIntent(renderedSoFar);
+      setOptimisticTask((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: "running",
+              latest_result_json: {
+                kind: "chat_answer",
+                answer: visibleAnswerSoFar,
+              },
+              updated_at: new Date().toISOString(),
+            }
+          : prev,
+      );
+      scrollToLatestMessage();
+    }, FLUSH_RATE_MS);
+    const drainAndStop = () => {
+      streamDone = true;
+      // Final flush: dump everything remaining.
+      if (pendingBuffer.length > 0) {
+        renderedSoFar += pendingBuffer;
+        pendingBuffer = "";
+        visibleAnswerSoFar = stripIntent(renderedSoFar);
+        setOptimisticTask((prev) =>
+          prev
+            ? {
+                ...prev,
+                latest_result_json: {
+                  kind: "chat_answer",
+                  answer: visibleAnswerSoFar,
+                },
+                updated_at: new Date().toISOString(),
+              }
+            : prev,
+        );
+      }
+      window.clearInterval(flushTick);
+    };
+    void streamDone;  // referenced via closure for future cancel logic
+
     try {
       const stream = api.chatSendStream({
         message: userMessage,
@@ -224,22 +281,10 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
       for await (const event of stream) {
         switch (event.type) {
           case "token":
+            // Push raw text into the smoother buffer; the interval ticker
+            // drains it character-by-character.
             answerSoFar += event.text;
-            visibleAnswerSoFar = stripIntent(answerSoFar);
-            setOptimisticTask((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    status: "running",
-                    latest_result_json: {
-                      kind: "chat_answer",
-                      answer: visibleAnswerSoFar,
-                    },
-                    updated_at: new Date().toISOString(),
-                  }
-                : prev,
-            );
-            scrollToLatestMessage();
+            pendingBuffer += event.text;
             break;
           case "task_created":
             finalTaskCreated = true;
@@ -250,6 +295,7 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
             // Transient — chain falls through automatically. No-op.
             break;
           case "error":
+            drainAndStop();
             setStreamError(event.message);
             setOptimisticTask((prev) =>
               prev
@@ -272,7 +318,10 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
             break;
         }
       }
+      // Stream finished cleanly — flush any pending buffered chars.
+      drainAndStop();
     } catch (error) {
+      drainAndStop();
       const msg = toErrorMessage(error);
       setStreamError(msg);
       setOptimisticTask((prev) =>
@@ -312,8 +361,10 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
         return;
       }
 
-      // Question: fetch the persisted task so the optimistic temp task gets
-      // replaced with the canonical row (preserves on reload).
+      // Question (no pipeline): replace optimistic temp task with the real
+      // persisted row, then navigate to /chat/{taskId} so the URL carries
+      // the session_id forward — without this, the user's follow-up message
+      // submits with session_id=null and starts a fresh conversation.
       try {
         const realTask = await api.getTask(createdTaskId);
         setOptimisticTask({
@@ -326,8 +377,15 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
           },
         });
         scrollToLatestMessage();
+        // Only navigate if we're currently at /chat (no taskId in URL),
+        // because the user's first message just bound a session. Existing
+        // /chat/{id} threads stay on their current URL.
+        if (!taskId) {
+          startTransition(() => {
+            void navigate(`/chat/${createdTaskId}`, { replace: true });
+          });
+        }
       } catch {
-        // Keep the optimistic task with status=completed.
         setOptimisticTask((prev) =>
           prev
             ? {
