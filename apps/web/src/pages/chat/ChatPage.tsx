@@ -531,7 +531,9 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
             </div>
           </div>
         ) : null}
-        {visibleThreadTasks.length > 0 ? <MessageList tasks={visibleThreadTasks} eventsMap={eventsMap} /> : null}
+        {visibleThreadTasks.length > 0 ? (
+          <MessageList tasks={visibleThreadTasks} eventsMap={eventsMap} streaming={isStreaming} />
+        ) : null}
       </section>
 
       {(() => {

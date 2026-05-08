@@ -15,6 +15,13 @@ interface MessageListProps {
   task?: TaskDetail | null;
   tasks?: TaskDetail[];
   eventsMap?: Record<string, EventRecord[]>;
+  /**
+   * True only while the chat endpoint is actively streaming tokens for the
+   * most recent turn. The blinking caret follows this prop instead of
+   * task.status so it disappears the instant the stream ends — even if the
+   * optimistic task object hasn't been replaced with the completed row yet.
+   */
+  streaming?: boolean;
 }
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "rolled_back"]);
@@ -171,7 +178,7 @@ export function buildAgentReply(task: TaskDetail): string {
   return buildDevelopDetail() ?? "I have received the request and am preparing the response.";
 }
 
-export function MessageList({ task, tasks, eventsMap }: MessageListProps) {
+export function MessageList({ task, tasks, eventsMap, streaming = false }: MessageListProps) {
   const visibleTasks = tasks ?? (task ? [task] : []);
 
   if (visibleTasks.length === 0) {
@@ -228,8 +235,11 @@ export function MessageList({ task, tasks, eventsMap }: MessageListProps) {
                         ) : (
                           <TypingText text={replyText} enabled={shouldAnimate} />
                         )}
-                        {/* Blinking caret while live-streaming a chat answer. */}
-                        {isLastTask && isActive ? <span className="streaming-caret" aria-hidden="true">▍</span> : null}
+                        {/* Blinking caret only while the chat is actively
+                            streaming — drives off the explicit `streaming`
+                            prop, not task.status, to avoid timing races
+                            after the stream ends. */}
+                        {isLastTask && streaming ? <span className="streaming-caret" aria-hidden="true">▍</span> : null}
                       </>
                     ) : null}
                     {developDiff ? (
