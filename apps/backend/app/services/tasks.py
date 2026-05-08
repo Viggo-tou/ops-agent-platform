@@ -25,8 +25,10 @@ from app.models.task import Task
 from app.models.tool_execution import ToolExecution
 from app.orchestrator.service import PrimaryOrchestrator, classify_request
 from app.schemas.task import TaskCreateRequest, TaskRollbackRequest
+from app.services import task_cancel
 from app.services.events import record_event, set_task_status
 from app.services.rollback import RollbackExecutor
+from app.services.task_cancel import TaskCancelledError
 
 logger = logging.getLogger("app.services.tasks")
 
@@ -66,6 +68,19 @@ def run_pipeline_job(task_id: str, actor_name: str) -> None:
             orchestrator = PrimaryOrchestrator(db)
             orchestrator.bootstrap_task(task, actor_name=actor_name)
             db.commit()
+        except TaskCancelledError as cancel_exc:
+            # Watchdog already set status=STALE_FAILED + recorded the
+            # EXECUTION_FAILED event before requesting cancel, so do NOT
+            # touch the task row here — just unwind the worker thread
+            # cleanly so the executor slot frees up.
+            db.rollback()
+            task_cancel.clear_cancel(task_id)
+            logger.info(
+                "Pipeline job exited via cooperative cancel for task %s (reason=%s)",
+                task_id,
+                cancel_exc.reason,
+            )
+            return
         except Exception as exc:
             db.rollback()
             logger.exception("Background pipeline job crashed for task %s", task_id)
@@ -119,6 +134,15 @@ def resume_pipeline_job(task_id: str) -> None:
             resumed = orchestrator.resume_task(task=task, actor_name=task.actor_name)
             if resumed:
                 db.commit()
+        except TaskCancelledError as cancel_exc:
+            db.rollback()
+            task_cancel.clear_cancel(task_id)
+            logger.info(
+                "Resume job exited via cooperative cancel for task %s (reason=%s)",
+                task_id,
+                cancel_exc.reason,
+            )
+            return
         except Exception as exc:
             db.rollback()
             logger.exception("Resume job crashed for task %s", task_id)

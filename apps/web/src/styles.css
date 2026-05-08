@@ -1894,6 +1894,12 @@ dd {
   border-color: #fca5a5;
   color: #7f1d1d;
 }
+.task-create-status.queued {
+  background: #fffbeb;
+  border-color: #fcd34d;
+  color: #78350f;
+}
+.task-create-status.queued .task-create-scenario { color: #78350f; border-color: #fcd34d; }
 .task-create-icon {
   display: inline-flex;
   align-items: center;

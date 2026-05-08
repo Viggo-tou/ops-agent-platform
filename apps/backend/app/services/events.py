@@ -8,6 +8,7 @@ from app.core.enums import EventSource, EventType, RoleName, TaskStatus, Workflo
 from app.core.logging import get_logger
 from app.models.event import Event
 from app.models.task import Task
+from app.services import task_cancel
 
 _event_logger = get_logger(component="events")
 
@@ -69,6 +70,13 @@ def record_event(
 
     Pass ``commit=False`` to opt out for legitimate batch-write callers.
     """
+    # Cooperative cancellation checkpoint. If watchdog flagged this task
+    # for cancel, abort here so the worker thread unwinds via the outer
+    # try/except in run_pipeline_job and frees its executor slot. Done
+    # BEFORE any DB write so we don't pollute the cancelled task with a
+    # post-mortem event.
+    task_cancel.check_or_raise(task_id)
+
     if session_id is None:
         task = db.get(Task, task_id)
         session_id = task.session_id if task is not None else None
@@ -90,6 +98,7 @@ def record_event(
     # 'database is locked' even with WAL + busy_timeout=120s. We retry up
     # to 5 times with exponential backoff (50→800ms, total ~1.5s) and
     # only re-raise if every attempt loses.
+    import random as _random
     import time as _time
     last_exc: Exception | None = None
     for attempt in range(5):
@@ -125,7 +134,12 @@ def record_event(
                 message=message,
                 payload_json=payload,
             )
-            _time.sleep(0.05 * (2 ** attempt))
+            # Backoff with jitter: deterministic 50→800ms exponential plus
+            # random 0-50ms so multiple worker threads losing the same lock
+            # don't all wake up at the same instant and re-collide. Without
+            # jitter, parallel codegen writers retry in lockstep and the
+            # contention pattern repeats on each retry tier.
+            _time.sleep(0.05 * (2 ** attempt) + _random.uniform(0.0, 0.05))
     _event_logger.info(
         "lifecycle_event",
         task_id=task_id,

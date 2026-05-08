@@ -34,6 +34,7 @@ from sqlalchemy import select
 from app.core.db import SessionLocal
 from app.core.enums import EventSource, EventType, RoleName, TaskStatus, WorkflowStage
 from app.models.task import Task
+from app.services import task_cancel
 from app.services.events import record_event, set_task_status
 
 logger = logging.getLogger("watchdog")
@@ -123,6 +124,12 @@ def _mark_stale_failed_once() -> int:
                     message="Stale execution timeout — watchdog terminated task.",
                     payload={"reason": reason, "stage_at_mark": str(task.workflow_stage)},
                 )
+                # Cooperative cancel: flag the task so the worker thread
+                # exits at its next record_event checkpoint and frees its
+                # executor slot. Without this the underlying thread keeps
+                # running its blocking LLM/subprocess call to completion
+                # and the slot stays consumed.
+                task_cancel.request_cancel(task.id)
                 marked += 1
                 logger.warning(
                     "watchdog marked task stale",

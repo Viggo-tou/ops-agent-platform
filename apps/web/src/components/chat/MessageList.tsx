@@ -280,7 +280,13 @@ export function MessageList({
                       const claims = /已经?\s*(提交|创建|启动|开始)|已加入\s*pipeline|task\s+(created|submitted)/i.test(
                         replyText || "",
                       );
-                      return <TaskCreationStatusBlock state={cs} modelClaimsCreated={claims} />;
+                      return (
+                        <TaskCreationStatusBlock
+                          state={cs}
+                          modelClaimsCreated={claims}
+                          lifecycleStatus={messageTask.status}
+                        />
+                      );
                     })()}
 
                     {/* Inline 继续修复 affordance — only for failed PIPELINE
@@ -341,9 +347,11 @@ function readCreationStatus(task: TaskDetail): {
 function TaskCreationStatusBlock({
   state,
   modelClaimsCreated,
+  lifecycleStatus,
 }: {
   state: ReturnType<typeof readCreationStatus>;
   modelClaimsCreated: boolean;
+  lifecycleStatus?: string;
 }) {
   if (!state) return null;
   // pending: render only if the model's text contained a "已提交"-style
@@ -363,6 +371,38 @@ function TaskCreationStatusBlock({
   }
   if (state.status === "created") {
     const link = state.task_id ? `/tasks/${state.task_id}` : null;
+    // Queued sub-state: task row is persisted, kicked off into the
+    // pipeline executor, but the worker hasn't started processing yet.
+    // This happens when all max_workers slots are busy. Distinguishing
+    // "queued behind another task" from "actively running" tells the
+    // user whether to expect quick progress or to wait.
+    const isQueued =
+      state.kicked_off_pipeline === true &&
+      lifecycleStatus === "created";
+    if (isQueued) {
+      return (
+        <div className="task-create-status queued">
+          <span className="task-create-spinner" aria-hidden="true" />
+          <div className="task-create-body">
+            <div className="task-create-title">
+              任务已创建,排队等待 worker…
+              {state.scenario ? <code className="task-create-scenario">{state.scenario}</code> : null}
+            </div>
+            <div className="task-create-sub">
+              其他任务占用了执行槽,会在空闲后自动开始
+              {link ? (
+                <>
+                  {" · "}
+                  <a href={link} target="_self" rel="noopener">
+                    打开 #{state.task_id?.slice(0, 8)}
+                  </a>
+                </>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      );
+    }
     const tagline = state.kicked_off_pipeline
       ? "已加入 pipeline 队列,可在任务详情页跟进"
       : "已存档,可在任务列表查看";
