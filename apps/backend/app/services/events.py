@@ -84,19 +84,48 @@ def record_event(
         message=message,
         payload_json=payload,
     )
-    db.add(event)
-    db.flush()
-    if commit:
+    # Retry-on-locked: under high write concurrency (max_workers=6, each
+    # codegen batch in parallel_max=4 also writes events), SQLite's single
+    # writer lock loses to concurrent writers and INSERT/COMMIT raises
+    # 'database is locked' even with WAL + busy_timeout=120s. We retry up
+    # to 5 times with exponential backoff (50→800ms, total ~1.5s) and
+    # only re-raise if every attempt loses.
+    import time as _time
+    last_exc: Exception | None = None
+    for attempt in range(5):
         try:
-            db.commit()
+            db.add(event)
+            db.flush()
+            if commit:
+                db.commit()
+            last_exc = None
+            break
         except Exception as exc:  # noqa: BLE001
-            # If the commit itself fails (rare — most likely a deeper
-            # constraint violation in the same transaction's pending
-            # writes), fall back to rollback so the session is usable
-            # again. Re-raise so the caller knows something went wrong.
-            _event_logger.warning("event_commit_failed", error=str(exc)[:200])
+            last_exc = exc
             db.rollback()
-            raise
+            msg = str(exc).lower()
+            is_locked = "database is locked" in msg or "operationalerror" in msg
+            if not is_locked or attempt == 4:
+                _event_logger.warning(
+                    "event_commit_failed",
+                    error=str(exc)[:200],
+                    attempts=attempt + 1,
+                    is_locked=is_locked,
+                )
+                raise
+            # Re-add the event for the retry — rollback() detached it.
+            event = Event(
+                task_id=task_id,
+                session_id=session_id,
+                event_type=event_type,
+                source=source,
+                stage=stage,
+                role=role,
+                tool_name=tool_name,
+                message=message,
+                payload_json=payload,
+            )
+            _time.sleep(0.05 * (2 ** attempt))
     _event_logger.info(
         "lifecycle_event",
         task_id=task_id,
