@@ -52,6 +52,7 @@ class TaskSummary(BaseModel):
     review_stage: str | None = None
     review_verdict: str | None = None
     review_summary: str | None = None
+    source_name: str | None = None
     created_at: datetime
     updated_at: datetime
 

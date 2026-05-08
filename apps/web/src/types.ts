@@ -280,6 +280,7 @@ export interface TaskSummary {
   review_stage: string | null;
   review_verdict: string | null;
   review_summary: string | null;
+  source_name: string | null;
   created_at: string;
   updated_at: string;
 }
