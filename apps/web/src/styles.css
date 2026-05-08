@@ -2108,6 +2108,66 @@ dd {
   font-size: 12px;
 }
 
+/* Milestone pill — intermediate progress (planner done / codegen done /
+   compile pass etc). Slim, light, sits between bigger status bubbles.
+   Renders inline so several milestones can stack compactly. */
+.status-feed-milestone {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  font-size: 12px;
+  color: #475569;
+}
+.status-feed-milestone.tone-ok {
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+  color: #065f46;
+}
+.status-feed-milestone.tone-fail {
+  background: #fff7ed;
+  border-color: #fed7aa;
+  color: #9a3412;
+}
+.status-feed-milestone-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  font-weight: 700;
+}
+.status-feed-milestone-label { font-weight: 600; }
+.status-feed-milestone-detail {
+  color: #94a3b8;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.status-feed-milestone.tone-ok .status-feed-milestone-detail { color: #047857; }
+.status-feed-milestone.tone-fail .status-feed-milestone-detail { color: #b45309; }
+.status-feed-milestone-link {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: #2563eb;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.status-feed-milestone-link:hover { text-decoration: underline; }
+
 /* Inline failed-pipeline action block (lives inside the assistant
    bubble, replaces the old continue-banner that floated above the
    chat input). */

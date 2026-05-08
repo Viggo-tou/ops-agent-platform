@@ -55,6 +55,82 @@ function isOptimisticTaskId(taskId: string): boolean {
   return taskId.startsWith("temp-");
 }
 
+
+/**
+ * Map an EventRecord to an intermediate-pipeline milestone, if it should
+ * surface as a chat status pill. Returns null for events the user
+ * doesn't need to see in chat (most low-level lifecycle / debug rows).
+ *
+ * Each milestone key must be stable (so dedup across event refetch
+ * works) — built from event_type + tool_name where needed.
+ */
+function milestoneFromEvent(
+  ev: EventRecord,
+): { key: string; label: string; detail?: string } | null {
+  const et = ev.event_type;
+  const tool = ev.tool_name || "";
+  const msg = ev.message || "";
+
+  if (et === "plan_generated") {
+    return { key: "plan_generated", label: "生成执行计划", detail: "planner ✓" };
+  }
+  if (et === "knowledge_retrieved") {
+    return { key: "knowledge_retrieved", label: "知识检索完成", detail: "knowledge ✓" };
+  }
+  if (et === "tool_succeeded" && tool === "codegen.generate_patch") {
+    // Each codegen success uses a distinct key (the event id) so
+    // multiple rounds (initial + repair) all show.
+    return {
+      key: `codegen_${ev.id}`,
+      label: "代码 patch 生成完成",
+      detail: msg.slice(0, 90) || "codegen ✓",
+    };
+  }
+  if (et === "tool_succeeded" && tool === "sandbox.apply_patch") {
+    return {
+      key: `sandbox_apply_${ev.id}`,
+      label: "patch 已应用到 sandbox",
+      detail: "sandbox ✓",
+    };
+  }
+  if (et === "tool_succeeded" && /Diff shape check passed/i.test(msg)) {
+    return { key: `diff_shape_${ev.id}`, label: "diff 形态检查通过" };
+  }
+  if (et === "tool_succeeded" && /compile-only verification|compile.*passed/i.test(msg)) {
+    return { key: `compile_${ev.id}`, label: "编译通过" };
+  }
+  if (et === "compile_failed") {
+    return { key: `compile_failed_${ev.id}`, label: "编译失败,进入修复轮", detail: msg.slice(0, 90) };
+  }
+  if (et === "tool_call_requested" && /Compile repair round (\d+) starting/i.test(msg)) {
+    const m = msg.match(/Compile repair round (\d+)/i);
+    return {
+      key: `repair_round_${m?.[1] ?? "x"}_${ev.id}`,
+      label: `修复 round ${m?.[1] ?? "?"} 启动`,
+      detail: msg.slice(0, 90),
+    };
+  }
+  if (et === "review_passed") {
+    return { key: "review_passed", label: "审查通过", detail: msg.slice(0, 90) };
+  }
+  if (et === "tool_succeeded" && tool === "diff_reviewer.review") {
+    return { key: "diff_reviewer", label: "diff reviewer 通过" };
+  }
+  if (et === "tool_succeeded" && /Spec conformance passed/i.test(msg)) {
+    return { key: "spec_conformance", label: "spec 一致性通过" };
+  }
+  if (et === "tool_succeeded" && /Goal attestation/i.test(msg)) {
+    return { key: "goal_attestation", label: "goal attestation ✓" };
+  }
+  if (et === "tool_succeeded" && /Evidence chain closed/i.test(msg)) {
+    return { key: "evidence_chain", label: "evidence chain 闭环 ✓" };
+  }
+  if (et === "approval_requested") {
+    return { key: "approval_requested", label: "已请求人工审批", detail: msg.slice(0, 90) };
+  }
+  return null;
+}
+
 export function ChatPage() {
   const { taskId } = useParams();
   const navigate = useNavigate();
@@ -80,19 +156,26 @@ export function ChatPage() {
     blocking?: boolean;
   };
   type StatusUpdate = {
-    id: string;                     // unique key (task_id + new_status)
+    id: string;                     // unique key (task_id + kind + label)
+    kind: "status" | "milestone";   // status = terminal transition; milestone = intermediate progress
     task_id: string;
-    new_status: string;
+    new_status: string;             // for status: TaskStatus; for milestone: short label like 'codegen_done'
     prev_status: string | null;
     scenario: string | null;
     title: string | null;
     timestamp: number;
-    reservations?: string[];        // back-compat plain strings
-    reservations_detailed?: ReservationDetail[];  // tagged with severity
+    label?: string;                 // human-readable label for milestones (e.g. "代码生成完成")
+    detail?: string;                // optional one-liner for milestones
+    reservations?: string[];        // back-compat plain strings (status only)
+    reservations_detailed?: ReservationDetail[];  // tagged with severity (status only)
   };
   const [statusUpdates, setStatusUpdates] = useState<StatusUpdate[]>([]);
   // Map of task_id → last-seen status, used to detect transitions.
   const lastStatusByIdRef = useRef<Record<string, string>>({});
+  // Map of task_id → set of milestone keys already pushed, used to dedup
+  // intermediate-progress notifications (otherwise compile_passed could
+  // fire many times if the events list is re-fetched).
+  const milestonesByIdRef = useRef<Record<string, Set<string>>>({});
   const stopStreaming = () => {
     const c = abortRef.current;
     if (c && !c.signal.aborted) {
@@ -599,12 +682,18 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
     return [...baseTasks, optimisticTask];
   }, [optimisticTask, task, threadTasks]);
 
-  // Watch all visible tasks for status transitions and append a system row
-  // to statusUpdates whenever a status changes. Skips first-seen tasks to
-  // avoid spamming on initial page load. Only fires for "interesting"
-  // transitions (avoids noisy planning→reviewing churn).
+  // Watch all visible tasks for status transitions AND intermediate
+  // pipeline milestones. Two kinds of updates land on `statusUpdates`:
+  //   - "status"    — terminal/awaiting transitions (full bubble with
+  //                   reservations + auto-fix button)
+  //   - "milestone" — intermediate progress (planner done, codegen
+  //                   done, compile passed/failed, repair starts,
+  //                   review passed). Renders as a slim inline pill so
+  //                   the user sees the pipeline IS moving in chat,
+  //                   without needing to flip to /tasks/{id}.
+  // First-seen tasks on initial page load don't notify.
   useEffect(() => {
-    const interesting = new Set([
+    const interestingStatus = new Set([
       "completed",
       "failed",
       "rolled_back",
@@ -615,49 +704,78 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
     ]);
     const next: StatusUpdate[] = [];
     for (const t of visibleThreadTasks) {
+      // Skip process_question chat answers — created already-completed.
+      if (t.scenario === "process_question") continue;
+
+      // ---- 1) terminal status transitions ----
       const prev = lastStatusByIdRef.current[t.id];
       const cur = t.status;
-      if (prev === undefined) {
-        // First sight — just record, don't notify.
+      const firstSight = prev === undefined;
+      if (firstSight) lastStatusByIdRef.current[t.id] = cur;
+      if (!firstSight && prev !== cur) {
         lastStatusByIdRef.current[t.id] = cur;
-        continue;
+        if (interestingStatus.has(cur)) {
+          const result = (t.latest_result_json as { result?: { reservations?: unknown; reservations_detailed?: unknown } } | null)?.result;
+          const reservations = (() => {
+            const r = result?.reservations;
+            if (Array.isArray(r)) return r.filter((x): x is string => typeof x === "string");
+            return undefined;
+          })();
+          const reservations_detailed = (() => {
+            const r = result?.reservations_detailed;
+            if (!Array.isArray(r)) return undefined;
+            return r
+              .filter((x): x is Record<string, unknown> => typeof x === "object" && x !== null)
+              .map((x) => ({
+                text: String(x.text ?? ""),
+                severity: String(x.severity ?? "bug"),
+                auto_fixable: Boolean(x.auto_fixable),
+                blocking: Boolean(x.blocking),
+              }))
+              .filter((x) => x.text.length > 0);
+          })();
+          next.push({
+            id: `${t.id}-status-${cur}-${t.updated_at}`,
+            kind: "status",
+            task_id: t.id,
+            new_status: cur,
+            prev_status: prev || null,
+            scenario: t.scenario || null,
+            title: t.title || null,
+            timestamp: Date.now(),
+            reservations,
+            reservations_detailed,
+          });
+        }
       }
-      if (prev === cur) continue;
-      lastStatusByIdRef.current[t.id] = cur;
-      if (!interesting.has(cur)) continue;
-      // Skip process_question chat answers — those don't have meaningful
-      // backend transitions (they're created already-completed).
-      if (t.scenario === "process_question") continue;
-      const result = (t.latest_result_json as { result?: { reservations?: unknown; reservations_detailed?: unknown } } | null)?.result;
-      const reservations = (() => {
-        const r = result?.reservations;
-        if (Array.isArray(r)) return r.filter((x): x is string => typeof x === "string");
-        return undefined;
-      })();
-      const reservations_detailed = (() => {
-        const r = result?.reservations_detailed;
-        if (!Array.isArray(r)) return undefined;
-        return r
-          .filter((x): x is Record<string, unknown> => typeof x === "object" && x !== null)
-          .map((x) => ({
-            text: String(x.text ?? ""),
-            severity: String(x.severity ?? "bug"),
-            auto_fixable: Boolean(x.auto_fixable),
-            blocking: Boolean(x.blocking),
-          }))
-          .filter((x) => x.text.length > 0);
-      })();
-      next.push({
-        id: `${t.id}-${cur}-${t.updated_at}`,
-        task_id: t.id,
-        new_status: cur,
-        prev_status: prev || null,
-        scenario: t.scenario || null,
-        title: t.title || null,
-        timestamp: Date.now(),
-        reservations,
-        reservations_detailed,
-      });
+
+      // ---- 2) intermediate milestones from event timeline ----
+      const events = eventsMap?.[t.id] ?? [];
+      let seenMs = milestonesByIdRef.current[t.id];
+      if (!seenMs) {
+        seenMs = new Set<string>();
+        milestonesByIdRef.current[t.id] = seenMs;
+      }
+      for (const ev of events) {
+        const ms = milestoneFromEvent(ev);
+        if (!ms) continue;
+        if (seenMs.has(ms.key)) continue;
+        seenMs.add(ms.key);
+        // Same first-sight gate as status: skip on initial render.
+        if (firstSight) continue;
+        next.push({
+          id: `${t.id}-mile-${ms.key}`,
+          kind: "milestone",
+          task_id: t.id,
+          new_status: ms.key,
+          prev_status: null,
+          scenario: t.scenario || null,
+          title: t.title || null,
+          timestamp: Date.now(),
+          label: ms.label,
+          detail: ms.detail,
+        });
+      }
     }
     if (next.length === 0) return;
     setStatusUpdates((prev) => {
@@ -666,12 +784,13 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
       if (additions.length === 0) return prev;
       return [...prev, ...additions];
     });
-  }, [visibleThreadTasks]);
+  }, [visibleThreadTasks, eventsMap]);
 
   // When taskId switches (cross-conversation reset), wipe status updates.
   useEffect(() => {
     setStatusUpdates([]);
     lastStatusByIdRef.current = {};
+    milestonesByIdRef.current = {};
   }, [taskId]);
 
   // When the user navigates here from sidebar's "继续修复 →" link
@@ -846,10 +965,13 @@ function StatusFeedItem({
   navigate,
 }: {
   update: {
+    kind: "status" | "milestone";
     task_id: string;
     new_status: string;
     scenario: string | null;
     title: string | null;
+    label?: string;
+    detail?: string;
     reservations?: string[];
     reservations_detailed?: ReservationDetail[];
   };
@@ -857,6 +979,29 @@ function StatusFeedItem({
 }) {
   const [iterating, setIterating] = useState(false);
   const [iterateError, setIterateError] = useState<string | null>(null);
+
+  // Milestone updates render as a slim inline pill — no reservations,
+  // no auto-fix button, just "task title — milestone label" with a
+  // small icon. Dedicated branch for clarity.
+  if (update.kind === "milestone") {
+    const isFailureLike = /fail|超时|timed_out|失败/i.test(update.new_status);
+    const tone = isFailureLike ? "fail" : "ok";
+    const icon = isFailureLike ? "⚠" : "•";
+    return (
+      <li className={`status-feed-milestone tone-${tone}`}>
+        <span className="status-feed-milestone-icon" aria-hidden="true">{icon}</span>
+        <span className="status-feed-milestone-label">{update.label ?? update.new_status}</span>
+        {update.detail ? <span className="status-feed-milestone-detail">{update.detail}</span> : null}
+        <button
+          type="button"
+          className="status-feed-milestone-link"
+          onClick={() => navigate(`/tasks/${update.task_id}`)}
+        >
+          #{update.task_id.slice(0, 8)}
+        </button>
+      </li>
+    );
+  }
 
   const tone =
     update.new_status === "completed"
