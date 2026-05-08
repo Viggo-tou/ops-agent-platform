@@ -42,7 +42,33 @@ def record_event(
     role: RoleName | None = None,
     tool_name: str | None = None,
     payload: dict[str, Any] | None = None,
+    commit: bool = True,
 ) -> Event:
+    """Insert a lifecycle event row. Auto-commits by default.
+
+    Why auto-commit: the orchestrator's run_pipeline_job wraps the ENTIRE
+    pipeline in one transaction (one final ``db.commit()`` at the end).
+    Inside that transaction, ~180 ``record_event`` calls each fire a
+    SQLite INSERT via ``flush()``. WAL mode gives each writer an
+    exclusive write lock from the first INSERT until COMMIT — held for
+    the whole pipeline (5-30 min). During that window EVERY other
+    writer in the process (chat persistence, /iterate, /diagnose,
+    follow-up tasks) gets ``database is locked``.
+
+    Committing after each event:
+      + releases the lock after every event so other writers can slip in
+      + makes progress visible to the UI immediately (better SSE feel)
+      + means task.plan_json / task.status updates committed alongside
+        the event are also persisted live
+
+    Trade-off: callers that intended an atomic Task+Event batch lose
+    rollback on crash. In practice that's fine here — events are
+    append-only progress logs, persisting them through a crash is a
+    feature not a bug, and crash recovery already re-derives state
+    from the latest event sequence.
+
+    Pass ``commit=False`` to opt out for legitimate batch-write callers.
+    """
     if session_id is None:
         task = db.get(Task, task_id)
         session_id = task.session_id if task is not None else None
@@ -60,6 +86,17 @@ def record_event(
     )
     db.add(event)
     db.flush()
+    if commit:
+        try:
+            db.commit()
+        except Exception as exc:  # noqa: BLE001
+            # If the commit itself fails (rare — most likely a deeper
+            # constraint violation in the same transaction's pending
+            # writes), fall back to rollback so the session is usable
+            # again. Re-raise so the caller knows something went wrong.
+            _event_logger.warning("event_commit_failed", error=str(exc)[:200])
+            db.rollback()
+            raise
     _event_logger.info(
         "lifecycle_event",
         task_id=task_id,
