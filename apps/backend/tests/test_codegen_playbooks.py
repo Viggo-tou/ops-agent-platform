@@ -186,3 +186,29 @@ def test_render_for_prompt_outputs_section_headers(tmp_path):
     assert "## Playbook: py" in rendered
     # high priority comes first
     assert rendered.index("## Playbook: diff") < rendered.index("## Playbook: py")
+
+
+# --- live filesystem smoke -----------------------------------------------------
+
+
+def test_default_codegen_dir_loads_shipped_playbooks():
+    """Smoke test: default `_CODEGEN_DIR` resolves correctly off the
+    module's own __file__ and at least the shipped playbooks parse.
+
+    Catches the parents[3]-vs-parents[4] off-by-one we hit on
+    2026-05-09 where the resolved root landed at apps/ and rebuild_index
+    silently returned 0 with no error. The rest of the test file uses
+    tmp_path on purpose, so this case is otherwise uncovered.
+    """
+    from app.services.codegen_playbooks import _CODEGEN_DIR
+
+    assert _CODEGEN_DIR.is_dir(), (
+        f"_CODEGEN_DIR resolved to {_CODEGEN_DIR}, which doesn't exist. "
+        "Likely path math drift; check parents[N] in codegen_playbooks.py."
+    )
+    count = rebuild_index()
+    assert count >= 2, f"expected at least 2 shipped playbooks, got {count}"
+    names = {p.name for p in all_playbooks()}
+    # The two checked-in playbooks live in docs/agent-playbooks/codegen/
+    assert "python" in names
+    assert "diff-discipline" in names
