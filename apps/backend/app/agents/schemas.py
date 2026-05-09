@@ -38,6 +38,31 @@ class FinalOutputContract(BaseModel):
     required_fields: list[str] = Field(min_length=1, max_length=12)
 
 
+class PlanAcceptanceTest(BaseModel):
+    """Structural acceptance test the planner asserts the patch must satisfy.
+
+    Consumed by the reviewer-side ``acceptance_check`` (Tier 1.3). Stronger
+    than ``feature_presence_check`` because the planner declares *what
+    structurally has to be present in the diff* before any model writes
+    code, which the reviewer then checks against the diff text — no token
+    matching, no LLM second-guessing.
+    """
+
+    kind: Literal[
+        "diff_contains_pattern",
+        "diff_contains_pattern_in_file",
+        "function_signature_unchanged",
+        "function_signature_changed",
+        "no_new_file_outside",
+        "import_added",
+    ]
+    pattern: str = Field(default="", max_length=240)
+    file: str | None = Field(default=None, max_length=400)
+    function: str | None = Field(default=None, max_length=200)
+    scope: str | None = Field(default=None, max_length=400)
+    rationale: str = Field(default="", max_length=240)
+
+
 class GeneratedPlanPayload(BaseModel):
     objective: str = Field(min_length=1, max_length=240)
     request_summary: str = Field(min_length=1, max_length=500)
@@ -76,6 +101,16 @@ class GeneratedPlanPayload(BaseModel):
     )
     tools: list[PlanTool] = Field(min_length=1, max_length=6)
     steps: list[PlanStep] = Field(min_length=1, max_length=10)
+    acceptance_tests: list[PlanAcceptanceTest] = Field(
+        default_factory=list,
+        max_length=10,
+        description=(
+            "Structural assertions the resulting patch must satisfy. The "
+            "reviewer's acceptance_check evaluates these against the diff "
+            "text. Populated by the planner for code-change scenarios "
+            "(jira_issue_develop, bug_fix); empty for non-code scenarios."
+        ),
+    )
     final_output_contract: FinalOutputContract
 
 

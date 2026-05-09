@@ -1428,7 +1428,7 @@ class PrimaryAgentPlanner:
             if isinstance(value, list) and value:
                 merged[field_name] = value
 
-        for field_name in ("affected_code_locations", "must_touch_files", "expected_new_files", "tools", "steps"):
+        for field_name in ("affected_code_locations", "must_touch_files", "expected_new_files", "tools", "steps", "acceptance_tests"):
             value = raw.get(field_name)
             if isinstance(value, list) and value:
                 merged[field_name] = value
@@ -1609,6 +1609,51 @@ class PrimaryAgentPlanner:
                     break
         sanitized["steps"] = steps
 
+        # Acceptance tests (Tier 1.3) — validate each entry has a known
+        # kind. Drop entries with unknown kind rather than fail-closed,
+        # so older planners that don't emit this field stay compatible.
+        _ALLOWED_AC_KINDS = {
+            "diff_contains_pattern",
+            "diff_contains_pattern_in_file",
+            "function_signature_unchanged",
+            "function_signature_changed",
+            "no_new_file_outside",
+            "import_added",
+        }
+        raw_acceptance = sanitized.get("acceptance_tests")
+        acceptance: list[dict[str, Any]] = []
+        if isinstance(raw_acceptance, list):
+            for raw_test in raw_acceptance:
+                if not isinstance(raw_test, dict):
+                    continue
+                kind = str(raw_test.get("kind") or "").strip()
+                if kind not in _ALLOWED_AC_KINDS:
+                    continue
+                entry: dict[str, Any] = {
+                    "kind": kind,
+                    "pattern": _trim_text(str(raw_test.get("pattern") or ""), limit=240),
+                    "file": (
+                        _trim_text(str(raw_test.get("file")), limit=400)
+                        if isinstance(raw_test.get("file"), str) and str(raw_test.get("file")).strip()
+                        else None
+                    ),
+                    "function": (
+                        _trim_text(str(raw_test.get("function")), limit=200)
+                        if isinstance(raw_test.get("function"), str) and str(raw_test.get("function")).strip()
+                        else None
+                    ),
+                    "scope": (
+                        _trim_text(str(raw_test.get("scope")), limit=400)
+                        if isinstance(raw_test.get("scope"), str) and str(raw_test.get("scope")).strip()
+                        else None
+                    ),
+                    "rationale": _trim_text(str(raw_test.get("rationale") or ""), limit=240),
+                }
+                acceptance.append(entry)
+                if len(acceptance) >= 10:
+                    break
+        sanitized["acceptance_tests"] = acceptance
+
         raw_contract = sanitized.get("final_output_contract")
         if isinstance(raw_contract, dict):
             contract_type = raw_contract.get("type")
@@ -1675,7 +1720,20 @@ class PrimaryAgentPlanner:
             "Return 3 to 5 short steps (exactly 4 for jira_issue_develop). Each step owner_role should be one of primary, planner, knowledge, action, reviewer. "
             "EVERY step MUST include all of these non-empty string fields: step_id, title, kind, owner_role, expected_output, success_criteria. "
             "Steps missing any of these fields will be discarded. "
-            "Do not invent extra systems, tools, or business modules."
+            "Do not invent extra systems, tools, or business modules. "
+            "For jira_issue_develop and bug_fix scenarios, populate acceptance_tests with 1-3 STRUCTURAL assertions about what the resulting patch must contain. "
+            "These are checked against the raw diff text — they are not LLM judgements. The reviewer rejects the patch if any test fails. "
+            "Only emit a test if you can already name the symbol or pattern from the issue text + repository context. If you cannot, leave acceptance_tests empty rather than guess. "
+            "Each entry has fields: kind, pattern, file (optional), function (optional), scope (optional, glob), rationale (short reason). "
+            "Allowed kinds, pick the simplest that fits: "
+            "(a) diff_contains_pattern — the unified diff must contain a regex/literal pattern in any added line. Example: kind=diff_contains_pattern, pattern=\"def fix_arithmetic\", rationale=\"adds the missing helper named in the issue\". "
+            "(b) diff_contains_pattern_in_file — same as (a) but pattern must appear inside hunks for `file`. Use this when you can already name the file from must_touch_files. "
+            "(c) function_signature_unchanged — kind, file, function. Use when the issue says \"do not change the API\" or \"keep backward compatibility\". "
+            "(d) function_signature_changed — kind, file, function. Use when the issue requires a signature change (add/remove a parameter). "
+            "(e) no_new_file_outside — kind, scope (glob). Use when the issue scopes the change to a directory. Example: scope=\"django/db/models/**\" — patch must not create files outside that subtree. "
+            "(f) import_added — kind, file, pattern (the imported name). Use when the fix demonstrably requires a new import. "
+            "DO NOT emit tests like \"all tests pass\" or \"behavior is correct\" — those are not structural. Tests must be checkable against diff text alone. "
+            "DO NOT emit acceptance_tests for process_question, slack_message, jira_issue_plan, jira_issue_create, jira_issue_writeback, internal_api_request, internal_db_query — leave the list empty for those scenarios."
         )
 
 
