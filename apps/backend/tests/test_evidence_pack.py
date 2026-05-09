@@ -133,3 +133,81 @@ def test_pack_default_budgets_are_sane():
     assert b.max_files <= 10
     assert b.max_total_bytes <= 25_000
     assert b.max_per_file_bytes <= 8_000
+
+
+# --- AST-aware truncation integration ---------------------------------------
+
+
+def _python_module(big_fn_lines: int = 80, small_fn_count: int = 3) -> str:
+    parts = ["import os\nimport sys\n\n", "ANSWER = 42\n\n"]
+    for i in range(small_fn_count):
+        parts.append(f"def small_{i}(arg):\n    return arg + {i}\n\n")
+    body = "\n".join(f"    x_{i} = {i}" for i in range(big_fn_lines))
+    parts.append(
+        f"def big_helper(arg):\n    \"\"\"big helper docstring.\"\"\"\n{body}\n    return arg\n"
+    )
+    return "".join(parts)
+
+
+def test_truncate_python_file_keeps_imports_and_signatures():
+    """A 2000-line .py file truncated at 6KB should still expose imports
+    and class/function signatures (the regression we hit on
+    2026-05-09 with django/db/models/sql/query.py)."""
+    src = _python_module(big_fn_lines=200, small_fn_count=4)
+    out = truncate_file(src, max_bytes=2_000, path="big.py")
+    assert "import os" in out
+    assert "import sys" in out
+    assert "ANSWER = 42" in out
+    assert "def small_0(arg):" in out
+    assert "def big_helper(arg):" in out
+    # Big-function body content is dropped.
+    assert "x_150 = 150" not in out
+
+
+def test_truncate_python_file_byte_caps_when_ast_still_too_big():
+    """When even the AST output exceeds the cap (e.g. dozens of small
+    methods all pinned), the AST output is byte-truncated. Strictly
+    better than truncating raw source because the AST output already
+    dropped big bodies."""
+    # 100 small functions — each ≤ small_body_lines, so all kept whole.
+    parts = ["import os\n\n"]
+    for i in range(100):
+        parts.append(f"def fn_{i}(x):\n    return x + {i}\n\n")
+    src = "".join(parts)
+    out = truncate_file(src, max_bytes=500, path="many.py")
+    assert len(out) <= 500 + 50  # cap + marker
+    # The byte-capped slice still leads with imports + early functions.
+    assert "import os" in out
+    assert "def fn_0" in out
+
+
+def test_truncate_non_python_file_uses_byte_path():
+    """Kotlin / JS files don't get AST truncation; they fall back to
+    byte truncation with the legacy marker."""
+    src = "fun main() {\n" + ("    println(\"x\")\n" * 200) + "}\n"
+    out = truncate_file(src, max_bytes=500, path="Foo.kt")
+    assert len(out) <= 500 + 50
+    assert "truncated" in out.lower()
+
+
+def test_truncate_python_syntax_error_falls_back_to_byte():
+    bad = "this is not python " + ("###\n" * 200)
+    out = truncate_file(bad, max_bytes=200, path="oops.py")
+    assert len(out) <= 200 + 50
+    assert "truncated" in out.lower()
+
+
+def test_evidence_pack_python_truncation_preserves_signatures():
+    """End-to-end: a big .py file in the pack arrives with function
+    signatures intact, not just imports + class headers."""
+    src = _python_module(big_fn_lines=200, small_fn_count=2)
+    files = [_ev("django/db/models/sql/query.py", content=src, priority=1)]
+    budget = EvidencePackBudget(
+        max_files=1, max_total_bytes=20_000, max_per_file_bytes=2_000
+    )
+    pack = build_evidence_pack(files, budget)
+    assert len(pack.included_files) == 1
+    out = pack.included_files[0].content
+    assert "def small_0(arg):" in out
+    assert "def big_helper(arg):" in out
+    assert "elided by ast_truncate" in out

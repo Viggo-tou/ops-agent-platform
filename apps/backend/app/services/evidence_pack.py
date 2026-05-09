@@ -63,10 +63,48 @@ class EvidencePack:
 _TRUNCATE_MARKER = "\n... (truncated)"
 
 
-def truncate_file(content: str, *, max_bytes: int) -> str:
-    """Cut a single file's content to stay under ``max_bytes``."""
+def truncate_file(
+    content: str,
+    *,
+    max_bytes: int,
+    path: str | None = None,
+    keep_symbols: list[str] | None = None,
+) -> str:
+    """Cut a single file's content to stay under ``max_bytes``.
+
+    For Python files (path ending ``.py``), use AST-aware structural
+    truncation so function bodies are preserved intact wherever
+    possible. The fix on 2026-05-09 was driven by a 2000-line django
+    file where naive byte truncation kept only imports and class
+    headers, leaving the LLM nothing to edit.
+
+    For non-Python files (or when AST parsing fails), fall back to the
+    historical byte truncation. ``keep_symbols`` is forwarded to the
+    AST truncator when relevant; ignored for the byte path.
+    """
     if len(content) <= max_bytes:
         return content
+    if path and path.endswith(".py"):
+        try:
+            from app.services.ast_truncate import truncate_python_source
+
+            result = truncate_python_source(
+                content,
+                max_bytes=max_bytes,
+                keep_symbols=keep_symbols or [],
+            )
+            if result.used_ast and result.text:
+                if len(result.text) <= max_bytes:
+                    return result.text
+                # AST truncation shrank the file but couldn't fit it
+                # under the cap (e.g. dozens of small methods all
+                # pinned). Byte-cap the AST output rather than raw
+                # source — the AST version drops big function bodies
+                # first, so even after a final byte cut the model
+                # sees more useful structure.
+                return result.text[:max_bytes] + _TRUNCATE_MARKER
+        except Exception:  # noqa: BLE001
+            pass
     return content[:max_bytes] + _TRUNCATE_MARKER
 
 
@@ -91,9 +129,15 @@ def build_evidence_pack(
             )
             continue
 
-        # Per-file truncation first.
+        # Per-file truncation first. AST-aware for Python files (so
+        # big files like django/db/models/sql/query.py keep function
+        # bodies intact instead of dumping just imports).
         truncated = (
-            truncate_file(file_.content, max_bytes=budget.max_per_file_bytes)
+            truncate_file(
+                file_.content,
+                max_bytes=budget.max_per_file_bytes,
+                path=file_.path,
+            )
             if len(file_.content) > budget.max_per_file_bytes
             else file_.content
         )
