@@ -46,7 +46,10 @@ _STAGE_THRESHOLDS_S: dict[str, int] = {
     "intake":     180,    # 3 min
     "planning":   600,    # 10 min — planner LLM can be slow
     "knowledge":  300,    # 5 min — knowledge synthesis
-    "action":     900,    # 15 min — codegen + sandbox
+    "action":    1800,    # 30 min — codegen self-validate is up to 3
+                          #   attempts × ~7min = 21min on large files
+                          #   (e.g. astropy nddata, must_touch=20).
+                          #   Was 15min and routinely tripped on those.
     "review":     600,    # 10 min — diff_reviewer + semantic_review
     "done":        60,    # 1 min — already terminal-adjacent
 }

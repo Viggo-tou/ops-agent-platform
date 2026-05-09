@@ -115,10 +115,17 @@ def resolve_verification_profile(
 
     python_marker = _first_existing(source_path, "pyproject.toml", "setup.py", "requirements.txt")
     if python_marker:
+        # `-q` silences compileall's per-directory "Listing 'X'..." chatter
+        # which the compile gate was misreading as error output (each
+        # subdir of a large repo's .git/ printed a Listing line, blowing
+        # past the error parser's buffer). With -q only true compile
+        # errors hit stdout/stderr.
+        # `-x \\.git` skips the .git dir entirely so we don't waste time
+        # walking thousands of object files looking for .py imports.
         return VerificationProfile(
             repo_type="python",
-            compile_command=["python", "-m", "compileall", "."],
-            syntax_only_command=["python", "-m", "compileall", "."],
+            compile_command=["python", "-m", "compileall", "-q", "-x", r"\\.git", "."],
+            syntax_only_command=["python", "-m", "compileall", "-q", "-x", r"\\.git", "."],
             test_command=_python_test_command(source_path, has_tests_yaml),
             timeout_seconds=180,
             detection_evidence=[_rel(source_path, python_marker)],

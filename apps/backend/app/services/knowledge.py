@@ -775,6 +775,28 @@ class KnowledgeService:
                 specs.append(SourceSpec(name=name, path=child))
                 seen_names.add(name)
 
+        # Managed registry sources (clones added via add_managed_source,
+        # e.g. SWE-bench harness, /api/repositories/sources). Without
+        # this branch /api/knowledge/sync rejects them as "Unknown
+        # knowledge source" even though the orchestrator already knows
+        # how to resolve them via repository_registry.
+        try:
+            from app.services import repository_registry as _registry
+            for record in _registry.list_managed_sources():
+                name = (record.name or "").strip().lower()
+                if not name or name in seen_names:
+                    continue
+                path = Path(record.path)
+                if not path.exists():
+                    continue
+                specs.append(
+                    SourceSpec(name=name, path=path, description=record.description or "")
+                )
+                seen_names.add(name)
+        except Exception:  # noqa: BLE001
+            # Registry must never break legacy resolution.
+            pass
+
         if not specs:
             raise ValueError("No knowledge source path is configured")
 

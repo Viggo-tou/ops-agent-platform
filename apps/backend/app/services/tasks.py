@@ -212,14 +212,23 @@ class TaskService:
             }
 
         intent_text = self._extract_user_intent_text(effective_request)
-        scenario = classify_request(intent_text)
-        # Continuation should inherit the parent task's scenario by default.
-        # Empirical (v48 P69-17): augmented continuation preamble contains
-        # the parent's status string ("completed") which trips the writeback
-        # classifier ("complete" keyword) and skips the develop pipeline
-        # entirely. The parent's scenario is the truer intent signal.
-        if continuation_meta and continuation_meta.get("parent_scenario"):
-            scenario = continuation_meta["parent_scenario"]
+        # Caller may force scenario explicitly (SWE-bench harness uses
+        # this — long problem statements contain "complete" / "done" /
+        # "fix" verbs that always trip the writeback classifier). Forced
+        # scenario takes priority over both the regex classifier and any
+        # parent-scenario inheritance.
+        forced_scenario = (getattr(payload, "scenario_override", None) or "").strip()
+        if forced_scenario:
+            scenario = forced_scenario
+        else:
+            scenario = classify_request(intent_text)
+            # Continuation should inherit the parent task's scenario by default.
+            # Empirical (v48 P69-17): augmented continuation preamble contains
+            # the parent's status string ("completed") which trips the writeback
+            # classifier ("complete" keyword) and skips the develop pipeline
+            # entirely. The parent's scenario is the truer intent signal.
+            if continuation_meta and continuation_meta.get("parent_scenario"):
+                scenario = continuation_meta["parent_scenario"]
         risk_level = self._infer_risk_level(intent_text)
         risk_category = self._infer_risk_category(intent_text, scenario=scenario)
         governance_json = {
@@ -235,6 +244,11 @@ class TaskService:
         }
         if continuation_meta is not None:
             governance_json["continuation"] = continuation_meta
+        if getattr(payload, "skip_jira_prefetch", False):
+            # Sticky on the task so the orchestrator can read it any time
+            # planning runs (resume, retry, etc.) without going back to
+            # the original request payload.
+            governance_json["skip_jira_prefetch"] = True
 
         task = Task(
             session_id=effective_session_id or str(uuid4()),
@@ -252,8 +266,23 @@ class TaskService:
             # Optional override; None = orchestrator falls back to env defaults.
             source_name=getattr(payload, "source_name", None),
         )
-        self.db.add(task)
-        self.db.flush()
+        # Retry-on-locked: under parallel benchmark load (e.g. SWE-bench
+        # harness with parallel=4) concurrent pipeline workers all hold
+        # SQLite write tickets and a fresh POST /api/tasks loses the
+        # race. record_event already handles this; mirror the strategy
+        # for the Task INSERT itself.
+        import random as _random
+        import time as _time
+        for _attempt in range(5):
+            try:
+                self.db.add(task)
+                self.db.flush()
+                break
+            except Exception as _exc:  # noqa: BLE001
+                self.db.rollback()
+                if "database is locked" not in str(_exc).lower() or _attempt == 4:
+                    raise
+                _time.sleep(0.05 * (2 ** _attempt) + _random.uniform(0.0, 0.05))
 
         record_event(
             self.db,

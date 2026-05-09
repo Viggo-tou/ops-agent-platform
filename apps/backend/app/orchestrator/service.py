@@ -845,7 +845,14 @@ class PrimaryOrchestrator:
         issue_context: dict[str, object] | None = None
         planning_knowledge_context: dict[str, object] | None = None
 
-        if task.scenario in {"jira_issue_plan", "jira_issue_develop"}:
+        # Caller may opt out of Jira prefetch (SWE-bench harness, GitHub
+        # issue feeders, ad-hoc internal requests). When set, planning
+        # treats the request_text itself as the source-of-truth issue
+        # body and proceeds straight to plan generation.
+        gov = task.governance_json if isinstance(task.governance_json, dict) else {}
+        skip_jira_prefetch = bool(gov.get("skip_jira_prefetch"))
+
+        if task.scenario in {"jira_issue_plan", "jira_issue_develop"} and not skip_jira_prefetch:
             issue_context = self._prefetch_jira_issue_context(
                 task=task,
                 actor_name=actor_name,
@@ -860,6 +867,25 @@ class PrimaryOrchestrator:
                 # ticket. The downstream gates can't catch this because they
                 # only validate diff shape, not whether the requirement existed.
                 return
+            self._workspace_write_intent(
+                task,
+                issue_context=issue_context,
+                write_checkpoint=False,
+            )
+        elif skip_jira_prefetch and task.scenario in {"jira_issue_plan", "jira_issue_develop"}:
+            # Synthesize a minimal issue_context from request_text so the
+            # rest of the planning code path doesn't need to special-case
+            # the Jira-less branch.
+            issue_context = {
+                "issue_key": semantic_translation.issue_key or "",
+                "summary": (task.title or "")[:255],
+                "description": task.request_text,
+                "status": None,
+                "priority": None,
+                "labels": [],
+                "components": [],
+                "_synthetic_no_jira": True,
+            }
             self._workspace_write_intent(
                 task,
                 issue_context=issue_context,
@@ -1381,8 +1407,16 @@ class PrimaryOrchestrator:
         if not isinstance(planning_request_text, str) or not planning_request_text.strip():
             planning_request_text = task.request_text
 
+        # Same opt-out used in the non-resume path: skip Jira prefetch when
+        # the task was created with skip_jira_prefetch=True.
+        gov_resume = task.governance_json if isinstance(task.governance_json, dict) else {}
+        skip_jira_prefetch_resume = bool(gov_resume.get("skip_jira_prefetch"))
+
         if resume_stage == "translate":
-            if task.scenario in {"jira_issue_plan", "jira_issue_develop", "jira_issue_writeback"}:
+            if (
+                task.scenario in {"jira_issue_plan", "jira_issue_develop", "jira_issue_writeback"}
+                and not skip_jira_prefetch_resume
+            ):
                 if issue_context is None:
                     issue_context = self._prefetch_jira_issue_context(
                         task=task,
@@ -1391,6 +1425,22 @@ class PrimaryOrchestrator:
                     )
                     if issue_context is None:
                         return
+            elif (
+                skip_jira_prefetch_resume
+                and task.scenario in {"jira_issue_plan", "jira_issue_develop"}
+                and issue_context is None
+            ):
+                issue_context = {
+                    "issue_key": semantic_translation.issue_key or "",
+                    "summary": (task.title or "")[:255],
+                    "description": task.request_text,
+                    "status": None,
+                    "priority": None,
+                    "labels": [],
+                    "components": [],
+                    "_synthetic_no_jira": True,
+                }
+            if task.scenario in {"jira_issue_plan", "jira_issue_develop", "jira_issue_writeback"}:
                 if task.scenario in {"jira_issue_plan", "jira_issue_develop"} and planning_knowledge_context is None:
                     planning_knowledge_context = self._prefetch_planning_repository_context(
                         task=task,
@@ -2195,11 +2245,22 @@ class PrimaryOrchestrator:
             payload={"query": query, "top_k": 4},
         )
 
+        # When task carries an explicit source_name, scope KB retrieval
+        # to that source — otherwise the LLM source router may pick a
+        # different one configured via knowledge_source_specs (e.g. the
+        # SWE-bench harness ran with handymanapp + hosteddashboard
+        # registered alongside its swebench-* clone, and the router was
+        # picking the largest of the three regardless of relevance).
+        kb_payload: dict[str, object] = {"query": query, "top_k": 4}
+        explicit_source = (getattr(task, "source_name", None) or "").strip()
+        if explicit_source:
+            kb_payload["source_name"] = explicit_source
+
         try:
             result = self.tool_gateway.execute(
                 task_id=task.id,
                 tool_name="knowledge.search",
-                payload={"query": query, "top_k": 4},
+                payload=kb_payload,
                 actor_context={"actor_name": actor_name, "task_id": task.id},
                 session_id=task.session_id,
                 stage=WorkflowStage.PLANNING,
@@ -2914,7 +2975,10 @@ class PrimaryOrchestrator:
 
             translation = task.translation_json if isinstance(task.translation_json, dict) else {}
             _evidence_source_name = (
-                str(translation.get("source_name") or "").strip()
+                # Explicit task.source_name beats router output and env
+                # default — required for SWE-bench / multi-source.
+                (getattr(task, "source_name", None) or "").strip()
+                or str(translation.get("source_name") or "").strip()
                 or str(getattr(self.tool_gateway.settings, "knowledge_source_name", "") or "").strip()
                 or None
             )
@@ -7813,21 +7877,38 @@ class PrimaryOrchestrator:
         """Resolve the active knowledge source path on disk.
 
         Priority chain (mirrors _resolve_develop_repo_url):
-        1. task.translation_json["source_path"] — set by LLM source router
+        1. task.source_name — explicit registry override (SWE-bench
+           harness, multi-source UI). Looked up via repository_registry.
+           Without this, the resolver fell back to settings and the
+           pipeline targeted the wrong repo on benchmark runs.
+        2. task.translation_json["source_path"] — set by LLM source router
            when KB selected a specific source from knowledge_source_specs.
            This is the SAME path used for sandbox setup, so per-file
            context lookups must use it too — otherwise context fetches
            miss and fall back to KB search (cc_agent), wasting 60-180s
            per file.
-        2. settings.knowledge_source_path — global fallback for
+        3. settings.knowledge_source_path — global fallback for
            single-source setups.
         """
-        if task is not None and isinstance(task.translation_json, dict):
-            translation_path = str(task.translation_json.get("source_path") or "").strip()
-            if translation_path:
-                p = Path(translation_path)
-                if p.is_dir():
-                    return p
+        if task is not None:
+            explicit_source = (getattr(task, "source_name", None) or "").strip()
+            if explicit_source:
+                try:
+                    from app.services.repository_registry import resolve_path_by_name
+
+                    resolved = resolve_path_by_name(explicit_source)
+                    if resolved:
+                        p = Path(resolved)
+                        if p.is_dir():
+                            return p
+                except Exception:  # noqa: BLE001
+                    pass
+            if isinstance(task.translation_json, dict):
+                translation_path = str(task.translation_json.get("source_path") or "").strip()
+                if translation_path:
+                    p = Path(translation_path)
+                    if p.is_dir():
+                        return p
         path_str = str(getattr(self.tool_gateway.settings, "knowledge_source_path", "") or "").strip()
         if not path_str:
             return None

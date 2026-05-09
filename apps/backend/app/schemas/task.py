@@ -21,6 +21,20 @@ class TaskCreateRequest(BaseModel):
     # path resolution chain (env / settings.knowledge_source_path) and
     # behaves bytewise-identically to the pre-multi-origin codebase.
     source_name: str | None = Field(default=None, min_length=1, max_length=64)
+    # Optional scenario override used by the SWE-bench harness. Long
+    # problem statements naturally contain words like "complete" / "done"
+    # / "fix" that trip the writeback classifier, so the harness needs to
+    # explicitly force jira_issue_develop. Only honored when caller
+    # provides it; chat / UI callers leave it None and the regex
+    # classifier runs as before.
+    scenario_override: str | None = Field(default=None, min_length=1, max_length=64)
+    # Bypass the Jira issue prefetch step that the develop pipeline
+    # otherwise runs at the start of planning. Set this when the request
+    # text describes a real bug / feature but the source-of-truth ticket
+    # lives somewhere other than Jira (SWE-bench harness, GitHub-issue
+    # feeders, ad-hoc internal requests). The pipeline still treats it
+    # as a develop scenario; it just skips the Jira HTTP fetch.
+    skip_jira_prefetch: bool = Field(default=False)
 
 
 class TaskRollbackRequest(BaseModel):
