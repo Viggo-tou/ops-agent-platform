@@ -3044,9 +3044,18 @@ class PrimaryOrchestrator:
                 # this, the LLM has been hallucinating API surfaces (e.g.
                 # invented SessionManager method names) and producing
                 # patches that don't match the real code's contracts.
+                #
+                # NOTE (Tier 1 wiring): the previous implementation
+                # blindly injected every must_touch + top-5 candidate
+                # at 50KB each, which bypassed _gather_codegen_context's
+                # evidence_pack cap and re-bloated the prompt to 111k+
+                # bytes (the 0/4 SWE-bench root cause). We now
+                # (a) skip files already in context_files (gather
+                #    already had them via Strategy 0/2/3), and
+                # (b) re-apply build_evidence_pack across the merged
+                #    set so the absolute byte/file caps still hold.
                 _inject_paths: list[str] = []
                 _inject_paths.extend(evidence.must_touch_files or [])
-                # Top candidates (capped) — useful supporting context.
                 for cf in (evidence.candidate_files or [])[:5]:
                     if cf not in _inject_paths:
                         _inject_paths.append(cf)
@@ -3063,12 +3072,73 @@ class PrimaryOrchestrator:
                     )
                     if body is None:
                         continue
-                    # 50KB per file cap to avoid prompt bloat
-                    if len(body) > 50_000:
-                        body = body[:50_000]
                     context_files[norm_rel] = body
                     _injected_count += 1
                     _injected_bytes += len(body)
+
+                if context_files:
+                    # Re-apply evidence_pack budget: gather's pack used
+                    # plan.must_touch (priority 1); these evidence-side
+                    # files come in at priority 5 (lower) so plan files
+                    # win when the budget is tight.
+                    try:
+                        from app.services.evidence_pack import (
+                            EvidencePackBudget,
+                            FileEvidence,
+                            build_evidence_pack,
+                        )
+
+                        env = (
+                            self.tool_gateway.settings
+                            if self.tool_gateway is not None
+                            else None
+                        )
+                        pack_budget = EvidencePackBudget(
+                            max_files=int(getattr(env, "evidence_pack_max_files", 6) or 6),
+                            max_total_bytes=int(
+                                getattr(env, "evidence_pack_max_total_bytes", 18_000)
+                                or 18_000
+                            ),
+                            max_per_file_bytes=int(
+                                getattr(env, "evidence_pack_max_per_file_bytes", 6_000)
+                                or 6_000
+                            ),
+                        )
+                        priority_keepers = {
+                            self._normalize_codegen_path(p) for p in (
+                                getattr(plan, "must_touch_files", None) or []
+                            )
+                        }
+                        merged_inputs = [
+                            FileEvidence(
+                                path=path,
+                                content=content,
+                                priority=1 if path in priority_keepers else 5,
+                            )
+                            for path, content in context_files.items()
+                        ]
+                        merged_pack = build_evidence_pack(merged_inputs, pack_budget)
+                        # Replace the dict in-place with the budgeted set.
+                        context_files = {
+                            ev.path: ev.content for ev in merged_pack.included_files
+                        }
+                        # Re-count what made it through for the event log.
+                        _injected_count = sum(
+                            1
+                            for path in (
+                                p for p in [self._normalize_codegen_path(x) for x in _inject_paths] if p
+                            )
+                            if path in context_files
+                        )
+                        _injected_bytes = sum(
+                            len(c)
+                            for path, c in context_files.items()
+                            if path
+                            in {self._normalize_codegen_path(x) for x in _inject_paths}
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+
                 if _injected_count > 0:
                     pipeline_state["context_file_paths"] = list(context_files)
                     pipeline_state["context_files"] = context_files
