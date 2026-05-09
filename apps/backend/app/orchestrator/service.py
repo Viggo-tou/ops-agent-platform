@@ -4312,9 +4312,13 @@ class PrimaryOrchestrator:
                     # Option A: feature_presence repair loop. Mirrors the
                     # compile-repair pattern — when the gate rejects, build
                     # a focused repair prompt listing what's missing and
-                    # re-call codegen. Bounded by MAX_FP_REPAIR rounds
-                    # (default 2). After exhaustion, fail-close.
-                    MAX_FP_REPAIR = 2
+                    # re-call codegen. Bounded by MAX_FP_REPAIR rounds.
+                    # Was 2; lowered to 1 because Tier 1.3 acceptance_check
+                    # (when wired) provides stronger semantic gating, and
+                    # observed: round 2 of feature_presence repair almost
+                    # never recovers from a round-1 fail. Saves ~7min per
+                    # task on the failure path. After exhaustion, fail-close.
+                    MAX_FP_REPAIR = 1
                     presence = None
                     for fp_round in range(MAX_FP_REPAIR + 1):  # initial + N repairs
                         diff_text = pipeline_state.get("diff") or ""
