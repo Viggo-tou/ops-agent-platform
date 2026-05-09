@@ -852,6 +852,23 @@ async def _text_stream_to_events(
             yield ("text", chunk)
 
 
+def _wire_name_to_tool_name(wire_name: str) -> str:
+    """Translate the on-the-wire function name back to the registry name.
+
+    OpenAI (and Anthropic) restrict tool names to ``^[a-zA-Z0-9_-]+$``,
+    so dots in ``mcp.<server>.<tool>`` aren't allowed in the tools array.
+    On the wire we use ``mcp__<server>__<tool>``; the gateway / registry
+    still keeps the canonical dotted form.
+    """
+    if not wire_name.startswith("mcp__"):
+        return wire_name
+    parts = wire_name.split("__", 2)
+    if len(parts) != 3:
+        return wire_name
+    _, server, tool = parts
+    return f"mcp.{server}.{tool}"
+
+
 def _collect_mcp_tools_openai_format() -> list[dict]:
     try:
         from app.services.mcp_client import get_mcp_client
@@ -873,7 +890,7 @@ def _collect_mcp_tools_openai_format() -> list[dict]:
                     {
                         "type": "function",
                         "function": {
-                            "name": f"mcp.{server_name}.{tool_name}",
+                            "name": f"mcp__{server_name}__{tool_name}",
                             "description": tool.get("description") or "",
                             "parameters": schema,
                         },
@@ -926,6 +943,12 @@ _CHAT_TOOL_USE_MAX_ITERATIONS = 5
 
 def _execute_chat_tool_blocking(tool_name: str, arguments: dict) -> str:
     from app.tools.gateway import ToolGateway
+
+    # The model received tools advertised with the wire-safe form
+    # (mcp__<server>__<tool>) because OpenAI/Anthropic reject dots in
+    # function names. The registry / gateway use the canonical dotted
+    # form, so translate here before dispatch.
+    tool_name = _wire_name_to_tool_name(tool_name)
 
     task_id = uuid.uuid4().hex
     db: Session = SessionLocal()
@@ -1133,7 +1156,10 @@ async def _stream_openai_compat_with_tools(
                 except json.JSONDecodeError:
                     parsed = {}
                 args = parsed if isinstance(parsed, dict) else {}
-                yield ("tool_call", {"id": tc_id, "name": name, "arguments": args})
+                # UI sees the canonical mcp.<server>.<tool> form even
+                # though the model received the wire-safe mcp__ form.
+                display_name = _wire_name_to_tool_name(name)
+                yield ("tool_call", {"id": tc_id, "name": display_name, "arguments": args})
                 result_str = await asyncio.to_thread(
                     _execute_chat_tool_blocking, name, args
                 )

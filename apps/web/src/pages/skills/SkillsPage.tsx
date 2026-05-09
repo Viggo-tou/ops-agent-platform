@@ -39,7 +39,7 @@ type UsageStats = {
   failed: number;
   success_rate: number;
   window_days: number;
-  per_tool: UsageEntry[];
+  by_tool: UsageEntry[];
 };
 
 export function SkillsPage() {
@@ -219,7 +219,7 @@ export function SkillsPage() {
               : `成功率 ${(usage.success_rate * 100).toFixed(1)}% (${usage.succeeded}/${usage.total_invocations})`}
           </span>
         </header>
-        {usage && usage.per_tool.length > 0 ? (
+        {usage && usage.by_tool.length > 0 ? (
           <table className="skills-tool-table">
             <thead>
               <tr>
@@ -231,7 +231,7 @@ export function SkillsPage() {
               </tr>
             </thead>
             <tbody>
-              {usage.per_tool.map((row) => (
+              {usage.by_tool.map((row) => (
                 <tr key={row.tool_name}>
                   <td><code>{row.tool_name}</code></td>
                   <td>{row.total}</td>

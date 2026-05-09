@@ -467,6 +467,7 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
               ...prev,
               status: "running",
               latest_result_json: {
+                ...(prev.latest_result_json ?? {}),
                 kind: "chat_answer",
                 answer: visibleAnswerSoFar,
               },
@@ -488,6 +489,7 @@ ${previousAssistant.slice(0, 3000)}${FOLLOW_UP_MARKER}${message}`;
             ? {
                 ...prev,
                 latest_result_json: {
+                  ...(prev.latest_result_json ?? {}),
                   kind: "chat_answer",
                   answer: visibleAnswerSoFar,
                 },
