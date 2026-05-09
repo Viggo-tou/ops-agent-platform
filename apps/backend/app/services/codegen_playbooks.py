@@ -47,7 +47,9 @@ from typing import Iterable
 
 logger = logging.getLogger(__name__)
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+# app/services/codegen_playbooks.py is 4 levels deep relative to repo
+# root (repo/apps/backend/app/services/codegen_playbooks.py).
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 _CODEGEN_DIR = _REPO_ROOT / "docs" / "agent-playbooks" / "codegen"
 
 # Language buckets we currently recognize. Anything else falls back to

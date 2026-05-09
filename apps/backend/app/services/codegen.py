@@ -371,16 +371,72 @@ class CodeGenerator:
         """Compose the full codegen system prompt.
 
         Layers (in order, most-context-bearing last):
-          1. Library hints block (Leg 1: pin OSMDroid vs Google Maps etc.)
-          2. The base prompt (CODEGEN_SYSTEM_PROMPT or variant)
-          3. Kotlin / Compose / multi-file augmentations from
+          1. Codegen playbooks (Tier 1.1) — language- and file-glob-
+             keyed structural rules (Python edit rules, diff
+             discipline, etc.). Playbooks land first so they're closest
+             to the system role anchor and least likely to be
+             attention-faded by long context.
+          2. Library hints block (Leg 1: pin OSMDroid vs Google Maps etc.)
+          3. The base prompt (CODEGEN_SYSTEM_PROMPT or variant)
+          4. Kotlin / Compose / multi-file augmentations from
              ``_augment_prompt_for_kotlin``
         """
+        playbook_block = self._codegen_playbooks_block(context_files)
         hints = self._library_hints_block()
         kotlin_augmented = self._augment_prompt_for_kotlin(base_prompt, context_files)
+        layers: list[str] = []
+        if playbook_block:
+            layers.append(playbook_block)
         if hints:
-            return hints + "\n\n" + kotlin_augmented
-        return kotlin_augmented
+            layers.append(hints)
+        layers.append(kotlin_augmented)
+        return "\n\n".join(layers)
+
+    def _codegen_playbooks_block(
+        self, context_files: dict[str, str] | None
+    ) -> str:
+        """Pull codegen playbooks relevant to the active task.
+
+        Best-effort — never let a playbook lookup error abort codegen.
+        Language is inferred from the first file's extension when
+        present; otherwise falls back to "any" so only high-priority
+        global playbooks are included.
+        """
+        try:
+            from app.services.codegen_playbooks import (
+                rebuild_index,
+                select_playbooks,
+                render_for_prompt,
+            )
+
+            # The index is process-wide; rebuild once on first call so
+            # subsequent codegen invocations reuse it. We accept the
+            # rebuild cost (a few hundred μs) to avoid coupling to a
+            # specific startup hook in this commit.
+            rebuild_index()
+            language = "any"
+            file_paths: list[str] = []
+            if context_files:
+                file_paths = list(context_files.keys())
+                first_ext = Path(file_paths[0]).suffix.lower() if file_paths else ""
+                language = {
+                    ".py": "python",
+                    ".kt": "kotlin",
+                    ".java": "java",
+                    ".ts": "typescript",
+                    ".tsx": "typescript",
+                    ".js": "javascript",
+                    ".jsx": "javascript",
+                    ".go": "go",
+                    ".rs": "rust",
+                }.get(first_ext, "any")
+            selected = select_playbooks(language=language, file_paths=file_paths)
+            if not selected:
+                return ""
+            rendered = render_for_prompt(selected)
+            return f"### Codegen playbooks\n\n{rendered}"
+        except Exception:  # noqa: BLE001
+            return ""
 
     @staticmethod
     def _validate_changed_files_within_allowed(
