@@ -1,6 +1,80 @@
 # Session Handoff
 
-Last updated: 2026-05-09
+Last updated: 2026-05-10
+
+## Session 2026-05-10: Harness V1 Tier 1.5 + Tier 2 (mid-tier window) ✅
+
+**Headline**: Five commits on `feat/harness-v1`. Tier 1.5 Aider format, Tier 1.3 planner closure (acceptance_tests in plan schema + sanitization + instructions), Tier 2 AST structural truncation (fixes the django/db big-file 0-diff regression observed on 2026-05-09), Tier 2 categorical context budgeter (per-provider profile registry). 131 unit tests across the new modules. Backend NOT yet restarted — the changes are on disk but the running process is still on commit `841cbf3`.
+
+### Branch state
+
+| branch | head | status |
+|---|---|---|
+| `checkpoint/pre-reclassify` | `5c40842` | unchanged this session |
+| `feat/postgres` | `8ce35d7` | unchanged this session |
+| **`feat/harness-v1`** | `950d577` | Tier 1.5 Aider + Tier 1.3 planner + Tier 2 AST + Tier 2 budgeter + STAGE_LOG. Backend running on older code (`841cbf3`); restart gates the next validation. |
+
+### Today's commits (`feat/harness-v1`)
+
+| Commit | Item |
+|---|---|
+| `7a14b02` | Tier 1.5 — Aider search/replace format wired into codegen (system prompt, dispatch, parsing, retries, settings) |
+| `45ca755` | Tier 1.3 — planner emits acceptance_tests (schema + sanitization + instructions) |
+| `b5c3c54` | Tier 2 — AST-aware structural truncation for big Python files |
+| `764d3f2` | Tier 2 — per-model categorical context budget profiles |
+| `950d577` | docs — STAGE_LOG entry for Stage 31 |
+
+### Validation v2 final tally
+
+| Task | Result | Reason |
+|---|---|---|
+| 1 — astropy-14995 | 2049 char diff produced | Real edit; rejected at feature_presence (added regression test instead of fix) |
+| 2 — django-11283 | 1496 char diff produced | Looks correct; failed sandbox apply (git add timeout — fixed in `c546151`) |
+| 3 — django-11797 | 0 char diff | django/db/models/sql/query.py 95KB → 6KB byte truncation kept only imports. **Fixed by `b5c3c54` (AST truncation).** |
+| 4 — django-12284 | hung 21h, then orphaned | Backend was restarted out from under the in-flight task; predictions.jsonl shows 0 chars. Treated as failed. |
+
+Net: 0/4 baseline → 2/4 substantive diffs under Tier 1. AST truncation + Aider format + per-model budgets are the structural fixes that should lift this on the next run.
+
+### What's running right now
+
+- Backend: same PID, uptime ~ 8h. Code through commit `841cbf3` (5 newer commits not yet active; restart needed).
+- No active SWE-bench run.
+
+### Deferred to next session (priority order)
+
+1. **Restart backend on `feat/harness-v1` HEAD `950d577`** and re-run the same 4 SWE-bench tasks. Compare task 3 diff length (was 0 with byte truncation, expect non-zero with AST). Compare task 1/2 with Aider format (expect higher first-attempt success per Aider published numbers).
+2. **claude_code reference validation run** on the same 4 tasks under `OPS_AGENT_CODEGEN_PROVIDER=claude_code`. Gives the harness-contribution delta per the harness-first product strategy memory.
+3. **(User) install Docker, run `swebench.harness.run_evaluation`** against any post-restart predictions.jsonl. First quantitative SWE-bench-Lite pass rate.
+4. **Tier 4-H lightweight tool-use loop in codegen** (read_file / search_symbol / list_directory). Generalizes to any model. The `codegen_react_loop.py` already covers symbol verification; extension is to allow the model to fetch additional file content during codegen.
+5. **Tier 3 layered RAG + summary tree** — multi-session work.
+6. **Postgres Phase 2** (FTS5 → tsvector cutover). Lives on `feat/postgres` branch; cross-branch scope.
+
+### Known operational notes (carried from 2026-05-09 + new)
+
+- Backend `.env`: `OPS_AGENT_RESUMABILITY_ENABLED=false`, `OPS_AGENT_KNOWLEDGE_SYNTHESIS_ENABLED=false`, `OPS_AGENT_KNOWLEDGE_RETRIEVAL_CACHE_ENABLED=false`, `OPS_AGENT_CLAUDE_CODE_TIMEOUT_SECONDS=600`, `OPS_AGENT_CODEGEN_PROVIDER=deepseek`, `OPS_AGENT_PLANNER_PROVIDER=claude_code`.
+- New: `OPS_AGENT_CODEGEN_OUTPUT_FORMAT` (default `auto`; auto picks aider_blocks for deepseek/openai, unified_diff for others). Force `unified_diff` for A/B vs Aider on the same task set.
+- `OPS_AGENT_MCP_SERVERS_JSON` populated with 6 servers (filesystem / memory / sequential-thinking / fetch / git / time). All connected.
+- 18 commits on `feat/harness-v1` since `checkpoint/pre-reclassify`.
+
+### To pick this up next session
+
+```powershell
+# 1. Restart the backend (foreground; check logs for the port bind)
+git switch feat/harness-v1
+git log --oneline -1   # expect 950d577
+powershell -ExecutionPolicy Bypass -File .\scripts\start-backend.ps1
+
+# 2. Re-run the same 4 SWE-bench tasks
+python apps/backend/scripts/run_swebench_lite.py `
+  --subset apps/backend/tests/benchmarks/swebench_lite_subset_50.jsonl `
+  --limit 4 --parallel 1
+
+# 3. Optionally launch claude_code reference run after the deepseek run
+$env:OPS_AGENT_CODEGEN_PROVIDER = "claude_code"
+# (restart backend) and re-run step 2 with a fresh --run-id label.
+```
+
+---
 
 ## Session 2026-05-09: Harness V1 — DeepSeek agent harness Tier 1 + SWE-bench harness ✅
 
