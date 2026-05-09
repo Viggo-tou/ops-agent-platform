@@ -446,19 +446,24 @@ class ExecutionSandbox:
 
         after_sha = before_sha
         if commit:
+            # Bumped from 10s → 60s. On large repos (django, sympy) `git
+            # add -A` can take 15-30s the first time it scans the working
+            # tree, especially under cold filesystem cache. Validation
+            # task 2 (django-11283, 2026-05-09) tripped the 10s budget
+            # and lost a 1496-char patch even though codegen succeeded.
             subprocess.run(
                 ["git", "add", "-A"],
                 capture_output=True,
                 text=True,
                 cwd=str(self.sandbox_dir),
-                timeout=10,
+                timeout=60,
             )
             commit_result = subprocess.run(
                 ["git", "commit", "-m", commit_message, "--allow-empty"],
                 capture_output=True,
                 text=True,
                 cwd=str(self.sandbox_dir),
-                timeout=10,
+                timeout=30,
             )
             if commit_result.returncode == 0:
                 sha_result = subprocess.run(
