@@ -4588,6 +4588,115 @@ class PrimaryOrchestrator:
                     {"error": str(exc)[:400]},
                 )
 
+        # --- Acceptance check (Tier 1.3) — structural gate using planner-
+        # declared acceptance_tests. Stronger than feature_presence's
+        # token-level matching (catches "diff added a comment with the
+        # word but no real implementation"). Permissive when the plan
+        # doesn't include acceptance_tests yet (current planners don't
+        # emit them; plan-prompt change ships separately).
+        if not pipeline_state.get("acceptance_check_done"):
+            try:
+                plan_dict = task.plan_json if isinstance(task.plan_json, dict) else {}
+                raw_tests = plan_dict.get("acceptance_tests") or []
+                if isinstance(raw_tests, list) and raw_tests:
+                    from app.services.acceptance_check import (
+                        AcceptanceTest,
+                        evaluate_acceptance,
+                    )
+
+                    parsed_tests = []
+                    for entry in raw_tests:
+                        if not isinstance(entry, dict):
+                            continue
+                        kind = str(entry.get("kind") or "").strip()
+                        if not kind:
+                            continue
+                        parsed_tests.append(
+                            AcceptanceTest(
+                                kind=kind,
+                                pattern=str(entry.get("pattern") or ""),
+                                file=entry.get("file") or None,
+                                function=entry.get("function") or None,
+                                scope=entry.get("scope") or None,
+                                rationale=str(entry.get("rationale") or ""),
+                            )
+                        )
+                    diff_text = pipeline_state.get("diff") or ""
+                    report = evaluate_acceptance(diff_text, parsed_tests)
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=(
+                            EventType.TOOL_FAILED
+                            if not report.passed
+                            else EventType.TOOL_SUCCEEDED
+                        ),
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="acceptance_check.evaluate",
+                        message=(
+                            "acceptance_check passed: "
+                            f"{len(report.results)} tests"
+                            if report.passed
+                            else "acceptance_check failed: "
+                            + " | ".join(
+                                f"[{r.test.kind}] {r.reason}"
+                                for r in report.results
+                                if not r.matched
+                            )
+                        ),
+                        payload={
+                            "passed": report.passed,
+                            "results": [
+                                {
+                                    "kind": r.test.kind,
+                                    "matched": r.matched,
+                                    "reason": r.reason,
+                                    "rationale": r.test.rationale,
+                                }
+                                for r in report.results
+                            ],
+                        },
+                    )
+                    if not report.passed:
+                        self._fail_develop_pipeline(
+                            task=task,
+                            event_type=EventType.REVIEW_FAILED,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            message=(
+                                "Acceptance gate failed: "
+                                + " | ".join(
+                                    f"[{r.test.kind}] {r.reason}"
+                                    for r in report.results
+                                    if not r.matched
+                                )
+                            ),
+                            payload={
+                                "plan_id": plan.plan_id,
+                                "acceptance": [
+                                    {
+                                        "kind": r.test.kind,
+                                        "matched": r.matched,
+                                        "reason": r.reason,
+                                    }
+                                    for r in report.results
+                                ],
+                            },
+                        )
+                        return
+                pipeline_state["acceptance_check_done"] = True
+                self._preserve_develop_pipeline_state(
+                    task=task, pipeline_state=pipeline_state
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._workspace_append_audit(
+                    task,
+                    "acceptance_check.errored",
+                    {"error": str(exc)[:400]},
+                )
+
         # --- SymbolGraph ref-validity gate (post-codegen, pre-compile) ---
         # Catches the v9 P69-17 failure class: codegen adds a reference
         # (e.g. AndroidManifest @string/google_maps_api_key) without adding
