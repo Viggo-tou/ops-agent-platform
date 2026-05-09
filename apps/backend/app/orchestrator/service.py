@@ -3601,6 +3601,79 @@ class PrimaryOrchestrator:
                 {"error": str(exc)[:400]},
             )
 
+        # Patch-budget pre-apply gate (Tier 1.2): structural budget on
+        # files-changed / lines-added / lines-removed / new-imports /
+        # new-files. Catches the "model rewrote 30 files for a one-line
+        # bug" failure mode before we waste a compile cycle. Pure
+        # diff parsing, no LLM, no DB.
+        try:
+            from app.services.patch_budget import (
+                PatchBudget,
+                evaluate_patch_budget,
+            )
+
+            patch_budget = PatchBudget()
+            budget_report = evaluate_patch_budget(diff, patch_budget)
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=(
+                    EventType.TOOL_FAILED
+                    if not budget_report.passed
+                    else EventType.TOOL_SUCCEEDED
+                ),
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="patch_budget.evaluate",
+                message=(
+                    "patch_budget passed: "
+                    + ", ".join(
+                        f"{k}={v}"
+                        for k, v in budget_report.metrics.items()
+                        if k != "per_file"
+                    )
+                    if budget_report.passed
+                    else "patch_budget violated: "
+                    + " | ".join(budget_report.violations)
+                ),
+                payload={
+                    "violations": budget_report.violations,
+                    "metrics": {
+                        k: v for k, v in budget_report.metrics.items() if k != "per_file"
+                    },
+                },
+            )
+            if not budget_report.passed:
+                self._fail_develop_pipeline(
+                    task=task,
+                    event_type=EventType.REVIEW_FAILED,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    message=(
+                        "Patch budget exceeded: "
+                        + " | ".join(budget_report.violations)
+                    ),
+                    payload={
+                        "plan_id": plan.plan_id,
+                        "patch_budget": {
+                            "violations": budget_report.violations,
+                            "metrics": {
+                                k: v
+                                for k, v in budget_report.metrics.items()
+                                if k != "per_file"
+                            },
+                        },
+                    },
+                )
+                return
+        except Exception as exc:  # noqa: BLE001
+            self._workspace_append_audit(
+                task,
+                "patch_budget.errored",
+                {"error": str(exc)[:400]},
+            )
+
         files_changed = codegen_result.get("files_changed")
         pipeline_state.setdefault("files_changed", files_changed if isinstance(files_changed, list) else [])
         pipeline_state.setdefault("codegen_provider", str(codegen_result.get("provider_name") or "unknown"))
