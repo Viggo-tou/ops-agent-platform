@@ -3090,7 +3090,7 @@ class PrimaryOrchestrator:
                             build_evidence_pack,
                         )
                         from app.services.symbol_hints import (
-                            extract_candidate_symbols,
+                            extract_keep_symbols_for_files,
                         )
 
                         env = (
@@ -3121,9 +3121,8 @@ class PrimaryOrchestrator:
                             _hint_text_parts.append(
                                 str(task.translation_json.get("objective") or "")
                             )
-                        _symbol_hints = extract_candidate_symbols(
-                            "\n".join(_hint_text_parts),
-                            file_contents=context_files,
+                        _symbol_hints = extract_keep_symbols_for_files(
+                            "\n".join(_hint_text_parts), context_files,
                         )
                         merged_inputs = [
                             FileEvidence(
@@ -6321,7 +6320,7 @@ class PrimaryOrchestrator:
             FileEvidence,
             build_evidence_pack,
         )
-        from app.services.symbol_hints import extract_candidate_symbols
+        from app.services.symbol_hints import extract_keep_symbols_for_files
 
         env = self.tool_gateway.settings if self.tool_gateway is not None else None
         budget = budget_for_codegen_provider(
@@ -6329,18 +6328,19 @@ class PrimaryOrchestrator:
         )
 
         # Pin function/method names mentioned in the issue so the AST
-        # truncator keeps those bodies whole. Regression on 2026-05-10:
-        # `_arithmetic_mask` was elided as a "big body" → DeepSeek
-        # emitted EVIDENCE_GAP. Pinning fixes that without raising the
-        # per-file byte cap.
+        # truncator keeps those bodies whole. The issue often does NOT
+        # name the function directly (astropy-14995 says "mask
+        # propagation fails" but never says `_arithmetic_mask`); the
+        # extractor cross-references issue concept words against AST-
+        # parsed function names in candidate files to bridge the gap.
         issue_text_parts = []
         if isinstance(getattr(task, "request_text", None), str):
             issue_text_parts.append(task.request_text)
         if isinstance(task.translation_json, dict):
             issue_text_parts.append(str(task.translation_json.get("normalized_request") or ""))
             issue_text_parts.append(str(task.translation_json.get("objective") or ""))
-        symbol_hints = extract_candidate_symbols(
-            "\n".join(issue_text_parts), file_contents=context_files
+        symbol_hints = extract_keep_symbols_for_files(
+            "\n".join(issue_text_parts), context_files
         )
 
         evidence_inputs = [

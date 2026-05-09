@@ -1,7 +1,10 @@
 """Tests for symbol_hints — candidate symbol extraction (Tier 2)."""
 from __future__ import annotations
 
-from app.services.symbol_hints import extract_candidate_symbols
+from app.services.symbol_hints import (
+    extract_candidate_symbols,
+    extract_keep_symbols_for_files,
+)
 
 
 def test_extracts_underscore_prefixed_name():
@@ -87,3 +90,85 @@ def test_minimum_length_3():
     # Length-2 names dropped.
     assert "_x" not in hints
     assert "_y" not in hints
+
+
+# --- AST cross-reference (regression: astropy-14995 on 2026-05-10) ----------
+
+
+def test_keep_symbols_indirect_concept_match():
+    """Issue text never names the function, but mentions 'mask
+    propagation'. Cross-referencing against the file's AST surfaces
+    `_arithmetic_mask` because its name contains 'mask'."""
+    issue = "NDDataRef mask propagation fails when one operand has no mask."
+    files = {
+        "ndarithmetic.py": (
+            "class NDArithmeticMixin:\n"
+            "    def add(self, other):\n"
+            "        return self._arithmetic_mask(other)\n"
+            "    def _arithmetic_mask(self, other):\n"
+            "        return self.mask | other.mask\n"
+            "    def unrelated_helper(self):\n"
+            "        return None\n"
+        ),
+    }
+    hints = extract_keep_symbols_for_files(issue, files)
+    assert "_arithmetic_mask" in hints
+    assert "unrelated_helper" not in hints
+
+
+def test_keep_symbols_includes_direct_and_indirect():
+    """Both direct (issue mentions `_helper`) and indirect (function
+    name contains issue word) should be merged in result."""
+    issue = "Fix the `_helper` and the propagate logic."
+    files = {
+        "x.py": (
+            "def _helper(): pass\n"
+            "def propagate_mask(): pass\n"
+            "def boring(): pass\n"
+        ),
+    }
+    hints = extract_keep_symbols_for_files(issue, files)
+    assert "_helper" in hints
+    assert "propagate_mask" in hints
+    assert "boring" not in hints
+
+
+def test_keep_symbols_empty_files_uses_direct_only():
+    issue = "Fix `_apply` method."
+    hints = extract_keep_symbols_for_files(issue, {})
+    assert hints == ["_apply"]
+
+
+def test_keep_symbols_skips_non_python():
+    issue = "fix the mask routine"
+    files = {
+        "Foo.kt": "fun maskHelper() { }\n",
+        "ok.py": "def maskHelper(): pass\n",
+    }
+    hints = extract_keep_symbols_for_files(issue, files)
+    assert "maskHelper" in hints  # only from .py
+
+
+def test_keep_symbols_handles_syntax_error_gracefully():
+    issue = "fix the mask thing"
+    files = {"bad.py": "this is not python ###"}
+    # Should not raise; returns empty (no parseable functions).
+    hints = extract_keep_symbols_for_files(issue, files)
+    assert hints == []
+
+
+def test_keep_symbols_caps_total_at_8():
+    issue = "fix the foo handler logic"
+    files = {
+        "x.py": "\n".join(f"def foo_handler_{i}(): pass" for i in range(20))
+    }
+    hints = extract_keep_symbols_for_files(issue, files)
+    assert len(hints) <= 8
+
+
+def test_keep_symbols_filters_obvious_stopwords():
+    """Pure stopwords (the/this/and/etc) should not produce any pins."""
+    issue = "the and this when from with that into"
+    files = {"x.py": "def the_helper(): pass\ndef and_routine(): pass\n"}
+    hints = extract_keep_symbols_for_files(issue, files)
+    assert hints == []

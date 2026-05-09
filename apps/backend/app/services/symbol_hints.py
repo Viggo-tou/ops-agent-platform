@@ -108,3 +108,83 @@ def extract_candidate_symbols(text: str, *, file_contents: dict[str, str] | None
 
 def _backtick_names(text: str) -> set[str]:
     return {m.group(1) for m in _BACKTICK.finditer(text)}
+
+
+# Concept words: lowercase tokens 4+ chars that look like content words
+# in the issue text. Used to fuzzy-match against function names defined
+# in candidate files. The 4-char floor + stopword filter keeps "the",
+# "with", "this" out without listing every English filler.
+_CONCEPT_WORD = re.compile(r"\b([a-z][a-z]{3,})\b")
+_CONCEPT_STOPWORDS = _STOPWORDS | {
+    "above", "after", "again", "also", "another", "around", "before",
+    "below", "between", "during", "every", "first", "found", "from",
+    "further", "into", "later", "more", "most", "much", "other", "over",
+    "result", "same", "since", "then", "there", "they", "those", "though",
+    "through", "under", "very", "while", "within", "without",
+    "happens", "happen", "called", "calling", "actually", "during",
+}
+
+
+def extract_keep_symbols_for_files(
+    issue_text: str,
+    files: dict[str, str],
+) -> list[str]:
+    """Function/method names worth pinning for the codegen prompt.
+
+    Two complementary signals are unioned:
+
+    1. Direct names mentioned in the issue text (delegates to
+       :func:`extract_candidate_symbols`).
+    2. Functions defined in ``files`` whose name contains a content word
+       from the issue text. Catches the case the SWE-bench astropy
+       regression hit on 2026-05-10: the issue says ``mask propagation
+       fails`` but never names ``_arithmetic_mask`` — yet that's the
+       function the model needs to edit. Cross-referencing the file's
+       AST against the issue's concept words bridges the gap.
+
+    Pure Python; non-.py files contribute only to signal 1. Result
+    deduplicated, capped at 8 entries.
+    """
+    direct = list(extract_candidate_symbols(issue_text, file_contents=files))
+
+    if not files:
+        return direct
+
+    issue_lower = (issue_text or "").lower()
+    concept_words = {
+        w for w in _CONCEPT_WORD.findall(issue_lower)
+        if w not in _CONCEPT_STOPWORDS
+    }
+    if not concept_words:
+        return direct
+
+    indirect: list[str] = []
+    for path, content in files.items():
+        if not path.endswith(".py") or not content:
+            continue
+        # Best-effort AST parse; corrupted files are skipped silently.
+        try:
+            import ast as _ast
+
+            tree = _ast.parse(content)
+        except (SyntaxError, ValueError):
+            continue
+        for node in _ast.walk(tree):
+            if isinstance(
+                node, (_ast.FunctionDef, _ast.AsyncFunctionDef)
+            ):
+                name = node.name
+                name_lower = name.lower()
+                if any(word in name_lower for word in concept_words):
+                    indirect.append(name)
+
+    seen: set[str] = set(direct)
+    merged: list[str] = list(direct)
+    for name in indirect:
+        if name in seen:
+            continue
+        seen.add(name)
+        merged.append(name)
+        if len(merged) >= _MAX_HINTS:
+            break
+    return merged
