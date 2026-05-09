@@ -203,6 +203,32 @@ def _build_system_prompt(db: Session) -> str:
     except Exception:  # noqa: BLE001
         pass
 
+    # 3b. MCP server guidance — only when at least one server is connected,
+    #     so we don't pollute the prompt for users who haven't configured MCP.
+    #     Lists each connected server's allowed-path / scope so the LLM
+    #     doesn't try relative paths that the filesystem server rejects.
+    try:
+        from app.services.mcp_client import get_mcp_client
+        mcp_client = get_mcp_client()
+        servers = mcp_client.list_servers()
+        connected = {n: s for n, s in servers.items() if s.get("connected")}
+        if connected:
+            lines = ["", "### 可用的 MCP 工具", ""]
+            lines.append(
+                "你可以通过 OpenAI 风格 tool-use 自主调用以下 MCP 服务器的工具。"
+                "工具名形如 `mcp.<server>.<tool>` (调用时实际线路上是 `mcp__<server>__<tool>`,"
+                "由后端自动转换,你按 schema 调即可)。"
+            )
+            for name, state in connected.items():
+                lines.append(f"- **{name}**: {state.get('tool_count', 0)} 个工具")
+            lines.append("")
+            lines.append("**调用规范**(避免常见失败):")
+            lines.append("- **filesystem 工具**:`path` 参数必须是 server 配置的允许目录之内的**绝对路径**(Windows 用正斜杠,如 `D:/项目/Ops_agent_platform/README.md`)。先调 `list_allowed_directories` 确认根目录,再用 `list_directory` 找文件,**不要瞎猜路径**。")
+            lines.append("- 不要把 MCP 工具调用和 TASK_INTENT 混用 —— 工具是回答问题的手段,创建 pipeline 任务才用 TASK_INTENT。")
+            out.append("\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+
     # 4. Recent agent memories — high-confidence cross-scope items so the
     #    chat LLM benefits from past gate failures / fixes / patterns the
     #    pipeline learned. Without this, every conversation starts from a

@@ -310,6 +310,11 @@ class TaskService:
         risk_category: RiskCategory | None = None,
     ) -> list[Task]:
         stmt = select(Task).order_by(Task.created_at.desc())
+        # chat_tool_call rows are synthetic Task records created by
+        # _execute_chat_tool_blocking solely so the gateway can write a
+        # proper ToolExecution audit row (FK to Task). They are not user
+        # tasks and would otherwise spam the chat sidebar.
+        stmt = stmt.where(Task.scenario != "chat_tool_call")
         if status is not None:
             stmt = stmt.where(Task.status == status)
         if actor_role is not None:
