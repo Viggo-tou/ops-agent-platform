@@ -5937,12 +5937,44 @@ class PrimaryOrchestrator:
 
         Always returns full file contents (required for JSON-mode codegen
         where the model must produce complete modified files for difflib).
+
+        Final output is run through evidence_pack budget enforcement so
+        codegen never receives more than ``EvidencePackBudget`` allows;
+        files beyond the budget are dropped (with a logged event) and
+        large files get per-file truncation. This is the structural
+        guard against the 0/4 SWE-bench DeepSeek result where 90-140k
+        bytes routinely overran the model's reliable codegen window.
         """
         context_files: dict[str, str] = {}
+        priority_map: dict[str, int] = {}
         source_path = self._resolve_knowledge_source_path(task)
         sandbox_dir = self._develop_sandbox_dir(task)
 
-        # --- Strategy 1 (priority): grep keywords in source tree ---
+        # Priority key: lower = more relevant. evidence_pack ranks by this
+        # before applying the budget. must_touch (planner declared edit
+        # targets) gets the highest priority, then affected_code_locations,
+        # then grep hits, then citations, then everything else.
+        # Priority is recorded only on first observation — once a file is
+        # in context_files we don't downgrade its rank.
+
+        # --- Strategy 0: must_touch_files (HIGHEST priority — planner
+        #     declared these will be edited; pin them first so the budget
+        #     never drops them in favor of context files).
+        must_touch = getattr(plan, "must_touch_files", None) or []
+        for mt_path in must_touch:
+            relative_path = self._normalize_codegen_path(mt_path)
+            if not relative_path or relative_path in context_files:
+                continue
+            content = self._read_context_file(
+                source_path=source_path,
+                sandbox_dir=sandbox_dir,
+                relative_path=relative_path,
+            )
+            if content is not None:
+                context_files[relative_path] = content
+                priority_map[relative_path] = 1
+
+        # --- Strategy 1: grep keywords in source tree ---
         grep_keywords = self._extract_grep_keywords(task)
         grep_hits: dict[str, list[int]] = {}
         if source_path and grep_keywords:
@@ -5957,6 +5989,7 @@ class PrimaryOrchestrator:
                 )
                 if full_content is not None:
                     context_files[relative_path] = full_content
+                    priority_map[relative_path] = 3
 
         # --- Strategy 2: plan locations (fill remaining slots) ---
         for location in plan.affected_code_locations:
@@ -5970,6 +6003,7 @@ class PrimaryOrchestrator:
             )
             if content is not None:
                 context_files[relative_path] = content
+                priority_map[relative_path] = 2
 
         # --- Strategy 3: knowledge citations from the planning phase ---
         # Fix for tasks where the request describes the change conceptually
@@ -5993,27 +6027,67 @@ class PrimaryOrchestrator:
                 )
                 if content is not None:
                     context_files[relative_path] = content
+                    priority_map[relative_path] = 4
 
-        # --- Strategy 4: must_touch_files (guarantee full file context) ---
-        # The planner declares which files MUST be modified. Earlier strategies
-        # may miss these if grep keywords don't match or affected_code_locations
-        # is empty.  Reading them here ensures codegen always receives the
-        # complete file contents it needs — the same quality of context that a
-        # human-written spec would provide.
-        must_touch = getattr(plan, "must_touch_files", None) or []
-        for mt_path in must_touch:
-            relative_path = self._normalize_codegen_path(mt_path)
-            if not relative_path or relative_path in context_files:
-                continue
-            content = self._read_context_file(
-                source_path=source_path,
-                sandbox_dir=sandbox_dir,
-                relative_path=relative_path,
+        # Strategy 4 (must_touch fallback) was inlined as Strategy 0
+        # above so its files claim priority before grep / plan-location
+        # fills any remaining slots.
+
+        if not context_files:
+            return context_files
+
+        # Apply evidence_pack budget. Bounds total bytes, file count, and
+        # per-file size so codegen never sees more than the configured
+        # window. Without this guard a multi-file SWE-bench task routinely
+        # injected 90-140k bytes — well past DeepSeek's reliable codegen
+        # window — and produced 0/4 passes.
+        from app.services.evidence_pack import (
+            EvidencePackBudget,
+            FileEvidence,
+            build_evidence_pack,
+        )
+
+        env = self.tool_gateway.settings if self.tool_gateway is not None else None
+        budget = EvidencePackBudget(
+            max_files=int(getattr(env, "evidence_pack_max_files", 6) or 6),
+            max_total_bytes=int(
+                getattr(env, "evidence_pack_max_total_bytes", 18_000) or 18_000
+            ),
+            max_per_file_bytes=int(
+                getattr(env, "evidence_pack_max_per_file_bytes", 6_000) or 6_000
+            ),
+        )
+
+        evidence_inputs = [
+            FileEvidence(
+                path=relative_path,
+                content=content,
+                priority=priority_map.get(relative_path, 5),
             )
-            if content is not None:
-                context_files[relative_path] = content
+            for relative_path, content in context_files.items()
+        ]
+        pack = build_evidence_pack(evidence_inputs, budget)
 
-        return context_files
+        try:
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_SUCCEEDED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.ACTION,
+                role=RoleName.ACTION,
+                tool_name="evidence_pack.build",
+                message=(
+                    f"Evidence pack built: {pack.metrics['files_included']} files / "
+                    f"{pack.metrics['bytes_used']} bytes "
+                    f"(dropped {pack.metrics['files_dropped']})."
+                ),
+                payload={**pack.metrics, "dropped": [d.path for d in pack.dropped]},
+            )
+        except Exception:  # noqa: BLE001 — never let evidence_pack telemetry break codegen
+            pass
+
+        return {ev.path: ev.content for ev in pack.included_files}
 
     def _citation_paths_from_planning_events(self, task: Task) -> list[str]:
         """Pull relative_path values from the most recent KNOWLEDGE_RETRIEVED
