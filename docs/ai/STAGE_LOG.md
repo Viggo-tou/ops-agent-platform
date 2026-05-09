@@ -1490,3 +1490,95 @@ env tweaks: codegen=deepseek, synth=deepseek, repair_max_rounds=1, codegen paral
   - Dogfood Stage A: re-run P69-17 / P69-19 with codegen self-validation enabled. Expect codegen to retry on hunk-drift failures instead of returning broken diff.
   - If Stage A doesn't materially improve dogfood pass rate: route Android tickets to canary list, focus on JS/Python tickets where LLM codegen is more reliable.
   - Backlog: B (5 review gates read final file), C (strict diff context match in sandbox.apply), D (canary policy infra).
+
+---
+
+## Stage 30 (2026-05-09 — full day) — Harness V1 spec + SWE-bench harness + Tier 1 implementation
+
+**Status:** OPEN (Tier 1 modules + wiring done; validation in flight; Aider format integration deferred)
+**Layer:** L1-L4 (model layer up to product layer)
+**Worker:** Claude (Opus 4.7) — single-driver session, no codex/deepseek dispatches today
+
+### Trigger
+After yesterday's pipeline reliability work, today is the day to (a) get a real SWE-bench-Lite number for our codegen, (b) refactor toward a model-agnostic agent harness so DeepSeek (and any other API model) can produce useful patches.
+
+### Scope shipped (chronological)
+
+**Morning — operational reliability + MCP**
+
+| commit | summary |
+|---|---|
+| `939cd1c` | A.1-3: cooperative task cancel (TaskCancelledError + watchdog request_cancel + run_pipeline_job catch) + record_event jitter + UI queued state |
+| `794f353` | B.1: MCP plumbing — client/lifespan/registry/gateway dispatch |
+| `50cfb3e` | B.1: chat tool-use loop (OpenAI + DeepSeek format) |
+| `e5b5d6b` | B.1: chat tool-use loop (Anthropic format) — later partially reverted |
+| `4aba391` | B.1: inline tool-call UI in chat bubble |
+| `590073f` | B.2: /skills page (MCP servers + tool registry + usage) |
+| `40de170` | B.4: agent_memory injection into chat system prompt + chat tool-call audit via synthetic Task row + Anthropic tool-use revert |
+| `b29c3a7` | hotfix: wire-safe MCP tool names + flushTick preserve tool_calls + by_tool key |
+| `379d2e2` | hide chat_tool_call audit rows + system prompt advertises connected MCP servers |
+
+**Afternoon — SWE-bench harness build**
+
+| commit | summary |
+|---|---|
+| `5c40842` | SWE-bench-Lite harness (50-task subset selector, harness adapter, 11 product unblockings exposed during integration: scenario_override, skip_jira_prefetch, source_name routing fix, KnowledgeService registry awareness, KB router source_name forwarding, evidence_bundle source_name priority, TaskService retry-on-locked, watchdog action threshold 15min→30min, compileall -q, chat_tool_call sidebar filter) |
+
+**Evening — Postgres Phase 1 + harness V1 spec + Tier 1 implementation**
+
+| commit | branch | summary |
+|---|---|---|
+| `8ce35d7` | feat/postgres | Postgres Phase 1: psycopg2-binary, docker-compose, migration plan doc; SQLite remains default |
+| `4966fdd` | feat/harness-v1 | Spec: docs/ai/specs/deepseek-agent-harness-v1.md (Tier 1-4 plan, A-H additions, Aider over JSON-patch decision) |
+| `a4b71f7` | feat/harness-v1 | Tier 1.1: codegen_playbooks router + python.md + diff-discipline.md (13 tests) |
+| `983f144` | feat/harness-v1 | Tier 1.2: PatchBudget structural gate (10 tests) |
+| `3e21cc7` | feat/harness-v1 | Tier 1.3: acceptance_check evaluator (15 tests) |
+| `a86b0cb` | feat/harness-v1 | Tier 1.4: bounded relevance-ranked evidence_pack (11 tests) |
+| `e930b1c` | feat/harness-v1 | Tier 1.5: Aider search/replace format module (21 tests) |
+| `4d64db1` | feat/harness-v1 | Wire evidence_pack budget into _gather_codegen_context |
+| `741790b` | feat/harness-v1 | Wire patch_budget gate post-codegen |
+| `07901e8` | feat/harness-v1 | Wire codegen_playbooks into codegen system prompt |
+| `c9ee900` | feat/harness-v1 | MAX_FP_REPAIR 2→1 (perf, ~7min saved per failing task) |
+| `841cbf3` | feat/harness-v1 | Cap second evidence injection path with evidence_pack |
+| `d6ed6b8` | feat/harness-v1 | Wire acceptance_check into reviewer phase (permissive when plan has no acceptance_tests) |
+
+70 unit tests pass across the 5 new modules.
+
+### SWE-bench data points
+
+| run | config | result |
+|---|---|---|
+| Baseline (parallel=1, 4 tasks, before harness) | DeepSeek + dump-everything | 0/4 valid diffs (0% pass), 90-140k bytes injection caused either no-diff output or hunk drift |
+| Tier 1 validation v2 task 1 (this evening) | DeepSeek + evidence_pack capped + patch_budget + playbooks | 2049 char real diff produced; pipeline reached AWAITING_APPROVAL adjacent (rejected only at feature_presence token gate). Substantive patch (added regression test for the issue, but didn't modify the actual fix code) |
+| Tier 1 validation v2 tasks 2-4 | (in flight at session end) | tbd |
+
+The 0 → 2049 char delta is the structural fix taking effect. Whether the patch itself solves SWE-bench's FAIL_TO_PASS tests requires running the official Docker evaluator (Docker not installed on this dev machine; user will run the evaluator separately).
+
+### Strategic clarification mid-session
+
+User reframed the project goal: **the harness is the product, the model is interchangeable**. Per-Tier validation should compare DeepSeek vs Claude vs GPT under the *same* harness so we can quote "harness contribution = +X percentage points across N models". This made multi-stage codegen + per-model context budgets (Tier 2) the next priority rather than just chasing higher DeepSeek numbers.
+
+### Out of scope (deferred)
+
+- **Aider format codegen integration** — module shipped (Tier 1.5) but the codegen call paths (`_call_deepseek_once` etc.) still emit unified-diff prompts. Wiring needs a separate session because it touches `_build_prompt`, all `_call_*` methods, and response parsing. Deferred to next session.
+- **Planner emits acceptance_tests** — reviewer side wired (`d6ed6b8`) but plans don't carry the field yet. Planner-prompt change is a separate small commit next session.
+- **claude_code reference run** — same 4 tasks under `OPS_AGENT_CODEGEN_PROVIDER=claude_code` to baseline the harness contribution in isolation from model choice.
+- **Tier 2 categorical context budgeter, multi-stage codegen, symbol graph (tree-sitter)** — biggest model-agnostic wins; queued for next session.
+- **Postgres Phase 2** — FTS5 → tsvector migration. SQLite-first stays the default.
+
+### Lessons
+
+1. **Two-path injection bug** — `_gather_codegen_context` was capped, but a parallel `inject_from_evidence` step blindly added more files at 50KB each, re-bloating context to 111k. Cap had to be applied at *both* paths. (Caught at validation v2.)
+2. **Backend restart timing matters under iterative wiring** — when a config or perf commit lands during a validation run, the running backend doesn't see it. Either restart-and-resume (preserves predictions, loses in-flight task) or accept stale code in the run.
+3. **feature_presence is a token-level proxy** that catches "added a comment" placebo edits but rejects synonym-substitution real edits. acceptance_check (planner-driven structural tests) is its replacement, but only after the planner-prompt change ships and N runs validate that acceptance_check covers the same failure modes.
+4. **Path resolution off-by-one** — `parents[3]` lands at `apps/` (because we have `apps/backend/app/services/...`); needed `parents[4]` for repo root. Test would have caught this if I'd run `rebuild_index()` in the test against the real docs dir, but I used a tmp dir. Documented as a TODO: add a smoke test that exercises the shipped playbook directory.
+
+### Next session checklist (in order)
+
+1. Wait for tier 1 validation v2 tasks 2-4 to complete; review predictions.jsonl + per-task event timelines.
+2. (User) install Docker, run `swebench.harness.run_evaluation` against the validation predictions.jsonl. Get the first quantitative SWE-bench-Lite pass rate.
+3. Aider format codegen integration commit.
+4. Planner-prompt change to emit acceptance_tests.
+5. claude_code reference validation run on the same 4 tasks.
+6. Tier 2 spec implementation kickoff.
+
