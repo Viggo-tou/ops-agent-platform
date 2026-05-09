@@ -3082,8 +3082,10 @@ class PrimaryOrchestrator:
                     # files come in at priority 5 (lower) so plan files
                     # win when the budget is tight.
                     try:
+                        from app.services.codegen_model_profiles import (
+                            budget_for_codegen_provider,
+                        )
                         from app.services.evidence_pack import (
-                            EvidencePackBudget,
                             FileEvidence,
                             build_evidence_pack,
                         )
@@ -3093,16 +3095,8 @@ class PrimaryOrchestrator:
                             if self.tool_gateway is not None
                             else None
                         )
-                        pack_budget = EvidencePackBudget(
-                            max_files=int(getattr(env, "evidence_pack_max_files", 6) or 6),
-                            max_total_bytes=int(
-                                getattr(env, "evidence_pack_max_total_bytes", 18_000)
-                                or 18_000
-                            ),
-                            max_per_file_bytes=int(
-                                getattr(env, "evidence_pack_max_per_file_bytes", 6_000)
-                                or 6_000
-                            ),
+                        pack_budget = budget_for_codegen_provider(
+                            getattr(env, "codegen_provider", None), env
                         )
                         priority_keepers = {
                             self._normalize_codegen_path(p) for p in (
@@ -6297,21 +6291,17 @@ class PrimaryOrchestrator:
         # window. Without this guard a multi-file SWE-bench task routinely
         # injected 90-140k bytes — well past DeepSeek's reliable codegen
         # window — and produced 0/4 passes.
+        from app.services.codegen_model_profiles import (
+            budget_for_codegen_provider,
+        )
         from app.services.evidence_pack import (
-            EvidencePackBudget,
             FileEvidence,
             build_evidence_pack,
         )
 
         env = self.tool_gateway.settings if self.tool_gateway is not None else None
-        budget = EvidencePackBudget(
-            max_files=int(getattr(env, "evidence_pack_max_files", 6) or 6),
-            max_total_bytes=int(
-                getattr(env, "evidence_pack_max_total_bytes", 18_000) or 18_000
-            ),
-            max_per_file_bytes=int(
-                getattr(env, "evidence_pack_max_per_file_bytes", 6_000) or 6_000
-            ),
+        budget = budget_for_codegen_provider(
+            getattr(env, "codegen_provider", None), env
         )
 
         evidence_inputs = [
