@@ -1582,3 +1582,46 @@ User reframed the project goal: **the harness is the product, the model is inter
 5. claude_code reference validation run on the same 4 tasks.
 6. Tier 2 spec implementation kickoff.
 
+
+## Stage 31 (2026-05-10) — Harness V1 Tier 1.5 + Tier 2 (mid-tier window) — CLOSED-DONE
+
+**Layer**: L4 (codegen pipeline + planner schema + evidence pack budgeting)
+
+**Trigger**: User directive "等task4完成 你继续迭代 修复 开剩余任务 直到所有任务完成不要停" — execute the remaining harness V1 backlog until done. Validation v2 task 4 hung post backend-restart 21h prior; the salvage path is "treat as failed, move on".
+
+**Status**: CLOSED-DONE — four substantive feature commits landed on `feat/harness-v1`, all with green tests (131 unit tests across the new modules). Backend has not been restarted to pick the changes up; that's the gate for the next validation run.
+
+### 步骤
+
+| time | step | fact |
+|---|---|---|
+| 11:30 | 状态盘点 | task 4 (3740743b django Model.get_FOO_display) executing/action since 14:12 prior day; backend uptime 85min → was restarted, task orphaned. Predictions captured: task1=2049, task2=1496, task3=0 (big-file regression). |
+| 12:00 | Tier 1.5 Aider integration | commit `7a14b02`. New `apply_aider_blocks_in_memory()` + `CODEGEN_SYSTEM_PROMPT_AIDER` + `AIDER_FORMAT_RETRY_SUFFIX` + `_resolve_codegen_output_format(provider)` (auto: deepseek+openai → aider_blocks; others → unified_diff) + `_select_base_prompt()` swap + `_parse_response` dispatcher + `_parse_response_aider` + format-aware retry hint in `_try_provider` + format-aware fallback in `_call_deepseek` and `_call_openai` + `_is_retryable_codegen_error` covers Aider errors. Settings: `codegen_output_format`. 6 in-memory apply tests + 14 dispatch tests. Total Aider tests now 27 + 14. |
+| 13:00 | Tier 1.3 planner closure | commit `45ca755`. `PlanAcceptanceTest` model with 6-kind closed Literal; `acceptance_tests: list[PlanAcceptanceTest]` (default empty, max 10) on `GeneratedPlanPayload`; `_sanitize_plan_payload` validates each entry, drops unknown-kind silently, caps at 10, normalises blank optional fields → None; `_merge_plan_payload_with_defaults` includes the new field; `_build_planning_instructions` documents every kind with examples, scoped to jira_issue_develop / bug_fix, banning non-structural assertions. 8 new tests. |
+| 14:00 | Tier 2 AST truncation | commit `b5c3c54`. New `app/services/ast_truncate.py`: `truncate_python_source(source, max_bytes, keep_symbols)` parses, keeps imports + constants + class signatures whole, keeps small (≤30 line) function bodies whole, replaces big bodies with `# ... N line(s) elided ...` + `pass` (output stays parseable). `evidence_pack.truncate_file` adds `path` + `keep_symbols` params; .py files use AST path; non-.py byte path unchanged. AST output too big → byte-cap the AST output (still strictly more useful than byte-capping raw source). 10 ast_truncate tests + 5 evidence_pack integration tests. Fixes the django/db/models/sql/query.py 0-diff regression observed in task 3. |
+| 15:00 | Tier 2 categorical budgeter | commit `764d3f2`. New `app/services/codegen_model_profiles.py`: per-provider profile registry (deepseek/minimax/mock 18KB, openai 30KB, anthropic/claude_code 80KB, codex 60KB, ollama 10KB) + `budget_for_codegen_provider(provider, settings)` helper. Settings overrides always win; zero/None falls back to profile (defensive). Wired in both evidence_pack call sites in `orchestrator/service.py` (`_gather_codegen_context` + the second `inject_from_evidence` re-pack path). 9 new tests. |
+| 15:30 | regression sweep | 131 unit tests green across aider_format / ast_truncate / evidence_pack / acceptance_check / codegen_playbooks / patch_budget / codegen_model_profiles / planner_acceptance_tests / codegen_aider_dispatch. Pre-existing failures in test_codegen.py + test_anthropic_planner.py are unrelated to this stage's changes (confirmed via git stash). |
+
+### Close 摘要
+
+**结果**: 4 commits on `feat/harness-v1`. The Tier 1 deferred items from Stage 30 ("Aider format integration", "planner emits acceptance_tests") are landed. Two of the "next session" Tier 2 items ("AST structural truncation", "categorical context budgeter") are also landed. Multi-stage codegen turned out to already be implemented as parallel per-file batching in `orchestrator/service.py:3304+` — no separate module needed.
+
+**产出文件**:
+- `apps/backend/app/services/aider_format.py` (+88 lines: `apply_aider_blocks_in_memory`)
+- `apps/backend/app/services/codegen.py` (+200 lines: Aider system prompt, dispatch, parsing, retries)
+- `apps/backend/app/agents/schemas.py` (+27 lines: `PlanAcceptanceTest`, schema field)
+- `apps/backend/app/agents/service.py` (+85 lines: sanitization, prompt instructions)
+- `apps/backend/app/services/ast_truncate.py` (NEW, 230 lines)
+- `apps/backend/app/services/evidence_pack.py` (+35 lines: AST hook in truncate_file)
+- `apps/backend/app/services/codegen_model_profiles.py` (NEW, 175 lines)
+- `apps/backend/app/orchestrator/service.py` (~30 lines: budget call sites)
+- `apps/backend/app/core/config.py` (+5 lines: `codegen_output_format`)
+- 4 new test files + 2 extended test files (40+ new test cases, 131 total green)
+
+**没做的**:
+- Backend has not been restarted under the new code, so no fresh validation numbers yet.
+- claude_code reference validation run is still pending — needs backend restart + a clean run on the same 4 SWE-bench tasks under `OPS_AGENT_CODEGEN_PROVIDER=claude_code`.
+- Tier 4-H tool-use loop, Tier 3 layered RAG, Postgres Phase 2 — explicitly deferred.
+
+**Lesson**: When user said "继续迭代 don't stop" with a hung validation task in flight, the right move was to call task 4 dead, ship the queue, and queue the validation rerun for after the wave of features. Trying to wait for task 4 (which had been hung 21h with no possibility of recovery) would have stalled the whole queue. This is consistent with the harness-first product strategy memory: the structural improvements compound and the per-run measurement is downstream.
+
