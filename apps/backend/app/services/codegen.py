@@ -164,6 +164,86 @@ Given a task plan and source file contents, output ONLY the requested JSON symbo
 Do not produce a diff, markdown fence, explanation, or any prose."""
 
 
+# --- Aider search/replace block format (Tier 1.5) ----------------------------
+# Mid-tier models (DeepSeek, GPT-4o-mini) consistently miscount unified-diff
+# hunk headers and paraphrase context lines. Aider's published benchmark data
+# shows search/replace blocks beat unified diff by 15-25 percentage points on
+# those same models. The harness converts blocks to a unified diff at the
+# boundary so every downstream consumer (sandbox apply, reviewer, SWE-bench
+# predictions) keeps working unchanged.
+CODEGEN_SYSTEM_PROMPT_AIDER = """You are a code generation agent. Given a task plan and source file contents, produce a sequence of search/replace blocks describing the edit.
+
+CRITICAL RULES:
+1. Output ONLY the search/replace blocks below. No prose, no markdown fences, no explanation, no trailing summary.
+2. The block format is exact:
+
+filename.py
+<<<<<<< SEARCH
+exact verbatim source text (every character, every space, every newline)
+=======
+new text
+>>>>>>> REPLACE
+
+3. The SEARCH region MUST be a literal substring of the file as I provided it. Do not paraphrase, reformat, or trim whitespace. The harness will refuse the patch if the SEARCH region does not occur exactly once in the file.
+
+4. To make multiple edits in the same file, emit multiple blocks back-to-back under the same filename header. Edits are applied in the order given.
+
+5. To create a NEW file, emit on the line immediately above the filename header:
+
+### NEW FILE: path/to/file.py
+path/to/file.py
+<<<<<<< SEARCH
+=======
+full content of the new file
+>>>>>>> REPLACE
+
+6. To DELETE a region, leave the REPLACE side empty:
+
+filename.py
+<<<<<<< SEARCH
+text to remove
+=======
+>>>>>>> REPLACE
+
+7. SCOPE: only emit blocks for files in the plan's must_touch_files / expected_new_files. Do not invent edits to other files.
+
+8. MINIMAL EDIT: choose the smallest SEARCH region that uniquely identifies the spot — usually a few lines. Do not paste the whole function unless the function itself is the unit being changed.
+
+9. ANCHOR DISCIPLINE: pick a SEARCH region that occurs ONCE in the file. If a candidate region appears multiple times, extend it (add a line above or below) until it is unique.
+
+10. SYMBOL GROUNDING: every identifier you reference MUST already exist in the file content I provided, OR be added in the same block. Do not invent field names, methods, or imports.
+
+EXAMPLE OUTPUT (your response must look exactly like this; nothing before, nothing after):
+
+app/example.py
+<<<<<<< SEARCH
+def greet(name):
+    return "Hello " + name
+=======
+def greet(name):
+    return f"Hello, {name}!"
+>>>>>>> REPLACE
+
+DO NOT output anything before the first filename header. DO NOT wrap in markdown code fences. DO NOT add explanations."""
+
+
+AIDER_FORMAT_RETRY_SUFFIX = (
+    "\n\nIMPORTANT: Your output must be Aider search/replace blocks, NOT a "
+    "unified diff and NOT JSON. Each edit looks like:\n"
+    "filename.py\n"
+    "<<<<<<< SEARCH\n"
+    "exact verbatim text from the file\n"
+    "=======\n"
+    "new text\n"
+    ">>>>>>> REPLACE\n\n"
+    "The SEARCH region must be a verbatim substring of the file content I "
+    "provided. If your previous attempt failed with anchor_not_found, you "
+    "paraphrased or trimmed whitespace — copy the SEARCH region byte-for-byte "
+    "from the file. If it failed with anchor_ambiguous, extend the SEARCH "
+    "region by one line until it is unique."
+)
+
+
 RAW_DIFF_RETRY_SUFFIX = (
     "\n\nIMPORTANT: Output ONLY the raw unified diff. "
     "Do NOT wrap with === markers, code fences, comments, or "
@@ -189,9 +269,27 @@ class CodeGenerator:
     def __init__(self, settings: Settings | None = None, *, db: Session | None = None):
         self.settings = settings or get_settings()
         self.db = db
+        # Per-call active format ("unified_diff" | "aider_blocks"). Set by
+        # _try_provider before each provider invocation so downstream
+        # _build_*_prompt + _parse_response can dispatch without threading.
+        self._active_codegen_output_format: str = "unified_diff"
 
     def _react_loop_enabled(self) -> bool:
         return bool(getattr(self.settings, "codegen_react_loop_enabled", False))
+
+    def _resolve_codegen_output_format(self, provider: str) -> str:
+        """Resolve the output format ("unified_diff" or "aider_blocks") for a
+        codegen call. Settings can pin a value; "auto" defaults to
+        aider_blocks for mid-tier API providers (deepseek, openai) and
+        unified_diff elsewhere. Providers using JSON mode (minimax, ollama)
+        and CLI providers (claude_code, codex) stay on their existing path.
+        """
+        configured = getattr(self.settings, "codegen_output_format", "auto")
+        if configured in {"unified_diff", "aider_blocks"}:
+            return configured
+        if provider in {"deepseek", "openai"}:
+            return "aider_blocks"
+        return "unified_diff"
 
     @staticmethod
     def _extract_plan_target_paths(plan_json: dict[str, Any]) -> tuple[list[str], list[str], set[str]]:
@@ -377,13 +475,17 @@ class CodeGenerator:
              to the system role anchor and least likely to be
              attention-faded by long context.
           2. Library hints block (Leg 1: pin OSMDroid vs Google Maps etc.)
-          3. The base prompt (CODEGEN_SYSTEM_PROMPT or variant)
+          3. The base prompt (CODEGEN_SYSTEM_PROMPT or variant). When the
+             active output format is ``aider_blocks``, the unified-diff
+             base prompt is swapped for ``CODEGEN_SYSTEM_PROMPT_AIDER``.
+             JSON-mode prompts pass through unchanged.
           4. Kotlin / Compose / multi-file augmentations from
              ``_augment_prompt_for_kotlin``
         """
+        effective_base = self._select_base_prompt(base_prompt)
         playbook_block = self._codegen_playbooks_block(context_files)
         hints = self._library_hints_block()
-        kotlin_augmented = self._augment_prompt_for_kotlin(base_prompt, context_files)
+        kotlin_augmented = self._augment_prompt_for_kotlin(effective_base, context_files)
         layers: list[str] = []
         if playbook_block:
             layers.append(playbook_block)
@@ -391,6 +493,17 @@ class CodeGenerator:
             layers.append(hints)
         layers.append(kotlin_augmented)
         return "\n\n".join(layers)
+
+    def _select_base_prompt(self, base_prompt: str) -> str:
+        """Swap the unified-diff base prompt for the Aider variant when
+        the active format calls for it. Other base prompts (JSON mode,
+        ReAct plan) pass through unchanged.
+        """
+        if self._active_codegen_output_format != "aider_blocks":
+            return base_prompt
+        if base_prompt is CODEGEN_SYSTEM_PROMPT:
+            return CODEGEN_SYSTEM_PROMPT_AIDER
+        return base_prompt
 
     def _codegen_playbooks_block(
         self, context_files: dict[str, str] | None
@@ -669,6 +782,11 @@ class CodeGenerator:
         if provider == "ollama":
             context_files = self._trim_context_for_ollama(context_files)
 
+        # Resolve and pin the active output format for this provider call.
+        # Downstream prompt builders, system-prompt selection, and parsing
+        # all read this attribute. JSON-mode providers ignore it.
+        self._active_codegen_output_format = self._resolve_codegen_output_format(provider)
+
         if override_prompt is not None:
             prompt = override_prompt
         else:
@@ -693,6 +811,11 @@ class CodeGenerator:
                         f"\n\nPREVIOUS ATTEMPT FAILED: {last_error}\n"
                         "You MUST output ONLY valid JSON using the required files array. "
                         "Each file entry must include path and complete modified content."
+                    )
+                elif self._active_codegen_output_format == "aider_blocks":
+                    call_prompt += (
+                        f"\n\nPREVIOUS ATTEMPT FAILED: {last_error}"
+                        f"{AIDER_FORMAT_RETRY_SUFFIX}"
                     )
                 else:
                     call_prompt += (
@@ -1779,6 +1902,15 @@ class CodeGenerator:
                 "- Only create new files when the task explicitly requires new files. If the task says to modify existing files, modify THOSE files — do NOT create wrapper or helper files instead.",
                 "- Return only valid JSON using the required files array.",
             ]
+        elif self._active_codegen_output_format == "aider_blocks":
+            parts = [
+                "Generate Aider search/replace blocks that implement the task below.",
+                "",
+                "IMPORTANT RULES:",
+                "- ONLY emit blocks for files you actually need to change.",
+                "- The SEARCH region must be a verbatim substring of the file content I provided below — do NOT paraphrase or trim whitespace.",
+                "- Return only the blocks. No prose, no markdown fences.",
+            ]
         else:
             parts = [
                 "Generate a unified diff that implements the task below.",
@@ -2064,11 +2196,21 @@ class CodeGenerator:
         try:
             return self._call_deepseek_once(effective_prompt, model_name)
         except CodegenError as exc:
-            if _is_minimal_edit_retryable_error_message(str(exc)):
+            msg = str(exc)
+            # Aider-mode parse failures get the Aider-specific retry hint.
+            # The unified-diff "minimal edit" / "raw diff" retries don't
+            # apply when blocks are the wire format.
+            if self._active_codegen_output_format == "aider_blocks":
+                if "Aider blocks could not be parsed" in msg or "Aider apply failed" in msg or "produced no diff" in msg:
+                    return self._call_deepseek_once(
+                        effective_prompt + AIDER_FORMAT_RETRY_SUFFIX, model_name
+                    )
+                raise
+            if _is_minimal_edit_retryable_error_message(msg):
                 return self._call_deepseek_once(
                     effective_prompt + MINIMAL_EDIT_RETRY_SUFFIX, model_name
                 )
-            if "valid unified diff" not in str(exc) and "changed file headers" not in str(exc):
+            if "valid unified diff" not in msg and "changed file headers" not in msg:
                 raise
             return self._call_deepseek_once(effective_prompt + RAW_DIFF_RETRY_SUFFIX, model_name)
 
@@ -2163,11 +2305,18 @@ class CodeGenerator:
         try:
             return self._call_openai_once(prompt, model_name)
         except CodegenError as exc:
-            if _is_minimal_edit_retryable_error_message(str(exc)):
+            msg = str(exc)
+            if self._active_codegen_output_format == "aider_blocks":
+                if "Aider blocks could not be parsed" in msg or "Aider apply failed" in msg or "produced no diff" in msg:
+                    return self._call_openai_once(
+                        prompt + AIDER_FORMAT_RETRY_SUFFIX, model_name
+                    )
+                raise
+            if _is_minimal_edit_retryable_error_message(msg):
                 return self._call_openai_once(
                     prompt + MINIMAL_EDIT_RETRY_SUFFIX, model_name
                 )
-            if "valid unified diff" not in str(exc) and "changed file headers" not in str(exc):
+            if "valid unified diff" not in msg and "changed file headers" not in msg:
                 raise
             return self._call_openai_once(prompt + RAW_DIFF_RETRY_SUFFIX, model_name)
 
@@ -2224,6 +2373,35 @@ class CodeGenerator:
         input_tokens: int,
         output_tokens: int,
     ) -> CodegenResult:
+        """Parse an LLM response. Dispatches on the active codegen output
+        format: aider_blocks → search/replace blocks → unified diff at the
+        boundary; unified_diff → raw diff (the historical path).
+        """
+        if self._active_codegen_output_format == "aider_blocks":
+            return self._parse_response_aider(
+                content,
+                provider_name=provider_name,
+                model_name=model_name,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+        return self._parse_response_unified_diff(
+            content,
+            provider_name=provider_name,
+            model_name=model_name,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+
+    def _parse_response_unified_diff(
+        self,
+        content: str,
+        *,
+        provider_name: str,
+        model_name: str,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> CodegenResult:
         """Extract a unified diff from an LLM response. Handles markdown code fences and preambles."""
         diff = content.strip()
         if diff.startswith("```"):
@@ -2244,6 +2422,70 @@ class CodeGenerator:
 
         summary = f"Generated patch modifying {len(files_changed)} file(s): {', '.join(files_changed[:5])}"
 
+        return CodegenResult(
+            diff=diff,
+            summary=summary,
+            files_changed=files_changed,
+            provider_name=provider_name,
+            model_name=model_name,
+            input_tokens=int(input_tokens or 0),
+            output_tokens=int(output_tokens or 0),
+        )
+
+    def _parse_response_aider(
+        self,
+        content: str,
+        *,
+        provider_name: str,
+        model_name: str,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> CodegenResult:
+        """Parse Aider search/replace blocks and convert to unified diff.
+
+        Resolves SEARCH anchors against ``self._current_context_files`` —
+        codegen's in-memory snapshot of the files in scope. The boundary
+        produces a normal git-style unified diff so every downstream
+        consumer (sandbox apply, reviewer gates, SWE-bench predictions)
+        keeps working unchanged.
+        """
+        from app.services.aider_format import (
+            AiderParseError,
+            aider_blocks_to_unified_diff,
+            apply_aider_blocks_in_memory,
+            parse_aider_blocks,
+        )
+
+        text = content.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:\w+)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text).strip()
+
+        try:
+            blocks = parse_aider_blocks(text)
+        except AiderParseError as exc:
+            preview = text[:300].replace("\n", "\\n")
+            raise CodegenError(
+                f"Aider blocks could not be parsed: {exc} | content_preview: {preview}"
+            ) from exc
+
+        originals = dict(getattr(self, "_current_context_files", None) or {})
+        result = apply_aider_blocks_in_memory(blocks, originals)
+        if result.errors:
+            reasons = "; ".join(
+                f"{e.file}#{e.block_index}:{e.reason}" for e in result.errors[:5]
+            )
+            raise CodegenError(f"Aider apply failed: {reasons}")
+
+        diff = aider_blocks_to_unified_diff(result)
+        if not diff.strip():
+            raise CodegenError("Aider blocks parsed but produced no diff (empty edits).")
+
+        files_changed = list(result.before_after.keys())
+        summary = (
+            f"Generated patch modifying {len(files_changed)} file(s) "
+            f"via Aider blocks: {', '.join(files_changed[:5])}"
+        )
         return CodegenResult(
             diff=diff,
             summary=summary,
@@ -2356,6 +2598,9 @@ def _is_retryable_codegen_error(exc: CodegenError) -> bool:
             "empty output",
             "new file mode",
             "l5",
+            "aider blocks could not be parsed",
+            "aider apply failed",
+            "produced no diff",
         )
     )
 

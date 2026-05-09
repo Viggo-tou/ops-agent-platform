@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     primary_agent_provider: Literal["auto", "mock", "openai", "minimax", "anthropic", "deepseek", "ollama", "claude_code", "codex"] = "auto"
     planner_provider: Literal["auto", "claude_code", "anthropic", "openai", "minimax", "mock"] | None = None
     codegen_provider: Literal["auto", "claude_code", "codex", "anthropic", "openai", "minimax", "deepseek", "ollama", "mock"] | None = None
+    # Codegen output format. "auto" picks per-provider: deepseek + openai
+    # → aider_blocks (15-25 pp gain on mid-tier per Aider data); others
+    # → unified_diff. Force a specific value for A/B measurement.
+    codegen_output_format: Literal["auto", "unified_diff", "aider_blocks"] = "auto"
     primary_agent_model: str = "gpt-4o-mini"
     primary_agent_timeout_seconds: float = 30.0
     minimax_planner_timeout_seconds: float = 90.0

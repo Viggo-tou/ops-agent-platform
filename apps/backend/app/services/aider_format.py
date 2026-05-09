@@ -273,6 +273,96 @@ def apply_aider_blocks(
     return result
 
 
+def apply_aider_blocks_in_memory(
+    blocks: list[AiderBlock], originals: dict[str, str]
+) -> AiderApplyResult:
+    """Apply Aider blocks against an in-memory dict of file contents.
+
+    Mirrors :func:`apply_aider_blocks` but does not touch the filesystem.
+    Used by the codegen pipeline, where the LLM emits blocks and we
+    convert them to a unified diff before any sandbox exists. ``originals``
+    maps file paths → current contents (empty string is fine for new
+    files). The returned ``before_after`` map is what feeds
+    :func:`aider_blocks_to_unified_diff`.
+    """
+    file_state: dict[str, str] = {}
+    file_before: dict[str, str] = {}
+    result = AiderApplyResult()
+
+    for idx, block in enumerate(blocks):
+        if block.is_new_file:
+            if block.file in file_state:
+                pass
+            else:
+                if block.file in originals and originals[block.file].strip():
+                    result.errors.append(
+                        AiderApplyError(
+                            file=block.file,
+                            block_index=idx,
+                            reason="new_file requested but file already has content in context",
+                        )
+                    )
+                    continue
+                file_state[block.file] = ""
+                file_before[block.file] = ""
+
+        if block.file not in file_state:
+            if block.file not in originals:
+                result.errors.append(
+                    AiderApplyError(
+                        file=block.file,
+                        block_index=idx,
+                        reason="file not present in codegen context",
+                    )
+                )
+                continue
+            original = originals[block.file]
+            file_state[block.file] = original
+            file_before[block.file] = original
+
+        current = file_state[block.file]
+
+        if block.is_new_file and block.search == "":
+            file_state[block.file] = block.replace
+            continue
+        if block.search == "":
+            file_state[block.file] = current + block.replace
+            continue
+
+        occurrences = current.count(block.search)
+        if occurrences == 0:
+            result.errors.append(
+                AiderApplyError(
+                    file=block.file,
+                    block_index=idx,
+                    reason="anchor_not_found: SEARCH block does not match any region",
+                )
+            )
+            continue
+        if occurrences > 1:
+            result.errors.append(
+                AiderApplyError(
+                    file=block.file,
+                    block_index=idx,
+                    reason=f"anchor_ambiguous: SEARCH block matches {occurrences} regions",
+                )
+            )
+            continue
+
+        file_state[block.file] = current.replace(
+            block.search, block.replace, 1
+        )
+
+    for path, after in file_state.items():
+        before = file_before.get(path, "")
+        if after == before and not any(b.is_new_file and b.file == path for b in blocks):
+            continue
+        result.applied_files.append(path)
+        result.before_after[path] = (before, after)
+
+    return result
+
+
 def aider_blocks_to_unified_diff(
     result: AiderApplyResult, *, context_lines: int = 3
 ) -> str:

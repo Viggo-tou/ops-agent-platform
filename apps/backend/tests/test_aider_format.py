@@ -16,6 +16,7 @@ from app.services.aider_format import (
     AiderParseError,
     aider_blocks_to_unified_diff,
     apply_aider_blocks,
+    apply_aider_blocks_in_memory,
     parse_aider_blocks,
 )
 
@@ -276,6 +277,76 @@ def test_aider_to_unified_diff_no_changes_returns_empty(tmp_path):
     result = apply_aider_blocks(blocks, tmp_path)
     diff = aider_blocks_to_unified_diff(result)
     assert diff == ""
+
+
+# --- in-memory apply (codegen integration path) -----------------------------
+
+
+def test_in_memory_apply_simple_replace():
+    originals = {"m.py": "def f():\n    return 1\n"}
+    blocks = [
+        AiderBlock(
+            file="m.py",
+            search="def f():\n    return 1",
+            replace="def f():\n    return 2",
+        )
+    ]
+    result = apply_aider_blocks_in_memory(blocks, originals)
+    assert result.errors == []
+    diff = aider_blocks_to_unified_diff(result)
+    assert "diff --git a/m.py b/m.py" in diff
+    assert "+    return 2" in diff
+
+
+def test_in_memory_apply_anchor_not_found():
+    originals = {"m.py": "x\n"}
+    blocks = [AiderBlock(file="m.py", search="zzz", replace="yyy")]
+    result = apply_aider_blocks_in_memory(blocks, originals)
+    assert any("anchor_not_found" in e.reason for e in result.errors)
+    assert result.applied_files == []
+
+
+def test_in_memory_apply_anchor_ambiguous():
+    originals = {"m.py": "dup\ndup\n"}
+    blocks = [AiderBlock(file="m.py", search="dup", replace="ok")]
+    result = apply_aider_blocks_in_memory(blocks, originals)
+    assert any("anchor_ambiguous" in e.reason for e in result.errors)
+
+
+def test_in_memory_apply_file_not_in_context():
+    originals = {"a.py": "x\n"}
+    blocks = [AiderBlock(file="missing.py", search="x", replace="y")]
+    result = apply_aider_blocks_in_memory(blocks, originals)
+    assert any("not present" in e.reason for e in result.errors)
+
+
+def test_in_memory_apply_new_file():
+    originals: dict[str, str] = {}
+    blocks = [
+        AiderBlock(
+            file="new.py",
+            search="",
+            replace="print('hi')\n",
+            is_new_file=True,
+        )
+    ]
+    result = apply_aider_blocks_in_memory(blocks, originals)
+    assert result.errors == []
+    diff = aider_blocks_to_unified_diff(result)
+    assert "diff --git a/new.py b/new.py" in diff
+    assert "+print('hi')" in diff
+
+
+def test_in_memory_apply_chained_blocks():
+    originals = {"m.py": "A\nB\nC\n"}
+    blocks = [
+        AiderBlock(file="m.py", search="A", replace="A1"),
+        AiderBlock(file="m.py", search="B", replace="B1"),
+    ]
+    result = apply_aider_blocks_in_memory(blocks, originals)
+    assert result.errors == []
+    diff = aider_blocks_to_unified_diff(result)
+    assert "+A1" in diff and "+B1" in diff
 
 
 def test_aider_to_unified_diff_new_file(tmp_path):
