@@ -2404,6 +2404,13 @@ class CodeGenerator:
     ) -> CodegenResult:
         """Extract a unified diff from an LLM response. Handles markdown code fences and preambles."""
         diff = content.strip()
+        # Honour playbook-defined terminal markers — model is signalling
+        # "can't proceed" and retries won't help. Surface a non-retryable
+        # CodegenError so the harness fails fast and the orchestrator can
+        # decide what to do next (e.g. expand evidence pack, re-plan).
+        marker = _detect_terminal_marker(diff)
+        if marker is not None:
+            raise CodegenError(f"codegen_terminal: {marker}")
         if diff.startswith("```"):
             diff = re.sub(r"^```(?:diff|patch)?\s*", "", diff)
             diff = re.sub(r"\s*```$", "", diff).strip()
@@ -2457,6 +2464,13 @@ class CodeGenerator:
         )
 
         text = content.strip()
+        # Same terminal-marker check as the unified-diff path. EVIDENCE_GAP
+        # / NO_CHANGE_NEEDED / PLAN_CONFLICT are the playbook-sanctioned
+        # ways for the model to say "can't make a patch from what I have"
+        # — retrying just burns tokens. Surface as non-retryable.
+        marker = _detect_terminal_marker(text)
+        if marker is not None:
+            raise CodegenError(f"codegen_terminal: {marker}")
         if text.startswith("```"):
             text = re.sub(r"^```(?:\w+)?\s*", "", text)
             text = re.sub(r"\s*```$", "", text).strip()
@@ -2580,6 +2594,37 @@ def _first_line(content: str) -> str | None:
     return content.splitlines()[0]
 
 
+_TERMINAL_MARKER_RE = re.compile(
+    r"##\s*(EVIDENCE_GAP|NO_CHANGE_NEEDED|PLAN_CONFLICT)\s*:?\s*(.*)",
+    re.IGNORECASE,
+)
+
+
+def _detect_terminal_marker(content: str) -> str | None:
+    """Return a one-line description if the response starts with one of
+    the playbook's terminal markers (EVIDENCE_GAP, NO_CHANGE_NEEDED,
+    PLAN_CONFLICT). Returns None otherwise.
+
+    The playbook (docs/agent-playbooks/codegen/diff-discipline.md) tells
+    the model these are valid terminal outputs when it can't proceed.
+    Treating them as parse errors and retrying just burns tokens — the
+    model has already said it can't make a patch with what it has. The
+    caller surfaces this as a non-retryable CodegenError so the
+    orchestrator can take a different remediation step (expand context,
+    re-plan, etc.) instead of looping in codegen.
+    """
+    if not content:
+        return None
+    head = content.lstrip().splitlines()[:3]
+    for line in head:
+        m = _TERMINAL_MARKER_RE.match(line.strip())
+        if m:
+            kind = m.group(1).upper()
+            detail = m.group(2).strip()
+            return f"{kind}: {detail[:240]}" if detail else kind
+    return None
+
+
 def _is_minimal_edit_retryable_error_message(message: str) -> bool:
     lowered = message.lower()
     return "new file mode" in lowered or "l5" in lowered
@@ -2587,6 +2632,10 @@ def _is_minimal_edit_retryable_error_message(message: str) -> bool:
 
 def _is_retryable_codegen_error(exc: CodegenError) -> bool:
     message = str(exc).lower()
+    # Playbook-sanctioned terminal markers are explicit "I can't proceed"
+    # signals; retrying changes nothing. Hard-no retry.
+    if "codegen_terminal" in message:
+        return False
     return any(
         key in message
         for key in (

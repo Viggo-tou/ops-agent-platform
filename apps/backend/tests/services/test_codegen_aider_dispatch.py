@@ -191,6 +191,71 @@ def test_parse_response_aider_garbage_input_raises_retryable():
     assert _is_retryable_codegen_error(excinfo.value) is True
 
 
+# --- terminal-marker handling (regression: 2026-05-10 task 1) ---------------
+
+
+@pytest.mark.parametrize(
+    "marker_text",
+    [
+        "## EVIDENCE_GAP: need full content of _arithmetic_mask method",
+        "## NO_CHANGE_NEEDED: source already implements behaviour",
+        "## PLAN_CONFLICT: must_touch and constraints contradict",
+        "  ## evidence_gap: lowercase variant",  # case + leading whitespace
+    ],
+)
+def test_parse_response_aider_terminal_marker_is_non_retryable(marker_text):
+    from app.services.codegen import _is_retryable_codegen_error
+
+    cg = CodeGenerator(_settings())
+    cg._active_codegen_output_format = "aider_blocks"
+    cg._current_context_files = {"m.py": "x = 1\n"}
+    with pytest.raises(CodegenError) as excinfo:
+        cg._parse_response(
+            marker_text + "\n",
+            provider_name="deepseek",
+            model_name="m",
+            input_tokens=0,
+            output_tokens=0,
+        )
+    assert "codegen_terminal" in str(excinfo.value)
+    # Critical: no 3-attempt retry storm on these markers.
+    assert _is_retryable_codegen_error(excinfo.value) is False
+
+
+def test_parse_response_unified_diff_terminal_marker_is_non_retryable():
+    from app.services.codegen import _is_retryable_codegen_error
+
+    cg = CodeGenerator(_settings("unified_diff"))
+    cg._active_codegen_output_format = "unified_diff"
+    with pytest.raises(CodegenError) as excinfo:
+        cg._parse_response(
+            "## EVIDENCE_GAP: cannot see the function I need to edit\n",
+            provider_name="anthropic",
+            model_name="claude",
+            input_tokens=0,
+            output_tokens=0,
+        )
+    assert "codegen_terminal" in str(excinfo.value)
+    assert _is_retryable_codegen_error(excinfo.value) is False
+
+
+def test_parse_response_aider_marker_text_carries_through():
+    cg = CodeGenerator(_settings())
+    cg._active_codegen_output_format = "aider_blocks"
+    cg._current_context_files = {"m.py": "x = 1\n"}
+    with pytest.raises(CodegenError) as excinfo:
+        cg._parse_response(
+            "## EVIDENCE_GAP: need full content of _arithmetic_mask method\n",
+            provider_name="deepseek",
+            model_name="m",
+            input_tokens=0,
+            output_tokens=0,
+        )
+    msg = str(excinfo.value)
+    assert "EVIDENCE_GAP" in msg
+    assert "_arithmetic_mask" in msg
+
+
 def test_parse_response_unified_diff_path_unaffected():
     """Sanity: when format is unified_diff (default), the historical
     parse path is preserved exactly — no Aider dispatch.

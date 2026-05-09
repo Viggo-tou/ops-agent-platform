@@ -44,6 +44,11 @@ class FileEvidence:
     path: str
     content: str
     priority: int = 5  # lower = higher priority
+    # Symbol names (function/method) the LLM is likely to need whole. Used
+    # by the AST truncator to pin those bodies even when the file would
+    # otherwise be elided. Empty list = "keep no symbols specifically",
+    # truncator falls back to its size heuristic.
+    keep_symbols: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -131,12 +136,16 @@ def build_evidence_pack(
 
         # Per-file truncation first. AST-aware for Python files (so
         # big files like django/db/models/sql/query.py keep function
-        # bodies intact instead of dumping just imports).
+        # bodies intact instead of dumping just imports). keep_symbols
+        # pins specific function/method names — when caller knows the
+        # name of the function the model needs to edit, that body stays
+        # whole even if the file is otherwise over budget.
         truncated = (
             truncate_file(
                 file_.content,
                 max_bytes=budget.max_per_file_bytes,
                 path=file_.path,
+                keep_symbols=list(file_.keep_symbols or []) or None,
             )
             if len(file_.content) > budget.max_per_file_bytes
             else file_.content

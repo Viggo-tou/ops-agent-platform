@@ -3089,6 +3089,9 @@ class PrimaryOrchestrator:
                             FileEvidence,
                             build_evidence_pack,
                         )
+                        from app.services.symbol_hints import (
+                            extract_candidate_symbols,
+                        )
 
                         env = (
                             self.tool_gateway.settings
@@ -3103,11 +3106,31 @@ class PrimaryOrchestrator:
                                 getattr(plan, "must_touch_files", None) or []
                             )
                         }
+                        # Same symbol pinning as _gather_codegen_context;
+                        # this re-pack path is hit when evidence_chain
+                        # injects more files post-codegen-prep, and big
+                        # files there are equally vulnerable to AST
+                        # eliding the target function body.
+                        _hint_text_parts = []
+                        if isinstance(getattr(task, "request_text", None), str):
+                            _hint_text_parts.append(task.request_text)
+                        if isinstance(task.translation_json, dict):
+                            _hint_text_parts.append(
+                                str(task.translation_json.get("normalized_request") or "")
+                            )
+                            _hint_text_parts.append(
+                                str(task.translation_json.get("objective") or "")
+                            )
+                        _symbol_hints = extract_candidate_symbols(
+                            "\n".join(_hint_text_parts),
+                            file_contents=context_files,
+                        )
                         merged_inputs = [
                             FileEvidence(
                                 path=path,
                                 content=content,
                                 priority=1 if path in priority_keepers else 5,
+                                keep_symbols=_symbol_hints,
                             )
                             for path, content in context_files.items()
                         ]
@@ -6298,10 +6321,26 @@ class PrimaryOrchestrator:
             FileEvidence,
             build_evidence_pack,
         )
+        from app.services.symbol_hints import extract_candidate_symbols
 
         env = self.tool_gateway.settings if self.tool_gateway is not None else None
         budget = budget_for_codegen_provider(
             getattr(env, "codegen_provider", None), env
+        )
+
+        # Pin function/method names mentioned in the issue so the AST
+        # truncator keeps those bodies whole. Regression on 2026-05-10:
+        # `_arithmetic_mask` was elided as a "big body" → DeepSeek
+        # emitted EVIDENCE_GAP. Pinning fixes that without raising the
+        # per-file byte cap.
+        issue_text_parts = []
+        if isinstance(getattr(task, "request_text", None), str):
+            issue_text_parts.append(task.request_text)
+        if isinstance(task.translation_json, dict):
+            issue_text_parts.append(str(task.translation_json.get("normalized_request") or ""))
+            issue_text_parts.append(str(task.translation_json.get("objective") or ""))
+        symbol_hints = extract_candidate_symbols(
+            "\n".join(issue_text_parts), file_contents=context_files
         )
 
         evidence_inputs = [
@@ -6309,6 +6348,7 @@ class PrimaryOrchestrator:
                 path=relative_path,
                 content=content,
                 priority=priority_map.get(relative_path, 5),
+                keep_symbols=symbol_hints,
             )
             for relative_path, content in context_files.items()
         ]
