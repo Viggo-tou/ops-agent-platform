@@ -101,12 +101,25 @@ def truncate_file(
             if result.used_ast and result.text:
                 if len(result.text) <= max_bytes:
                     return result.text
-                # AST truncation shrank the file but couldn't fit it
-                # under the cap (e.g. dozens of small methods all
-                # pinned). Byte-cap the AST output rather than raw
-                # source — the AST version drops big function bodies
-                # first, so even after a final byte cut the model
-                # sees more useful structure.
+                # AST truncation shrank the file but couldn't fit under
+                # the cap. If callers explicitly pinned a symbol AND the
+                # truncator kept it whole, return verbatim — the whole
+                # point of the pin is to accept overshoot for the body
+                # the model needs. Without this, a 25 KB module like
+                # astropy/nddata/mixins/ndarithmetic.py would have its
+                # AST output (~ 8 KB, with `_arithmetic_mask` body
+                # preserved) byte-capped at 6 KB, slicing off the very
+                # function the model came to edit. (2026-05-10 v5
+                # regression.)
+                pinned = set(keep_symbols or [])
+                preserved = pinned.intersection(result.symbols_kept_whole)
+                if pinned and preserved:
+                    return result.text
+                # No pin or the pin was not actually kept (file too big
+                # even for the pinned body). Byte-cap the AST output
+                # rather than raw source — AST drops big bodies first,
+                # so the cut is still strictly more useful than cutting
+                # the raw file.
                 return result.text[:max_bytes] + _TRUNCATE_MARKER
         except Exception:  # noqa: BLE001
             pass

@@ -197,6 +197,50 @@ def test_truncate_python_syntax_error_falls_back_to_byte():
     assert "truncated" in out.lower()
 
 
+def test_truncate_python_keep_symbols_overshoots_max_bytes_to_preserve_body():
+    """When caller pins a symbol AND the AST keeps it whole, the result
+    should overshoot max_bytes rather than byte-cap mid-pinned-body.
+
+    Regression on 2026-05-10 v5: astropy task 1 still hit EVIDENCE_GAP
+    after the AST + cross-reference fixes because ndarithmetic.py's
+    AST output was ~ 8 KB (with `_arithmetic_mask` body preserved at
+    bytes 6500-8500) and the byte-cap at max_bytes=6000 sliced the
+    pinned body off."""
+    parts = ['"""docstring."""\n', "import os\n\n", "class Big:\n"]
+    for i in range(10):
+        parts.append(f"    def big_method_{i}(self):\n")
+        parts.append(f"        \"\"\"big_method_{i}.\"\"\"\n")
+        parts.extend(f"        line_{j}_of_{i} = {j}\n" for j in range(60))
+        parts.append("        return None\n\n")
+    parts.append("    def _target_routine(self):\n")
+    parts.append("        \"\"\"target.\"\"\"\n")
+    parts.extend(f"        target_line_{j} = {j}\n" for j in range(40))
+    parts.append("        return self.x\n")
+    src = "".join(parts)
+    out = truncate_file(
+        src, max_bytes=2_000, path="m.py", keep_symbols=["_target_routine"]
+    )
+    # The pinned body must be present in full.
+    assert "target_line_25 = 25" in out
+    assert "target_line_39 = 39" in out
+    # The other big bodies must still be elided.
+    assert "line_30_of_3 = 30" not in out
+    # Output is allowed to exceed max_bytes when pin was honoured.
+    # (No assertion on length — just verify the body is intact.)
+
+
+def test_truncate_python_unpinned_still_byte_capped():
+    """When no pin or pin not kept, byte-cap fallback still applies."""
+    parts = ["import os\n\n"]
+    for i in range(20):
+        parts.append(f"def fn_{i}():\n    return {i}\n\n")
+    src = "".join(parts)
+    out = truncate_file(src, max_bytes=200, path="m.py")
+    # No pin → we don't overshoot.
+    assert len(out) <= 200 + 50
+    assert "truncated" in out.lower()
+
+
 def test_evidence_pack_python_truncation_preserves_signatures():
     """End-to-end: a big .py file in the pack arrives with function
     signatures intact, not just imports + class headers."""
