@@ -80,6 +80,32 @@ def _trim_text(value: str, *, limit: int) -> str:
     return f"{normalized[: max(limit - 3, 1)]}..."
 
 
+def _looks_like_test_path(path: str) -> bool:
+    """Return True if ``path`` is a test file by the usual conventions.
+
+    Used by the planner sanitizer to keep test files out of
+    ``must_touch_files`` for code-change scenarios — the fix should
+    live in source, not in a freshly-edited test file. Conservative:
+    only matches obvious test patterns (path starts with ``tests/``
+    or basename matches ``test_*.py``/``*_test.py``).
+    """
+    if not isinstance(path, str):
+        return False
+    norm = path.replace("\\", "/").strip().lstrip("/")
+    if not norm:
+        return False
+    if norm.startswith("tests/") or "/tests/" in f"/{norm}":
+        return True
+    base = norm.rsplit("/", 1)[-1].lower()
+    if base.startswith("test_") and base.endswith(".py"):
+        return True
+    if base.endswith("_test.py"):
+        return True
+    if base in {"conftest.py"}:
+        return True
+    return False
+
+
 def _extract_plan_locations_from_knowledge(planning_knowledge: dict[str, Any] | None) -> list[PlanCodeLocation]:
     if not planning_knowledge:
         return []
@@ -1513,6 +1539,21 @@ class PrimaryAgentPlanner:
                 limit=limit,
             )
 
+        # 2026-05-10 Class E counter-measure at planner level: for code-
+        # change scenarios (jira_issue_develop / bug_fix), test files do
+        # NOT belong in must_touch_files. The fix lives in source code;
+        # tests belong in their own subtree and the SWE-bench
+        # FAIL_TO_PASS suite is pre-existing. When the planner emits
+        # tests/* paths in must_touch the model takes that as
+        # permission to write a test as the "fix" (regression v8 task 4
+        # django-12284: planner emitted ['tests/.../tests.py', ...,
+        # 'django/db/models/enums.py']; model produced test-only diff).
+        if sanitized.get("scenario") in {"jira_issue_develop", "bug_fix"}:
+            sanitized["must_touch_files"] = [
+                p for p in sanitized.get("must_touch_files", [])
+                if not _looks_like_test_path(p)
+            ]
+
         if sanitized["scenario"] == "process_question":
             sanitized["missing_information"] = []
             sanitized["requires_approval"] = False
@@ -1713,6 +1754,8 @@ class PrimaryAgentPlanner:
             "- pure scaffolding tasks where every change is in new files (use expected_new_files instead) "
             "- jira_issue_plan (plan-only scenarios) "
             "- internal_db_query / internal_api_request / slack_message. "
+            "DO NOT include test files (paths under tests/, test_*.py, *_test.py, conftest.py) in must_touch_files for jira_issue_develop or bug_fix scenarios. "
+            "The fix lives in source code, not in a new or edited test file. Editing a test file as 'the fix' is a hallucination pattern (Class E); the harness will strip such entries from must_touch_files automatically. "
             "For expected_new_files, list any files that MUST BE CREATED to satisfy the task and that do not yet exist in the repository. "
             "Examples: a new Firebase rules file (database.rules.json), a new config file (firebase.json), a new migration, a new schema, a new test fixture. "
             "Infer new file paths from the request text when the task is clearly asking for a new artifact (keywords: create, add new file, write a new, set up, introduce). "

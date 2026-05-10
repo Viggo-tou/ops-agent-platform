@@ -175,6 +175,65 @@ def test_sanitize_normalises_optional_fields_to_none_when_blank():
     assert entry["scope"] is None
 
 
+def test_sanitize_strips_test_paths_from_must_touch_for_develop():
+    """Class E counter-measure at planner level: the v8 task 4 planner
+    emitted test files in must_touch (e.g. ['tests/.../tests.py',
+    'django/db/models/enums.py']). The model then took that as license
+    to produce a test-only diff. Sanitization should strip test paths
+    for code-change scenarios."""
+    raw = _base_payload(
+        scenario="jira_issue_develop",
+        must_touch_files=[
+            "tests/model_inheritance_regress/tests.py",
+            "tests/model_inheritance/test_abstract_inheritance.py",
+            "django/db/models/fields/__init__.py",
+            "tests/conftest.py",
+            "django/db/models/enums.py",
+            "package/test_helper.py",
+        ],
+    )
+    sanitized = PrimaryAgentPlanner._sanitize_plan_payload(raw)
+    must = sanitized["must_touch_files"]
+    # Source files retained.
+    assert "django/db/models/fields/__init__.py" in must
+    assert "django/db/models/enums.py" in must
+    # Test files dropped.
+    assert all("tests/" not in p for p in must)
+    assert "tests/conftest.py" not in must
+    assert "package/test_helper.py" not in must
+
+
+def test_sanitize_keeps_test_paths_in_must_touch_for_non_develop():
+    """For scenarios that aren't bug-fix-shaped, the test-path filter
+    is not applied — a test refactor or test-add task may legitimately
+    touch test files."""
+    raw = _base_payload(
+        scenario="other_scenario",
+        must_touch_files=[
+            "tests/model_inheritance_regress/tests.py",
+            "django/db/models/fields/__init__.py",
+        ],
+    )
+    sanitized = PrimaryAgentPlanner._sanitize_plan_payload(raw)
+    must = sanitized["must_touch_files"]
+    # All retained.
+    assert "tests/model_inheritance_regress/tests.py" in must
+    assert "django/db/models/fields/__init__.py" in must
+
+
+def test_sanitize_test_path_filter_handles_windows_separators():
+    raw = _base_payload(
+        scenario="jira_issue_develop",
+        must_touch_files=[
+            r"tests\foo\bar.py",
+            r"src\real_fix.py",
+        ],
+    )
+    sanitized = PrimaryAgentPlanner._sanitize_plan_payload(raw)
+    must = sanitized["must_touch_files"]
+    assert all("tests" not in p.replace("\\", "/").split("/") for p in must)
+
+
 def test_planning_instructions_mention_acceptance_tests():
     text = PrimaryAgentPlanner._build_planning_instructions()
     assert "acceptance_tests" in text
