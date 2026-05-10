@@ -279,6 +279,71 @@ def test_aider_to_unified_diff_no_changes_returns_empty(tmp_path):
     assert diff == ""
 
 
+# --- placeholder-anchor rejection (Class F regression) ---------------------
+
+
+def test_in_memory_apply_rejects_anchor_on_elision_marker():
+    """A SEARCH block that includes the AST-truncation placeholder
+    text would produce a diff that targets lines that don't exist in
+    the un-truncated source (git apply rejects). Reject at apply time
+    so the model retries with a real anchor.
+
+    Regression: 2026-05-10 v8 task 1 produced a 1143-char diff with
+    `# ... 45 line(s) elided by ast_truncate (regex fallback) ...`
+    and `pass` as context lines."""
+    originals = {
+        "m.py": (
+            "def foo():\n"
+            "    # ... 45 line(s) elided by ast_truncate (regex fallback) ...\n"
+            "    pass\n"
+        )
+    }
+    blocks = [
+        AiderBlock(
+            file="m.py",
+            search=(
+                "def foo():\n"
+                "    # ... 45 line(s) elided by ast_truncate (regex fallback) ...\n"
+                "    pass"
+            ),
+            replace="def foo():\n    return 1",
+        )
+    ]
+    result = apply_aider_blocks_in_memory(blocks, originals)
+    assert any("anchor_on_placeholder" in e.reason for e in result.errors)
+    assert result.applied_files == []
+
+
+def test_in_memory_apply_rejects_anchor_on_truncation_header():
+    originals = {"m.py": "# === ast_truncate header ===\nx = 1\n"}
+    blocks = [
+        AiderBlock(
+            file="m.py",
+            search="# === ast_truncate header ===",
+            replace="# new",
+        )
+    ]
+    result = apply_aider_blocks_in_memory(blocks, originals)
+    assert any("anchor_on_placeholder" in e.reason for e in result.errors)
+
+
+def test_filesystem_apply_rejects_anchor_on_placeholder(tmp_path):
+    f = tmp_path / "m.py"
+    f.write_text(
+        "def foo():\n    # ... 10 line(s) elided by ast_truncate ...\n    pass\n",
+        encoding="utf-8",
+    )
+    blocks = [
+        AiderBlock(
+            file="m.py",
+            search="    # ... 10 line(s) elided by ast_truncate ...",
+            replace="    return 1",
+        )
+    ]
+    result = apply_aider_blocks(blocks, tmp_path)
+    assert any("anchor_on_placeholder" in e.reason for e in result.errors)
+
+
 # --- in-memory apply (codegen integration path) -----------------------------
 
 

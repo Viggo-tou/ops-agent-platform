@@ -70,6 +70,16 @@ _DIVIDER = "======="
 _REPLACE_TAIL = ">>>>>>> REPLACE"
 _NEW_FILE_RE = re.compile(r"^### NEW FILE:\s*(\S+)\s*$")
 
+# Anchor regions that include any of these substrings come from
+# AST-truncation placeholder content, not real source. Accepting them
+# would produce a diff that targets lines which never exist in the
+# un-truncated repo, and `git apply` will reject it. Force the model
+# to re-anchor on preserved code. (2026-05-10 Class F regression.)
+_PLACEHOLDER_FINGERPRINTS = (
+    "elided by ast_truncate",
+    "=== ast_truncate header ===",
+)
+
 
 class AiderParseError(Exception):
     """Raised when the LLM output is not parseable as Aider blocks."""
@@ -234,6 +244,16 @@ def apply_aider_blocks(
             file_state[block.file] = current + block.replace
             continue
 
+        if any(fp in block.search for fp in _PLACEHOLDER_FINGERPRINTS):
+            result.errors.append(
+                AiderApplyError(
+                    file=block.file,
+                    block_index=idx,
+                    reason="anchor_on_placeholder: SEARCH region contains AST-truncation placeholder text; re-anchor on a function kept whole (see truncation header)",
+                )
+            )
+            continue
+
         occurrences = current.count(block.search)
         if occurrences == 0:
             result.errors.append(
@@ -327,6 +347,16 @@ def apply_aider_blocks_in_memory(
             continue
         if block.search == "":
             file_state[block.file] = current + block.replace
+            continue
+
+        if any(fp in block.search for fp in _PLACEHOLDER_FINGERPRINTS):
+            result.errors.append(
+                AiderApplyError(
+                    file=block.file,
+                    block_index=idx,
+                    reason="anchor_on_placeholder: SEARCH region contains AST-truncation placeholder text; re-anchor on a function kept whole (see truncation header)",
+                )
+            )
             continue
 
         occurrences = current.count(block.search)
