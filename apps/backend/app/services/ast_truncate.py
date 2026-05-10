@@ -22,6 +22,7 @@ with the original size). Callers should fall back to byte truncation.
 from __future__ import annotations
 
 import ast
+import re
 from dataclasses import dataclass, field
 
 
@@ -81,6 +82,18 @@ def truncate_python_source(
     try:
         tree = ast.parse(source)
     except SyntaxError:
+        # Fallback to regex/indent-based truncation. Real-world Python
+        # files occasionally trip the strict parser even though they
+        # otherwise execute fine (e.g. astropy/nddata/mixins/
+        # ndarithmetic.py: 9.5-pair triple-quote count under Python
+        # 3.14). Without this fallback the truncator returns the file
+        # unchanged and the caller's byte cap kicks in, slicing off
+        # function bodies past the first 6 KB.
+        regex_result = _regex_truncate_python(
+            source, max_bytes=max_bytes, keep=keep
+        )
+        if regex_result is not None:
+            return regex_result
         return TruncationResult(
             text=source,
             bytes_kept=len(encoded),
@@ -253,4 +266,128 @@ def truncate_python_source(
         symbols_truncated=truncated,
         elided_lines=elided_total,
         used_ast=True,
+    )
+
+
+_DEF_RE = re.compile(r"^(?P<indent>[ \t]*)(?:async\s+)?def\s+(?P<name>\w+)\s*\(")
+_CLASS_RE = re.compile(r"^(?P<indent>[ \t]*)class\s+(?P<name>\w+)\b")
+
+
+def _regex_truncate_python(
+    source: str,
+    *,
+    max_bytes: int,
+    keep: set[str],
+    small_body_lines: int = _SMALL_BODY_LINES,
+) -> TruncationResult | None:
+    """Indent-based Python truncation when ``ast.parse`` won't accept
+    the file. Walks lines, identifies def/class blocks via regex +
+    indent level, and applies the same keep/elide logic as the AST
+    path. Output is line-faithful, so it stays byte-for-byte
+    compatible with the original where possible (important for Aider
+    SEARCH anchors).
+
+    Returns None if the file has no parseable structure to work with —
+    caller falls back to byte truncation.
+    """
+    lines = source.splitlines(keepends=True)
+    if not lines:
+        return None
+
+    # Locate every def/class line by regex.
+    blocks: list[dict] = []
+    for i, line in enumerate(lines):
+        m = _DEF_RE.match(line)
+        if m:
+            blocks.append({
+                "kind": "def",
+                "line": i,
+                "indent": len(m.group("indent")),
+                "name": m.group("name"),
+            })
+            continue
+        m = _CLASS_RE.match(line)
+        if m:
+            blocks.append({
+                "kind": "class",
+                "line": i,
+                "indent": len(m.group("indent")),
+                "name": m.group("name"),
+            })
+
+    if not blocks:
+        return None
+
+    # Determine each block's body end via the next sibling/parent block.
+    for idx, b in enumerate(blocks):
+        end = len(lines) - 1
+        for nxt in blocks[idx + 1:]:
+            if nxt["indent"] <= b["indent"]:
+                end = nxt["line"] - 1
+                break
+        b["end"] = end
+        b["body_start"] = b["line"] + 1
+        b["body_lines"] = max(0, end - b["line"])
+
+    # Decide keep / truncate per def. Class blocks are always kept
+    # whole as containers — their nested defs are individually
+    # judged.
+    keep_set: set[int] = set()      # indices of blocks to keep whole
+    truncate_set: set[int] = set()  # def blocks to body-truncate
+    for idx, b in enumerate(blocks):
+        if b["kind"] != "def":
+            continue
+        if b["name"] in keep or b["body_lines"] <= small_body_lines:
+            keep_set.add(idx)
+        else:
+            truncate_set.add(idx)
+
+    # Build output: walk lines, eliding bodies of truncate_set defs.
+    out_lines: list[str] = []
+    elided = 0
+    kept_whole_names: list[str] = []
+    truncated_names: list[str] = []
+    skip_until: int = -1
+
+    block_starts = {b["line"]: i for i, b in enumerate(blocks) if b["kind"] == "def"}
+    for i, line in enumerate(lines):
+        if i <= skip_until:
+            continue
+        if i in block_starts and block_starts[i] in truncate_set:
+            b = blocks[block_starts[i]]
+            # Emit signature (def line + any continuation lines until
+            # the line that ends with ":"). Heuristic: keep emitting
+            # until we see a line ending in ":" possibly with comment.
+            sig_end = b["line"]
+            for j in range(b["line"], min(b["end"] + 1, len(lines))):
+                stripped = lines[j].rstrip()
+                if stripped.endswith(":") or re.search(r":\s*(#.*)?$", stripped):
+                    sig_end = j
+                    break
+                sig_end = j
+            out_lines.extend(lines[b["line"]:sig_end + 1])
+            # Body indent = function indent + 4 spaces (best-effort).
+            indent = " " * (b["indent"] + 4)
+            body_count = max(0, b["end"] - sig_end)
+            elided += body_count
+            out_lines.append(
+                f"{indent}# ... {body_count} line(s) elided by ast_truncate (regex fallback) ...\n"
+            )
+            out_lines.append(f"{indent}pass\n")
+            truncated_names.append(b["name"])
+            skip_until = b["end"]
+            continue
+        # If this line begins a kept-whole def, just record the name.
+        if i in block_starts and block_starts[i] in keep_set:
+            kept_whole_names.append(blocks[block_starts[i]]["name"])
+        out_lines.append(line)
+
+    text = "".join(out_lines)
+    return TruncationResult(
+        text=text,
+        bytes_kept=len(text.encode("utf-8")),
+        symbols_kept_whole=kept_whole_names,
+        symbols_truncated=truncated_names,
+        elided_lines=elided,
+        used_ast=True,  # treat as AST-equivalent for downstream gating
     )

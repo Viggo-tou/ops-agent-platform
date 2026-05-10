@@ -110,6 +110,34 @@ def _backtick_names(text: str) -> set[str]:
     return {m.group(1) for m in _BACKTICK.finditer(text)}
 
 
+_PY_DEF_RE = re.compile(r"^(?:[ \t]*)(?:async\s+)?def\s+(\w+)\s*\(", re.MULTILINE)
+
+
+def _function_names_in_python(content: str) -> list[str]:
+    """Return all function/method names in a Python source string.
+
+    Tries ast.parse first (precise), falls back to a regex scan when
+    the parser rejects the file. Real-world example: Python 3.14
+    rejects astropy/nddata/mixins/ndarithmetic.py with a triple-quote
+    parity error even though the file otherwise runs fine; the regex
+    fallback recovers ~ all top-level function/method names.
+    """
+    try:
+        import ast as _ast
+
+        tree = _ast.parse(content)
+        return [
+            node.name
+            for node in _ast.walk(tree)
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+        ]
+    except (SyntaxError, ValueError):
+        # Best-effort: scan for line-leading `def name(` / `async def name(`.
+        # Misses `def` defined inside string literals, but that's a
+        # vanishingly small corner case and not worth fighting for.
+        return [m.group(1) for m in _PY_DEF_RE.finditer(content)]
+
+
 # Concept words: lowercase tokens 4+ chars that look like content words
 # in the issue text. Used to fuzzy-match against function names defined
 # in candidate files. The 4-char floor + stopword filter keeps "the",
@@ -162,21 +190,11 @@ def extract_keep_symbols_for_files(
     for path, content in files.items():
         if not path.endswith(".py") or not content:
             continue
-        # Best-effort AST parse; corrupted files are skipped silently.
-        try:
-            import ast as _ast
-
-            tree = _ast.parse(content)
-        except (SyntaxError, ValueError):
-            continue
-        for node in _ast.walk(tree):
-            if isinstance(
-                node, (_ast.FunctionDef, _ast.AsyncFunctionDef)
-            ):
-                name = node.name
-                name_lower = name.lower()
-                if any(word in name_lower for word in concept_words):
-                    indirect.append(name)
+        names = _function_names_in_python(content)
+        for name in names:
+            name_lower = name.lower()
+            if any(word in name_lower for word in concept_words):
+                indirect.append(name)
 
     seen: set[str] = set(direct)
     merged: list[str] = list(direct)

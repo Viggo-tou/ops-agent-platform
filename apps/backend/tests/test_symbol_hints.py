@@ -157,6 +157,35 @@ def test_keep_symbols_handles_syntax_error_gracefully():
     assert hints == []
 
 
+def test_keep_symbols_regex_fallback_finds_names_when_ast_fails():
+    """Real-world: Python 3.14 rejects astropy ndarithmetic.py with a
+    triple-quote parity error even though the file runs fine. Regex
+    fallback must still surface the function names so cross-reference
+    matching works."""
+    # Craft a file ast.parse rejects but with clear def lines.
+    src = (
+        '_doc = """unterminated\n'
+        "import os\n"
+        "def _arithmetic_mask(self, op):\n"
+        "    return self.mask | op.mask\n"
+        "def helper():\n"
+        "    pass\n"
+    )
+    # Sanity: confirm ast actually rejects, otherwise this doesn't
+    # exercise the fallback.
+    import ast as _ast
+    raises = False
+    try:
+        _ast.parse(src)
+    except SyntaxError:
+        raises = True
+    assert raises, "test premise broken — ast.parse accepted source"
+
+    issue = "mask propagation fails"
+    hints = extract_keep_symbols_for_files(issue, {"x.py": src})
+    assert "_arithmetic_mask" in hints
+
+
 def test_keep_symbols_caps_total_at_8():
     issue = "fix the foo handler logic"
     files = {
