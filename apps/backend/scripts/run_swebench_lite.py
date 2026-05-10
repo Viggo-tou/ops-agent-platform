@@ -270,7 +270,11 @@ def poll_until_terminal(
             resp = httpx.get(
                 f"{backend_url}/api/tasks/{task_id}",
                 headers=ACTOR_HEADERS,
-                timeout=30.0,
+                # Bumped 30s → 60s for v10: full-DeepSeek reviewer makes
+                # /api/tasks/{id} occasionally slower than 30s when
+                # gates run synchronously. ReadTimeout was seen on v10
+                # task 2 (django-11283) under DeepSeek reviewer load.
+                timeout=60.0,
             )
             resp.raise_for_status()
             last = resp.json()
@@ -313,7 +317,7 @@ def extract_diff(backend_url: str, task: dict[str, Any]) -> str:
             resp = httpx.get(
                 f"{backend_url}/api/tasks/{task_id}/events",
                 headers=ACTOR_HEADERS,
-                timeout=30.0,
+                timeout=60.0,
             )
             resp.raise_for_status()
             events = resp.json()
