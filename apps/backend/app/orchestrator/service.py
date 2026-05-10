@@ -3054,9 +3054,29 @@ class PrimaryOrchestrator:
                 #    already had them via Strategy 0/2/3), and
                 # (b) re-apply build_evidence_pack across the merged
                 #    set so the absolute byte/file caps still hold.
-                _inject_paths: list[str] = []
-                _inject_paths.extend(evidence.must_touch_files or [])
-                for cf in (evidence.candidate_files or [])[:5]:
+                # Filter both must_touch and candidate_files through the
+                # exclusion list so non-source repo metadata (LICENSE,
+                # AUTHORS, *.po, *.rst, README) cannot become a codegen
+                # batch target. Surfaced 2026-05-10 task 4: planner left
+                # must_touch empty, retrieval surfaced 6 root-level Django
+                # repo files, the model invented edits to AUTHORS et al.
+                from app.services.evidence_bundle import (
+                    _filter_must_touch_files,
+                )
+
+                _evidence_settings = (
+                    self.tool_gateway.settings if self.tool_gateway is not None else None
+                )
+                _inject_paths: list[str] = list(
+                    _filter_must_touch_files(
+                        list(evidence.must_touch_files or []),
+                        settings=_evidence_settings,
+                    )
+                )
+                for cf in _filter_must_touch_files(
+                    list(evidence.candidate_files or [])[:5],
+                    settings=_evidence_settings,
+                ):
                     if cf not in _inject_paths:
                         _inject_paths.append(cf)
                 _injected_count = 0

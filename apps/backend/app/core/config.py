@@ -169,17 +169,29 @@ class Settings(BaseSettings):
         ".png,.jpg,.jpeg,.gif,.svg,.webp,.ico,.bmp,"
         ".woff,.woff2,.ttf,.otf,.eot,"
         ".mp3,.mp4,.mov,.wav,.avi,.mkv,"
-        ".pyc,.pyo,.class,.dll,.so,.dylib,.exe"
+        ".pyc,.pyo,.class,.dll,.so,.dylib,.exe,"
+        # Documentation + i18n + repo metadata: a Python bug fix never
+        # lives in these. Surfaced as 2026-05-10 task 4 regression
+        # where the planner left must_touch empty and retrieval
+        # surfaced .po / .rst files which then got dispatched as
+        # codegen targets.
+        ".po,.pot,.mo,.rst,.md"
     )
     evidence_must_touch_excluded_path_segments: str = (
         "build/,build-before/,build-after/,dist/,node_modules/,"
-        "__pycache__/,.next/,.cache/,.tmp/,data/sandboxes/,data/agent_workspace/"
+        "__pycache__/,.next/,.cache/,.tmp/,data/sandboxes/,data/agent_workspace/,"
+        "locale/,locales/,docs/,doc/"
     )
     evidence_must_touch_excluded_filenames: str = (
         "package.json,package-lock.json,yarn.lock,pnpm-lock.yaml,"
         "tsconfig.json,jsconfig.json,.eslintrc*,.prettierrc*,.editorconfig,"
         "cors.json,firebase.json,poetry.lock,requirements.txt,requirements-*.txt,"
-        "go.sum,cargo.lock"
+        "go.sum,cargo.lock,"
+        # Repo-root metadata files (often surfaced by retrieval as
+        # high-coverage hits but never the actual fix target).
+        "license,license.*,authors,install,install.*,changelog,changelog.*,"
+        "copying,copying.*,manifest.in,readme,readme.*,contributing,contributing.*,"
+        "notice,trove_classifiers,py.typed"
     )
     evidence_must_touch_include_configs: bool = False
     # Semantic reranker: when enabled, the keyword-based retriever picks
