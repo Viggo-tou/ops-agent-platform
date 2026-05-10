@@ -820,12 +820,13 @@ class CodeGenerator:
         if provider == "mock":
             return self._mock_generate(plan_json, context_files)
 
-        # 2026-05-10: cut 3→2. v10 task 1 burned ~10 min on a 3-retry
-        # cycle (each Aider parse failure ≈ 5 min). Two attempts is
-        # enough for "first reply was malformed → second cleaner with
-        # AIDER_FORMAT_RETRY_SUFFIX". The 3rd attempt rarely converged
-        # in practice and was the dominant tax on failure paths.
-        max_attempts = 2
+        # Reverted to 3 after v11 task 1 (astropy-14995) regressed:
+        # the original v10 success on this task came from the 3rd
+        # attempt converging where attempts 1+2 had emitted plain
+        # EVIDENCE_GAP. Keep 3; the perf gain wasn't worth a real
+        # bug fix being lost. The Tier 4-H implicit extraction in
+        # a384544 should make this less critical going forward.
+        max_attempts = 3
         last_error: str | None = None
         prompt_fingerprint = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:10]
         for attempt in range(max_attempts):
