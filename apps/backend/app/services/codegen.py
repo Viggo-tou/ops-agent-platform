@@ -895,10 +895,27 @@ class CodeGenerator:
                 # through to the regular failure path.
                 if not getattr(self, "_tool_loop_used", False):
                     self._tool_loop_used = True
+                    import logging as _log
+
+                    _tl_logger = _log.getLogger("codegen.tool_loop")
+                    _tl_logger.warning(
+                        "tool_loop.fire requests=%s candidate_files=%s repo_root=%s",
+                        [
+                            {"file": r.file, "symbol": r.symbol, "why": (r.why or "")[:100]}
+                            for r in gap_exc.requests
+                        ],
+                        list(context_files.keys()),
+                        source_repo_path,
+                    )
                     spans_text = self._fulfil_evidence_gap_request(
                         gap_exc.requests,
                         candidate_files=context_files,
                         source_repo_path=source_repo_path,
+                    )
+                    _tl_logger.warning(
+                        "tool_loop.result span_count=%d span_bytes=%d",
+                        spans_text.count("--- "),
+                        len(spans_text),
                     )
                     if spans_text:
                         recovered_prompt = (
