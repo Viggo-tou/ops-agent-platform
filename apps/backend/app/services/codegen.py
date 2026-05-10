@@ -265,6 +265,22 @@ class CodegenError(Exception):
     pass
 
 
+class CodegenEvidenceGapRequest(CodegenError):
+    """Raised when the model emits a structured ``## EVIDENCE_GAP_REQUEST``.
+
+    Carries the parsed requests so the harness can fetch the named
+    spans from disk and re-run codegen ONCE with the additional
+    context appended. This is the Tier 4-H bounded tool-use loop.
+    """
+
+    def __init__(self, requests: list, raw_marker: str = "") -> None:  # type: ignore[no-untyped-def]
+        super().__init__(
+            f"codegen_terminal: EVIDENCE_GAP_REQUEST ({len(requests)} request(s))"
+        )
+        self.requests = requests
+        self.raw_marker = raw_marker
+
+
 class CodeGenerator:
     def __init__(self, settings: Settings | None = None, *, db: Session | None = None):
         self.settings = settings or get_settings()
@@ -592,6 +608,10 @@ class CodeGenerator:
         # context_files through every provider signature).
         self._current_context_files = dict(context_files or {})
         self._current_source_repo_path = source_repo_path
+        # Tier 4-H: track whether the bounded tool-use loop already fired
+        # for this generate_patch call. Reset here (instance is reused
+        # across calls).
+        self._tool_loop_used = False
         providers = self._resolve_provider_chain()
         must_touch_files, expected_new_files, allowed_paths = self._extract_plan_target_paths(plan_json)
         enforce = bool(allowed_paths)
@@ -858,6 +878,54 @@ class CodeGenerator:
                     prompt_fingerprint=prompt_fingerprint,
                 )
                 return result
+            except CodegenEvidenceGapRequest as gap_exc:
+                self._record_codegen_failure(
+                    task_id=task_id,
+                    actor_name=actor_name,
+                    provider=provider,
+                    latency_ms=int((time.perf_counter() - started) * 1000) if "started" in locals() else 0,
+                    retry_count=attempt,
+                    fallback_step=fallback_step,
+                    prompt_fingerprint=prompt_fingerprint,
+                    error_type=type(gap_exc).__name__,
+                )
+                # Tier 4-H bounded recovery: ONCE per provider call we
+                # let the model's stated "I need symbol X in file Y" be
+                # fulfilled from disk + retry codegen. After that, fall
+                # through to the regular failure path.
+                if not getattr(self, "_tool_loop_used", False):
+                    self._tool_loop_used = True
+                    spans_text = self._fulfil_evidence_gap_request(
+                        gap_exc.requests,
+                        candidate_files=context_files,
+                        source_repo_path=source_repo_path,
+                    )
+                    if spans_text:
+                        recovered_prompt = (
+                            prompt
+                            + "\n\n---\nThe harness fulfilled your "
+                            "EVIDENCE_GAP_REQUEST below. Use these spans "
+                            "as your Aider SEARCH anchors and produce the "
+                            "diff now.\n"
+                            + spans_text
+                        )
+                        try:
+                            return self._call_provider_once(
+                                provider=provider,
+                                prompt=recovered_prompt,
+                                context_files=context_files,
+                                source_repo_path=source_repo_path,
+                                task_id=task_id,
+                            )
+                        except CodegenError:
+                            # Recovery attempt also failed; fall through.
+                            pass
+                # No request fulfilled (or recovery failed) — surface as
+                # plain terminal so caller treats it as a hard stop.
+                raise CodegenError(
+                    f"codegen_terminal: EVIDENCE_GAP_REQUEST unfulfilled "
+                    f"({len(gap_exc.requests)} request(s))"
+                ) from gap_exc
             except CodegenError as exc:
                 self._record_codegen_failure(
                     task_id=task_id,
@@ -875,6 +943,66 @@ class CodeGenerator:
                 raise
 
         raise CodegenError(f"Failed to generate valid diff after {max_attempts} attempts. Last error: {last_error}")
+
+    def _fulfil_evidence_gap_request(
+        self,
+        requests: list,
+        *,
+        candidate_files: dict[str, str],
+        source_repo_path: str | None,
+    ) -> str:
+        """Wrap the codegen_tool_loop fetcher with a safe try/except.
+
+        Returns the rendered prompt section (possibly empty) so the
+        caller can append it without further checking.
+        """
+        try:
+            from app.services.codegen_tool_loop import (
+                fulfil_requests,
+                render_spans_for_prompt,
+            )
+
+            repo_root = Path(source_repo_path) if source_repo_path else None
+            spans = fulfil_requests(
+                requests, candidate_files=candidate_files, repo_root=repo_root
+            )
+            return render_spans_for_prompt(spans)
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _call_provider_once(
+        self,
+        *,
+        provider: str,
+        prompt: str,
+        context_files: dict[str, str],
+        source_repo_path: str | None,
+        task_id: str,
+    ) -> CodegenResult:
+        """Single-shot provider invocation used by the Tier 4-H recovery
+        path. Mirrors the dispatch in ``_try_provider`` but doesn't
+        re-enter the retry loop or terminal-marker handler.
+        """
+        if provider == "claude_code":
+            return self._call_claude_code(
+                prompt,
+                context_files=context_files,
+                source_repo_path=source_repo_path,
+                task_id=task_id,
+            )
+        if provider == "codex":
+            return self._call_codex(prompt, context_files=context_files)
+        if provider == "anthropic":
+            return self._call_anthropic(prompt)
+        if provider == "deepseek":
+            return self._call_deepseek(prompt)
+        if provider == "ollama":
+            return self._call_ollama(prompt, context_files=context_files)
+        if provider == "minimax":
+            return self._call_minimax(prompt, context_files=context_files)
+        if provider == "openai":
+            return self._call_openai(prompt)
+        raise CodegenError(f"Unknown provider: {provider}")
 
     def _record_codegen_call(
         self,
@@ -2410,6 +2538,17 @@ class CodeGenerator:
         # decide what to do next (e.g. expand evidence pack, re-plan).
         marker = _detect_terminal_marker(diff)
         if marker is not None:
+            # Tier 4-H: if the model emitted a structured request alongside
+            # EVIDENCE_GAP, raise a special exception so _try_provider can
+            # fetch the missing spans and retry once.
+            if marker.startswith("EVIDENCE_GAP"):
+                from app.services.codegen_tool_loop import (
+                    parse_evidence_gap_requests,
+                )
+
+                requests = parse_evidence_gap_requests(diff)
+                if requests:
+                    raise CodegenEvidenceGapRequest(requests, raw_marker=marker)
             raise CodegenError(f"codegen_terminal: {marker}")
         if diff.startswith("```"):
             diff = re.sub(r"^```(?:diff|patch)?\s*", "", diff)
@@ -2470,6 +2609,14 @@ class CodeGenerator:
         # — retrying just burns tokens. Surface as non-retryable.
         marker = _detect_terminal_marker(text)
         if marker is not None:
+            if marker.startswith("EVIDENCE_GAP"):
+                from app.services.codegen_tool_loop import (
+                    parse_evidence_gap_requests,
+                )
+
+                requests = parse_evidence_gap_requests(text)
+                if requests:
+                    raise CodegenEvidenceGapRequest(requests, raw_marker=marker)
             raise CodegenError(f"codegen_terminal: {marker}")
         if text.startswith("```"):
             text = re.sub(r"^```(?:\w+)?\s*", "", text)

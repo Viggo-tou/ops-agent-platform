@@ -71,3 +71,34 @@ the new text
 
 These are valid terminal outputs. The orchestrator routes them to the
 planner for clarification rather than to apply_patch.
+
+### Asking the harness for missing source (preferred over EVIDENCE_GAP)
+
+When the only thing blocking a real fix is "I need to see the body of
+function X in file Y", emit a structured request instead of plain
+`EVIDENCE_GAP`. The harness fetches the requested span from disk and
+re-runs codegen ONE more time:
+
+```
+## EVIDENCE_GAP_REQUEST
+file: django/db/models/fields/__init__.py
+symbol: contribute_to_class
+why: need closure binding site for _get_FIELD_display
+```
+
+Rules:
+
+- Up to 4 requests per response. Separate each with a blank line.
+- ``file`` and ``symbol`` are both optional but at least one MUST be
+  present. ``symbol`` alone (no file) is rejected; ``file`` alone
+  fetches the whole file (capped at 4 KB).
+- Only request files / symbols that the planner or evidence pack has
+  already mentioned. Names you invent will not be found.
+- Do NOT mix EVIDENCE_GAP_REQUEST with diff hunks in the same response.
+  The harness either retries with fetched evidence OR accepts your diff;
+  it cannot do both.
+
+When the harness retries with fetched spans you'll see a new section
+``=== EVIDENCE FETCH (you asked for these) ===``. Use the spans there
+as your Aider SEARCH anchors. Do NOT emit EVIDENCE_GAP again for those
+names — they are now ground truth.
