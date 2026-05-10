@@ -259,6 +259,14 @@ def truncate_python_source(
         out_lines.extend(lines[last_emitted_end:])
 
     text = "".join(out_lines)
+    # Prepend a header so the model understands what's been elided
+    # vs preserved. Without this, the surrounding `pass` placeholders
+    # made DeepSeek emit EVIDENCE_GAP defensively even when the
+    # function it actually needed was kept whole (2026-05-10 v7
+    # regression on astropy ndarithmetic.py).
+    if kept_whole or truncated:
+        header = _build_truncation_header(kept_whole, truncated)
+        text = header + text
     return TruncationResult(
         text=text,
         bytes_kept=len(text.encode("utf-8")),
@@ -267,6 +275,45 @@ def truncate_python_source(
         elided_lines=elided_total,
         used_ast=True,
     )
+
+
+def _build_truncation_header(
+    kept_whole: list[str], truncated: list[str]
+) -> str:
+    """Explanatory comment block at the top of a truncated file.
+
+    Tells the model exactly which functions are preserved with full
+    bodies (usable as Aider SEARCH anchors) and which were elided.
+    Helps the model not emit EVIDENCE_GAP just because it sees
+    `# ... N line(s) elided ...` placeholders elsewhere in the file.
+    """
+    lines = [
+        "# === ast_truncate header ===",
+        "# This file has been STRUCTURALLY TRUNCATED for context budget.",
+    ]
+    if kept_whole:
+        sample = ", ".join(kept_whole[:8])
+        if len(kept_whole) > 8:
+            sample += f", ... (+{len(kept_whole) - 8} more)"
+        lines.append(
+            f"# Functions kept WHOLE (use as SEARCH anchors): {sample}"
+        )
+    if truncated:
+        sample = ", ".join(truncated[:8])
+        if len(truncated) > 8:
+            sample += f", ... (+{len(truncated) - 8} more)"
+        lines.append(
+            f"# Functions with bodies elided (signatures still visible): {sample}"
+        )
+    lines.append(
+        "# DO NOT emit EVIDENCE_GAP because of `# ... N line(s) elided ...` markers"
+    )
+    lines.append(
+        "# below -- those mark non-target functions whose bodies are intentionally"
+    )
+    lines.append("# omitted. The functions named above are present in full.")
+    lines.append("# === end header ===\n")
+    return "\n".join(lines) + "\n"
 
 
 _DEF_RE = re.compile(r"^(?P<indent>[ \t]*)(?:async\s+)?def\s+(?P<name>\w+)\s*\(")
@@ -383,6 +430,8 @@ def _regex_truncate_python(
         out_lines.append(line)
 
     text = "".join(out_lines)
+    if kept_whole_names or truncated_names:
+        text = _build_truncation_header(kept_whole_names, truncated_names) + text
     return TruncationResult(
         text=text,
         bytes_kept=len(text.encode("utf-8")),
