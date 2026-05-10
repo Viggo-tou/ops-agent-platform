@@ -175,12 +175,21 @@ class Settings(BaseSettings):
         # where the planner left must_touch empty and retrieval
         # surfaced .po / .rst files which then got dispatched as
         # codegen targets.
-        ".po,.pot,.mo,.rst,.md"
+        ".po,.pot,.mo,.rst,.md,"
+        # Templates + frontend assets: surfaced 2026-05-10 v9 task 3
+        # where empty planner must_touch let retrieval inject 20 admin
+        # HTML / JS / CSS files as codegen batch targets — every batch
+        # honestly emitted PLAN_CONFLICT but burned tokens.
+        ".html,.htm,.js,.jsx,.ts,.tsx,.css,.scss,.sass,.vue,.svelte"
     )
     evidence_must_touch_excluded_path_segments: str = (
         "build/,build-before/,build-after/,dist/,node_modules/,"
         "__pycache__/,.next/,.cache/,.tmp/,data/sandboxes/,data/agent_workspace/,"
-        "locale/,locales/,docs/,doc/"
+        "locale/,locales/,docs/,doc/,"
+        # Static + template directories — Django convention puts admin
+        # HTML in `templates/` and frontend bundles in `static/`. None
+        # of those are valid codegen targets for an ORM/query bug.
+        "templates/,static/,assets/,public/"
     )
     evidence_must_touch_excluded_filenames: str = (
         "package.json,package-lock.json,yarn.lock,pnpm-lock.yaml,"
