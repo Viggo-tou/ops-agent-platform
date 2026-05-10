@@ -32,6 +32,16 @@ class Settings(BaseSettings):
     # → aider_blocks (15-25 pp gain on mid-tier per Aider data); others
     # → unified_diff. Force a specific value for A/B measurement.
     codegen_output_format: Literal["auto", "unified_diff", "aider_blocks"] = "auto"
+    # Agent mode (Tier 4 main course). "static" = the existing 1-shot
+    # codegen + retry + structural-gate pipeline. "loop" = multi-turn
+    # agent that issues read_file/search_symbol/list_directory tool
+    # calls then commits via apply_diff. Static stays default until
+    # the loop validates ≥ static quality on the 4-task regression.
+    codegen_agent_mode: Literal["static", "loop"] = "static"
+    # Agent-loop turn cap (hard stop).
+    codegen_agent_max_turns: int = 12
+    # Agent-loop wall-clock cap, seconds.
+    codegen_agent_max_seconds: float = 600.0
     primary_agent_model: str = "gpt-4o-mini"
     primary_agent_timeout_seconds: float = 30.0
     minimax_planner_timeout_seconds: float = 90.0

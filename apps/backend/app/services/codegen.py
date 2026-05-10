@@ -612,6 +612,21 @@ class CodeGenerator:
         # for this generate_patch call. Reset here (instance is reused
         # across calls).
         self._tool_loop_used = False
+
+        # Tier 4 main course: when agent mode = loop, run the multi-turn
+        # agent loop instead of the static 1-shot pipeline. Decision
+        # 2026-05-10: static stays default until loop validates ≥ static
+        # quality on the 4-task regression baseline.
+        if getattr(self.settings, "codegen_agent_mode", "static") == "loop":
+            return self._run_agent_loop(
+                task_id=task_id,
+                plan_json=plan_json,
+                context_files=context_files,
+                task_description=task_description,
+                source_repo_path=source_repo_path,
+                actor_name=actor_name,
+            )
+
         providers = self._resolve_provider_chain()
         must_touch_files, expected_new_files, allowed_paths = self._extract_plan_target_paths(plan_json)
         enforce = bool(allowed_paths)
@@ -2756,6 +2771,247 @@ class CodeGenerator:
             raise CodegenError("JSON codegen response produced no files with changes.")
 
         return "\n".join(diff_parts) + "\n", files_changed
+
+    # ===========================================================
+    # Tier 4 main course: multi-turn agent loop integration.
+    # ===========================================================
+
+    def _run_agent_loop(
+        self,
+        *,
+        task_id: str,
+        plan_json: dict[str, Any],
+        context_files: dict[str, str],
+        task_description: str,
+        source_repo_path: str | None,
+        actor_name: str | None,
+    ) -> CodegenResult:
+        """Run the multi-turn agent loop and return its diff as a
+        CodegenResult.
+
+        Maps the static-pipeline contract onto agent-loop semantics:
+          - ``plan_json`` → user_prompt (plan summary + targets)
+          - ``context_files`` → AgentLoopContext.candidate_files
+          - ``source_repo_path`` → AgentLoopContext.repo_root
+          - sandbox dir → from settings (when develop pipeline has one)
+          - DeepSeek (default codegen provider) → llm_call wrapper
+
+        On terminal_reason == "diff_emitted" the unified diff is wrapped
+        as a CodegenResult. On any other terminal (cannot_proceed, budget,
+        error, no diff), raise CodegenError so the caller's existing
+        failure path takes over.
+        """
+        from app.services.agent_loop import (
+            AgentLoopBudget,
+            AgentLoopContext,
+            run_agent_loop,
+        )
+
+        user_prompt = self._build_agent_user_prompt(plan_json, task_description)
+        sandbox_dir_path: Path | None = None
+        if source_repo_path:
+            try:
+                sandbox_dir_path = Path(source_repo_path)
+            except (TypeError, ValueError):
+                sandbox_dir_path = None
+
+        ctx = AgentLoopContext(
+            sandbox_dir=sandbox_dir_path,
+            repo_root=sandbox_dir_path,
+            candidate_files=dict(context_files or {}),
+        )
+        budget = AgentLoopBudget(
+            max_turns=int(getattr(self.settings, "codegen_agent_max_turns", 12)),
+            max_seconds=float(getattr(self.settings, "codegen_agent_max_seconds", 600.0)),
+        )
+
+        # Dispatch the codegen provider as the loop's LLM. DeepSeek is
+        # the target per current product config; openai / anthropic
+        # available as fallbacks for measurement.
+        provider = self._resolve_provider_chain()[0]
+        if provider == "mock":
+            raise CodegenError(
+                "agent loop does not support mock provider — set codegen_provider=deepseek"
+            )
+
+        def _llm_call(system_prompt: str, messages: list[dict[str, str]]) -> str:
+            return self._agent_llm_call(
+                provider=provider,
+                system_prompt=system_prompt,
+                messages=messages,
+            )
+
+        result = run_agent_loop(
+            task_id=task_id,
+            user_prompt=user_prompt,
+            llm_call=_llm_call,
+            ctx=ctx,
+            budget=budget,
+        )
+
+        if result.terminated_reason == "diff_emitted" and result.final_diff.strip():
+            from app.services.reviewer import DiffReviewer
+
+            files_changed = DiffReviewer.parse_changed_files(result.final_diff)
+            return CodegenResult(
+                diff=result.final_diff,
+                summary=(
+                    f"Agent loop produced patch in {len(result.state.turns)} turn(s); "
+                    f"modified {len(files_changed)} file(s)"
+                ),
+                files_changed=files_changed,
+                provider_name=f"agent_loop:{provider}",
+                model_name=getattr(self.settings, "deepseek_model", "deepseek-coder")
+                if provider == "deepseek" else self._resolve_model_name(provider),
+            )
+
+        # Any non-success terminal becomes a CodegenError. Static
+        # pipeline's existing failure path handles it from there.
+        raise CodegenError(
+            f"agent_loop_terminated:{result.terminated_reason} "
+            f"(turns={len(result.state.turns)}, "
+            f"final_diff_bytes={len(result.final_diff)})"
+        )
+
+    def _build_agent_user_prompt(
+        self,
+        plan_json: dict[str, Any],
+        task_description: str,
+    ) -> str:
+        """Build the agent loop's initial user message.
+
+        Includes the planner's objective + must_touch + acceptance_tests
+        so the model knows what to fix without us pre-loading every file.
+        Tools let the model fetch what it actually needs.
+        """
+        parts: list[str] = []
+        objective = str(plan_json.get("objective") or "").strip()
+        if objective:
+            parts.append(f"OBJECTIVE: {objective}")
+        change_summary = str(plan_json.get("change_summary") or "").strip()
+        if change_summary and change_summary != objective:
+            parts.append(f"SUMMARY: {change_summary}")
+
+        if task_description.strip():
+            parts.append("TASK DESCRIPTION:")
+            parts.append(task_description.strip())
+
+        must_touch = plan_json.get("must_touch_files") or []
+        if must_touch:
+            parts.append("MUST-TOUCH FILES (the patch should target these):")
+            for path in must_touch:
+                parts.append(f"  - {path}")
+
+        expected_new = plan_json.get("expected_new_files") or []
+        if expected_new:
+            parts.append("EXPECTED NEW FILES (the patch should create these):")
+            for path in expected_new:
+                parts.append(f"  - {path}")
+
+        acceptance_tests = plan_json.get("acceptance_tests") or []
+        if acceptance_tests:
+            parts.append(
+                "ACCEPTANCE TESTS (the diff will be checked against these structurally):"
+            )
+            for t in acceptance_tests[:6]:
+                if isinstance(t, dict):
+                    kind = str(t.get("kind") or "")
+                    pattern = str(t.get("pattern") or "")
+                    rationale = str(t.get("rationale") or "")[:160]
+                    parts.append(f"  - {kind}: {pattern}  ({rationale})")
+
+        parts.append("")
+        parts.append(
+            "Use the read_file / search_symbol / list_directory tools to gather "
+            "what you need. When ready, emit a single apply_diff call with "
+            "Aider-style search/replace blocks for the fix."
+        )
+        return "\n".join(parts)
+
+    def _agent_llm_call(
+        self,
+        *,
+        provider: str,
+        system_prompt: str,
+        messages: list[dict[str, str]],
+    ) -> str:
+        """Provider-agnostic single-turn LLM call for agent loop.
+
+        Currently wires DeepSeek (production codegen target). Anthropic
+        and OpenAI added when needed for cross-model harness-contribution
+        measurement.
+        """
+        if provider == "deepseek":
+            return self._agent_llm_call_deepseek(system_prompt, messages)
+        if provider == "openai":
+            return self._agent_llm_call_openai(system_prompt, messages)
+        raise CodegenError(
+            f"agent loop currently supports deepseek + openai only, got: {provider}"
+        )
+
+    def _agent_llm_call_deepseek(
+        self, system_prompt: str, messages: list[dict[str, str]]
+    ) -> str:
+        if not self.settings.deepseek_api_key:
+            raise CodegenError("OPS_AGENT_DEEPSEEK_API_KEY is not configured.")
+        url = "https://api.deepseek.com/v1/chat/completions"
+        body = {
+            "model": self.settings.deepseek_model,
+            "messages": [{"role": "system", "content": system_prompt}, *messages],
+            "temperature": 0.0,
+            "max_tokens": 4096,
+        }
+        try:
+            response = cached_http_post(
+                url=url,
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {self.settings.deepseek_api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=external_http_timeout(self.settings.deepseek_timeout_seconds),
+                provider_hint="codegen.agent_loop.deepseek",
+            )
+            response.raise_for_status()
+            data = response.json()
+            return str(
+                data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            )
+        except httpx.HTTPError as exc:
+            raise CodegenError(f"DeepSeek API error in agent loop: {exc}") from exc
+
+    def _agent_llm_call_openai(
+        self, system_prompt: str, messages: list[dict[str, str]]
+    ) -> str:
+        if not self.settings.openai_api_key:
+            raise CodegenError("OPS_AGENT_OPENAI_API_KEY is not configured.")
+        url = f"{self.settings.openai_base_url.rstrip('/')}/chat/completions"
+        body = {
+            "model": self._resolve_model_name("openai"),
+            "messages": [{"role": "system", "content": system_prompt}, *messages],
+            "temperature": 0.0,
+            "max_tokens": 4096,
+        }
+        try:
+            response = cached_http_post(
+                url=url,
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {self.settings.openai_api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=external_http_timeout(
+                    getattr(self.settings, "primary_agent_timeout_seconds", 90)
+                ),
+                provider_hint="codegen.agent_loop.openai",
+            )
+            response.raise_for_status()
+            data = response.json()
+            return str(
+                data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            )
+        except httpx.HTTPError as exc:
+            raise CodegenError(f"OpenAI API error in agent loop: {exc}") from exc
 
 
 def _first_line(content: str) -> str | None:
