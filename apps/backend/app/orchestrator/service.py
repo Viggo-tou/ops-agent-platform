@@ -4345,6 +4345,54 @@ class PrimaryOrchestrator:
         # but FILE has no implementation. Static check: each must_touch
         # file must contain at least one required token derived from
         # plan.objective + translation.search_queries + spec text.
+        # Gate audit (2026-05-10): when the planner emits a non-empty
+        # acceptance_tests list with at least one structural assertion,
+        # skip feature_presence — the two gates overlap and acceptance
+        # is the precise version. v9 task 1 had its real bug fix
+        # rejected by feature_presence (sparse-token fallback gave
+        # only 1 strict token, below the threshold of 3) even though
+        # the code change was correct. acceptance_check would have
+        # accepted that diff because it has a `_arithmetic_mask`-shape
+        # pattern hit. Without acceptance_tests, feature_presence still
+        # runs as the only structural anchor.
+        _plan_acceptance_tests = (
+            (task.plan_json or {}).get("acceptance_tests")
+            if isinstance(task.plan_json, dict)
+            else None
+        )
+        _has_structural_acceptance = (
+            isinstance(_plan_acceptance_tests, list)
+            and any(
+                isinstance(t, dict)
+                and t.get("kind")
+                in {
+                    "diff_contains_pattern",
+                    "diff_contains_pattern_in_file",
+                    "no_new_file_outside",
+                    "import_added",
+                }
+                for t in _plan_acceptance_tests
+            )
+        )
+        if not pipeline_state.get("feature_presence_done") and _has_structural_acceptance:
+            pipeline_state["feature_presence_done"] = True
+            pipeline_state["feature_presence_skipped"] = "structural_acceptance_present"
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_SUCCEEDED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="feature_presence_check.skipped",
+                message=(
+                    "Plan emits structural acceptance_tests; "
+                    "skipping feature_presence pre-gate "
+                    "(acceptance_check is the precise version)."
+                ),
+                payload={"reason": "structural_acceptance_present"},
+            )
+
         if not pipeline_state.get("feature_presence_done"):
             try:
                 from app.services.feature_presence_check import (
