@@ -59,8 +59,58 @@ def test_parse_capped_at_max_hits():
 
 
 def test_parse_no_request_block_returns_empty():
+    """Pure EVIDENCE_GAP without identifiers or paths still yields empty."""
     text = "## EVIDENCE_GAP: just plain prose, no structured request."
     assert parse_evidence_gap_requests(text) == []
+
+
+def test_parse_implicit_extracts_backtick_idents_and_path():
+    """V11 regression: DeepSeek emitted plain EVIDENCE_GAP with prose
+    naming a backtick-quoted symbol + a .py path. Implicit path should
+    synthesise a structured GapRequest so Tier 4-H still fires."""
+    text = (
+        "## EVIDENCE_GAP: the full implementation of "
+        "`_arithmetic_mask` in astropy/nddata/mixins/ndarithmetic.py "
+        "is required to produce the SEARCH block."
+    )
+    reqs = parse_evidence_gap_requests(text)
+    assert len(reqs) == 1
+    assert reqs[0].file == "astropy/nddata/mixins/ndarithmetic.py"
+    assert reqs[0].symbol == "_arithmetic_mask"
+    assert "implicit" in reqs[0].why
+
+
+def test_parse_implicit_multiple_symbols_share_path():
+    text = (
+        "## EVIDENCE_GAP: I need both `foo_helper` and `bar_helper` "
+        "from app/utils.py to construct the diff."
+    )
+    reqs = parse_evidence_gap_requests(text)
+    syms = {r.symbol for r in reqs}
+    assert syms == {"foo_helper", "bar_helper"}
+    assert all(r.file == "app/utils.py" for r in reqs)
+
+
+def test_parse_implicit_no_extraction_when_no_evidence_gap_marker():
+    """Identifiers alone without an EVIDENCE_GAP marker shouldn't
+    synthesise requests — that text isn't a gap signal."""
+    text = "Random prose with `foo` and src/x.py mentioned."
+    assert parse_evidence_gap_requests(text) == []
+
+
+def test_parse_structured_takes_precedence_over_implicit():
+    """When both formats appear, structured requests win (their
+    why-line carries planner intent; implicit guesses are noisy)."""
+    text = (
+        "## EVIDENCE_GAP: also missing `extra_helper` from foo.py\n"
+        "## EVIDENCE_GAP_REQUEST\n"
+        "file: app/main.py\n"
+        "symbol: handle_request\n"
+    )
+    reqs = parse_evidence_gap_requests(text)
+    assert len(reqs) == 1
+    assert reqs[0].file == "app/main.py"
+    assert reqs[0].symbol == "handle_request"
 
 
 def test_parse_handles_lowercase_and_dash_variants():

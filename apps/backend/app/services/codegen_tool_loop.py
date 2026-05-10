@@ -63,11 +63,27 @@ _SYMBOL_RE = re.compile(r"^\s*symbol\s*:\s*(\S+)", re.IGNORECASE | re.MULTILINE)
 _WHY_RE = re.compile(r"^\s*why\s*:\s*(.+)", re.IGNORECASE | re.MULTILINE)
 
 
+_BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)`")
+_PATH_RE = re.compile(r"\b([\w\-./]+/[\w\-./]+\.py)\b")
+
+
 def parse_evidence_gap_requests(text: str) -> list[GapRequest]:
-    """Parse zero-or-more structured requests out of an EVIDENCE_GAP
-    response. Returns an empty list when the model's gap message has
-    no parseable structured request — caller should treat that as
-    "nothing to fetch, just give up".
+    """Parse zero-or-more requests out of an EVIDENCE_GAP response.
+
+    Two paths:
+    1. **Structured** — model followed the playbook and emitted
+       ``## EVIDENCE_GAP_REQUEST`` blocks with ``file:`` / ``symbol:`` /
+       ``why:`` fields. Preferred.
+    2. **Implicit** — model wrote prose like
+       ``## EVIDENCE_GAP: the full implementation of `_arithmetic_mask`
+       in astropy/nddata/mixins/ndarithmetic.py is required``. Extract
+       backtick-quoted identifiers + path-shaped tokens and synthesise
+       GapRequests so Tier 4-H still fires. (DeepSeek 2026-05-10:
+       v11 task 1 emitted plain EVIDENCE_GAP without the structured
+       block.)
+
+    Returns an empty list when neither path yields anything — caller
+    treats that as "nothing to fetch, give up".
     """
     if not text:
         return []
@@ -91,6 +107,38 @@ def parse_evidence_gap_requests(text: str) -> list[GapRequest]:
             )
             if len(requests) >= _MAX_REQUEST_HITS:
                 return requests
+    if requests:
+        return requests
+    # Implicit path: scan EVIDENCE_GAP prose for backtick-quoted
+    # identifiers + .py path tokens. Common DeepSeek phrasing:
+    # "the full implementation of `_arithmetic_mask` in
+    # astropy/nddata/mixins/ndarithmetic.py is required"
+    if not re.search(r"##\s*EVIDENCE[_\- ]?GAP\b", text, re.IGNORECASE):
+        return []
+    paths = list(dict.fromkeys(_PATH_RE.findall(text)))
+    symbols = list(dict.fromkeys(_BACKTICK_IDENT_RE.findall(text)))
+    if not paths and not symbols:
+        return []
+    primary_path = paths[0] if paths else None
+    if symbols and primary_path:
+        # One request per symbol, all anchored to the named file.
+        for sym in symbols[:_MAX_REQUEST_HITS]:
+            requests.append(
+                GapRequest(
+                    file=primary_path,
+                    symbol=sym,
+                    why="implicit-from-EVIDENCE_GAP-prose",
+                )
+            )
+    elif primary_path:
+        requests.append(
+            GapRequest(file=primary_path, symbol=None, why="implicit-from-EVIDENCE_GAP-prose")
+        )
+    elif symbols:
+        for sym in symbols[:_MAX_REQUEST_HITS]:
+            requests.append(
+                GapRequest(file=None, symbol=sym, why="implicit-from-EVIDENCE_GAP-prose")
+            )
     return requests
 
 
