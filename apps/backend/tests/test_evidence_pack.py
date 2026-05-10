@@ -241,6 +241,74 @@ def test_truncate_python_unpinned_still_byte_capped():
     assert "truncated" in out.lower()
 
 
+# --- must_touch never-drop + aggressive truncation -------------------------
+
+
+def test_must_touch_never_dropped_overshoots_total_budget():
+    """priority=1 (must_touch) files survive even when their truncated
+    size exceeds the remaining total-byte budget. EVIDENCE_GAP-ing the
+    codegen call because the file got squeezed out is strictly worse
+    than overshooting the prompt budget. (Regression: django-11797 v7
+    where query.py was dropped under d26abed because AST-truncated
+    size (~ 25 KB) > remaining budget.)"""
+    big_must_touch = "import os\n" + "\n".join(
+        f"def fn_{i}(arg):\n    return arg + {i}\n" for i in range(50)
+    ) * 5  # padding to push well past budget
+    files = [
+        _ev("django/db/models/sql/query.py", content=big_must_touch, priority=1),
+        _ev("filler.py", content="x" * 18_000, priority=5),
+    ]
+    budget = EvidencePackBudget(
+        max_files=4, max_total_bytes=18_000, max_per_file_bytes=6_000
+    )
+    pack = build_evidence_pack(files, budget)
+    paths = [f.path for f in pack.included_files]
+    assert "django/db/models/sql/query.py" in paths
+    # filler.py may or may not fit, but the must_touch is in.
+
+
+def test_must_touch_with_aggressive_when_normal_truncation_overshoots():
+    """When the must_touch's normal AST truncation is too big to fit
+    alongside a higher-priority pin chain, the harness re-runs with
+    aggressive=True (small_body_lines=5)."""
+    parts = ["import os\n\n"]
+    # Many medium-sized methods (15 lines each) that the default
+    # small_body_lines=30 keeps whole, but aggressive=5 elides.
+    for i in range(20):
+        parts.append(f"def fn_{i}(x):\n")
+        parts.extend(f"    line_{j} = {j}\n" for j in range(15))
+        parts.append("    return x\n\n")
+    src = "".join(parts)
+    files = [_ev("a.py", content=src, priority=1)]
+    budget = EvidencePackBudget(
+        max_files=2, max_total_bytes=2_000, max_per_file_bytes=2_000
+    )
+    pack = build_evidence_pack(files, budget)
+    assert len(pack.included_files) == 1
+    out = pack.included_files[0].content
+    # Aggressive should have elided the 15-line bodies.
+    assert "elided by ast_truncate" in out
+    assert "line_10 = 10" not in out  # body was truncated
+
+
+def test_low_priority_files_still_dropped_when_budget_exhausted():
+    """Sanity: making must_touch overshoot doesn't break the contract
+    that priority>=2 files can be dropped to make room."""
+    must = "x = 1\n" + "y = 2\n" * 1000  # ~ 7 KB
+    files = [
+        _ev("must.py", content=must, priority=1),
+        _ev("optional.py", content="o" * 15_000, priority=5),
+    ]
+    budget = EvidencePackBudget(
+        max_files=4, max_total_bytes=10_000, max_per_file_bytes=10_000
+    )
+    pack = build_evidence_pack(files, budget)
+    paths = [f.path for f in pack.included_files]
+    assert "must.py" in paths
+    # optional.py should be dropped because must.py used most of the budget.
+    assert "optional.py" not in paths or len(pack.dropped) > 0
+
+
 def test_evidence_pack_python_truncation_preserves_signatures():
     """End-to-end: a big .py file in the pack arrives with function
     signatures intact, not just imports + class headers."""

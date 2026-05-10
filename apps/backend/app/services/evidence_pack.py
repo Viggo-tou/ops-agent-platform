@@ -74,6 +74,7 @@ def truncate_file(
     max_bytes: int,
     path: str | None = None,
     keep_symbols: list[str] | None = None,
+    aggressive: bool = False,
 ) -> str:
     """Cut a single file's content to stay under ``max_bytes``.
 
@@ -91,12 +92,21 @@ def truncate_file(
         return content
     if path and path.endswith(".py"):
         try:
-            from app.services.ast_truncate import truncate_python_source
+            from app.services.ast_truncate import (
+                _AGGRESSIVE_SMALL_BODY_LINES,
+                _SMALL_BODY_LINES,
+                truncate_python_source,
+            )
 
             result = truncate_python_source(
                 content,
                 max_bytes=max_bytes,
                 keep_symbols=keep_symbols or [],
+                small_body_lines=(
+                    _AGGRESSIVE_SMALL_BODY_LINES
+                    if aggressive
+                    else _SMALL_BODY_LINES
+                ),
             )
             if result.used_ast and result.text:
                 if len(result.text) <= max_bytes:
@@ -137,7 +147,14 @@ def build_evidence_pack(
     bytes_used = 0
 
     for file_ in sorted_files:
-        if len(included) >= budget.max_files:
+        # priority=1 means "must_touch — file the patch MUST modify".
+        # These cannot be dropped without making codegen fail with
+        # EVIDENCE_GAP. When budget pressure would push them out we
+        # re-truncate aggressively (drop ALL non-pinned function
+        # bodies) instead.
+        is_must_touch = file_.priority <= 1
+
+        if len(included) >= budget.max_files and not is_must_touch:
             dropped.append(
                 DroppedEvidence(
                     path=file_.path,
@@ -153,19 +170,52 @@ def build_evidence_pack(
         # pins specific function/method names — when caller knows the
         # name of the function the model needs to edit, that body stays
         # whole even if the file is otherwise over budget.
+        keep_syms = list(file_.keep_symbols or []) or None
         truncated = (
             truncate_file(
                 file_.content,
                 max_bytes=budget.max_per_file_bytes,
                 path=file_.path,
-                keep_symbols=list(file_.keep_symbols or []) or None,
+                keep_symbols=keep_syms,
             )
             if len(file_.content) > budget.max_per_file_bytes
             else file_.content
         )
         size = len(truncated)
 
+        if bytes_used + size > budget.max_total_bytes and is_must_touch:
+            # Try aggressive truncation: only the pinned target body
+            # + tiny (<=5 line) helpers stay whole. Other bodies
+            # become elided placeholders. Recovers ~ 50-70% on big
+            # files like django/db/models/sql/query.py (95 KB → ~ 8 KB).
+            aggressive = truncate_file(
+                file_.content,
+                max_bytes=budget.max_per_file_bytes,
+                path=file_.path,
+                keep_symbols=keep_syms,
+                aggressive=True,
+            )
+            if len(aggressive) < size:
+                truncated = aggressive
+                size = len(aggressive)
+
         if bytes_used + size > budget.max_total_bytes:
+            if is_must_touch:
+                # Even after aggressive truncation, must_touch overshoots.
+                # Include anyway — overshooting the prompt budget is
+                # strictly less bad than EVIDENCE_GAP-ing the codegen
+                # call. Lower-priority files later in the loop will be
+                # squeezed out instead.
+                included.append(
+                    FileEvidence(
+                        path=file_.path,
+                        content=truncated,
+                        priority=file_.priority,
+                        keep_symbols=list(file_.keep_symbols or []),
+                    )
+                )
+                bytes_used += size
+                continue
             dropped.append(
                 DroppedEvidence(
                     path=file_.path,

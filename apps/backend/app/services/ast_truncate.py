@@ -42,6 +42,14 @@ class TruncationResult:
 # something larger that gets pinned via keep_symbols.
 _SMALL_BODY_LINES = 30
 
+# Aggressive mode: cut small_body_lines down hard when caller signals
+# "this file MUST fit under the byte cap". Used by build_evidence_pack
+# when a must_touch (priority=1) file's first-pass truncation still
+# overshoots the remaining total-byte budget. 5 means: only the
+# tiniest helpers (one-liner accessors, return statements) stay
+# whole; everything else is body-elided.
+_AGGRESSIVE_SMALL_BODY_LINES = 5
+
 
 def truncate_python_source(
     source: str,
@@ -90,7 +98,7 @@ def truncate_python_source(
         # unchanged and the caller's byte cap kicks in, slicing off
         # function bodies past the first 6 KB.
         regex_result = _regex_truncate_python(
-            source, max_bytes=max_bytes, keep=keep
+            source, max_bytes=max_bytes, keep=keep, small_body_lines=small_body_lines
         )
         if regex_result is not None:
             return regex_result
