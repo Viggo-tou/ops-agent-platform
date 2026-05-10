@@ -113,6 +113,115 @@ def _backtick_names(text: str) -> set[str]:
 _PY_DEF_RE = re.compile(r"^(?:[ \t]*)(?:async\s+)?def\s+(\w+)\s*\(", re.MULTILINE)
 
 
+def _function_names_with_ancestors(
+    content: str, concept_words: set[str]
+) -> list[str]:
+    """For each function whose name matches a concept word, return that
+    name plus every enclosing function/class name on the path to the
+    module root.
+
+    Tries ast.parse for accurate ancestor walking; falls back to a
+    regex/indent heuristic when the parser rejects the file. The
+    ancestor expansion is what addresses the closure-pinning case
+    (e.g. `_get_FIELD_display` defined inside `Field.contribute_to_class`).
+    """
+    matched: list[str] = []
+    try:
+        import ast as _ast
+
+        tree = _ast.parse(content)
+    except (SyntaxError, ValueError):
+        # Regex fallback: same logic by indent.
+        return _regex_function_names_with_ancestors(content, concept_words)
+
+    def visit(node: object, ancestors: list[str]) -> None:
+        # Walk every body-bearing attribute. Closures may live inside
+        # If / For / While / Try / With / orelse / finalbody / handlers
+        # — without recursing through those, `_get_FIELD_display`
+        # defined inside `if self.choices is not None:` is invisible
+        # to the ancestor walk.
+        bodies: list[list] = []
+        for attr in ("body", "orelse", "finalbody"):
+            block = getattr(node, attr, None)
+            if isinstance(block, list):
+                bodies.append(block)
+        # try/except handlers: each handler has its own body
+        handlers = getattr(node, "handlers", None)
+        if isinstance(handlers, list):
+            for h in handlers:
+                if isinstance(getattr(h, "body", None), list):
+                    bodies.append(h.body)
+        for block in bodies:
+            for child in block:
+                if isinstance(
+                    child, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)
+                ):
+                    child_name = child.name
+                    next_ancestors = ancestors + [child_name]
+                    if isinstance(
+                        child, (_ast.FunctionDef, _ast.AsyncFunctionDef)
+                    ):
+                        name_lower = child_name.lower()
+                        if any(word in name_lower for word in concept_words):
+                            for ancestor in next_ancestors:
+                                matched.append(ancestor)
+                    visit(child, next_ancestors)
+                else:
+                    # Compound statement (If/For/While/Try/With/etc.)
+                    # — preserve ancestors, descend.
+                    visit(child, ancestors)
+
+    visit(tree, [])
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for name in matched:
+        if name in seen:
+            continue
+        seen.add(name)
+        deduped.append(name)
+    return deduped
+
+
+def _regex_function_names_with_ancestors(
+    content: str, concept_words: set[str]
+) -> list[str]:
+    """Indent-based ancestor recovery for files ast.parse rejects."""
+    lines = content.splitlines()
+    # Stack of (indent, name) for currently-open def/class scopes.
+    stack: list[tuple[int, str]] = []
+    matched: list[str] = []
+    for raw in lines:
+        # Compute leading whitespace columns.
+        stripped = raw.lstrip(" \t")
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw) - len(stripped)
+        # Pop scopes that we've exited.
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        m_def = re.match(r"(?:async\s+)?def\s+(\w+)\s*\(", stripped)
+        m_class = re.match(r"class\s+(\w+)\b", stripped)
+        if m_def:
+            name = m_def.group(1)
+            stack.append((indent, name))
+            if any(w in name.lower() for w in concept_words):
+                for _ind, ancestor in stack:
+                    matched.append(ancestor)
+            continue
+        if m_class:
+            name = m_class.group(1)
+            stack.append((indent, name))
+    seen: set[str] = set()
+    out: list[str] = []
+    for n in matched:
+        if n in seen:
+            continue
+        seen.add(n)
+        out.append(n)
+    return out
+
+
 def _function_names_in_python(content: str) -> list[str]:
     """Return all function/method names in a Python source string.
 
@@ -142,7 +251,11 @@ def _function_names_in_python(content: str) -> list[str]:
 # in the issue text. Used to fuzzy-match against function names defined
 # in candidate files. The 4-char floor + stopword filter keeps "the",
 # "with", "this" out without listing every English filler.
-_CONCEPT_WORD = re.compile(r"\b([a-z][a-z]{3,})\b")
+# Concept-word splitter. Underscore-joined identifiers (`get_foo_display`)
+# need to yield each component (`get`, `foo`, `display`) as separate
+# concept-word candidates, so we split on any non-letter — `\b` alone
+# stops at letter/digit boundaries but not at underscores.
+_CONCEPT_WORD = re.compile(r"[a-z]{4,}")
 _CONCEPT_STOPWORDS = _STOPWORDS | {
     "above", "after", "again", "also", "another", "around", "before",
     "below", "between", "during", "every", "first", "found", "from",
@@ -190,11 +303,13 @@ def extract_keep_symbols_for_files(
     for path, content in files.items():
         if not path.endswith(".py") or not content:
             continue
-        names = _function_names_in_python(content)
-        for name in names:
-            name_lower = name.lower()
-            if any(word in name_lower for word in concept_words):
-                indirect.append(name)
+        # When a concept-word matches a function name, also pin its
+        # ancestor functions (e.g. `_get_FIELD_display` is defined as
+        # a closure inside `Field.contribute_to_class`; pinning only
+        # the closure is insufficient because its surrounding
+        # binding/registration context lives in the parent body).
+        for name in _function_names_with_ancestors(content, concept_words):
+            indirect.append(name)
 
     seen: set[str] = set(direct)
     merged: list[str] = list(direct)

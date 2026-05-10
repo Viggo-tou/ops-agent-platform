@@ -187,5 +187,7 @@ def test_planning_instructions_mention_acceptance_tests():
         "function_signature_changed",
         "no_new_file_outside",
         "import_added",
+        "forbids_pattern_in_diff",
+        "test_must_reference_existing_symbol",
     ):
         assert kind in text, f"missing kind {kind} in instructions"

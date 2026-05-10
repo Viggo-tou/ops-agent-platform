@@ -1619,6 +1619,8 @@ class PrimaryAgentPlanner:
             "function_signature_changed",
             "no_new_file_outside",
             "import_added",
+            "forbids_pattern_in_diff",
+            "test_must_reference_existing_symbol",
         }
         raw_acceptance = sanitized.get("acceptance_tests")
         acceptance: list[dict[str, Any]] = []
@@ -1732,6 +1734,8 @@ class PrimaryAgentPlanner:
             "(d) function_signature_changed — kind, file, function. Use when the issue requires a signature change (add/remove a parameter). "
             "(e) no_new_file_outside — kind, scope (glob). Use when the issue scopes the change to a directory. Example: scope=\"django/db/models/**\" — patch must not create files outside that subtree. "
             "(f) import_added — kind, file, pattern (the imported name). Use when the fix demonstrably requires a new import. "
+            "(g) forbids_pattern_in_diff — kind, pattern (regex), optional file. Use to BAN a shape that would indicate a hallucinated bypass. Example for an ORM/query bug where the fix must edit executable code (not introduce a new flag): kind=forbids_pattern_in_diff, pattern=\"^[A-Z_]+ = (True|False)$\", rationale=\"this issue is in query-construction logic, not in module-level configuration; a new boolean settings flag is not a valid fix\". "
+            "(h) test_must_reference_existing_symbol — kind, optional scope (default tests/). Catches \"new test only validates a freshly-invented symbol\" patterns. Emit it whenever the bug class makes self-justifying test files plausible. "
             "DO NOT emit tests like \"all tests pass\" or \"behavior is correct\" — those are not structural. Tests must be checkable against diff text alone. "
             "DO NOT emit acceptance_tests for process_question, slack_message, jira_issue_plan, jira_issue_create, jira_issue_writeback, internal_api_request, internal_db_query — leave the list empty for those scenarios."
         )

@@ -55,6 +55,8 @@ class PlanAcceptanceTest(BaseModel):
         "function_signature_changed",
         "no_new_file_outside",
         "import_added",
+        "forbids_pattern_in_diff",
+        "test_must_reference_existing_symbol",
     ]
     pattern: str = Field(default="", max_length=240)
     file: str | None = Field(default=None, max_length=400)

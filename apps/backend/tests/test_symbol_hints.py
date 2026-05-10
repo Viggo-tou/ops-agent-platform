@@ -157,6 +157,69 @@ def test_keep_symbols_handles_syntax_error_gracefully():
     assert hints == []
 
 
+def test_keep_symbols_pins_closure_ancestor_chain():
+    """Codex rec #2 (closure pinning): when the matched function is a
+    nested closure, also pin every enclosing function/class so the
+    truncator keeps the parent body that defines the closure's binding
+    and registration site.
+
+    Regression target: django-12284 needs `Field.contribute_to_class`
+    body because `_get_FIELD_display` is a closure inside it. Pinning
+    only the closure name leaves the model with no surrounding
+    context."""
+    issue = "Model.get_FOO_display() does not work correctly with inherited choices."
+    files = {
+        "django/db/models/fields/__init__.py": (
+            "class Field:\n"
+            "    def contribute_to_class(self, cls, name):\n"
+            "        self.set_attributes_from_name(name)\n"
+            "        self.model = cls\n"
+            "        cls._meta.add_field(self)\n"
+            "        if self.choices is not None:\n"
+            "            def _get_FIELD_display(obj):\n"
+            "                value = getattr(obj, self.attname)\n"
+            "                return self._choices_to_value(value)\n"
+            "            setattr(cls, 'get_%s_display' % name, _get_FIELD_display)\n"
+            "    def unrelated_helper(self):\n"
+            "        return None\n"
+        ),
+    }
+    hints = extract_keep_symbols_for_files(issue, files)
+    # The closure that matched concept word "display" should be pinned.
+    assert "_get_FIELD_display" in hints
+    # AND its enclosing function should also be pinned.
+    assert "contribute_to_class" in hints
+    # AND the enclosing class.
+    assert "Field" in hints
+    # Unrelated helpers should NOT be pinned.
+    assert "unrelated_helper" not in hints
+
+
+def test_ancestor_pin_works_through_regex_fallback():
+    """Same expansion when ast.parse rejects the file."""
+    issue = "fix the display logic for inherited choices"
+    src = (
+        '_doc = """unterminated\n'  # trips ast.parse
+        "class Field:\n"
+        "    def contribute_to_class(self, cls, name):\n"
+        "        if self.choices:\n"
+        "            def _get_FIELD_display(obj):\n"
+        "                return None\n"
+    )
+    import ast as _ast
+    raises = False
+    try:
+        _ast.parse(src)
+    except SyntaxError:
+        raises = True
+    assert raises, "test premise broken — file accepted by ast.parse"
+
+    hints = extract_keep_symbols_for_files(issue, {"x.py": src})
+    assert "_get_FIELD_display" in hints
+    assert "contribute_to_class" in hints
+    assert "Field" in hints
+
+
 def test_keep_symbols_regex_fallback_finds_names_when_ast_fails():
     """Real-world: Python 3.14 rejects astropy ndarithmetic.py with a
     triple-quote parity error even though the file runs fine. Regex

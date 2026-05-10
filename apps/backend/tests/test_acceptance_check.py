@@ -217,3 +217,148 @@ def test_empty_test_list_passes_trivially():
     report = evaluate_acceptance(_DIFF_ASTROPY, [])
     assert report.passed
     assert report.results == []
+
+
+# --- forbids_pattern_in_diff (Class B counter-measure) ----------------------
+
+
+_DIFF_HALLUCINATED_FLAG = """\
+diff --git a/django/conf/global_settings.py b/django/conf/global_settings.py
+--- a/django/conf/global_settings.py
++++ b/django/conf/global_settings.py
+@@ -150,6 +150,8 @@ LANGUAGES_BIDI = ["he", "ar", "fa", "ur"]
++# Bypass for the SUBQUERY GROUP BY thing
++SUBQUERY_GROUP_BY_PRESERVE = True
++_ = SUBQUERY_GROUP_BY_PRESERVE
+ USE_I18N = True
+"""
+
+
+def test_forbids_pattern_catches_hallucinated_settings_flag():
+    tests = [
+        AcceptanceTest(
+            kind="forbids_pattern_in_diff",
+            pattern=r"^[A-Z_]+ = (True|False)$",
+            rationale="ORM/query bug; new boolean flag is not a valid fix",
+        )
+    ]
+    report = evaluate_acceptance(_DIFF_HALLUCINATED_FLAG, tests)
+    assert not report.passed
+    assert "forbidden pattern" in report.results[0].reason.lower()
+
+
+def test_forbids_pattern_passes_when_pattern_absent():
+    tests = [
+        AcceptanceTest(
+            kind="forbids_pattern_in_diff",
+            pattern=r"^[A-Z_]+ = (True|False)$",
+        )
+    ]
+    report = evaluate_acceptance(_DIFF_ASTROPY, tests)
+    assert report.passed
+
+
+def test_forbids_pattern_scoped_to_file():
+    """File-scoped forbid: only checks added lines in the named file."""
+    tests = [
+        AcceptanceTest(
+            kind="forbids_pattern_in_diff",
+            pattern=r"^[A-Z_]+ = True$",
+            file="django/conf/other.py",
+        )
+    ]
+    # Pattern would match in global_settings.py but file is "other.py" → pass.
+    report = evaluate_acceptance(_DIFF_HALLUCINATED_FLAG, tests)
+    assert report.passed
+
+
+def test_forbids_pattern_invalid_regex_fails_safely():
+    tests = [
+        AcceptanceTest(
+            kind="forbids_pattern_in_diff",
+            pattern=r"[",  # invalid regex
+        )
+    ]
+    report = evaluate_acceptance(_DIFF_HALLUCINATED_FLAG, tests)
+    assert not report.passed
+    assert "did not compile" in report.results[0].reason.lower()
+
+
+# --- test_must_reference_existing_symbol (Class E counter-measure) ----------
+
+
+_DIFF_SELF_JUSTIFYING_TEST = """\
+diff --git a/django/conf/global_settings.py b/django/conf/global_settings.py
+--- a/django/conf/global_settings.py
++++ b/django/conf/global_settings.py
+@@ -150,6 +150,7 @@ LANGUAGES_BIDI = ["he", "ar", "fa", "ur"]
++SUBQUERY_GROUP_BY_PRESERVE = True
+diff --git a/tests/test_subquery_flag.py b/tests/test_subquery_flag.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_subquery_flag.py
+@@ -0,0 +1,5 @@
++from django.conf import settings
++
++
++def test_flag_exists():
++    assert settings.SUBQUERY_GROUP_BY_PRESERVE is True
+"""
+
+
+def test_self_justifying_test_caught():
+    """The new test only references SUBQUERY_GROUP_BY_PRESERVE — which
+    DOES exist in the fix code. So actually this self-justifying case
+    is one the symbol-reference check WOULD pass on. The check catches
+    a stricter pathology: tests referencing names absent from the fix."""
+    tests = [
+        AcceptanceTest(
+            kind="test_must_reference_existing_symbol",
+            scope="tests/",
+        )
+    ]
+    report = evaluate_acceptance(_DIFF_SELF_JUSTIFYING_TEST, tests)
+    # SUBQUERY_GROUP_BY_PRESERVE appears both in the fix and the test
+    # → the structural check passes. The forbids_pattern test (above)
+    # is the one that catches this hallucination class.
+    assert report.passed
+
+
+_DIFF_TEST_WITH_FAKE_SYMBOL = """\
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -200,6 +200,7 @@ class Field:
++        existing_value = self.value_for_db()
+diff --git a/tests/test_invented.py b/tests/test_invented.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_invented.py
+@@ -0,0 +1,4 @@
++def test_my_helper_works():
++    from django.utils.fictitious import HelperThatDoesNotExist
++    assert HelperThatDoesNotExist().run() is True
+"""
+
+
+def test_test_referencing_nothing_in_fix_caught():
+    tests = [
+        AcceptanceTest(
+            kind="test_must_reference_existing_symbol",
+            scope="tests/",
+        )
+    ]
+    report = evaluate_acceptance(_DIFF_TEST_WITH_FAKE_SYMBOL, tests)
+    assert not report.passed
+    assert "tests/test_invented.py" in report.results[0].reason
+
+
+def test_test_must_reference_no_new_test_files_passes():
+    """If the diff doesn't add any test files, the gate is a no-op pass."""
+    tests = [
+        AcceptanceTest(
+            kind="test_must_reference_existing_symbol", scope="tests/"
+        )
+    ]
+    report = evaluate_acceptance(_DIFF_ASTROPY, tests)
+    assert report.passed
