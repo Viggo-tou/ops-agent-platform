@@ -1,0 +1,49 @@
+name: Backend tests
+
+# Runs the backend pytest suite on every push to main and every PR. The
+# suite is the structural-correctness signal for the harness: planner /
+# codegen / verifier modules all have regression tests here. Long-running
+# benchmark suites (tests/benchmarks/) and e2e drivers that need a live
+# provider are excluded — they run on demand, not on every commit.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pytest:
+    name: pytest (Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: apps/backend/requirements.txt
+
+      - name: Install dependencies
+        working-directory: apps/backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio
+
+      - name: Run unit + integration tests
+        working-directory: apps/backend
+        env:
+          # CI runs against SQLite for speed; the platform supports
+          # Postgres at runtime (see docker-compose.yml) but every test
+          # in CI is portable to either backend.
+          DATABASE_URL: "sqlite:///./ci_ops_agent_platform.db"
+        run: |
+          python -m pytest tests/ \
+            --ignore=tests/benchmarks \
+            --ignore=tests/scripts \
+            -q --tb=short

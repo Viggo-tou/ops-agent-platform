@@ -1,6 +1,12 @@
 # Ops Agent Platform
 
+[![Backend tests](https://github.com/Viggo-tou/ops-agent-platform/actions/workflows/backend-tests.yml/badge.svg)](https://github.com/Viggo-tou/ops-agent-platform/actions/workflows/backend-tests.yml)
+[![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 A human-in-the-loop LLM coding agent platform with a structural verification harness for software engineering tasks.
+
+![Pipeline event timeline — codegen batches running in parallel, harness gates evaluating, a failure caught and routed into the repair loop](docs/screenshots/pipeline-event-timeline.png)
 
 ## Problem
 
