@@ -1,10 +1,31 @@
 # Task Queue
 
-Last updated: 2026-04-14
+Last updated: 2026-04-14 (body) — **but see SESSION_HANDOFF.md 2026-05-12 section for the active v16 roadmap**. This file's body below is from the T-026/T-029-era backlog and does not reflect the v15 governance closure or v16 chat UX / repair-intent work.
+
+> **🚨 New-agent pointer**: the live in-flight backlog is in **SESSION_HANDOFF.md → "Open / pending work — roadmap"**. The named items (v16.0 / v16.1 / v16.2 / v16.3 / v16.4 + the v16 P0 backlog T-DEPENDENCY-FINGERPRINT / T-IMPORT-DEPENDENCY-GATE / T-COMPILE-ERROR-MEMORY) supersede everything below for new work. The 2026-04-14 items below are kept for historical traceability — many are done, some folded into v15/v16, none should be picked up without first reading the handoff.
 
 Status values: `todo`, `doing`, `blocked`, `done`.
 
 ## P0
+
+### T-C7-COMPILE-REPAIR-STALL Investigate compile_repair stall behavior (opened 2026-05-12)
+
+Status: open
+
+Trigger: surfaced during v16.2.1 live verification (Stage 27, task `cf2b0a81-b855-4ece-91a9-3a6def8e1b1e`, round 7b). Target gate (`contract_coverage`) passed cleanly with 6/6 contracts verified, then pipeline entered `compile_repair.round_started` and produced no further progress events for ~8 min before manual abort.
+
+Scope (investigate, do NOT modify v16.2.1 verifier):
+
+- Does the generated Kotlin actually fail compile, or is it the repair loop itself stuck before invoking Gradle?
+- Is the repair loop lacking progress events (per-batch deadline / cancel telemetry missing) so we cannot tell stuck-vs-running from outside?
+- Is the per-batch deadline (720s) correctly counted from `round_started`, or does it inherit from earlier stages?
+- Check whether v16.2.1 verifier changes accidentally corrupted the repair prompt (compare repair prompt before/after the contract_coverage refactor).
+
+Evidence pack: [`docs/incidents/2026-05-12-v16.2.1-live-verification/`](docs/incidents/2026-05-12-v16.2.1-live-verification/) — has audit.jsonl, plan, codegen diff, and the contract_coverage verdict. The codegen diff in there (112 lines) is what the compile gate received.
+
+Hard rule: this ticket does NOT block committing v16.2.1. v16.2.1 already shipped at `72242f4`. C7 is a separate failure class on a different gate.
+
+---
 
 ### T-034 Jira Develop Pipeline Stability Fixes
 
