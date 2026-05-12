@@ -11151,7 +11151,110 @@ class PrimaryOrchestrator:
             "pipeline.failed",
             {"message": message, "stage": stage.value if hasattr(stage, "value") else str(stage)},
         )
+        # T-LEARNING-LOOP-V1 (2026-05-12): record terminal failure as
+        # failure_observation memory row(s) so next-task planner can
+        # retrieve "this kind of failure happened before". Fail-soft —
+        # any error here MUST NOT mask the original pipeline failure.
+        try:
+            self._record_failure_observation_memory(
+                task=task,
+                pipeline_failed_message=message,
+                payload=payload or {},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "failure_observation memory write failed (non-fatal): %s",
+                exc,
+            )
         self._run_failure_diagnosis(task, failure_kind="tool_failed_terminal")
+
+    def _record_failure_observation_memory(
+        self,
+        *,
+        task: Task,
+        pipeline_failed_message: str,
+        payload: dict[str, object],
+    ) -> None:
+        """T-LEARNING-LOOP-V1: classify the terminal failure and persist
+        one row per matching failure_class into agent_memory.
+
+        Pulls signals from ``task.plan_json`` (must_touch, provider mode),
+        ``payload`` (verdicts, repair-loop flags), and the
+        ``pipeline_failed_message`` string. Lightweight task-family
+        detection runs alongside so similar future tasks can match.
+        """
+        from app.services.failure_classifier import (  # local import — keep top-of-file imports stable
+            classify,
+            detect_task_family,
+        )
+        from app.services.memory import MemoryService
+
+        plan_dict = task.plan_json if isinstance(task.plan_json, dict) else {}
+        result_dict = task.latest_result_json if isinstance(task.latest_result_json, dict) else {}
+        pipeline_state = result_dict.get("pipeline_state") if isinstance(result_dict.get("pipeline_state"), dict) else {}
+
+        # Signals — best-effort, missing fields are fine; classifiers
+        # return None when their signals aren't present.
+        plan_must_touch = list(plan_dict.get("must_touch_files") or [])
+        files_actually_patched = list(pipeline_state.get("files_changed") or [])
+        coverage_verdict = pipeline_state.get("contract_coverage_verdict")
+        plan_provider_mode = (plan_dict.get("provider") or {}).get("mode") if isinstance(plan_dict.get("provider"), dict) else None
+        plan_provider_name = (plan_dict.get("provider") or {}).get("name") if isinstance(plan_dict.get("provider"), dict) else None
+        codegen_provider = getattr(self.tool_gateway.settings, "codegen_provider", None)
+        diff_chars = pipeline_state.get("attempt_diff_chars") or pipeline_state.get("first_attempt_diff_chars")
+        compile_repair_rounds = pipeline_state.get("compile_repair_rounds") or []
+        cap_exceeded = "cap_exceeded" in (pipeline_failed_message or "").lower() or bool(pipeline_state.get("compile_repair_cap_exceeded"))
+        stuck = "stuck" in (pipeline_failed_message or "").lower() or bool(pipeline_state.get("compile_repair_stuck"))
+
+        task_family = detect_task_family(
+            request_text=task.request_text or "",
+            plan_json=plan_dict,
+        )
+
+        classifications = classify(
+            plan_must_touch=plan_must_touch,
+            files_actually_patched=files_actually_patched,
+            pipeline_failed_message=pipeline_failed_message,
+            coverage_verdict=coverage_verdict,
+            compile_repair_cap_exceeded=cap_exceeded,
+            compile_repair_stuck=stuck,
+            compile_repair_rounds_completed=len(compile_repair_rounds),
+            plan_provider_mode=plan_provider_mode,
+            plan_provider_name=plan_provider_name,
+            codegen_provider=codegen_provider,
+            diff_chars=diff_chars,
+            task_family=task_family,
+            task_id=task.id,
+        )
+        if not classifications:
+            return  # No signals recognized — don't guess.
+
+        memory = MemoryService(self.db)
+        for cls in classifications:
+            try:
+                memory.write_failure_observation(
+                    failure_class=cls.failure_class,
+                    scope=cls.scope,
+                    observation_text=(
+                        f"[{cls.failure_class}] task={task.id[:8]} "
+                        f"family={cls.task_family or 'unknown'} "
+                        f"provider={codegen_provider or 'unknown'}. "
+                        f"Pipeline message: {(pipeline_failed_message or '')[:240]}"
+                    ),
+                    lesson=cls.lesson,
+                    task_family=cls.task_family,
+                    provenance_task_id=task.id,
+                    trust_level=cls.trust_level,
+                    prompt_eligible=list(cls.prompt_eligible),
+                    evidence_refs=dict(cls.evidence_refs),
+                )
+            except Exception as inner_exc:  # noqa: BLE001
+                logger.warning(
+                    "failure_observation write skipped for class=%s: %s",
+                    cls.failure_class,
+                    inner_exc,
+                )
+                continue
 
     def _run_failure_diagnosis(self, task: Task, *, failure_kind: FailureKind) -> None:
         try:

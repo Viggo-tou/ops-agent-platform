@@ -197,7 +197,92 @@ def backfill_knowledge_fts_if_empty(db: Session) -> int:
     return inserted
 
 
+def ensure_agent_memory_v2_columns() -> None:
+    """T-LEARNING-LOOP-V1 (2026-05-12): add failure-observation columns
+    to ``agent_memory`` so the learning loop can record failure facts
+    alongside the existing success-only memory pool.
+
+    Runs against BOTH SQLite (local dev) and Postgres (production) —
+    the ``ALTER TABLE ADD COLUMN IF NOT EXISTS`` form used here is
+    Postgres-native. SQLite doesn't support ``IF NOT EXISTS`` on column
+    adds, so we inspect first and emit raw ``ADD COLUMN`` only when the
+    column is missing.
+
+    Idempotent — safe to call on every startup.
+    """
+    inspector = inspect(engine)
+    if "agent_memory" not in set(inspector.get_table_names()):
+        return  # Table doesn't exist yet; create_all() will create it
+                # with the new columns directly.
+
+    existing = {c["name"] for c in inspector.get_columns("agent_memory")}
+    if not is_sqlite:
+        # Postgres path — use IF NOT EXISTS for atomicity.
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE agent_memory ADD COLUMN IF NOT EXISTS memory_kind "
+                "VARCHAR(32) NOT NULL DEFAULT 'success_fact'"
+            ))
+            conn.execute(text(
+                "ALTER TABLE agent_memory ADD COLUMN IF NOT EXISTS failure_class VARCHAR(64)"
+            ))
+            conn.execute(text(
+                "ALTER TABLE agent_memory ADD COLUMN IF NOT EXISTS task_family VARCHAR(64)"
+            ))
+            conn.execute(text(
+                "ALTER TABLE agent_memory ADD COLUMN IF NOT EXISTS trust_level "
+                "VARCHAR(32) NOT NULL DEFAULT 'verified'"
+            ))
+            conn.execute(text(
+                "ALTER TABLE agent_memory ADD COLUMN IF NOT EXISTS prompt_eligible JSONB"
+            ))
+            conn.execute(text(
+                "ALTER TABLE agent_memory ADD COLUMN IF NOT EXISTS evidence_refs JSONB"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_agent_memory_kind_class "
+                "ON agent_memory (memory_kind, failure_class)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_agent_memory_family "
+                "ON agent_memory (task_family)"
+            ))
+        return
+    # SQLite path — inspect-then-add, no IF NOT EXISTS support.
+    with engine.begin() as conn:
+        if "memory_kind" not in existing:
+            conn.execute(text(
+                "ALTER TABLE agent_memory ADD COLUMN memory_kind VARCHAR(32) "
+                "NOT NULL DEFAULT 'success_fact'"
+            ))
+        if "failure_class" not in existing:
+            conn.execute(text(
+                "ALTER TABLE agent_memory ADD COLUMN failure_class VARCHAR(64)"
+            ))
+        if "task_family" not in existing:
+            conn.execute(text(
+                "ALTER TABLE agent_memory ADD COLUMN task_family VARCHAR(64)"
+            ))
+        if "trust_level" not in existing:
+            conn.execute(text(
+                "ALTER TABLE agent_memory ADD COLUMN trust_level VARCHAR(32) "
+                "NOT NULL DEFAULT 'verified'"
+            ))
+        if "prompt_eligible" not in existing:
+            conn.execute(text(
+                "ALTER TABLE agent_memory ADD COLUMN prompt_eligible JSON"
+            ))
+        if "evidence_refs" not in existing:
+            conn.execute(text(
+                "ALTER TABLE agent_memory ADD COLUMN evidence_refs JSON"
+            ))
+
+
 def ensure_local_schema() -> None:
+    # T-LEARNING-LOOP-V1 runs FIRST so the agent_memory schema is
+    # already extended before any service code touches it.
+    ensure_agent_memory_v2_columns()
+
     if not is_sqlite:
         return
 

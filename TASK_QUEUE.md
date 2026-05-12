@@ -8,6 +8,69 @@ Status values: `todo`, `doing`, `blocked`, `done`.
 
 ## P0
 
+### T-LEARNING-LOOP-V1 Failure-observation memory closes the learning loop (opened 2026-05-12)
+
+Status: in progress (Phase 1 — schema + classifier + first 3 hook scopes)
+
+Diagnosis (evidence from this session, see Stage 28 + recent runs):
+
+- 49 `agent_memory` rows total; last write 2026-05-10; **0 rows from rounds 6/7/7b/8 (May 11-12)**.
+- Write discipline `recompile + symbol_graph + quote_verified` is correct for success memory but **starves on failure memory**: terminal-fail runs never satisfy the gate.
+- All 49 rows are `gate_failure_resolution` scoped to old gates (`gate:semantic_review:*`, `gate:failure_diagnosis`); **0 rows for `gate:contract_coverage`, `gate:compile_repair`, or `gate:must_touch`** — the exact failure classes hitting recent runs.
+- 25,965 events in DB; **0 events with tool_name containing 'history' / 'previous' / 'past_plan' / 'few_shot'** — no path retrieves prior runs as planner/codegen context.
+- Net: planner and codegen start from scratch on every task even when an identical task_family failed an identical gate one day prior.
+
+Goal:
+
+Create a failure-observation memory loop that records **verified failure facts**, not speculative fixes, separated from the existing success-memory write discipline.
+
+Phase 1 (this iteration):
+
+1. Extend `agent_memory` schema with `memory_kind` (`success_fact` | `failure_observation` | `verifier_diagnostic` | `provider_liveness`), `failure_class`, `task_family`, `trust_level` (`verified` | `human_confirmed` | `auto_classified`), `prompt_eligible` (JSON whitelist), `evidence_refs` (JSON).
+2. Add `apps/backend/app/services/failure_classifier.py` with rule-based classifiers for:
+   - `must_touch_incomplete_diff` (gate:must_touch)
+   - `contract_coverage_unverified | contradicted | lie` (gate:contract_coverage)
+   - `compile_repair_timeout | liveness_gap` (gate:compile_repair)
+   - `provider_partial_diff | provider_empty_response` (codegen provider)
+3. Hook `pipeline.failed` and explicit `manual_abort_with_reason` in `orchestrator/service.py` to call classifier → `memory_service.write_failure_observation(...)`.
+4. Backfill round 8 (task `6803021c`) as the first `must_touch_incomplete_diff` row to validate the write path.
+5. Tests:
+   - `test_must_touch_failure_writes_observation_row`
+   - `test_contract_coverage_lie_does_not_write_to_success_pool`
+   - `test_planner_retrieves_failure_observation_for_similar_task`
+   - `test_prompt_injection_excludes_speculative_fixes`
+
+Phase 2 (next iteration):
+
+- Planner retrieval injection: query failure_observation by `task_family` + `scope`, top-3 with `prompt_eligible` containing `planner_warning`, render as prior-failure warning section before plan generation.
+
+Phase 3 (later):
+
+- Codegen retrieval (gate/family-specific, 1 row max, `prompt_eligible: codegen_warning`).
+
+Phase 4 (later):
+
+- Historical few-shot from past successful plans only (`memory_kind=success_fact`, verdict=approval_requested).
+
+Phase 5 (concurrent):
+
+- Metrics dashboard. Core indicator: `same_failure_recurrence_rate` (% of runs whose `failure_class` matches a row already in failure_observation for the same `task_family`).
+
+Hard rules:
+
+- success memory write discipline (recompile + symbol_graph + quote_verified) **unchanged**.
+- failure_observation rows record observed facts only — never "the correct fix is X".
+- `prompt_eligible` is a whitelist; planner/codegen consume only the labels they're authorized for.
+- New rows tagged `trust_level=auto_classified` unless human confirms; planner retrieval may surface but must label as unconfirmed.
+
+Acceptance:
+
+- Round 8 backfill row reads correctly through `memory_service.query(kind='failure_observation', scope='gate:must_touch', task_family='android_map_location')`.
+- New `failure_observation` rows accumulate on every subsequent terminal pipeline failure without further code changes.
+- Existing success-memory query path returns unchanged result set (`kind='success_fact'` filter applied transparently).
+
+---
+
 ### T-C7-COMPILE-REPAIR-STALL Investigate compile_repair stall behavior (opened 2026-05-12)
 
 Status: open

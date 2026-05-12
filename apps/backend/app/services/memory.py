@@ -24,6 +24,19 @@ GATE_MEMORY_KIND = "gate_failure_resolution"
 PENDING_RESOLUTION = "Pending resolution: linked task has not reached a resolved state yet."
 
 
+def _engine_is_sqlite(db: Session) -> bool:
+    """Return True when the session's bound engine is SQLite.
+
+    Used by T-LEARNING-LOOP-V1 paths that index into the SQLite-only
+    FTS5 virtual table; the same paths must short-circuit on Postgres
+    to avoid aborting the outer transaction.
+    """
+    try:
+        return db.bind.dialect.name == "sqlite"  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @dataclass(frozen=True)
 class MemoryCandidate:
     scope: str
@@ -317,6 +330,115 @@ class MemoryService:
             candidate=fallback.candidate,
         )
 
+    # ----- FAILURE-OBSERVATION WRITE PATH (T-LEARNING-LOOP-V1) -----------
+    #
+    # Failure observations bypass the LLM judge and the verified-success
+    # promote gate so the failure pool can grow on every terminal pipeline
+    # failure. Hard rules enforced here:
+    #   1. memory_kind is locked to 'failure_observation' for this path —
+    #      callers cannot mislabel a failure as success_fact.
+    #   2. The row is immediately usable (last_used_at = now, usage_count
+    #      stays at 0) so `query()` returns it without waiting for the
+    #      `promote_pending()` gate.
+    #   3. Trust level defaults to 'auto_classified' — surfaces in
+    #      `attach_provenance_lines` so the downstream agent knows it's
+    #      a rule-classified observation, not a human-confirmed lesson.
+    #   4. `prompt_eligible` is a whitelist of section contexts allowed
+    #      to consume this row. Retrieval layer must respect it.
+    #
+    # No judge call — judges are for filtering noise out of success
+    # observations. A failure that actually fired a gate is by
+    # construction signal, not noise.
+
+    def write_failure_observation(
+        self,
+        *,
+        failure_class: str,
+        scope: str,
+        observation_text: str,
+        lesson: str,
+        task_family: str | None = None,
+        provenance_task_id: str | None = None,
+        provenance_event_id: str | None = None,
+        trust_level: str = "auto_classified",
+        prompt_eligible: list[str] | None = None,
+        evidence_refs: dict | None = None,
+        confidence: float = 1.0,
+    ) -> AgentMemory | None:
+        """Write a failure_observation row directly to agent_memory.
+
+        Returns the persisted row, or None if memory writes are
+        globally disabled. Bypasses LLM judge and promote-pending
+        gate — failure facts go in immediately and are queryable on
+        the next read.
+        """
+        if not bool(getattr(self.settings, "memory_enabled", True)):
+            return None
+
+        if not failure_class.strip():
+            raise ValueError("failure_class is required for failure_observation rows")
+        if trust_level not in ("verified", "human_confirmed", "auto_classified"):
+            raise ValueError(
+                f"trust_level must be one of "
+                f"verified|human_confirmed|auto_classified; got {trust_level!r}"
+            )
+
+        observation = _clean_text(observation_text, limit=2000)
+        # Resolution is intentionally the lesson text. The retrieval
+        # layer renders both `observation` (what happened) and
+        # `resolution` (the lesson learned) in `attach_provenance_lines`.
+        # We deliberately store the lesson as plain warning prose, not
+        # as a fix recipe — see classifier docstrings for the discipline.
+        resolution = _clean_text(lesson, limit=2000) or "(no lesson recorded)"
+
+        row = AgentMemory(
+            scope=scope,
+            key=_slug(failure_class)[:256] or failure_class[:256],
+            kind=GATE_MEMORY_KIND,
+            memory_kind="failure_observation",
+            failure_class=failure_class[:64],
+            task_family=(task_family or "")[:64] or None,
+            trust_level=trust_level,
+            prompt_eligible=list(prompt_eligible or ["planner_warning"]),
+            evidence_refs=dict(evidence_refs or {}),
+            observation=observation,
+            resolution=resolution,
+            provenance_event_id=provenance_event_id,
+            provenance_task_id=provenance_task_id,
+            confidence=float(confidence),
+            last_used_at=datetime.now(timezone.utc),  # bypass promote gate
+            usage_count=0,
+        )
+        self.db.add(row)
+        self.db.flush()
+        # Index into FTS5 so the text-hint query path can find the row.
+        # The FTS5 virtual table is SQLite-only; on Postgres the
+        # query path falls back to structured (scope/kind/family)
+        # filters and the to_tsvector trigger on the main table.
+        if _engine_is_sqlite(self.db):
+            # Wrap in a SAVEPOINT so an FTS5 failure cannot abort the
+            # outer transaction (which would prevent the row from
+            # being committed).
+            try:
+                with self.db.begin_nested():
+                    self.db.execute(
+                        text(
+                            "INSERT INTO agent_memory_fts(rowid, observation, resolution, scope) "
+                            "VALUES (:rowid, :observation, :resolution, :scope)"
+                        ),
+                        {
+                            "rowid": row.id,
+                            "observation": observation,
+                            "resolution": resolution,
+                            "scope": scope,
+                        },
+                    )
+            except Exception:
+                # FTS index errors are non-fatal — the row is still
+                # queryable via the structured fallback path.
+                pass
+        return row
+
     # ----- READ PATH ------------------------------------------------------
 
     def query(
@@ -326,11 +448,31 @@ class MemoryService:
         kind: str | None = None,
         text_hint: str | None = None,
         top_n: int = 5,
+        memory_kind: str | None = None,
+        task_family: str | None = None,
+        prompt_context: str | None = None,
     ) -> list[AgentMemory]:
+        """Read agent_memory rows.
+
+        Backward-compat: when ``memory_kind`` is None, this method
+        behaves exactly like before — all kinds returned, FTS5 first,
+        last_used_at fallback. v16.2.1+ callers that want failure
+        observations specifically pass ``memory_kind='failure_observation'``.
+
+        Filtering:
+          - ``scope``: required (every memory row is scoped).
+          - ``kind``: legacy GATE_MEMORY_KIND filter, still honored.
+          - ``memory_kind``: new T-LEARNING-LOOP-V1 axis
+            ('success_fact' | 'failure_observation' | ...).
+          - ``task_family``: new — only rows tagged for this family.
+          - ``prompt_context``: new — drop rows whose
+            ``prompt_eligible`` whitelist excludes this context.
+          - ``text_hint``: FTS5 ranking signal.
+        """
         if not bool(getattr(self.settings, "memory_enabled", True)):
             return []
         top_n = max(1, min(int(top_n or 5), 20))
-        memories = self._query_fts(scope=scope, kind=kind, text_hint=text_hint, top_n=top_n)
+        memories = self._query_fts(scope=scope, kind=kind, text_hint=text_hint, top_n=top_n * 3)
         if not memories:
             stmt = select(AgentMemory).where(
                 AgentMemory.scope == scope,
@@ -342,16 +484,37 @@ class MemoryService:
                 AgentMemory.usage_count.desc(),
                 AgentMemory.last_used_at.desc(),
                 AgentMemory.created_at.desc(),
-            ).limit(top_n)
+            ).limit(top_n * 3)
             memories = list(self.db.scalars(stmt))
 
+        # T-LEARNING-LOOP-V1 post-filter on the new axes. Done in Python
+        # rather than SQL because (a) the new columns are nullable on
+        # legacy rows, (b) FTS5 doesn't index them, and (c) the
+        # candidate list is already small.
+        if memory_kind is not None:
+            memories = [m for m in memories if (m.memory_kind or "success_fact") == memory_kind]
+        if task_family is not None:
+            memories = [m for m in memories if (m.task_family or "") == task_family]
+        if prompt_context is not None:
+            def _allowed(m: AgentMemory) -> bool:
+                allowed_list = m.prompt_eligible
+                # Rows with no whitelist default-allow only the broadest
+                # planner_warning context — never codegen_warning. This
+                # prevents legacy rows (which predate the whitelist)
+                # from leaking into codegen prompts.
+                if not allowed_list:
+                    return prompt_context == "planner_warning"
+                return prompt_context in allowed_list
+            memories = [m for m in memories if _allowed(m)]
+
+        memories = memories[:top_n]
         now = datetime.now(timezone.utc)
         for memory in memories:
             memory.usage_count = int(memory.usage_count or 0) + 1
             memory.last_used_at = now
         if memories:
             self.db.flush()
-        return memories[:top_n]
+        return memories
 
     def attach_provenance_lines(self, memories: list[AgentMemory]) -> str:
         blocks: list[str] = []
@@ -530,7 +693,39 @@ class MemoryService:
         tokens = _fts_tokens(observation)
         if not tokens:
             return []
+        # Phase B (2026-05-11): dialect dispatch + savepoint. Postgres
+        # poisons the parent transaction on any SQL error, so a failing
+        # FTS5 MATCH (FTS5 is SQLite-only syntax) would cascade-abort
+        # every subsequent INSERT in the same task. Wrap in SAVEPOINT
+        # and use ILIKE on Postgres.
+        bind = getattr(self.db, "bind", None) or self.db.get_bind()
+        dialect_name = bind.dialect.name if bind and hasattr(bind, "dialect") else ""
+        if dialect_name == "postgresql":
+            like_pattern = "%" + observation[:100].replace("%", "").replace("_", "") + "%"
+            try:
+                rows = self.db.execute(
+                    text(
+                        """
+                        SELECT m.*
+                        FROM agent_memory AS m
+                        WHERE m.scope = :scope
+                          AND (m.observation ILIKE :q OR m.resolution ILIKE :q)
+                        LIMIT :limit
+                        """
+                    ),
+                    {"q": like_pattern, "scope": scope, "limit": int(top_k)},
+                ).mappings().all()
+            except Exception:  # noqa: BLE001
+                return []
+            out: list[AgentMemory] = []
+            for row in rows:
+                memory = self.db.get(AgentMemory, row["id"])
+                if memory is not None:
+                    out.append(memory)
+            return out
+        savepoint = None
         try:
+            savepoint = self.db.begin_nested()
             rows = self.db.execute(
                 text(
                     """
@@ -545,7 +740,10 @@ class MemoryService:
                 ),
                 {"query": " OR ".join(tokens[:8]), "scope": scope, "limit": int(top_k)},
             ).mappings().all()
+            savepoint.commit()
         except Exception:  # noqa: BLE001
+            if savepoint is not None and savepoint.is_active:
+                savepoint.rollback()
             return []
         out: list[AgentMemory] = []
         for row in rows:
@@ -615,7 +813,46 @@ class MemoryService:
         }
         if kind:
             params["kind"] = kind
+        # Phase B (2026-05-11): same dialect dispatch as _find_similar.
+        bind = getattr(self.db, "bind", None) or self.db.get_bind()
+        dialect_name = bind.dialect.name if bind and hasattr(bind, "dialect") else ""
+        if dialect_name == "postgresql":
+            like_pattern = "%" + (text_hint or "")[:100].replace("%", "").replace("_", "") + "%"
+            pg_params: dict[str, Any] = {
+                "q": like_pattern,
+                "scope": scope,
+                "limit": int(top_n),
+            }
+            kind_sql_pg = "AND m.kind = :kind" if kind else ""
+            if kind:
+                pg_params["kind"] = kind
+            try:
+                rows = self.db.execute(
+                    text(
+                        f"""
+                        SELECT m.id
+                        FROM agent_memory AS m
+                        WHERE m.scope = :scope
+                          AND m.last_used_at IS NOT NULL
+                          AND (m.observation ILIKE :q OR m.resolution ILIKE :q)
+                          {kind_sql_pg}
+                        ORDER BY m.usage_count DESC, m.last_used_at DESC
+                        LIMIT :limit
+                        """
+                    ),
+                    pg_params,
+                ).mappings().all()
+            except Exception:  # noqa: BLE001
+                return []
+            memories: list[AgentMemory] = []
+            for row in rows:
+                memory = self.db.get(AgentMemory, row["id"])
+                if memory is not None:
+                    memories.append(memory)
+            return memories
+        savepoint = None
         try:
+            savepoint = self.db.begin_nested()
             rows = self.db.execute(
                 text(
                     f"""
@@ -632,7 +869,10 @@ class MemoryService:
                 ),
                 params,
             ).mappings().all()
+            savepoint.commit()
         except Exception:  # noqa: BLE001
+            if savepoint is not None and savepoint.is_active:
+                savepoint.rollback()
             return []
         memories: list[AgentMemory] = []
         for row in rows:
