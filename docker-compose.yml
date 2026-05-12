@@ -1,0 +1,60 @@
+# docker-compose for local development.
+#
+# Spins up:
+#   - postgres 16 (with a named volume for data persistence)
+#   - backend (FastAPI app, talks to postgres over the internal network)
+#
+# Usage:
+#   docker compose up --build         # start in foreground
+#   docker compose up -d --build      # start detached
+#   docker compose logs -f backend    # tail backend logs
+#   docker compose down               # stop containers (data persists)
+#   docker compose down -v            # stop and wipe data volume
+#
+# The backend reads its DATABASE_URL from the environment. With the default
+# config below, SQLAlchemy connects to the `postgres` service on the
+# internal docker network. To use a different password / database, edit the
+# variables in this file or supply a sibling `.env` (compose picks it up
+# automatically).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ops-agent-postgres
+    environment:
+      POSTGRES_USER: ops_agent
+      POSTGRES_PASSWORD: ops_agent_dev_password
+      POSTGRES_DB: ops_agent_platform
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ops_agent -d ops_agent_platform"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: ./apps/backend
+      dockerfile: Dockerfile
+    container_name: ops-agent-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://ops_agent:ops_agent_dev_password@postgres:5432/ops_agent_platform
+      # LLM provider keys — supply via .env at the repo root and uncomment
+      # the lines you actually need. The platform falls back to mock
+      # providers when keys are missing, so the API is usable out of the
+      # box without any keys.
+      # OPENAI_API_KEY: ${OPENAI_API_KEY}
+      # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      # DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      # MINIMAX_API_KEY: ${MINIMAX_API_KEY}
+    ports:
+      - "8000:8000"
+
+volumes:
+  postgres_data:

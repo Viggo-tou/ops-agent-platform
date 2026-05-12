@@ -84,7 +84,9 @@ These four legs together turned hallucination-prone codegen into reliably-real p
 
 ## Tech stack
 
-- **Backend**: Python 3.12, FastAPI, SQLAlchemy, SQLite (~82k LoC, 130+ pytest cases)
+- **Backend**: Python 3.12, FastAPI, SQLAlchemy 2 (~82k LoC, 130+ pytest cases)
+- **Database**: PostgreSQL 16 (SQLite supported as a fallback for quick local hacks)
+- **Infra**: Docker + docker-compose for local dev; `docker compose up` brings up postgres + backend together
 - **Frontend**: React 18 + Vite + TypeScript — chat UI, plan / diff / approval views, SSE event feed
 - **LLM providers**: OpenAI · Anthropic · DeepSeek · MiniMax (pluggable, per-stage provider override)
 - **Tooling**: MCP (Model Context Protocol) for Jira / memory / Playwright
@@ -95,8 +97,28 @@ These four legs together turned hallucination-prone codegen into reliably-real p
 
 ## Running locally
 
+### Docker (recommended)
+
+```bash
+# Starts postgres + backend together
+docker compose up --build
+# → backend at http://127.0.0.1:8000/docs
+# → postgres at localhost:5433 (host) / postgres:5432 (internal)
+```
+
+The frontend is started separately (it talks to the backend on `8000`):
+
+```bash
+cd apps/web
+npm install
+npm run dev
+# → http://127.0.0.1:5173
+```
+
+### Without Docker (Windows / PowerShell)
+
 ```powershell
-# Backend (FastAPI)
+# Backend (FastAPI) — uses SQLite by default; set DATABASE_URL for Postgres
 powershell -ExecutionPolicy Bypass -File .\scripts\start-backend.ps1
 # → http://127.0.0.1:8000/docs
 
@@ -105,7 +127,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-web.ps1 -Dev
 # → http://127.0.0.1:5173
 ```
 
-Provider keys live in `apps/backend/.env` (one per provider you want to enable). The platform falls back to mock providers if keys are missing, so the API surface is browsable without any keys.
+### Environment
+
+Copy `apps/backend/.env.example` to `apps/backend/.env` and fill in the LLM provider keys you want to enable. The platform falls back to mock providers when keys are missing, so the API surface (`/docs`) is browsable without any keys.
 
 ## Key result
 
