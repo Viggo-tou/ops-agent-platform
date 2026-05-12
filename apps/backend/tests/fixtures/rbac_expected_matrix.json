@@ -1,0 +1,289 @@
+{
+  "roles": [
+    "admin",
+    "operator",
+    "member",
+    "viewer"
+  ],
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/api/knowledge/documents",
+      "requires": [],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 200,
+        "viewer": 200
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/knowledge/sources",
+      "requires": [],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 200,
+        "viewer": 200
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/knowledge/search",
+      "requires": [],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 200,
+        "viewer": 200
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/knowledge/sync",
+      "requires": [
+        "knowledge:upload"
+      ],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 403,
+        "viewer": 403
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/knowledge/upload",
+      "requires": [
+        "knowledge:upload"
+      ],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 403,
+        "viewer": 403
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/knowledge/upload-zip",
+      "requires": [
+        "knowledge:upload"
+      ],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 403,
+        "viewer": 403
+      }
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/knowledge/documents/{id}",
+      "requires": [
+        "knowledge:delete"
+      ],
+      "expected": {
+        "admin": 200,
+        "operator": 403,
+        "member": 403,
+        "viewer": 403
+      }
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/knowledge/sources/{name}",
+      "requires": [
+        "knowledge:delete"
+      ],
+      "expected": {
+        "admin": 200,
+        "operator": 403,
+        "member": 403,
+        "viewer": 403
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/memory/items",
+      "requires": [],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 200,
+        "viewer": 200
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/memory/items",
+      "requires": [
+        "memory:edit"
+      ],
+      "expected": {
+        "admin": 201,
+        "operator": 201,
+        "member": 201,
+        "viewer": 403
+      }
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/memory/items/{id}",
+      "requires": [
+        "memory:edit"
+      ],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 200,
+        "viewer": 403
+      }
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/memory/items/{id}",
+      "requires": [
+        "memory:edit"
+      ],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 200,
+        "viewer": 403
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/memory/settings",
+      "requires": [],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 200,
+        "viewer": 200
+      }
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/memory/settings",
+      "requires": [
+        "memory:edit"
+      ],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 200,
+        "viewer": 403
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/model-config/providers",
+      "requires": [],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 200,
+        "viewer": 200
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/model-config/selected",
+      "requires": [],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 200,
+        "viewer": 200
+      }
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/model-config/selected",
+      "requires": [
+        "settings:model_config"
+      ],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 403,
+        "viewer": 403
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/governance/roles",
+      "requires": [],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 200,
+        "viewer": 200
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/governance/policy-rules",
+      "requires": [],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 200,
+        "viewer": 200
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/approvals",
+      "requires": [],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 200,
+        "viewer": 200
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/approvals/{id}/grant",
+      "requires": [
+        "approval:decide"
+      ],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 403,
+        "viewer": 403
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/approvals/{id}/reject",
+      "requires": [
+        "approval:decide"
+      ],
+      "expected": {
+        "admin": 200,
+        "operator": 200,
+        "member": 403,
+        "viewer": 403
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/tasks",
+      "requires": [
+        "task:create"
+      ],
+      "expected": {
+        "admin": 201,
+        "operator": 201,
+        "member": 201,
+        "viewer": 403
+      }
+    }
+  ]
+}

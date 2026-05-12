@@ -1,0 +1,515 @@
+import type {
+  Approval,
+  ActorRole,
+  EventRecord,
+  KnowledgeDeleteResponse,
+  KnowledgeDocumentSummary,
+  KnowledgeSourceDescriptor,
+  KnowledgeSyncResponse,
+  KnowledgeUploadResponse,
+  MemoryItem,
+  MemoryItemCreate,
+  MemoryItemUpdate,
+  MemorySettings,
+  MemorySettingsUpdate,
+  ModelProvider,
+  SelectedModel,
+  SelectedModelUpdate,
+  TaskCreateInput,
+  TaskDetail,
+  TaskListFilters,
+  TaskSummary,
+  ToolExecutionRecord,
+  ToolRegistryEntry,
+} from "../types";
+
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000/api";
+
+type ApprovalDecisionPayload = {
+  actor_name: string;
+  actor_role: ActorRole | string;
+  notes?: string;
+};
+
+let currentActorRole: string | null = null;
+let currentAppRole: string | null = null;
+
+export function setApiActor(actorRole: string | null, appRole: string | null) {
+  currentActorRole = actorRole;
+  currentAppRole = appRole;
+}
+
+function buildHeaders(headers?: HeadersInit, includeJson = false): Headers {
+  const nextHeaders = new Headers(headers);
+  if (includeJson && !nextHeaders.has("Content-Type")) {
+    nextHeaders.set("Content-Type", "application/json");
+  }
+  if (currentActorRole) {
+    nextHeaders.set("X-Actor-Role", currentActorRole);
+    if (currentAppRole !== null) {
+      nextHeaders.set("X-Actor-App-Role", currentAppRole);
+    }
+  }
+  return nextHeaders;
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    ...init,
+    headers: buildHeaders(init?.headers, true),
+  });
+
+  if (!response.ok) {
+    const detail = await response
+      .json()
+      .then((payload) => payload.detail ?? response.statusText)
+      .catch(() => response.statusText);
+    throw new Error(String(detail));
+  }
+
+  return (await response.json()) as T;
+}
+
+async function requestMultipart<T>(path: string, body: FormData): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method: "POST",
+    headers: buildHeaders(),
+    body,
+  });
+
+  if (!response.ok) {
+    const detail = await response
+      .json()
+      .then((payload) => payload.detail ?? response.statusText)
+      .catch(() => response.statusText);
+    throw new Error(String(detail));
+  }
+
+  return (await response.json()) as T;
+}
+
+function buildApprovalDecisionPayload(
+  decision: ApprovalDecisionPayload | string,
+  notes?: string,
+): ApprovalDecisionPayload {
+  if (typeof decision === "string") {
+    return { actor_name: decision, actor_role: "team_lead", notes };
+  }
+  return decision;
+}
+
+export const api = {
+  baseUrl: API_BASE_URL,
+  listTasks: (filters: TaskListFilters = {}) => {
+    const params = new URLSearchParams();
+
+    if (filters.search) {
+      params.set("search", filters.search);
+    }
+    if (filters.sessionId) {
+      params.set("session_id", filters.sessionId);
+    }
+    if (filters.status) {
+      params.set("status", filters.status);
+    }
+    if (filters.provider) {
+      params.set("provider", filters.provider);
+    }
+    if (filters.actorRole) {
+      params.set("actor_role", filters.actorRole);
+    }
+    if (filters.riskCategory) {
+      params.set("risk_category", filters.riskCategory);
+    }
+
+    const query = params.toString();
+    return request<TaskSummary[]>(query ? `/tasks?${query}` : "/tasks");
+  },
+  getTask: (taskId: string) => request<TaskDetail>(`/tasks/${taskId}`),
+  getTaskEvents: (taskId: string) => request<EventRecord[]>(`/tasks/${taskId}/events`),
+  getTaskToolExecutions: (taskId: string) => request<ToolExecutionRecord[]>(`/tasks/${taskId}/tool-executions`),
+  getToolRegistry: () => request<ToolRegistryEntry[]>("/tools/registry"),
+  getMcpServers: () =>
+    request<
+      {
+        name: string;
+        connected: boolean;
+        error: string | null;
+        tool_count: number;
+        tools: { name: string; description: string; input_schema: Record<string, unknown> }[];
+      }[]
+    >("/tools/mcp/servers"),
+  listRepositorySources: () =>
+    request<{
+      sources: {
+        name: string;
+        path: string;
+        description: string;
+        origin: string;
+        git_url: string;
+        added_at: string;
+      }[];
+      multi_source_enabled: boolean;
+    }>("/repositories/sources"),
+  uploadRepositoryZip: ({
+    name,
+    description,
+    file,
+  }: {
+    name: string;
+    description: string;
+    file: File;
+  }) => {
+    const fd = new FormData();
+    fd.append("name", name);
+    fd.append("description", description);
+    fd.append("file", file);
+    return requestMultipart<{
+      name: string;
+      path: string;
+      origin: string;
+      description: string;
+    }>("/repositories/upload", fd);
+  },
+  cloneRepositoryGit: (body: { name: string; git_url: string; description: string }) =>
+    request<{
+      name: string;
+      path: string;
+      origin: string;
+      description: string;
+      git_url: string;
+    }>("/repositories/clone", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  deleteRepositorySource: (name: string) =>
+    request<{ removed: boolean }>(`/repositories/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    }),
+  getIntegrationStatus: () =>
+    request<{
+      integrations: {
+        key: string;
+        label: string;
+        description: string;
+        category: string;
+        configured: boolean;
+        status: "connected" | "not_configured" | "coming_soon";
+        config_hint: string;
+      }[];
+    }>("/integrations/status"),
+  listRbacRoles: () =>
+    request<
+      {
+        role_key: string;
+        display_name: string;
+        description: string;
+        is_human: boolean;
+        is_system: boolean;
+        is_active: boolean;
+      }[]
+    >("/governance/roles"),
+  listPolicyRules: () =>
+    request<
+      {
+        id: string;
+        rule_key: string;
+        title: string;
+        description: string;
+        subject_role: string;
+        resource_type: string;
+        action_key: string;
+        tool_name: string | null;
+        decision: string;
+        risk_level: string;
+        risk_category: string;
+        required_approver_role: string | null;
+        priority: number;
+        is_active: boolean;
+      }[]
+    >("/governance/policy-rules"),
+  getKnowledgeSources: () => request<KnowledgeSourceDescriptor[]>("/knowledge/sources"),
+  getKnowledgeDocuments: (sourceName?: string, limit = 100) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (sourceName) {
+      params.set("source_name", sourceName);
+    }
+    return request<KnowledgeDocumentSummary[]>(`/knowledge/documents?${params.toString()}`);
+  },
+  syncKnowledge: (sourceName?: string) => {
+    const params = new URLSearchParams();
+    if (sourceName) {
+      params.set("source_name", sourceName);
+    }
+    const query = params.toString();
+    return request<KnowledgeSyncResponse>(query ? `/knowledge/sync?${query}` : "/knowledge/sync", {
+      method: "POST",
+    });
+  },
+  uploadKnowledgeFiles: (files: File[], sourceName?: string) => {
+    const body = new FormData();
+    for (const file of files) {
+      body.append("files", file, file.name);
+    }
+    if (sourceName) {
+      body.append("source_name", sourceName);
+    }
+    return requestMultipart<KnowledgeUploadResponse>("/knowledge/upload", body);
+  },
+  deleteKnowledgeDocument: (documentId: string) =>
+    request<KnowledgeDeleteResponse>(`/knowledge/documents/${documentId}`, {
+      method: "DELETE",
+    }),
+  deleteKnowledgeSource: (sourceName: string) =>
+    request<KnowledgeDeleteResponse>(`/knowledge/sources/${encodeURIComponent(sourceName)}`, {
+      method: "DELETE",
+    }),
+  listMemoryItems: (search?: string) => {
+    const params = new URLSearchParams();
+    const normalized = search?.trim();
+    if (normalized) {
+      params.set("search", normalized);
+    }
+    const query = params.toString();
+    return request<MemoryItem[]>(query ? `/memory/items?${query}` : "/memory/items");
+  },
+  createMemoryItem: (payload: MemoryItemCreate) =>
+    request<MemoryItem>("/memory/items", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  updateMemoryItem: (itemId: string, payload: MemoryItemUpdate) =>
+    request<MemoryItem>(`/memory/items/${encodeURIComponent(itemId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  deleteMemoryItem: (itemId: string) =>
+    request<{ ok: boolean }>(`/memory/items/${encodeURIComponent(itemId)}`, {
+      method: "DELETE",
+    }),
+  getMemorySettings: () => request<MemorySettings>("/memory/settings"),
+  updateMemorySettings: (payload: MemorySettingsUpdate) =>
+    request<MemorySettings>("/memory/settings", {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  getModelProviders: () => request<ModelProvider[]>("/model-config/providers"),
+  getSelectedModel: () => request<SelectedModel>("/model-config/selected"),
+  setSelectedModel: (payload: SelectedModelUpdate) =>
+    request<SelectedModel>("/model-config/selected", {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  getEffectiveRuntime: () =>
+    request<{
+      detected_mode: "recommended" | "cli" | "api" | "advanced";
+      planner_provider: string | null;
+      codegen_provider: string | null;
+      knowledge_synthesis_provider: string | null;
+      primary_agent_provider: string | null;
+      selected_model_id: string | null;
+      notes: string[];
+    }>("/model-config/runtime"),
+  getRuntimeOverrides: () =>
+    request<{
+      stages: {
+        stage: string;
+        default: string | null;
+        override: string | null;
+        effective: string | null;
+        allowed: string[];
+      }[];
+    }>("/runtime-config/overrides"),
+  patchRuntimeOverride: (body: { stage: string; value: string | null }) =>
+    request<{ stages: any[] }>("/runtime-config/overrides", {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  getAuthStatus: () =>
+    request<{
+      cli: {
+        key: string;
+        label: string;
+        cli_available: boolean;
+        authenticated: boolean;
+        auth_path: string | null;
+        login_command: string;
+        notes: string;
+      }[];
+      api_keys: {
+        key: string;
+        label: string;
+        env_var: string;
+        set: boolean;
+        notes: string;
+      }[];
+    }>("/runtime-config/auth-status"),
+  createTask: (input: TaskCreateInput) =>
+    request<TaskDetail>("/tasks", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  grantApproval: (approvalId: string, decision: ApprovalDecisionPayload | string, notes?: string) =>
+    request<Approval>(`/approvals/${approvalId}/grant`, {
+      method: "POST",
+      body: JSON.stringify(buildApprovalDecisionPayload(decision, notes)),
+    }),
+  rejectApproval: (approvalId: string, decision: ApprovalDecisionPayload | string, notes?: string) =>
+    request<Approval>(`/approvals/${approvalId}/reject`, {
+      method: "POST",
+      body: JSON.stringify(buildApprovalDecisionPayload(decision, notes)),
+    }),
+  rollbackTask: (taskId: string, actorName: string, reason: string) =>
+    request<TaskDetail>(`/tasks/${taskId}/rollback`, {
+      method: "POST",
+      body: JSON.stringify({ actor_name: actorName, reason }),
+    }),
+  iterateTask: (taskId: string, followUp: string, actorName?: string) =>
+    request<TaskDetail>(`/tasks/${taskId}/iterate`, {
+      method: "POST",
+      body: JSON.stringify({ follow_up: followUp, actor_name: actorName ?? null }),
+    }),
+  diagnoseTask: (taskId: string) =>
+    request<{
+      summary: string;
+      root_cause: string;
+      likely_fix: string;
+      confidence: "high" | "medium" | "low";
+      related_files: string[];
+    }>(`/tasks/${taskId}/diagnose`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+  /**
+   * Streaming chat endpoint. Returns an async iterator of typed events:
+   *   { type: "session", session_id, provider }
+   *   { type: "token", text }              — streaming tokens
+   *   { type: "task_created", task_id, scenario, kicked_off_pipeline, summary? }
+   *   { type: "error", message }
+   *   { type: "end", length }
+   */
+  chatSendStream: async function* (body: {
+    message: string;
+    session_id?: string | null;
+    source_name?: string | null;
+    actor_name?: string | null;
+    previous_task_id?: string | null;
+    signal?: AbortSignal;
+  }): AsyncGenerator<
+    | { type: "session"; session_id: string; provider: string; model?: string; fallback_attempt?: number }
+    | { type: "token"; text: string }
+    | { type: "tool_call"; id: string; name: string; arguments: Record<string, unknown> }
+    | { type: "tool_result"; tool_call_id: string; content: string; is_error: boolean }
+    | { type: "task_created"; task_id: string; scenario: string; kicked_off_pipeline: boolean; summary?: string }
+    | {
+        type: "task_create_failed";
+        reason: string;
+        reason_kind: "db_locked" | "persistence_error" | string;
+        answer_kept: boolean;
+        scenario_intended: string;
+        user_advice: string;
+      }
+    | { type: "provider_failed"; provider: string; model?: string; error: string }
+    | { type: "error"; message: string }
+    | { type: "end"; length: number }
+  > {
+    const response = await fetch(`${API_BASE_URL}/chat/send`, {
+      method: "POST",
+      headers: buildHeaders({}, true),
+      body: JSON.stringify({
+        message: body.message,
+        session_id: body.session_id ?? null,
+        source_name: body.source_name ?? null,
+        actor_name: body.actor_name ?? null,
+        previous_task_id: body.previous_task_id ?? null,
+      }),
+      signal: body.signal,
+    });
+    if (!response.ok || !response.body) {
+      const detail = await response.text().catch(() => response.statusText);
+      throw new Error(detail || `chat/send returned ${response.status}`);
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        // Split on the SSE record terminator (blank line).
+        let idx;
+        while ((idx = buffer.indexOf("\n\n")) >= 0) {
+          const record = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          let eventName = "message";
+          const dataLines: string[] = [];
+          for (const line of record.split("\n")) {
+            if (line.startsWith("event: ")) eventName = line.slice(7).trim();
+            else if (line.startsWith("data: ")) dataLines.push(line.slice(6));
+          }
+          if (dataLines.length === 0) continue;
+          const data = dataLines.join("\n");
+          let parsed: any = null;
+          try {
+            parsed = JSON.parse(data);
+          } catch {
+            continue;
+          }
+          yield { type: eventName, ...parsed } as any;
+        }
+      }
+    } finally {
+      try { reader.releaseLock(); } catch { /* noop */ }
+    }
+  },
+  getToolUsageStats: (windowDays = 7, top = 10) =>
+    request<{
+      total_invocations: number;
+      succeeded: number;
+      failed: number;
+      success_rate: number;
+      window_days: number;
+      by_tool: {
+        tool_name: string;
+        total: number;
+        succeeded: number;
+        failed: number;
+        success_rate: number;
+      }[];
+    }>(`/tools/usage-stats?window_days=${windowDays}&top=${top}`),
+  getLlmUsageStats: (windowDays = 30, top = 20) =>
+    request<{
+      window_days: number;
+      total_invocations: number;
+      total_input_tokens: number;
+      total_output_tokens: number;
+      total_tokens: number;
+      total_cost_usd: number;
+      by_model: {
+        model_name: string;
+        provider_name: string;
+        invocations: number;
+        input_tokens: number;
+        output_tokens: number;
+        total_tokens: number;
+        estimated_cost_usd: number;
+      }[];
+      by_purpose: {
+        purpose: string;
+        invocations: number;
+        total_tokens: number;
+        estimated_cost_usd: number;
+      }[];
+    }>(`/llm-usage/stats?window_days=${windowDays}&top=${top}`),
+  getLlmUsageTimeseries: (windowDays = 14) =>
+    request<{
+      window_days: number;
+      points: {
+        date: string;
+        total_tokens: number;
+        total_cost_usd: number;
+        invocations: number;
+      }[];
+    }>(`/llm-usage/timeseries?window_days=${windowDays}`),
+};

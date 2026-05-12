@@ -1,0 +1,98 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+venv/
+.venv/
+env/
+
+# Node
+node_modules/
+dist/
+build/
+.vite/
+*.tsbuildinfo
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets (root-level safety net; nested .gitignore still applies)
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+*.crt
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Logs
+*.log
+runtime-logs/
+logs/
+
+# Codex session artifacts
+.codex/
+
+# Backend uploaded knowledge files
+apps/backend/data/uploads/
+
+# Per-task orchestrator sandboxes (runtime state)
+apps/backend/data/sandboxes/
+apps/backend/data/agent_workspace/
+
+# Repo-root e2e/test scratch dir (reports, sandboxes, tmp)
+/data/
+
+# Stray test-artifact directories
+apps/backend/manual-mode-777/
+apps/backend/manual-pathlib-default/
+
+# Claude Code per-machine session state
+.claude/
+
+# One-off MiniMax generated output
+scripts/minimax_r4_output.py
+
+# Cloned repos used for e2e testing
+HostedDashboard/
+
+# Playwright MCP logs
+.playwright-mcp/
+
+# Codex temp pytest artifacts
+.pytest-tmp/
+pytest-basetemp/
+apps/backend/.tmp-pytest/
+apps/backend/.tmp-*/
+apps/backend/.pytest_tmp/
+apps/backend/.tmp-test/
+apps/backend/manual-pytest-temp/
+pytest-cache-files-*/
+/.tmp/
+
+# MCP config (machine-local)
+.mcp.json

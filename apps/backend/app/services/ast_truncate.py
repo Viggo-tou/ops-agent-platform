@@ -1,0 +1,450 @@
+"""AST-aware structural truncation for Python source (Tier 2).
+
+Why this exists. ``evidence_pack.truncate_file`` does naive byte
+truncation: it keeps the first ``max_per_file_bytes`` bytes and drops
+the rest. That's catastrophic for files like ``django/db/models/sql/
+query.py`` (2000+ lines) — the truncated head holds imports + class
+headers but no function body, so the model has nothing to edit. The
+SWE-bench task we hit on 2026-05-09 produced a 0-character diff for
+exactly this reason.
+
+This module truncates at AST boundaries instead: keep imports + module-
+level constants + class signatures whole; keep small function bodies
+whole; replace big function bodies with a placeholder. The output is
+syntactically valid Python so further tooling can still parse it.
+
+Public entry point: :func:`truncate_python_source`. Returns a
+:class:`TruncationResult` with the rebuilt text + bookkeeping.
+
+Non-Python files: this module declines (returns the source unchanged
+with the original size). Callers should fall back to byte truncation.
+"""
+from __future__ import annotations
+
+import ast
+import re
+from dataclasses import dataclass, field
+
+
+@dataclass
+class TruncationResult:
+    text: str
+    bytes_kept: int
+    symbols_kept_whole: list[str] = field(default_factory=list)
+    symbols_truncated: list[str] = field(default_factory=list)
+    elided_lines: int = 0
+    used_ast: bool = False
+
+
+# Default: keep any function ≤ this many lines whole, even when no
+# explicit keep-list is provided. Empirically chosen — most utility
+# helpers and short methods fit; bug fixes nearly always live inside
+# something larger that gets pinned via keep_symbols.
+_SMALL_BODY_LINES = 30
+
+# Aggressive mode: cut small_body_lines down hard when caller signals
+# "this file MUST fit under the byte cap". Used by build_evidence_pack
+# when a must_touch (priority=1) file's first-pass truncation still
+# overshoots the remaining total-byte budget. 5 means: only the
+# tiniest helpers (one-liner accessors, return statements) stay
+# whole; everything else is body-elided.
+_AGGRESSIVE_SMALL_BODY_LINES = 5
+
+
+def truncate_python_source(
+    source: str,
+    *,
+    max_bytes: int,
+    keep_symbols: list[str] | None = None,
+    small_body_lines: int = _SMALL_BODY_LINES,
+) -> TruncationResult:
+    """Truncate a Python source string at AST boundaries.
+
+    ``max_bytes`` is a soft target. The algorithm:
+
+    1. If the source already fits, return it unchanged.
+    2. Try to parse. If parsing fails, return the source unchanged
+       (caller falls back to byte truncation).
+    3. For each top-level node, keep imports / assignments / aliases
+       whole. For classes, keep the header and small methods whole;
+       for big methods, replace body with a placeholder. For module-
+       level functions, same rule.
+    4. ``keep_symbols`` pins specific function/method names so they're
+       always kept whole, even when over ``small_body_lines``.
+
+    The final text may still exceed ``max_bytes`` — when every body
+    is already either pinned or small. That's acceptable: an over-
+    budget rendering of an actual function body is always more useful
+    to the model than an in-budget rendering of imports alone. Caller
+    can re-truncate at the byte level as a last resort.
+    """
+    keep = set(keep_symbols or [])
+    encoded = source.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return TruncationResult(
+            text=source,
+            bytes_kept=len(encoded),
+            used_ast=False,
+        )
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        # Fallback to regex/indent-based truncation. Real-world Python
+        # files occasionally trip the strict parser even though they
+        # otherwise execute fine (e.g. astropy/nddata/mixins/
+        # ndarithmetic.py: 9.5-pair triple-quote count under Python
+        # 3.14). Without this fallback the truncator returns the file
+        # unchanged and the caller's byte cap kicks in, slicing off
+        # function bodies past the first 6 KB.
+        regex_result = _regex_truncate_python(
+            source, max_bytes=max_bytes, keep=keep, small_body_lines=small_body_lines
+        )
+        if regex_result is not None:
+            return regex_result
+        return TruncationResult(
+            text=source,
+            bytes_kept=len(encoded),
+            used_ast=False,
+        )
+
+    lines = source.splitlines(keepends=True)
+    out_lines: list[str] = []
+    kept_whole: list[str] = []
+    truncated: list[str] = []
+    elided_total = 0
+    last_emitted_end = 0  # 1-indexed line; 0 means nothing emitted yet
+
+    def emit_range(start: int, end: int) -> None:
+        """Emit lines[start-1:end] (1-indexed, inclusive)."""
+        nonlocal last_emitted_end
+        if start <= 0 or end <= 0 or start > end:
+            return
+        # Clip to file bounds.
+        start = max(start, 1)
+        end = min(end, len(lines))
+        # If a gap exists between last emit and start, keep the gap
+        # lines too (blank lines, comments between top-level defs).
+        if last_emitted_end + 1 < start:
+            for ln in lines[last_emitted_end : start - 1]:
+                out_lines.append(ln)
+        out_lines.extend(lines[start - 1 : end])
+        last_emitted_end = end
+
+    def signature_end_line(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
+        """Return the last line of the def's signature (the line ending
+        with the colon). Body starts on the next line. We approximate
+        with the docstring's start - 1 if a docstring exists, else the
+        first body statement's line - 1.
+        """
+        if not func_node.body:
+            return func_node.lineno
+        first_stmt = func_node.body[0]
+        # Signature ends on the line *before* the first body statement.
+        return max(func_node.lineno, first_stmt.lineno - 1)
+
+    def emit_truncated_function(
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        indent: str,
+    ) -> None:
+        """Emit signature + (if present) docstring + a placeholder."""
+        nonlocal elided_total
+        sig_end = signature_end_line(node)
+        emit_range(node.lineno, sig_end)
+        # Docstring detection: first body stmt is an Expr(Constant(str)).
+        body = node.body or []
+        body_start_line = node.body[0].lineno if body else (sig_end + 1)
+        body_end_line = node.end_lineno or body_start_line
+        had_doc = False
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            doc_node = body[0]
+            doc_end = doc_node.end_lineno or doc_node.lineno
+            emit_range(doc_node.lineno, doc_end)
+            body_start_line = doc_end + 1
+            had_doc = True
+        elided = max(0, body_end_line - body_start_line + 1)
+        if elided <= 0:
+            return
+        elided_total += elided
+        # Indent the placeholder to match the function body's expected
+        # indent level. Use the docstring or first non-doc stmt indent
+        # as the source of truth; fall back to indent + 4 spaces.
+        if had_doc and len(node.body) > 1:
+            sample_line = lines[node.body[1].lineno - 1] if node.body[1].lineno - 1 < len(lines) else ""
+        elif body and not had_doc:
+            sample_line = lines[body[0].lineno - 1] if body[0].lineno - 1 < len(lines) else ""
+        else:
+            sample_line = ""
+        body_indent = ""
+        for ch in sample_line:
+            if ch in (" ", "\t"):
+                body_indent += ch
+            else:
+                break
+        if not body_indent:
+            body_indent = indent + "    "
+        out_lines.append(
+            f"{body_indent}# ... {elided} line(s) elided by ast_truncate ...\n"
+        )
+        # If the function body just `pass`'d, emit `pass` so the file
+        # still parses cleanly without our placeholder.
+        out_lines.append(f"{body_indent}pass\n")
+        # Skip past the original body in lines[].
+        nonlocal_last(body_end_line)
+
+    def nonlocal_last(end: int) -> None:
+        nonlocal last_emitted_end
+        last_emitted_end = max(last_emitted_end, end)
+
+    def function_body_line_count(
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> int:
+        if not node.body:
+            return 0
+        body_end = node.end_lineno or node.lineno
+        body_start = node.body[0].lineno
+        return max(0, body_end - body_start + 1)
+
+    def should_keep_whole(
+        name: str,
+        body_lines: int,
+    ) -> bool:
+        if name in keep:
+            return True
+        return body_lines <= small_body_lines
+
+    def handle_function(
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        indent: str,
+    ) -> None:
+        body_lines = function_body_line_count(node)
+        if should_keep_whole(node.name, body_lines):
+            emit_range(node.lineno, node.end_lineno or node.lineno)
+            kept_whole.append(node.name)
+        else:
+            emit_truncated_function(node, indent)
+            truncated.append(node.name)
+
+    def handle_class(node: ast.ClassDef) -> None:
+        # Class header: lineno through the line of the first body stmt - 1.
+        if not node.body:
+            emit_range(node.lineno, node.end_lineno or node.lineno)
+            return
+        first = node.body[0]
+        header_end = max(node.lineno, first.lineno - 1)
+        emit_range(node.lineno, header_end)
+        # Walk class body. Keep non-funcdef stmts whole; recurse into
+        # methods.
+        method_indent = ""
+        sample_line = lines[first.lineno - 1] if first.lineno - 1 < len(lines) else ""
+        for ch in sample_line:
+            if ch in (" ", "\t"):
+                method_indent += ch
+            else:
+                break
+        for child in node.body:
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                handle_function(child, method_indent)
+            else:
+                emit_range(child.lineno, child.end_lineno or child.lineno)
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            handle_function(node, indent="")
+        elif isinstance(node, ast.ClassDef):
+            handle_class(node)
+        else:
+            emit_range(node.lineno, node.end_lineno or node.lineno)
+
+    # Append any trailing lines (blank lines / comments after the last
+    # top-level node).
+    if last_emitted_end < len(lines):
+        out_lines.extend(lines[last_emitted_end:])
+
+    text = "".join(out_lines)
+    # Prepend a header so the model understands what's been elided
+    # vs preserved. Without this, the surrounding `pass` placeholders
+    # made DeepSeek emit EVIDENCE_GAP defensively even when the
+    # function it actually needed was kept whole (2026-05-10 v7
+    # regression on astropy ndarithmetic.py).
+    if kept_whole or truncated:
+        header = _build_truncation_header(kept_whole, truncated)
+        text = header + text
+    return TruncationResult(
+        text=text,
+        bytes_kept=len(text.encode("utf-8")),
+        symbols_kept_whole=kept_whole,
+        symbols_truncated=truncated,
+        elided_lines=elided_total,
+        used_ast=True,
+    )
+
+
+def _build_truncation_header(
+    kept_whole: list[str], truncated: list[str]
+) -> str:
+    """Explanatory comment block at the top of a truncated file.
+
+    Tells the model exactly which functions are preserved with full
+    bodies (usable as Aider SEARCH anchors) and which were elided.
+    Helps the model not emit EVIDENCE_GAP just because it sees
+    `# ... N line(s) elided ...` placeholders elsewhere in the file.
+    """
+    lines = [
+        "# === ast_truncate header ===",
+        "# This file has been STRUCTURALLY TRUNCATED for context budget.",
+    ]
+    if kept_whole:
+        sample = ", ".join(kept_whole[:8])
+        if len(kept_whole) > 8:
+            sample += f", ... (+{len(kept_whole) - 8} more)"
+        lines.append(
+            f"# Functions kept WHOLE (use as SEARCH anchors): {sample}"
+        )
+    if truncated:
+        sample = ", ".join(truncated[:8])
+        if len(truncated) > 8:
+            sample += f", ... (+{len(truncated) - 8} more)"
+        lines.append(
+            f"# Functions with bodies elided (signatures still visible): {sample}"
+        )
+    lines.append(
+        "# DO NOT emit EVIDENCE_GAP because of `# ... N line(s) elided ...` markers"
+    )
+    lines.append(
+        "# below -- those mark non-target functions whose bodies are intentionally"
+    )
+    lines.append("# omitted. The functions named above are present in full.")
+    lines.append("# === end header ===\n")
+    return "\n".join(lines) + "\n"
+
+
+_DEF_RE = re.compile(r"^(?P<indent>[ \t]*)(?:async\s+)?def\s+(?P<name>\w+)\s*\(")
+_CLASS_RE = re.compile(r"^(?P<indent>[ \t]*)class\s+(?P<name>\w+)\b")
+
+
+def _regex_truncate_python(
+    source: str,
+    *,
+    max_bytes: int,
+    keep: set[str],
+    small_body_lines: int = _SMALL_BODY_LINES,
+) -> TruncationResult | None:
+    """Indent-based Python truncation when ``ast.parse`` won't accept
+    the file. Walks lines, identifies def/class blocks via regex +
+    indent level, and applies the same keep/elide logic as the AST
+    path. Output is line-faithful, so it stays byte-for-byte
+    compatible with the original where possible (important for Aider
+    SEARCH anchors).
+
+    Returns None if the file has no parseable structure to work with —
+    caller falls back to byte truncation.
+    """
+    lines = source.splitlines(keepends=True)
+    if not lines:
+        return None
+
+    # Locate every def/class line by regex.
+    blocks: list[dict] = []
+    for i, line in enumerate(lines):
+        m = _DEF_RE.match(line)
+        if m:
+            blocks.append({
+                "kind": "def",
+                "line": i,
+                "indent": len(m.group("indent")),
+                "name": m.group("name"),
+            })
+            continue
+        m = _CLASS_RE.match(line)
+        if m:
+            blocks.append({
+                "kind": "class",
+                "line": i,
+                "indent": len(m.group("indent")),
+                "name": m.group("name"),
+            })
+
+    if not blocks:
+        return None
+
+    # Determine each block's body end via the next sibling/parent block.
+    for idx, b in enumerate(blocks):
+        end = len(lines) - 1
+        for nxt in blocks[idx + 1:]:
+            if nxt["indent"] <= b["indent"]:
+                end = nxt["line"] - 1
+                break
+        b["end"] = end
+        b["body_start"] = b["line"] + 1
+        b["body_lines"] = max(0, end - b["line"])
+
+    # Decide keep / truncate per def. Class blocks are always kept
+    # whole as containers — their nested defs are individually
+    # judged.
+    keep_set: set[int] = set()      # indices of blocks to keep whole
+    truncate_set: set[int] = set()  # def blocks to body-truncate
+    for idx, b in enumerate(blocks):
+        if b["kind"] != "def":
+            continue
+        if b["name"] in keep or b["body_lines"] <= small_body_lines:
+            keep_set.add(idx)
+        else:
+            truncate_set.add(idx)
+
+    # Build output: walk lines, eliding bodies of truncate_set defs.
+    out_lines: list[str] = []
+    elided = 0
+    kept_whole_names: list[str] = []
+    truncated_names: list[str] = []
+    skip_until: int = -1
+
+    block_starts = {b["line"]: i for i, b in enumerate(blocks) if b["kind"] == "def"}
+    for i, line in enumerate(lines):
+        if i <= skip_until:
+            continue
+        if i in block_starts and block_starts[i] in truncate_set:
+            b = blocks[block_starts[i]]
+            # Emit signature (def line + any continuation lines until
+            # the line that ends with ":"). Heuristic: keep emitting
+            # until we see a line ending in ":" possibly with comment.
+            sig_end = b["line"]
+            for j in range(b["line"], min(b["end"] + 1, len(lines))):
+                stripped = lines[j].rstrip()
+                if stripped.endswith(":") or re.search(r":\s*(#.*)?$", stripped):
+                    sig_end = j
+                    break
+                sig_end = j
+            out_lines.extend(lines[b["line"]:sig_end + 1])
+            # Body indent = function indent + 4 spaces (best-effort).
+            indent = " " * (b["indent"] + 4)
+            body_count = max(0, b["end"] - sig_end)
+            elided += body_count
+            out_lines.append(
+                f"{indent}# ... {body_count} line(s) elided by ast_truncate (regex fallback) ...\n"
+            )
+            out_lines.append(f"{indent}pass\n")
+            truncated_names.append(b["name"])
+            skip_until = b["end"]
+            continue
+        # If this line begins a kept-whole def, just record the name.
+        if i in block_starts and block_starts[i] in keep_set:
+            kept_whole_names.append(blocks[block_starts[i]]["name"])
+        out_lines.append(line)
+
+    text = "".join(out_lines)
+    if kept_whole_names or truncated_names:
+        text = _build_truncation_header(kept_whole_names, truncated_names) + text
+    return TruncationResult(
+        text=text,
+        bytes_kept=len(text.encode("utf-8")),
+        symbols_kept_whole=kept_whole_names,
+        symbols_truncated=truncated_names,
+        elided_lines=elided,
+        used_ast=True,  # treat as AST-equivalent for downstream gating
+    )
