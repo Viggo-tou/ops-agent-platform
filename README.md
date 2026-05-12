@@ -59,6 +59,32 @@ The planner doesn't just produce a free-text plan — it commits to **structural
 
 `acceptance_check.evaluate` runs each rule against the actual diff. Token matching is not enough — the model has to write the structural change, not just mention it.
 
+## Contract Coverage (v16.2.1)
+
+On top of the planner's acceptance tests, every domain playbook declares **required contracts** — named semantic gates the patch must close before it ships. The model emits a `## CONTRACT_COVERAGE` JSON block on every batch declaring which contracts it implemented, which were already present, and which it deliberately skipped:
+
+```json
+{
+  "implemented_contracts": [
+    {
+      "id": "persisted_to_storage",
+      "file": "CustomerSignup.kt",
+      "evidence_mode": "diff_modified_payload_existing_sink",
+      "diff_evidence": "changed payload bindings from 0.0 to selected state vars",
+      "context_evidence": "userRef.setValue(userData) in same function consumes the modified map"
+    }
+  ],
+  "verified_no_change_contracts": [],
+  "unimplemented_contracts": []
+}
+```
+
+The harness then verifies every claim against the actual artifact via composite rules (`any_of` / `all_of` / `final_context_contains_pattern`). The verifier is **diff-anchored** — it parses unified diff hunks, resolves the enclosing function scope in the patched tree via brace counting, and matches verification patterns against that scope. This catches the failure class where the model implements a contract by changing the *input* of an existing unchanged sink call (e.g. lat/lng bound to state variables, but the existing `setValue(userData)` line untouched), which a diff-only verifier would misclassify as a lie.
+
+Verdicts are tri-state: `unverified` (verifier blind spot, soft-fail to human review), `contradicted` (patched tree directly disproves the claim, hard-fail), `lie` (extreme — claimed feature has no evidence anywhere, hard-fail).
+
+Live-verified on the Android KYC target: 6 out of 6 required contracts pass after the fix that round 6 incorrectly classified `persisted_to_storage` as a coverage lie.
+
 ## Architecture
 
 ```
