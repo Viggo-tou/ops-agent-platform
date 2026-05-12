@@ -31,6 +31,7 @@ from app.models.memory import AgentMemory  # noqa: E402
 import app.models  # noqa: F401, E402   # ensures every model is registered
 from app.services.failure_classifier import (  # noqa: E402
     classify,
+    classify_acceptance_test_pattern_missing,
     classify_must_touch_incomplete_diff,
     classify_contract_coverage_failure,
     detect_task_family,
@@ -321,4 +322,100 @@ def test_prompt_injection_whitelist_excludes_repair_hint(db: Session) -> None:
     assert repair_rows == [], (
         "failure_observation must NOT leak into repair_hint context "
         "(would be misread as 'fix recipe' by downstream agent)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Acceptance #5 (post-round-9) — acceptance_test_pattern_missing classifier
+# ---------------------------------------------------------------------------
+
+
+def test_acceptance_test_pattern_missing_round_9_message(db: Session) -> None:
+    """Reproduce the actual round-9 pipeline.failed message and verify
+    classify_acceptance_test_pattern_missing extracts all 5 missing
+    patterns into evidence_refs.missing_patterns."""
+    round_9_msg = (
+        "Acceptance gate failed: "
+        "[diff_contains_pattern] pattern 'singleTapConfirmedHelper|setOnMarkerDragListener' not in any added line "
+        "| [diff_contains_pattern] pattern 'getFromLocation\\\\s*\\\\(' not in any added line "
+        "| [diff_contains_pattern] pattern 'updateChildren|setValue' not in any added line "
+        "| [diff_contains_pattern] pattern 'org\\\\.osmdroid\\\\.' not in any added line "
+        "| [diff_contains_pattern] pattern 'Geocoder\\\\s*\\\\([^,)]+,\\\\s*Locale' not in any added line"
+    )
+    cls = classify_acceptance_test_pattern_missing(
+        pipeline_failed_message=round_9_msg,
+        provider="deepseek-v4-pro",
+        task_family="android_map_location",
+        task_id="round-9",
+    )
+    assert cls is not None
+    assert cls.failure_class == "acceptance_test_pattern_missing"
+    assert cls.scope == "gate:acceptance_check"
+    assert cls.task_family == "android_map_location"
+    # All 5 patterns extracted into evidence
+    missing = cls.evidence_refs["missing_patterns"]
+    assert len(missing) == 5
+    patterns_found = [m["pattern"] for m in missing]
+    assert "singleTapConfirmedHelper|setOnMarkerDragListener" in patterns_found
+    assert "updateChildren|setValue" in patterns_found
+    # Lesson body mentions concrete missing patterns
+    assert "singleTapConfirmedHelper" in cls.lesson or "setOnMarkerDragListener" in cls.lesson
+
+
+def test_must_touch_classifier_defers_to_acceptance_gate_message(db: Session) -> None:
+    """When pipeline_failed_message says 'Acceptance gate failed',
+    must_touch classifier must NOT fire — even if files_actually_patched
+    happens to be empty (acceptance_check fires before
+    sandbox.apply_patch writes pipeline_state.files_changed).
+
+    This is the round-9 false-positive that motivated the fix.
+    """
+    msg = (
+        "Acceptance gate failed: [diff_contains_pattern] pattern 'X' "
+        "not in any added line"
+    )
+    # plan_must_touch non-empty, files_actually_patched empty — would
+    # have wrongly fired must_touch_incomplete_diff before the fix.
+    result = classify_must_touch_incomplete_diff(
+        plan_must_touch=["A.kt", "B.kt"],
+        files_actually_patched=[],  # acceptance fired pre-apply_patch
+        pipeline_failed_message=msg,
+        provider="deepseek-v4-pro",
+        task_family="android_map_location",
+        task_id="round-9-replay",
+    )
+    assert result is None, (
+        "must_touch_incomplete_diff must defer to acceptance_check when "
+        "the failure message belongs to the acceptance gate"
+    )
+
+
+def test_dispatcher_prefers_acceptance_over_must_touch(db: Session) -> None:
+    """End-to-end: feed round-9 conditions through classify() dispatcher
+    and verify the output is acceptance_test_pattern_missing alone, not
+    a false-positive must_touch row. This pins the bug we hit live on
+    round 9 (auto-classified ``must_touch_incomplete_diff`` when the
+    real failure was the acceptance gate).
+    """
+    round_9_msg = (
+        "Acceptance gate failed: "
+        "[diff_contains_pattern] pattern 'singleTapConfirmedHelper' not in any added line "
+        "| [diff_contains_pattern] pattern 'updateChildren' not in any added line"
+    )
+    results = classify(
+        plan_must_touch=[
+            "app/.../CustomerSignup.kt",
+            "app/.../CustomerKYCAddressForm.kt",
+        ],
+        files_actually_patched=[],  # acceptance fired pre-apply_patch
+        pipeline_failed_message=round_9_msg,
+        codegen_provider="deepseek-v4-pro",
+        task_family="android_map_location",
+        task_id="round-9-replay",
+    )
+    failure_classes = [c.failure_class for c in results]
+    assert "acceptance_test_pattern_missing" in failure_classes
+    assert "must_touch_incomplete_diff" not in failure_classes, (
+        f"Expected dispatcher to defer must_touch on acceptance failures. "
+        f"Got: {failure_classes}"
     )

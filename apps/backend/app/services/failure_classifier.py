@@ -26,6 +26,7 @@ downstream planner / codegen reads it as a *warning* not a *recipe*.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -71,21 +72,40 @@ def classify_must_touch_incomplete_diff(
     """Fired when ``must_touch enforcement`` gate rejects a diff that
     only covers a subset of the planner-declared must_touch files.
 
-    Signals:
-      - ``plan_must_touch`` non-empty
-      - ``files_actually_patched`` proper subset of ``plan_must_touch``
-      - OR the pipeline message string explicitly mentions
-        "must_touch file(s) were not successfully patched"
+    Signal source priority (tightened 2026-05-12 after round-9 mis-fire):
+      1. Explicit message keyword ``"must_touch file(s) were not
+         successfully patched"`` is the AUTHORITATIVE signal. When this
+         phrase is present, the row is must_touch-related.
+      2. Otherwise: ``plan_must_touch`` non-empty AND
+         ``files_actually_patched`` is a *proper* subset AND the message
+         does NOT match another more-specific gate (e.g. acceptance
+         gate, contract_coverage). This prevents the false-positive we
+         saw on round 9: ``files_actually_patched`` was empty because
+         the acceptance gate fired BEFORE sandbox.apply_patch wrote
+         anything to ``pipeline_state.files_changed``, so the bare
+         "missing = must_touch - []" arithmetic mis-classified an
+         acceptance-test failure as a must_touch incomplete-diff.
     """
     must_touch = {f for f in (plan_must_touch or []) if f}
     patched = {f for f in (files_actually_patched or []) if f}
     missing = sorted(must_touch - patched)
     msg = (pipeline_failed_message or "").lower()
-    explicit = (
+
+    explicit_keyword = (
         "must_touch" in msg
         and ("were not successfully patched" in msg or "missing" in msg)
     )
-    if not (missing or explicit):
+    # If the message explicitly belongs to another gate, defer.
+    fires_other_gate = (
+        "acceptance gate failed" in msg
+        or "contract_coverage_lie" in msg
+        or "contract_coverage_contradicted" in msg
+        or "contract_coverage_unverified" in msg
+        or "compile_repair" in msg
+    )
+    if not explicit_keyword and fires_other_gate:
+        return None
+    if not (missing or explicit_keyword):
         return None
     return FailureClassification(
         failure_class="must_touch_incomplete_diff",
@@ -108,6 +128,77 @@ def classify_must_touch_incomplete_diff(
             "files_actually_patched": list(patched),
             "missing_files": missing,
             "pipeline_message": pipeline_failed_message[:400],
+        },
+        prompt_eligible=["planner_warning", "codegen_warning"],
+    )
+
+
+_ACCEPTANCE_RULE_RE = re.compile(
+    r"\[(?P<kind>[a-z_]+)\]\s+pattern\s+'(?P<pattern>[^']+)'\s+not in any added line",
+    re.IGNORECASE,
+)
+
+
+def classify_acceptance_test_pattern_missing(
+    *,
+    pipeline_failed_message: str = "",
+    provider: str | None = None,
+    task_family: str | None = None,
+    task_id: str | None = None,
+) -> FailureClassification | None:
+    """T-LEARNING-LOOP-V1 (2026-05-12, post-round-9): fired when the
+    acceptance_check gate rejects a diff because one or more planner-
+    declared structural patterns are absent from the added lines.
+
+    The acceptance-check gate emits a message of the form::
+
+        Acceptance gate failed: [diff_contains_pattern] pattern 'X' not in any added line
+            | [diff_contains_pattern] pattern 'Y' not in any added line
+            | [diff_contains_pattern_in_file] pattern 'Z' not in any added line
+            ...
+
+    Each ``[...]`` block describes one violated acceptance test. We
+    extract the patterns into ``evidence_refs.missing_patterns`` so the
+    planner-side retrieval can render them concretely (e.g. "previous
+    run missed `singleTapConfirmedHelper` and `getFromLocation`") and
+    the LLM can prioritize emitting those exact symbols on the next
+    run. Much higher-bandwidth signal than the must_touch path
+    (which only knows files were missing, not which semantic patterns).
+    """
+    msg = pipeline_failed_message or ""
+    if "acceptance gate failed" not in msg.lower():
+        return None
+    matches = _ACCEPTANCE_RULE_RE.findall(msg)
+    missing_patterns: list[dict[str, str]] = []
+    for kind_str, pattern in matches:
+        missing_patterns.append({"kind": kind_str.strip(), "pattern": pattern.strip()})
+    # Compact a human-readable preview for the lesson body.
+    preview_patterns = [m["pattern"] for m in missing_patterns[:5]]
+    return FailureClassification(
+        failure_class="acceptance_test_pattern_missing",
+        scope="gate:acceptance_check",
+        task_family=task_family,
+        lesson=(
+            f"Planner declared {len(missing_patterns)} structural "
+            "acceptance_test(s) the patch must satisfy, but codegen's "
+            "diff did not introduce any added line matching them. "
+            "Concretely missing: "
+            + (", ".join(f"`{p}`" for p in preview_patterns) or "see message")
+            + ". For task_family-similar future tasks the planner must "
+            "make these patterns explicit in the acceptance_tests block "
+            "AND the codegen prompt must list them as required symbols "
+            "the diff must introduce — not just as 'related concepts'. "
+            "Map UI / location-picker tasks specifically need event "
+            "receivers (singleTapConfirmedHelper / setOnMarkerDragListener), "
+            "Geocoder.getFromLocation calls, and the storage sink (e.g. "
+            "Firebase updateChildren) actually present in the added "
+            "lines — not merely imported."
+        ),
+        evidence_refs={
+            "task_id": task_id,
+            "provider": provider,
+            "missing_patterns": missing_patterns,
+            "pipeline_message": (pipeline_failed_message or "")[:600],
         },
         prompt_eligible=["planner_warning", "codegen_warning"],
     )
@@ -321,8 +412,21 @@ def classify(
 
     # Order matters only for documentation — the orchestrator emits
     # one row per match, so two simultaneous failure modes are recorded
-    # without collision.
+    # without collision. The acceptance classifier runs before
+    # must_touch because acceptance failures sometimes look like
+    # must_touch failures from the bare ``files_changed`` perspective
+    # (the acceptance gate fires before sandbox.apply_patch writes
+    # anything to pipeline_state.files_changed).
     for fn, kwargs in (
+        (
+            classify_acceptance_test_pattern_missing,
+            {
+                "pipeline_failed_message": pipeline_failed_message,
+                "provider": codegen_provider,
+                "task_family": task_family,
+                "task_id": task_id,
+            },
+        ),
         (
             classify_must_touch_incomplete_diff,
             {
