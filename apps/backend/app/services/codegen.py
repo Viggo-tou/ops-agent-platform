@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -12,6 +13,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
+
+logger = logging.getLogger("app.services.codegen")
 
 import httpx
 from sqlalchemy.orm import Session
@@ -240,7 +243,20 @@ AIDER_FORMAT_RETRY_SUFFIX = (
     "provided. If your previous attempt failed with anchor_not_found, you "
     "paraphrased or trimmed whitespace — copy the SEARCH region byte-for-byte "
     "from the file. If it failed with anchor_ambiguous, extend the SEARCH "
-    "region by one line until it is unique."
+    "region by one line until it is unique.\n\n"
+    # 2026-05-11 reverse-evidence prompt (codex consult):
+    # Curb premature ## EVIDENCE_GAP_REQUEST. Each truncated file's view
+    # summary lists which functions are kept WHOLE — those are the only
+    # legitimate SEARCH anchors anyway. If the planner picked a stub'd
+    # function, the model should re-anchor onto a sibling kept-whole
+    # function, not give up.
+    "REMINDER about the file context: each truncated file begins with a "
+    "`=== view summary ===` header that lists which functions have REAL "
+    "bodies (use these as SEARCH anchors) and which are stubbed (body is "
+    "`pass`). Pick a SEARCH anchor only from the 'Real bodies' list. Do NOT "
+    "emit ## EVIDENCE_GAP_REQUEST when one of the listed real-body functions "
+    "is a viable patch site — patch that one. Only request more context if "
+    "the fix demonstrably requires a function whose body is stubbed."
 )
 
 
@@ -326,7 +342,18 @@ class CodeGenerator:
 
         must_touch = clean(plan_json.get("must_touch_files"))
         expected_new = clean(plan_json.get("expected_new_files"))
-        return must_touch, expected_new, set(must_touch) | set(expected_new)
+        # Phase 2.4 (2026-05-11): likely_touch_files are allowed-to-edit
+        # candidates the planner surfaced but isn't sure about. Including
+        # them in allowed_paths means the codegen LLM is free to upgrade
+        # them to actual edits when in-context evidence justifies it.
+        # must_inspect_files are NOT in this set — they remain read-only
+        # context and codegen will be rejected if it modifies them.
+        likely_touch = clean(plan_json.get("likely_touch_files"))
+        return (
+            must_touch,
+            expected_new,
+            set(must_touch) | set(expected_new) | set(likely_touch),
+        )
 
     @staticmethod
     def _paths_match(left: str, right: str) -> bool:
@@ -611,7 +638,7 @@ class CodeGenerator:
         # Tier 4-H: track whether the bounded tool-use loop already fired
         # for this generate_patch call. Reset here (instance is reused
         # across calls).
-        self._tool_loop_used = False
+        self._tool_loop_count = 0
 
         # Tier 4 main course: when agent mode = loop, run the multi-turn
         # agent loop instead of the static 1-shot pipeline. Decision
@@ -638,6 +665,7 @@ class CodeGenerator:
         attempts: list[dict[str, Any]] = []
         for provider_idx, provider in enumerate(providers):
             _logger.info("Trying provider %d/%d: %s", provider_idx + 1, len(providers), provider)
+            _provider_t0 = time.monotonic()
             try:
                 result = self._try_provider(
                     provider=provider,
@@ -648,6 +676,10 @@ class CodeGenerator:
                     source_repo_path=source_repo_path,
                     actor_name=actor_name,
                     fallback_step=provider_idx,
+                )
+                _logger.info(
+                    "Provider %s primary call returned in %.1fs",
+                    provider, time.monotonic() - _provider_t0,
                 )
                 if enforce:
                     self._validate_changed_files_within_allowed(
@@ -668,7 +700,30 @@ class CodeGenerator:
                 # would falsely reject every legit repair attempt and loop
                 # max_retries before raising. Repair's own validation is
                 # the next compile_gate round.
-                _is_repair_call = isinstance(task_description, str) and task_description.startswith("Fix syntax errors in")
+                #
+                # M1 fix (2026-05-11): the marker "Fix syntax errors in"
+                # is stored in plan_json.objective (orchestrator service
+                # line 7712), not task_description. The previous guard
+                # checked the wrong field, so self_validate ran during
+                # every repair attempt and falsely rejected legit
+                # sandbox-based patches against the original repo. v9
+                # spent 28 min stuck in this loop before the 30-min
+                # watchdog killed the task. Check both fields against
+                # a list of repair markers.
+                _repair_markers = (
+                    "Fix syntax errors in",
+                    "Fix compile errors in",
+                    "Repair patch for",
+                    "Compile repair",
+                )
+                _plan_objective = ""
+                if isinstance(plan_json, dict):
+                    _plan_objective = str(plan_json.get("objective") or "")
+                _task_desc_str = task_description if isinstance(task_description, str) else ""
+                _is_repair_call = any(
+                    _plan_objective.startswith(m) or _task_desc_str.startswith(m)
+                    for m in _repair_markers
+                )
                 if not _is_repair_call and getattr(self.settings, "codegen_self_validation_enabled", True):
                     from app.services.codegen_self_validate import self_validate
                     raw_source = str(
@@ -740,12 +795,44 @@ class CodeGenerator:
                                 task_description,
                                 json_mode=provider in {"minimax", "ollama"},
                             )
+                            # v16 P0-3: classify the apply error and inject a
+                            # TARGETED hint instead of generic "hunk drift". The
+                            # most common silent-killer is `MISSING_NEW_FILE` —
+                            # model emitted `--- a/<new-file>` for a path in
+                            # expected_new_files, git rejects with "No such file
+                            # or directory", and the generic retry just says
+                            # "context mismatch" so the model has no idea what
+                            # actually needs to change.
+                            targeted_hint = ""
+                            kind = getattr(validation, "error_kind", "UNKNOWN")
+                            if kind == "MISSING_NEW_FILE":
+                                new_files_list = "\n".join(
+                                    f"  - {p}" for p in (expected_new_files or [])
+                                ) or "  (none declared)"
+                                targeted_hint = (
+                                    "\n---\n"
+                                    "TARGETED FIX: at least one path in this diff "
+                                    "does not exist in the source tree. git apply "
+                                    "rejected with 'No such file or directory'. "
+                                    "This file is a NEW FILE — you MUST emit the "
+                                    "new-file diff shape:\n"
+                                    "    diff --git a/<path> b/<path>\n"
+                                    "    new file mode 100644\n"
+                                    "    --- /dev/null\n"
+                                    "    +++ b/<path>\n"
+                                    "    @@ -0,0 +1,N @@\n"
+                                    "    +<content>\n"
+                                    "Do NOT use '--- a/<path>' — that header is "
+                                    "only for files that already exist on disk.\n"
+                                    f"Plan's expected_new_files:\n{new_files_list}\n"
+                                )
                             retry_prompt = (
                                 f"{sv_prompt}\n\n"
                                 f"---\n"
                                 f"VALIDATION FEEDBACK (your previous attempt failed):\n"
                                 f"{validation.reason}\n"
-                                f"{validation.error_detail[:1500]}\n\n"
+                                f"{validation.error_detail[:1500]}\n"
+                                f"{targeted_hint}\n"
                                 f"Regenerate the diff. Make sure the hunk context "
                                 f"matches the actual file content (no drift). If "
                                 f"parse failed, fix the syntactic error."
@@ -753,9 +840,10 @@ class CodeGenerator:
                             if l5_failure:
                                 retry_prompt += MINIMAL_EDIT_RETRY_SUFFIX
                             _logger.info(
-                                "Self-validation retry %d/%d for provider %s",
-                                sv_attempt + 1, max_retries, provider,
+                                "Self-validation retry %d/%d for provider %s (error_kind=%s)",
+                                sv_attempt + 1, max_retries, provider, kind,
                             )
+                            _sv_retry_t0 = time.monotonic()
                             result = self._try_provider(
                                 provider=provider,
                                 task_id=task_id,
@@ -767,6 +855,11 @@ class CodeGenerator:
                                 fallback_step=provider_idx,
                                 override_prompt=retry_prompt,
                             )
+                            _logger.info(
+                                "Retry call returned in %.1fs (provider=%s, error_kind=%s, retry=%d/%d)",
+                                time.monotonic() - _sv_retry_t0,
+                                provider, kind, sv_attempt + 1, max_retries,
+                            )
                             if enforce:
                                 self._validate_changed_files_within_allowed(
                                     result.files_changed,
@@ -775,19 +868,45 @@ class CodeGenerator:
                                     expected_new_files=expected_new_files,
                                 )
 
-                _logger.info("Provider %s succeeded: %d files changed", provider, len(result.files_changed))
-                attempts.append({"provider": provider, "status": "succeeded"})
+                _provider_total_s = round(time.monotonic() - _provider_t0, 1)
+                _logger.info(
+                    "Provider %s succeeded: %d files changed in %.1fs",
+                    provider, len(result.files_changed), _provider_total_s,
+                )
+                attempts.append({
+                    "provider": provider,
+                    "status": "succeeded",
+                    "duration_s": _provider_total_s,
+                })
                 try:
                     result.attempt_history = attempts
                 except Exception:
                     result = result.model_copy(update={"attempt_history": attempts})
                 return result
             except CodegenError as exc:
-                _logger.warning("Provider %s failed: %s", provider, str(exc)[:300])
+                _provider_total_s = round(time.monotonic() - _provider_t0, 1)
+                _logger.warning(
+                    "Provider %s failed after %.1fs: %s",
+                    provider, _provider_total_s, str(exc)[:300],
+                )
+                # Extract error_kind from the CodegenError if it embedded one
+                # via self-validate (format: "<reason> :: <detail>" or
+                # "codegen self-validation failed after N attempt(s): <reason>: <detail>").
+                # Best-effort tag for observability + downstream fail-fast decisions.
+                _err_msg = str(exc)
+                _error_kind = "UNKNOWN"
+                if "No such file or directory" in _err_msg:
+                    _error_kind = "MISSING_NEW_FILE"
+                elif "corrupt patch" in _err_msg.lower():
+                    _error_kind = "CORRUPT_PATCH"
+                elif "patch does not apply" in _err_msg.lower() or "hunk drift" in _err_msg.lower():
+                    _error_kind = "HUNK_DRIFT"
                 attempts.append({
                     "provider": provider,
                     "status": "failed",
                     "error": str(exc)[:300],
+                    "error_kind": _error_kind,
+                    "duration_s": _provider_total_s,
                 })
                 if _is_provider_level_error(exc) and provider_idx < len(providers) - 1:
                     _logger.info("Classified as provider-level error — trying next provider")
@@ -910,12 +1029,15 @@ class CodeGenerator:
                     prompt_fingerprint=prompt_fingerprint,
                     error_type=type(gap_exc).__name__,
                 )
-                # Tier 4-H bounded recovery: ONCE per provider call we
-                # let the model's stated "I need symbol X in file Y" be
-                # fulfilled from disk + retry codegen. After that, fall
-                # through to the regular failure path.
-                if not getattr(self, "_tool_loop_used", False):
-                    self._tool_loop_used = True
+                # Tier 4-H bounded recovery: cap at 2 fires per provider
+                # call. 2 (was 1) lets the stub-anchor detector raise a
+                # follow-up EVIDENCE_GAP_REQUEST and have it actually
+                # trigger another swap attempt, rather than fail with
+                # "unfulfilled" when the model anchors on a stub during
+                # the recovery prompt.
+                _loop_count = int(getattr(self, "_tool_loop_count", 0))
+                if _loop_count < 2:
+                    self._tool_loop_count = _loop_count + 1
                     import logging as _log
 
                     _tl_logger = _log.getLogger("codegen.tool_loop")
@@ -928,6 +1050,40 @@ class CodeGenerator:
                         list(context_files.keys()),
                         source_repo_path,
                     )
+                    # Codex option E (2026-05-11): try budgeted swap
+                    # first — re-truncate the requested file with the
+                    # symbol added to keep_symbols, staying within the
+                    # per-file byte cap. This makes Tier 4-H actually
+                    # fulfillable for the common "I need this stubbed
+                    # function's body" case.
+                    swapped = self._swap_evidence_for_request(
+                        gap_exc.requests,
+                        candidate_files=context_files,
+                        source_repo_path=source_repo_path,
+                    )
+                    _tl_logger.warning(
+                        "tool_loop.swap files=%s",
+                        swapped,
+                    )
+                    if swapped:
+                        # Rebuild the prompt with the new context and try
+                        # codegen again. The same `prompt` string still
+                        # references file paths; context_files was
+                        # mutated in place so the next provider call
+                        # picks up the swapped views.
+                        try:
+                            return self._call_provider_once(
+                                provider=provider,
+                                prompt=prompt,
+                                context_files=context_files,
+                                source_repo_path=source_repo_path,
+                                task_id=task_id,
+                            )
+                        except CodegenError:
+                            # Swap recovery failed too — fall through to
+                            # the older append-spans path below as a
+                            # second-chance recovery.
+                            pass
                     spans_text = self._fulfil_evidence_gap_request(
                         gap_exc.requests,
                         candidate_files=context_files,
@@ -1007,6 +1163,202 @@ class CodeGenerator:
             return render_spans_for_prompt(spans)
         except Exception:  # noqa: BLE001
             return ""
+
+    def _swap_evidence_for_request(
+        self,
+        requests: list,
+        *,
+        candidate_files: dict[str, str],
+        source_repo_path: str | None,
+    ) -> list[str]:
+        """Re-truncate requested file with augmented keep set, replacing
+        the version in candidate_files. Codex's option E (2026-05-11):
+        when a symbol is stubbed, don't append spans (which exceed
+        budget); rebuild the file view with the symbol added to
+        keep_symbols, evicting other slices to stay within the same
+        per-file byte cap. Returns the list of file paths that were
+        successfully re-truncated.
+        """
+        if not source_repo_path:
+            return []
+        try:
+            from app.services.evidence_pack import truncate_for_context
+        except Exception:  # noqa: BLE001
+            return []
+        repo_root = Path(source_repo_path)
+        per_file_budget = int(
+            getattr(self.settings, "codegen_per_file_byte_budget", 18_000)
+        )
+        swapped: list[str] = []
+        # Group requests by file so we can union all requested symbols
+        # for each file in a single re-truncation pass.
+        by_file: dict[str, list[str]] = {}
+        for req in requests:
+            file = getattr(req, "file", None)
+            symbol = getattr(req, "symbol", None)
+            if not file or not symbol:
+                continue
+            by_file.setdefault(str(file), []).append(str(symbol))
+        for file_path, new_keeps in by_file.items():
+            if file_path not in candidate_files:
+                continue
+            disk = repo_root / file_path
+            try:
+                original_text = disk.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            existing = candidate_files[file_path]
+            # Best-effort: extract any function names already kept whole
+            # from the existing view-summary header so we don't drop them
+            # when adding the new symbol.
+            prior_keeps: list[str] = []
+            for line in existing.splitlines()[:30]:
+                marker = "Real bodies (use as SEARCH anchors):"
+                if marker in line:
+                    tail = line.split(marker, 1)[1]
+                    for chunk in tail.replace("(", ",").replace(")", ",").split(","):
+                        token = chunk.strip(" #.,")
+                        if token and token.replace("_", "").isalnum():
+                            prior_keeps.append(token)
+                    break
+            merged_keeps = list(dict.fromkeys(prior_keeps + new_keeps))
+            new_view = truncate_for_context(
+                original_text,
+                max_bytes=per_file_budget,
+                path=file_path,
+                keep_symbols=merged_keeps,
+            )
+            existing_stubbed = [
+                sym for sym in new_keeps
+                if self._symbol_is_stubbed(existing, sym)
+            ]
+            new_stubbed = [
+                sym for sym in new_keeps
+                if self._symbol_is_stubbed(new_view, sym)
+            ]
+            logger.warning(
+                "swap_evidence file=%s new_keeps=%s prior_keeps=%s "
+                "existing_bytes=%d new_bytes=%d existing_stubbed=%s "
+                "new_stubbed=%s view_changed=%s",
+                file_path, new_keeps, prior_keeps,
+                len(existing), len(new_view) if new_view else 0,
+                existing_stubbed, new_stubbed,
+                new_view != existing,
+            )
+            # Codex's correctness criterion (2026-05-11): success means
+            # each requested symbol's body is ACTUALLY whole in the new
+            # view, not just that the view changed. Heuristic: if a
+            # `def NAME(...):\n    pass\n` stub for the requested symbol
+            # still appears, swap failed for this symbol — try a
+            # focused per-symbol view as last resort.
+            if not new_view:
+                continue
+            unresolved = [
+                sym for sym in new_keeps
+                if self._symbol_is_stubbed(new_view, sym)
+            ]
+            if not unresolved:
+                # Every requested symbol is whole in new_view. Take it
+                # even if it's identical to the existing view — that
+                # means the symbol was already whole and the swap is a
+                # no-op (the model just need to be told to look there).
+                if new_view != existing:
+                    candidate_files[file_path] = new_view
+                    swapped.append(file_path)
+                else:
+                    # No-op swap: log but don't add to swapped (caller
+                    # should fall through to span fetcher).
+                    pass
+                continue
+            # Symbol(s) still stubbed in budgeted re-truncation —
+            # produce a focused view with just those symbols' bodies
+            # plus minimal surrounding context.
+            focused = self._build_focused_symbol_view(
+                original_text=original_text,
+                file_path=file_path,
+                requested_symbols=unresolved,
+            )
+            if focused and focused != existing:
+                candidate_files[file_path] = focused
+                swapped.append(file_path)
+        return swapped
+
+    @staticmethod
+    def _symbol_is_stubbed(view: str, symbol: str) -> bool:
+        """Heuristic: detect if a function/class is rendered as a `pass`
+        stub in the truncated view. Returns True if `def {symbol}(...):`
+        is followed (modulo blank lines / docstring) by an indented
+        `pass` and nothing else of substance.
+        """
+        # Match the symbol's def line + the following few lines. If
+        # the body collapses to just `pass`, it's a stub.
+        pattern = re.compile(
+            rf"^[ \t]*(?:async\s+)?def\s+{re.escape(symbol)}\s*\([^)]*\)[^\n:]*:\s*\n"
+            rf"((?:[ \t]+(?:\"\"\".*?\"\"\"|'''.*?''')\s*\n)?)"
+            rf"[ \t]+pass\s*\n",
+            re.MULTILINE | re.DOTALL,
+        )
+        return bool(pattern.search(view))
+
+    def _build_focused_symbol_view(
+        self,
+        *,
+        original_text: str,
+        file_path: str,
+        requested_symbols: list[str],
+    ) -> str:
+        """Build a per-symbol focused view: pull the requested function
+        bodies whole from disk plus a tiny header noting that other
+        parts of the file are omitted. Used as last resort when budget
+        truncation can't keep all requested symbols whole.
+        """
+        try:
+            import ast as _ast
+            tree = _ast.parse(original_text)
+        except SyntaxError:
+            return ""
+        lines = original_text.splitlines(keepends=True)
+        kept: list[str] = []
+        kept.append("# === focused symbol view ===\n")
+        kept.append(
+            f"# {file_path}: extracting only requested symbols whole; "
+            f"rest of file omitted.\n"
+        )
+        kept.append(
+            f"# Requested: {', '.join(requested_symbols)}\n"
+        )
+        kept.append("# === end ===\n\n")
+        # Walk top-level + class-level defs; emit any matching the request.
+        wanted = set(requested_symbols)
+
+        def emit_def(node: Any) -> None:
+            if not getattr(node, "lineno", None):
+                return
+            start = node.lineno - 1
+            end = (node.end_lineno or node.lineno) - 1
+            if 0 <= start < len(lines) and 0 <= end < len(lines):
+                kept.append(f"# --- {file_path}:{node.lineno}-{node.end_lineno} ---\n")
+                kept.extend(lines[start:end + 1])
+                kept.append("\n")
+
+        for node in tree.body:
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                if node.name in wanted:
+                    emit_def(node)
+            elif isinstance(node, _ast.ClassDef):
+                emitted_class_header = False
+                for child in node.body:
+                    if isinstance(child, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                        if child.name in wanted:
+                            if not emitted_class_header:
+                                kept.append(
+                                    f"# (in class {node.name})\n"
+                                )
+                                emitted_class_header = True
+                            emit_def(child)
+        if len(kept) <= 4:  # only header lines, no bodies — nothing matched
+            return ""
+        return "".join(kept)
 
     def _call_provider_once(
         self,
@@ -1252,6 +1604,7 @@ class CodeGenerator:
             prompt,
             context_files=context_files,
             claude_cmd=claude_cmd,
+            source_repo_path=source_repo_path,
         )
 
     # ---- worktree-based codegen ------------------------------------------- #
@@ -1650,21 +2003,46 @@ class CodeGenerator:
         *,
         context_files: dict[str, str],
         claude_cmd: str,
+        source_repo_path: str | None = None,
     ) -> CodegenResult:
         """Fallback: run Claude Code CLI in a disposable temp directory.
 
         Used when no source repo is available for worktree mode.
+
+        2026-05-11 (G2 v26 finding): when `source_repo_path` is given
+        (e.g. SWE-bench's cached repo without .git metadata), copy the
+        ORIGINAL un-truncated file content from disk into the tempdir
+        instead of the truncated `context_files`. This makes the
+        post-edit `git diff` produce a patch in original-file
+        coordinates, which is what SWE-bench's `git apply` and our
+        leg-2 symbol verifier expect.
         """
         import logging as _log
         _logger = _log.getLogger("codegen.claude_code.tempdir")
 
         workdir = tempfile.mkdtemp(prefix="ops_claude_code_")
+        repo_root = Path(source_repo_path) if source_repo_path else None
+
+        def _resolve_initial_content(rel_path: str, fallback: str) -> str:
+            """Prefer un-truncated disk content; fall back to context_files
+            (truncated view) only if disk read fails."""
+            if repo_root is None:
+                return fallback
+            disk = repo_root / rel_path
+            try:
+                return disk.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                return fallback
+
         try:
             # Write context files into the working directory
             for rel_path, content in context_files.items():
                 full = Path(workdir) / rel_path
                 full.parent.mkdir(parents=True, exist_ok=True)
-                full.write_text(content, encoding="utf-8")
+                full.write_text(
+                    _resolve_initial_content(rel_path, content),
+                    encoding="utf-8",
+                )
 
             # Initialize git repo so claude trusts the directory
             subprocess.run(
@@ -1697,7 +2075,10 @@ class CodeGenerator:
                 for rel_path, content in context_files.items():
                     fp = Path(workdir) / rel_path
                     fp.parent.mkdir(parents=True, exist_ok=True)
-                    fp.write_text(content, encoding="utf-8")
+                    fp.write_text(
+                        _resolve_initial_content(rel_path, content),
+                        encoding="utf-8",
+                    )
 
             stdout, stderr, rc = self._run_claude_cli(
                 claude_cmd=claude_cmd,
@@ -2130,6 +2511,34 @@ class CodeGenerator:
                 ]
             )
 
+        # Phase 2.3 (2026-05-11): inject must_inspect_files / likely_touch_files
+        # as READ-ONLY context advisories. The planner lists files whose content
+        # the patch depends on (e.g. build.gradle for a SDK version, Manifest for
+        # a permission tag) but that are not themselves modified. Surfacing them
+        # in the prompt lets the codegen LLM ground references (e.g. "the play-
+        # services-maps dependency is at the version declared in
+        # libs.versions.toml") without licensing edits to those files.
+        must_inspect_files = plan_json.get("must_inspect_files") or []
+        likely_touch_files = plan_json.get("likely_touch_files") or []
+        if isinstance(must_inspect_files, list) and must_inspect_files:
+            parts.extend(["", "=== READ-ONLY CONTEXT FILES (must inspect, do NOT modify) ==="])
+            for path in must_inspect_files[:12]:
+                if isinstance(path, str) and path.strip():
+                    parts.append(f"- {path.strip()}")
+            parts.append(
+                "Inspect these for grounding (config / manifest / dependency / "
+                "route registration). Do NOT include them in your diff hunks."
+            )
+        if isinstance(likely_touch_files, list) and likely_touch_files:
+            parts.extend(["", "=== LIKELY-TOUCH CANDIDATES (modify only if directly required) ==="])
+            for path in likely_touch_files[:12]:
+                if isinstance(path, str) and path.strip():
+                    parts.append(f"- {path.strip()}")
+            parts.append(
+                "Evidence here is inconclusive. Modify only if you find a "
+                "concrete reason in context. Prefer must-touch over guesses."
+            )
+
         memory_context = str(plan_json.get("memory_context") or "").strip()
         if memory_context:
             max_lines = max(1, int(getattr(self.settings, "memory_max_lines_in_prompt", 30) or 30))
@@ -2152,6 +2561,188 @@ class CodeGenerator:
                 title = step.get("title", "")
                 expected = step.get("expected_output", "")
                 parts.append(f"- {title}: {expected}")
+
+        # Phase 1.2 (2026-05-11): acceptance-as-codegen-contract.
+        # Planner-emitted acceptance_tests are normally a post-codegen
+        # gate, but DeepSeek often satisfies the surface intent without
+        # meeting the structural requirements (e.g. P69-19 v11: wrote a
+        # signup-form field patch that compiled but never imported the
+        # Maps SDK). Surface acceptance patterns up front as a hard
+        # contract so the model includes the required signals or
+        # declines explicitly via NO_CHANGE_NEEDED / EVIDENCE_GAP.
+        acceptance_tests = plan_json.get("acceptance_tests") or []
+        # v16.0 (2026-05-12) — batch-scope filtering. The codegen call is
+        # often scoped to a single file (parallel_max>1 per-file batches).
+        # An acceptance_test that targets a DIFFERENT file is impossible
+        # for this batch to satisfy on its own; surfacing it as a HARD
+        # REQUIREMENT makes the model emit `## PLAN_CONFLICT` and produce
+        # no diff, which then fails batch_coverage.check on the
+        # legitimately-must-touch file (24ecfb5c failure mode).
+        #
+        # Filter rule: keep a test if its `file` field is empty (global —
+        # the test applies to the merged diff, will be re-evaluated post-
+        # merge) OR if the file is in this batch's context_files.
+        _batch_paths = set(context_files.keys()) if context_files else set()
+        _filtered_acceptance: list[dict] = []
+        _deferred_acceptance: list[dict] = []
+        for _t in acceptance_tests:
+            if not isinstance(_t, dict):
+                continue
+            _tgt = str(_t.get("file") or _t.get("target") or "").strip()
+            if not _tgt or _tgt in _batch_paths:
+                _filtered_acceptance.append(_t)
+            else:
+                _deferred_acceptance.append(_t)
+        if _filtered_acceptance:
+            parts.extend(["", "=== HARD ACCEPTANCE REQUIREMENTS ==="])
+            parts.append(
+                "Your patch will be REJECTED by an automated post-gate unless "
+                "the final diff satisfies ALL of the following. Do not produce "
+                "a shallow patch that passes compilation but misses these "
+                "signals — if the available context is insufficient to "
+                "implement them, emit NO_CHANGE_NEEDED or EVIDENCE_GAP_REQUEST "
+                "instead of inventing a partial answer. "
+                "If you emit NO_CHANGE_NEEDED, you MUST include a JSON block "
+                "with `evidence` listing EXACT quoted lines from the file you "
+                "reviewed. A claim without verifiable quotes is treated as "
+                "PHANTOM_NO_CHANGE and rejected. Format:\n"
+                "## NO_CHANGE_NEEDED\n"
+                "{\n"
+                "  \"reason\": \"...\",\n"
+                "  \"evidence\": [\n"
+                "    {\"file_path\": \"...\", \"claim\": \"...\", "
+                "\"quote\": \"copy real lines from file\"}\n"
+                "  ]\n"
+                "}"
+            )
+            for idx, test in enumerate(_filtered_acceptance[:8], start=1):
+                kind = str(test.get("kind") or "").strip()
+                pattern = str(test.get("pattern") or "").strip()
+                target = str(test.get("file") or test.get("target") or "").strip()
+                rationale = str(test.get("rationale") or "").strip()
+                line = f"  {idx}. [{kind}]" if kind else f"  {idx}."
+                if pattern:
+                    line += f" required pattern: `{pattern}`"
+                if target:
+                    line += f" in {target}"
+                parts.append(line)
+                if rationale:
+                    parts.append(f"     why: {rationale[:240]}")
+            parts.append(
+                "Treat these as non-negotiable. Adding the required imports / "
+                "callbacks / class references is preferred over leaving them "
+                "out."
+            )
+        if _deferred_acceptance and _batch_paths:
+            # Show the model what's deferred to OTHER batches so it knows
+            # NOT to emit PLAN_CONFLICT for these — they're someone else's
+            # job. This is the explicit signal the 24ecfb5c run was missing.
+            parts.extend([
+                "",
+                "=== ACCEPTANCE TESTS HANDLED BY OTHER BATCHES (informational) ===",
+                "These tests target files NOT in your batch. They will be "
+                "satisfied by a parallel codegen call for the relevant file. "
+                "Do NOT emit PLAN_CONFLICT just because you can't satisfy "
+                "them — your job is the files listed above only.",
+            ])
+            for test in _deferred_acceptance[:6]:
+                target = str(test.get("file") or test.get("target") or "").strip()
+                pattern = str(test.get("pattern") or "").strip()
+                parts.append(f"  - {target}: pattern `{pattern}` (handled elsewhere)")
+
+        # v16.2 — Contract Coverage requirement. When the plan carries
+        # required_contracts (sourced from a matched domain playbook in
+        # the orchestrator, not invented by the planner), the model MUST
+        # close every contract by emitting a CONTRACT_COVERAGE JSON
+        # block at the end of its response. NO_CHANGE_NEEDED_VERIFIED is
+        # NOT a free pass — every required_contract must appear in
+        # exactly one of implemented_contracts / verified_no_change_contracts
+        # / unimplemented_contracts, AND the harness will grep the diff
+        # (for implemented) or the actual file content (for no_change)
+        # against the contract's verification patterns. Prose claims
+        # without verifiable evidence are treated as lies.
+        required_contracts = plan_json.get("required_contracts") or []
+        if required_contracts:
+            parts.extend(["", "=== REQUIRED CONTRACTS (v16.2 coverage protocol) ==="])
+            parts.append(
+                "Your plan commits to implementing the following named "
+                "contracts. You MUST close every one of them by including "
+                "a CONTRACT_COVERAGE JSON block at the end of your "
+                "response. The harness will verify each claim against "
+                "the actual artifact (diff or pre-existing file content) "
+                "using the contract's verification patterns. Prose "
+                "claims without grep-verifiable evidence are rejected "
+                "as coverage lies.\n\n"
+                "Required contracts for this task:"
+            )
+            for c in required_contracts[:8]:
+                if not isinstance(c, dict):
+                    continue
+                cid = c.get("contract_id") or c.get("id") or "?"
+                signal = (c.get("signal") or "").strip().replace("\n", " ")
+                patterns = c.get("verification_patterns") or []
+                pat_preview = patterns[0] if patterns else ""
+                parts.append(f"  - id: {cid}")
+                if signal:
+                    parts.append(f"    signal: {signal[:280]}")
+                if pat_preview:
+                    parts.append(f"    verifier_pattern (one of): `{pat_preview}`")
+            parts.append("")
+            parts.append("At the end of your response, emit (literal text):")
+            parts.append("")
+            parts.append("## CONTRACT_COVERAGE")
+            parts.append("```json")
+            parts.append("{")
+            parts.append('  "implemented_contracts": [')
+            parts.append(
+                '    {"id": "<contract_id>", "file": "<path>", '
+                '"evidence_quote": "<exact line you ADDED in your diff>", '
+                '"evidence_mode": "direct_diff | diff_modified_payload_existing_sink", '
+                '"diff_evidence": "<what your diff CHANGED in one sentence>", '
+                '"context_evidence": "<unchanged surrounding code that completes the data flow, if any>"}'
+            )
+            parts.append("  ],")
+            parts.append('  "verified_no_change_contracts": [')
+            parts.append(
+                '    {"id": "<contract_id>", "file": "<path>", '
+                '"evidence_quote": "<exact line that ALREADY EXISTS in the file>"}'
+            )
+            parts.append("  ],")
+            parts.append('  "unimplemented_contracts": [')
+            parts.append(
+                '    {"id": "<contract_id>", "reason": "<honest reason '
+                'this batch did not address it>"}'
+            )
+            parts.append("  ]")
+            parts.append("}")
+            parts.append("```")
+            parts.append("")
+            parts.append(
+                "Rules: every required_contract MUST appear in exactly "
+                "one of the three lists. NO_CHANGE_NEEDED_VERIFIED is "
+                "ONLY accepted when every relevant required_contract is "
+                "in verified_no_change_contracts WITH a quoted line from "
+                "the file. If a contract you can't see evidence for in "
+                "this batch's files: put it in unimplemented_contracts "
+                "with a real reason — do NOT silently omit it."
+            )
+            parts.append("")
+            parts.append(
+                "evidence_mode guide (v16.2.1): when your diff DIRECTLY "
+                "adds the contract's expected pattern (e.g. you add a new "
+                "setValue() call carrying the contract's payload), use "
+                "evidence_mode = direct_diff. When you implement the "
+                "contract by CHANGING THE INPUT of an existing, unchanged "
+                "sink call (e.g. you replace hardcoded 0.0 with state "
+                "variables inside the userData map that the unchanged "
+                "userRef.setValue(userData) consumes), use evidence_mode "
+                "= diff_modified_payload_existing_sink and explain BOTH "
+                "what the diff changed AND which unchanged surrounding "
+                "line completes the data flow. This second mode IS still "
+                "implemented (not verified_no_change), because the "
+                "previous behavior persisted hardcoded values, not the "
+                "user's selection."
+            )
 
         # Separate existing files from new files (empty content = to be created)
         existing_files = {f: c for f, c in context_files.items() if c.strip()}
@@ -2431,8 +3022,17 @@ class CodeGenerator:
                 {"role": "system", "content": self._build_system_prompt(CODEGEN_SYSTEM_PROMPT, getattr(self, "_current_context_files", None)),},
                 {"role": "user", "content": prompt},
             ],
+            # Phase A.2 (2026-05-11): temperature ignored under thinking
+            # mode but kept for non-thinking variants. max_tokens bumped
+            # 8K → 32K (was hitting empty-response cliff). reasoning_effort
+            # explicitly `high` for cross-file codegen (was implicit `high`).
             "temperature": 0.0,
-            "max_tokens": 8192,
+            "max_tokens": int(
+                getattr(self.settings, "deepseek_max_tokens_codegen", 32768)
+            ),
+            "reasoning_effort": str(
+                getattr(self.settings, "deepseek_reasoning_effort_codegen", "high")
+            ),
         }
         try:
             response = cached_http_post(
@@ -2587,6 +3187,20 @@ class CodeGenerator:
                 requests = parse_evidence_gap_requests(diff)
                 if requests:
                     raise CodegenEvidenceGapRequest(requests, raw_marker=marker)
+            if marker.startswith("NO_CHANGE_NEEDED"):
+                classification = _classify_no_change(
+                    diff,
+                    getattr(self, "_current_context_files", None),
+                )
+                if classification is not None:
+                    raise CodegenError(
+                        _format_no_change_terminal_message(
+                            classification,
+                            default_marker_detail=marker.removeprefix(
+                                "NO_CHANGE_NEEDED"
+                            ).lstrip(": "),
+                        )
+                    )
             raise CodegenError(f"codegen_terminal: {marker}")
         if diff.startswith("```"):
             diff = re.sub(r"^```(?:diff|patch)?\s*", "", diff)
@@ -2606,6 +3220,12 @@ class CodeGenerator:
 
         summary = f"Generated patch modifying {len(files_changed)} file(s): {', '.join(files_changed[:5])}"
 
+        # v16.2: extract the model's contract coverage block (when
+        # present) from the FULL raw response — the diff text has
+        # already been stripped of code fences and prose. The coverage
+        # block lives outside the diff fence so we look in `content`.
+        coverage_payload = _extract_contract_coverage(content)
+
         return CodegenResult(
             diff=diff,
             summary=summary,
@@ -2614,6 +3234,7 @@ class CodeGenerator:
             model_name=model_name,
             input_tokens=int(input_tokens or 0),
             output_tokens=int(output_tokens or 0),
+            contract_coverage=coverage_payload,
         )
 
     def _parse_response_aider(
@@ -2627,11 +3248,16 @@ class CodeGenerator:
     ) -> CodegenResult:
         """Parse Aider search/replace blocks and convert to unified diff.
 
-        Resolves SEARCH anchors against ``self._current_context_files`` —
-        codegen's in-memory snapshot of the files in scope. The boundary
-        produces a normal git-style unified diff so every downstream
-        consumer (sandbox apply, reviewer gates, SWE-bench predictions)
-        keeps working unchanged.
+        Codex consult 2026-05-11 (truncation-coord-bug): Aider blocks
+        must apply to ORIGINAL un-truncated source, not to the prompt
+        view. Otherwise the produced diff carries truncated-coordinate
+        line numbers (e.g. anchored on a `pass` stub) and SWE-bench's
+        `git apply` rejects it. Flow: read original from
+        ``source_repo_path`` for each touched file, apply blocks
+        there, generate diff against original. If a block's SEARCH
+        text exists ONLY in the prompt view (i.e. a synthetic stub),
+        we surface a synthetic EVIDENCE_GAP_REQUEST so Tier 4-H/E can
+        expand the symbol whole and retry.
         """
         from app.services.aider_format import (
             AiderParseError,
@@ -2655,6 +3281,20 @@ class CodeGenerator:
                 requests = parse_evidence_gap_requests(text)
                 if requests:
                     raise CodegenEvidenceGapRequest(requests, raw_marker=marker)
+            if marker.startswith("NO_CHANGE_NEEDED"):
+                classification = _classify_no_change(
+                    text,
+                    getattr(self, "_current_context_files", None),
+                )
+                if classification is not None:
+                    raise CodegenError(
+                        _format_no_change_terminal_message(
+                            classification,
+                            default_marker_detail=marker.removeprefix(
+                                "NO_CHANGE_NEEDED"
+                            ).lstrip(": "),
+                        )
+                    )
             raise CodegenError(f"codegen_terminal: {marker}")
         if text.startswith("```"):
             text = re.sub(r"^```(?:\w+)?\s*", "", text)
@@ -2668,7 +3308,28 @@ class CodeGenerator:
                 f"Aider blocks could not be parsed: {exc} | content_preview: {preview}"
             ) from exc
 
-        originals = dict(getattr(self, "_current_context_files", None) or {})
+        prompt_view = dict(getattr(self, "_current_context_files", None) or {})
+        repo_path = getattr(self, "_current_source_repo_path", None)
+        originals = self._load_originals_for_blocks(blocks, repo_path, prompt_view)
+        # Detect stub-anchor blocks BEFORE apply: SEARCH that exists in
+        # the prompt view but not in the original is a coordinate-space
+        # mismatch — the model anchored on a synthetic `pass` stub. Turn
+        # those into EVIDENCE_GAP_REQUEST so E swap can expand the
+        # symbol and retry. This matches Codex's "fail closed and feed
+        # failures into E" recommendation.
+        stub_requests = self._detect_stub_anchor_requests(
+            blocks, originals=originals, prompt_view=prompt_view
+        )
+        if stub_requests:
+            from app.services.codegen_tool_loop import GapRequest
+
+            requests_obj = [
+                GapRequest(file=r["file"], symbol=r["symbol"], why=r["why"])
+                for r in stub_requests
+            ]
+            raise CodegenEvidenceGapRequest(
+                requests_obj, raw_marker="STUB_ANCHOR_DETECTED"
+            )
         result = apply_aider_blocks_in_memory(blocks, originals)
         if result.errors:
             reasons = "; ".join(
@@ -2685,6 +3346,9 @@ class CodeGenerator:
             f"Generated patch modifying {len(files_changed)} file(s) "
             f"via Aider blocks: {', '.join(files_changed[:5])}"
         )
+        # v16.2: contract coverage block, when present in the model's
+        # response, is parsed identically across output formats.
+        coverage_payload = _extract_contract_coverage(content)
         return CodegenResult(
             diff=diff,
             summary=summary,
@@ -2693,7 +3357,104 @@ class CodeGenerator:
             model_name=model_name,
             input_tokens=int(input_tokens or 0),
             output_tokens=int(output_tokens or 0),
+            contract_coverage=coverage_payload,
         )
+
+    def _load_originals_for_blocks(
+        self,
+        blocks: list,
+        source_repo_path: str | None,
+        prompt_view: dict[str, str],
+    ) -> dict[str, str]:
+        """Load un-truncated source from disk for files referenced in
+        Aider blocks. New files (is_new_file=True) keep an empty
+        original. Falls back to prompt_view content if disk read fails
+        or no source_repo_path is set — preserves backward compatibility
+        for non-SWE-bench paths where original==prompt_view.
+        """
+        result: dict[str, str] = {}
+        repo = Path(source_repo_path) if source_repo_path else None
+        for blk in blocks:
+            file = getattr(blk, "file", None)
+            if not file or file in result:
+                continue
+            if getattr(blk, "is_new_file", False):
+                result[file] = ""
+                continue
+            if repo is not None:
+                disk = repo / file
+                try:
+                    result[file] = disk.read_text(encoding="utf-8")
+                    continue
+                except (OSError, UnicodeDecodeError):
+                    pass
+            # Fallback: use prompt view content. This is the
+            # pre-2026-05-11 behavior — only safe when the file wasn't
+            # truncated.
+            result[file] = prompt_view.get(file, "")
+        return result
+
+    def _detect_stub_anchor_requests(
+        self,
+        blocks: list,
+        *,
+        originals: dict[str, str],
+        prompt_view: dict[str, str],
+    ) -> list[dict[str, str]]:
+        """Detect blocks whose SEARCH text exists ONLY in the prompt
+        view (truncated stub) but not in the original file. Returns a
+        list of {file, symbol, why} so the caller can raise a synthetic
+        EVIDENCE_GAP_REQUEST and trigger E swap. The symbol is best-
+        effort extracted from the block's SEARCH text (`def NAME(...)`
+        line), defaulting to '<unknown>' if not found.
+        """
+        out: list[dict[str, str]] = []
+        for blk in blocks:
+            file = getattr(blk, "file", None)
+            search = getattr(blk, "search", "") or ""
+            if not file or not search.strip():
+                continue
+            if getattr(blk, "is_new_file", False):
+                continue
+            original = originals.get(file, "")
+            view = prompt_view.get(file, "")
+            # If SEARCH matches both, no stub problem.
+            if search in original:
+                continue
+            # If SEARCH matches the prompt view but NOT the original,
+            # that's a stub-anchor mismatch.
+            if not view or search not in view:
+                # SEARCH doesn't match either — different failure
+                # (anchor_not_found); let apply_aider_blocks handle it
+                # so the model gets a real error.
+                continue
+            symbol = self._extract_symbol_from_search(search)
+            why = (
+                f"SEARCH matches the truncated view's `pass` stub for "
+                f"{symbol}() but the original file's body is non-empty. "
+                f"The harness needs the actual body to produce an "
+                f"applyable diff. Re-truncate this file with {symbol} "
+                f"in keep_symbols and emit a SEARCH/REPLACE block "
+                f"against the real body."
+            )
+            out.append({"file": file, "symbol": symbol, "why": why})
+        return out
+
+    @staticmethod
+    def _extract_symbol_from_search(search: str) -> str:
+        """Best-effort extract a Python def/class name from a SEARCH
+        block. Returns '<unknown>' if the SEARCH doesn't begin with a
+        recognizable definition line.
+        """
+        for line in search.splitlines():
+            stripped = line.strip()
+            m = re.match(r"^(?:async\s+)?def\s+(\w+)\s*\(", stripped)
+            if m:
+                return m.group(1)
+            m = re.match(r"^class\s+(\w+)\b", stripped)
+            if m:
+                return m.group(1)
+        return "<unknown>"
 
     def _parse_json_codegen_response(self, content: str) -> list[dict[str, Any]]:
         """Parse JSON codegen response (MiniMax, Claude Code, Ollama). Handles markdown code fences."""
@@ -2834,7 +3595,9 @@ class CodeGenerator:
                 "agent loop does not support mock provider — set codegen_provider=deepseek"
             )
 
-        def _llm_call(system_prompt: str, messages: list[dict[str, str]]) -> str:
+        def _llm_call(
+            system_prompt: str, messages: list[dict[str, str]]
+        ) -> tuple[str, str]:
             return self._agent_llm_call(
                 provider=provider,
                 system_prompt=system_prompt,
@@ -2849,10 +3612,17 @@ class CodeGenerator:
             budget=budget,
         )
 
-        if result.terminated_reason == "diff_emitted" and result.final_diff.strip():
-            from app.services.reviewer import DiffReviewer
+        from app.services.reviewer import DiffReviewer
 
+        # Path 1: model self-emitted a valid apply_diff during the loop.
+        if result.terminated_reason == "diff_emitted" and result.final_diff.strip():
             files_changed = DiffReviewer.parse_changed_files(result.final_diff)
+            logger.warning(
+                "agent_loop diff source=loop turns=%d files=%d bytes=%d",
+                len(result.state.turns),
+                len(files_changed),
+                len(result.final_diff),
+            )
             return CodegenResult(
                 diff=result.final_diff,
                 summary=(
@@ -2865,13 +3635,276 @@ class CodeGenerator:
                 if provider == "deepseek" else self._resolve_model_name(provider),
             )
 
-        # Any non-success terminal becomes a CodegenError. Static
-        # pipeline's existing failure path handles it from there.
+        # Path 2: synthesis fallback. Loop did not emit apply_diff but
+        # gathered evidence; force a tool-free synthesis call against
+        # what was actually read.
+        from app.services.agent_loop import build_context_bundle
+
+        bundle = build_context_bundle(result.state)
+        synth_diff = self._synthesize_from_context_bundle(
+            bundle=bundle,
+            plan_json=plan_json,
+            task_description=task_description,
+            context_files=context_files,
+            provider=provider,
+        )
+        if synth_diff.strip():
+            files_changed = DiffReviewer.parse_changed_files(synth_diff)
+            logger.warning(
+                "agent_loop diff source=synth_fallback turns=%d files=%d bytes=%d "
+                "loop_terminated=%s",
+                len(result.state.turns),
+                len(files_changed),
+                len(synth_diff),
+                result.terminated_reason,
+            )
+            return CodegenResult(
+                diff=synth_diff,
+                summary=(
+                    f"Agent loop ({result.terminated_reason}) → synthesis fallback "
+                    f"produced patch on {len(files_changed)} file(s)"
+                ),
+                files_changed=files_changed,
+                provider_name=f"agent_loop_synth:{provider}",
+                model_name=getattr(self.settings, "deepseek_model", "deepseek-coder")
+                if provider == "deepseek" else self._resolve_model_name(provider),
+            )
+
+        # Both paths failed — surface as CodegenError so the caller's
+        # existing static-pipeline failure handling takes over.
         raise CodegenError(
             f"agent_loop_terminated:{result.terminated_reason} "
             f"(turns={len(result.state.turns)}, "
-            f"final_diff_bytes={len(result.final_diff)})"
+            f"final_diff_bytes={len(result.final_diff)}, "
+            f"synth_fallback_bytes=0)"
         )
+
+    def _synthesize_from_context_bundle(
+        self,
+        *,
+        bundle: Any,
+        plan_json: dict[str, Any],
+        task_description: str,
+        context_files: dict[str, str],
+        provider: str,
+    ) -> str:
+        """Force a tool-free synthesis call from gathered context.
+
+        Codex's prescription (2026-05-10): treat the agent loop as
+        context retrieval; force apply_diff via a separate stage that
+        has no tools, no JSON, no prose — just Aider blocks. One repair
+        retry on Aider parse failure, then give up.
+        """
+        from app.services.aider_format import (
+            AiderParseError,
+            aider_blocks_to_unified_diff,
+            apply_aider_blocks_in_memory,
+            parse_aider_blocks,
+        )
+
+        system_prompt = (
+            "You are the patch synthesis stage. You have no tools.\n\n"
+            "The investigation phase is over. The context below is all "
+            "available context.\n"
+            "You MUST output Aider SEARCH/REPLACE blocks only.\n\n"
+            "Rules:\n"
+            "- No JSON.\n"
+            "- No TOOL_CALL.\n"
+            "- No prose, no preamble, no explanations.\n"
+            "- Do not ask for more context.\n"
+            "- Produce a minimal patch using only files/snippets shown below.\n"
+            "- SEARCH text must be copied EXACTLY from the provided snippets "
+            "(whitespace, indentation, comments preserved verbatim).\n"
+            "- Prefer one file and the smallest behavior-preserving fix.\n"
+            "- If several fixes are plausible, choose the most local one.\n"
+            "- Do not edit tests unless the task is explicitly a test fix.\n"
+            "- If no exact SEARCH block can be formed from the snippets, "
+            "output exactly: CANNOT_PROCEED\n"
+        )
+        user_prompt = self._build_synth_user_prompt(
+            bundle=bundle,
+            plan_json=plan_json,
+            task_description=task_description,
+        )
+
+        def _call(messages: list[dict[str, str]]) -> str:
+            # synth fallback uses content only (no tool loop, so
+            # reasoning_content doesn't need to be threaded forward).
+            if provider == "deepseek":
+                content, _ = self._agent_llm_call_deepseek(system_prompt, messages)
+                return content
+            if provider == "openai":
+                content, _ = self._agent_llm_call_openai(system_prompt, messages)
+                return content
+            return ""
+
+        logger.warning(
+            "synth user_prompt: bytes=%d snippets=%d hits=%d listings=%d",
+            len(user_prompt),
+            sum(len(v) for v in bundle.file_snippets.values()),
+            sum(len(v) for v in bundle.symbol_hits.values()),
+            len(bundle.dir_listings),
+        )
+        response = _call([{"role": "user", "content": user_prompt}])
+        logger.warning(
+            "synth response_1: bytes=%d preview=%r",
+            len(response), response[:200],
+        )
+        if response.strip().upper().startswith("CANNOT_PROCEED"):
+            return ""
+        diff = self._parse_synth_response_to_diff(
+            response, context_files,
+            parse_aider_blocks, apply_aider_blocks_in_memory,
+            aider_blocks_to_unified_diff,
+        )
+        if diff:
+            return diff
+
+        # One repair call: feed the parser error back, ask for fixed blocks.
+        repair_user = (
+            user_prompt
+            + "\n\n---\nYour previous response could not be parsed as Aider "
+            "SEARCH/REPLACE blocks. Re-emit ONLY the blocks, with the exact "
+            "fenced format:\n"
+            "<<<<<<< SEARCH\n<exact text>\n=======\n<replacement>\n>>>>>>> REPLACE\n"
+            "Do not add prose. Make sure the SEARCH text is copied verbatim "
+            "from a snippet above."
+        )
+        response2 = _call([{"role": "user", "content": repair_user}])
+        logger.warning(
+            "synth response_2: bytes=%d preview=%r",
+            len(response2), response2[:200],
+        )
+        if response2.strip().upper().startswith("CANNOT_PROCEED"):
+            return ""
+        return self._parse_synth_response_to_diff(
+            response2, context_files,
+            parse_aider_blocks, apply_aider_blocks_in_memory,
+            aider_blocks_to_unified_diff,
+        )
+
+    def _parse_synth_response_to_diff(
+        self,
+        response: str,
+        context_files: dict[str, str],
+        parse_fn: Callable[[str], Any],
+        apply_fn: Callable[[Any, dict[str, str]], Any],
+        diff_fn: Callable[[Any], str],
+    ) -> str:
+        """Strip code fences, parse Aider blocks, apply, emit diff. Returns
+        empty string on any failure; logs the specific failure mode so
+        a post-mortem can find it."""
+        text = response.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:\w+)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text).strip()
+        try:
+            blocks = parse_fn(text)
+        except Exception as exc:  # noqa: BLE001
+            preview = text[:300].replace("\n", "\\n")
+            logger.warning(
+                "synth parse failed: %s | response_bytes=%d preview=%s",
+                exc, len(response), preview,
+            )
+            return ""
+        if not blocks:
+            preview = text[:300].replace("\n", "\\n")
+            logger.warning(
+                "synth parse returned 0 blocks | response_bytes=%d preview=%s",
+                len(response), preview,
+            )
+            return ""
+        result = apply_fn(blocks, dict(context_files or {}))
+        errors = getattr(result, "errors", None) or []
+        if errors:
+            reasons = "; ".join(
+                f"{getattr(e, 'file', '?')}#{getattr(e, 'block_index', '?')}:"
+                f"{getattr(e, 'reason', str(e))}"
+                for e in errors[:5]
+            )
+            logger.warning(
+                "synth apply failed: blocks=%d errors=%d reasons=%s",
+                len(blocks), len(errors), reasons,
+            )
+            return ""
+        diff = diff_fn(result)
+        if not diff.strip():
+            logger.warning(
+                "synth applied but diff empty: blocks=%d files=%d",
+                len(blocks), len(getattr(result, "before_after", {})),
+            )
+            return ""
+        return diff
+
+    def _build_synth_user_prompt(
+        self,
+        *,
+        bundle: Any,
+        plan_json: dict[str, Any],
+        task_description: str,
+    ) -> str:
+        """Compact, structured digest for synthesis. NO conversation history,
+        NO reasoning_content, NO tool-call protocol noise — just facts."""
+        parts: list[str] = []
+
+        objective = str(plan_json.get("objective") or "").strip()
+        if objective:
+            parts.append(f"OBJECTIVE: {objective}")
+        change_summary = str(plan_json.get("change_summary") or "").strip()
+        if change_summary and change_summary != objective:
+            parts.append(f"SUMMARY: {change_summary}")
+
+        if task_description.strip():
+            parts.append("")
+            parts.append("ISSUE:")
+            parts.append(task_description.strip())
+
+        must_touch = plan_json.get("must_touch_files") or []
+        if must_touch:
+            parts.append("")
+            parts.append("CANDIDATE FILES (planner-suggested):")
+            for path in must_touch:
+                parts.append(f"  - {path}")
+
+        # Symbol search hits — short, just (path, line, preview).
+        if bundle.symbol_hits:
+            parts.append("")
+            parts.append("SYMBOL SEARCH HITS:")
+            for name, hits in bundle.symbol_hits.items():
+                parts.append(f"  {name}:")
+                for hit in hits[:8]:
+                    parts.append(f"    - {hit.path}:{hit.line}  {hit.preview[:120]}")
+
+        # File snippets — the meat. Tag each so the model knows what's
+        # available and where it came from.
+        if bundle.file_snippets:
+            parts.append("")
+            parts.append("FILE SNIPPETS (verbatim — copy SEARCH text from these):")
+            for path, snippets in bundle.file_snippets.items():
+                for snippet in snippets:
+                    range_label = ""
+                    if snippet.line_start or snippet.line_end:
+                        range_label = (
+                            f" lines {snippet.line_start or '?'}-"
+                            f"{snippet.line_end or '?'}"
+                        )
+                    parts.append("")
+                    parts.append(f"--- BEGIN {path}{range_label} ---")
+                    parts.append(snippet.text.rstrip())
+                    parts.append(f"--- END {path}{range_label} ---")
+
+        if bundle.dir_listings:
+            parts.append("")
+            parts.append("DIRECTORY LISTINGS (for orientation only):")
+            for path, names in bundle.dir_listings.items():
+                parts.append(f"  {path}: {', '.join(names[:30])}")
+
+        parts.append("")
+        parts.append(
+            "Now output Aider SEARCH/REPLACE blocks for the fix, "
+            "or CANNOT_PROCEED if no exact SEARCH can be formed from the snippets above."
+        )
+        return "\n".join(parts)
 
     def _build_agent_user_prompt(
         self,
@@ -2922,9 +3955,18 @@ class CodeGenerator:
 
         parts.append("")
         parts.append(
-            "Use the read_file / search_symbol / list_directory tools to gather "
-            "what you need. When ready, emit a single apply_diff call with "
-            "Aider-style search/replace blocks for the fix."
+            "BUDGET (hard): you have at most 12 turns total. Soft caps: "
+            "6 reads, 4 symbol searches, 3 directory listings. "
+            "Aim to apply_diff by turn 6-8 — finish reading by turn 5."
+        )
+        parts.append(
+            "Workflow: read just enough to locate the fix (typically 2-3 "
+            "narrow read_file calls + 1 search_symbol), then emit a single "
+            "apply_diff with Aider-style SEARCH/REPLACE blocks. "
+            "If after 6 reads you still don't see a fix, emit "
+            "`## CANNOT_PROCEED` with a one-line reason. "
+            "Do NOT loop on read_file — every extra read shrinks your "
+            "budget for the actual fix."
         )
         return "\n".join(parts)
 
@@ -2934,7 +3976,7 @@ class CodeGenerator:
         provider: str,
         system_prompt: str,
         messages: list[dict[str, str]],
-    ) -> str:
+    ) -> tuple[str, str]:
         """Provider-agnostic single-turn LLM call for agent loop.
 
         Currently wires DeepSeek (production codegen target). Anthropic
@@ -2951,7 +3993,7 @@ class CodeGenerator:
 
     def _agent_llm_call_deepseek(
         self, system_prompt: str, messages: list[dict[str, str]]
-    ) -> str:
+    ) -> tuple[str, str]:
         if not self.settings.deepseek_api_key:
             raise CodegenError("OPS_AGENT_DEEPSEEK_API_KEY is not configured.")
         url = "https://api.deepseek.com/v1/chat/completions"
@@ -2959,7 +4001,15 @@ class CodeGenerator:
             "model": self.settings.deepseek_model,
             "messages": [{"role": "system", "content": system_prompt}, *messages],
             "temperature": 0.0,
-            "max_tokens": 4096,
+            "reasoning_effort": str(
+                getattr(self.settings, "deepseek_reasoning_effort_codegen", "high")
+            ),
+            # Phase A.2 (2026-05-11): bump 16K → settings-driven 32K
+            # default. V4-Pro reasoning_content easily exceeds 16K on
+            # complex turns; older 16K caused empty-response cliffs.
+            "max_tokens": int(
+                getattr(self.settings, "deepseek_max_tokens_agent_loop", 32768)
+            ),
         }
         try:
             response = cached_http_post(
@@ -2974,15 +4024,30 @@ class CodeGenerator:
             )
             response.raise_for_status()
             data = response.json()
-            return str(
-                data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            choice = data.get("choices", [{}])[0]
+            message = choice.get("message", {}) or {}
+            content = str(message.get("content", ""))
+            reasoning = str(message.get("reasoning_content", "") or "")
+            usage = data.get("usage", {}) or {}
+            logger.warning(
+                "agent_loop deepseek call: prompt_msgs=%d content_bytes=%d "
+                "reasoning_bytes=%d finish=%s prompt_tokens=%s completion_tokens=%s "
+                "total_tokens=%s",
+                len(messages),
+                len(content),
+                len(reasoning),
+                choice.get("finish_reason"),
+                usage.get("prompt_tokens"),
+                usage.get("completion_tokens"),
+                usage.get("total_tokens"),
             )
+            return content, reasoning
         except httpx.HTTPError as exc:
             raise CodegenError(f"DeepSeek API error in agent loop: {exc}") from exc
 
     def _agent_llm_call_openai(
         self, system_prompt: str, messages: list[dict[str, str]]
-    ) -> str:
+    ) -> tuple[str, str]:
         if not self.settings.openai_api_key:
             raise CodegenError("OPS_AGENT_OPENAI_API_KEY is not configured.")
         url = f"{self.settings.openai_base_url.rstrip('/')}/chat/completions"
@@ -3007,9 +4072,12 @@ class CodeGenerator:
             )
             response.raise_for_status()
             data = response.json()
-            return str(
+            content = str(
                 data.get("choices", [{}])[0].get("message", {}).get("content", "")
             )
+            # OpenAI doesn't return reasoning_content; second tuple
+            # element stays empty.
+            return content, ""
         except httpx.HTTPError as exc:
             raise CodegenError(f"OpenAI API error in agent loop: {exc}") from exc
 
@@ -3024,6 +4092,30 @@ _TERMINAL_MARKER_RE = re.compile(
     r"##\s*(EVIDENCE_GAP|NO_CHANGE_NEEDED|PLAN_CONFLICT)\s*:?\s*(.*)",
     re.IGNORECASE,
 )
+
+
+def _extract_contract_coverage(content: str) -> dict[str, Any] | None:
+    """v16.2: parse the model's ``## CONTRACT_COVERAGE`` JSON block out of
+    its response. Returns the dict-form `CoverageDeclaration.to_dict()`,
+    or None when the block is absent or unparseable.
+
+    Implemented as a thin wrapper around
+    ``contract_coverage.parse_coverage_block`` so the response parsers
+    don't need to import the data classes directly. Caller treats None
+    as "model didn't follow the protocol" when the plan carried
+    required_contracts — the orchestrator's coverage gate then treats
+    every required contract as missing (incomplete verdict, not lie).
+    """
+    if not content:
+        return None
+    try:
+        from app.services.contract_coverage import parse_coverage_block
+        decl = parse_coverage_block(content)
+        if decl is None:
+            return None
+        return decl.to_dict()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _detect_terminal_marker(content: str) -> str | None:
@@ -3051,6 +4143,188 @@ def _detect_terminal_marker(content: str) -> str | None:
     return None
 
 
+# Match the line that starts a NO_CHANGE_NEEDED section. Captures
+# whatever follows on the line so we can also accept the legacy
+# ``## NO_CHANGE_NEEDED: <reason>`` format when there is no JSON.
+_NO_CHANGE_HEADER_RE = re.compile(
+    r"^[ \t]*##[ \t]*NO_CHANGE_NEEDED[ \t]*:?[ \t]*(.*)$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _parse_no_change_payload(content: str) -> dict | None:
+    """Extract the structured payload following a ``## NO_CHANGE_NEEDED``
+    marker. Returns ``{"reason": str, "evidence": [...]}`` when a JSON
+    block is present, ``{"reason": str, "evidence": []}`` for the legacy
+    inline-reason form, and ``None`` when the marker itself is missing.
+
+    Tolerant to:
+    - JSON optionally wrapped in triple-backtick json fences
+    - Reason inlined on the marker line (legacy form) with no JSON body
+    - Extra prose after the JSON block (truncate at next ``##`` heading)
+
+    NEVER raises — malformed JSON returns ``{"reason": "", "evidence": []}``
+    so the caller treats it as PHANTOM_NO_CHANGE rather than blowing up.
+    """
+    if not content:
+        return None
+    text = content.strip()
+    header = _NO_CHANGE_HEADER_RE.search(text)
+    if not header:
+        return None
+    inline_reason = header.group(1).strip()
+    after = text[header.end():].lstrip()
+    # Stop at the next top-level ``##`` heading so we don't swallow
+    # unrelated sections.
+    next_header = re.search(r"^\s*##\s+\S", after, re.MULTILINE)
+    if next_header:
+        after = after[: next_header.start()].rstrip()
+
+    # Strip a possible code fence wrapping the JSON body.
+    fenced = re.match(r"^```(?:json)?\s*\n(.*?)\n```\s*$", after, re.DOTALL)
+    body = fenced.group(1).strip() if fenced else after.strip()
+
+    payload: dict = {"reason": inline_reason, "evidence": []}
+    if body and body.startswith("{"):
+        try:
+            import json as _json
+
+            parsed = _json.loads(body)
+            if isinstance(parsed, dict):
+                reason = parsed.get("reason")
+                if isinstance(reason, str) and reason.strip():
+                    payload["reason"] = reason.strip()
+                raw_evidence = parsed.get("evidence")
+                if isinstance(raw_evidence, list):
+                    cleaned: list[dict] = []
+                    for entry in raw_evidence:
+                        if not isinstance(entry, dict):
+                            continue
+                        file_path = str(
+                            entry.get("file_path") or entry.get("file") or ""
+                        ).strip()
+                        quote = str(entry.get("quote") or "").strip()
+                        claim = str(entry.get("claim") or "").strip()
+                        if file_path or quote or claim:
+                            cleaned.append(
+                                {"file_path": file_path, "quote": quote, "claim": claim}
+                            )
+                    payload["evidence"] = cleaned
+        except Exception:  # noqa: BLE001
+            # Malformed JSON: keep the inline reason if any, no evidence.
+            pass
+    return payload
+
+
+def _classify_no_change(
+    content: str, context_files: dict[str, str] | None
+) -> dict | None:
+    """Classify a NO_CHANGE_NEEDED response as ``verified`` or ``phantom``.
+
+    Returns ``None`` when the response is not a NO_CHANGE_NEEDED marker
+    (caller should fall through to other handling). Otherwise returns::
+
+        {
+            "kind": "verified" | "phantom",
+            "reason": str,
+            "evidence_count": int,
+            "verification": [VerifiedEvidence, ...],
+            "phantom_summary": str,  # human-readable, surfaced as the
+                                     # retry-feedback last_error
+        }
+
+    Phantom triggers when ANY of:
+    - No evidence list at all (legacy inline-reason form)
+    - evidence is empty
+    - any evidence item's quote fails verification against the file
+      content the model was shown (``context_files``)
+
+    Verified requires at least one evidence item AND every item's quote
+    to verify against the file the model was given.
+    """
+    payload = _parse_no_change_payload(content)
+    if payload is None:
+        return None
+
+    from app.services.quote_verifier import verify_evidence_quotes
+
+    reason = payload.get("reason") or ""
+    evidence = payload.get("evidence") or []
+
+    if not evidence:
+        return {
+            "kind": "phantom",
+            "reason": reason,
+            "evidence_count": 0,
+            "verification": [],
+            "phantom_summary": (
+                "PHANTOM_NO_CHANGE: claim has no evidence quotes. "
+                "When emitting NO_CHANGE_NEEDED you MUST include a JSON "
+                "block with `evidence` listing real quotes copied from "
+                "the file you reviewed: "
+                "## NO_CHANGE_NEEDED\\n"
+                "{\\\"reason\\\": \\\"...\\\", \\\"evidence\\\": "
+                "[{\\\"file_path\\\": \\\"...\\\", \\\"claim\\\": \\\"...\\\", "
+                "\\\"quote\\\": \\\"exact text from file\\\"}]}"
+            ),
+        }
+
+    files_map = dict(context_files or {})
+    verification = verify_evidence_quotes(file_to_source=files_map, claims=evidence)
+    failures = [v for v in verification if not v.matched]
+    if failures:
+        details = "; ".join(
+            f"file={(v.file_path or '?')!s} quote_preview={(v.quote_preview or '')!r} reason={v.reason}"
+            for v in failures[:4]
+        )
+        summary = (
+            f"PHANTOM_NO_CHANGE: {len(failures)} of {len(verification)} "
+            f"evidence quote(s) could not be verified against the file "
+            f"content you were shown. Failures: {details}. "
+            "Either (a) generate the required patch instead of claiming "
+            "no change, or (b) re-read the file and provide EXACT quotes "
+            "(copy whole lines, do not paraphrase)."
+        )
+        return {
+            "kind": "phantom",
+            "reason": reason,
+            "evidence_count": len(verification),
+            "verification": verification,
+            "phantom_summary": summary,
+        }
+
+    return {
+        "kind": "verified",
+        "reason": reason,
+        "evidence_count": len(verification),
+        "verification": verification,
+        "phantom_summary": "",
+    }
+
+
+def _format_no_change_terminal_message(
+    classification: dict, *, default_marker_detail: str
+) -> str:
+    """Produce the ``codegen_terminal:`` error message string.
+
+    Verified: ``codegen_terminal: NO_CHANGE_NEEDED_VERIFIED: <reason>``
+    Phantom:  ``codegen_terminal: PHANTOM_NO_CHANGE: <summary>``
+
+    Both are wrapped in CodegenError; the verified flavor is
+    non-retryable (the model gave honest evidence — retrying won't help)
+    while the phantom flavor is retryable so ``_is_retryable_codegen_error``
+    picks it up and the retry feedback includes the failure summary.
+    """
+    if classification.get("kind") == "verified":
+        reason = (classification.get("reason") or default_marker_detail)[:240]
+        return f"codegen_terminal: NO_CHANGE_NEEDED_VERIFIED: {reason}"
+    summary = (
+        classification.get("phantom_summary")
+        or "PHANTOM_NO_CHANGE: no verifiable evidence quotes"
+    )
+    return f"codegen_terminal: {summary[:1000]}"
+
+
 def _is_minimal_edit_retryable_error_message(message: str) -> bool:
     lowered = message.lower()
     return "new file mode" in lowered or "l5" in lowered
@@ -3058,8 +4332,16 @@ def _is_minimal_edit_retryable_error_message(message: str) -> bool:
 
 def _is_retryable_codegen_error(exc: CodegenError) -> bool:
     message = str(exc).lower()
+    # v15 Ticket 2A: PHANTOM_NO_CHANGE is a quote-verification failure —
+    # the model claimed the file already implements the feature but the
+    # quotes don't exist. This is a fixable mistake (the model can either
+    # write the patch or quote real lines), so retry with feedback.
+    if "phantom_no_change" in message:
+        return True
     # Playbook-sanctioned terminal markers are explicit "I can't proceed"
-    # signals; retrying changes nothing. Hard-no retry.
+    # signals; retrying changes nothing. Hard-no retry. Includes
+    # NO_CHANGE_NEEDED_VERIFIED (model gave honest evidence; the patch
+    # would be wrong) and the legacy un-classified NO_CHANGE_NEEDED.
     if "codegen_terminal" in message:
         return False
     return any(
