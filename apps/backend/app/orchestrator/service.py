@@ -127,6 +127,31 @@ class RepairRoundTimeout(Exception):
     """
 
 
+class DevelopToolTimeout(Exception):
+    """Raised when a single ``_execute_develop_tool`` call exceeds its
+    wall-clock budget. Introduced in C7 liveness fix (2026-05-12) so the
+    compile-repair stage has bounded terminal state even when one
+    provider/tool socket hangs.
+
+    NOTE: this is a *Python-level* timeout enforced by the orchestrator
+    via ``concurrent.futures.ThreadPoolExecutor.result(timeout=...)``.
+    It does NOT cancel the underlying HTTP socket or subprocess — the
+    worker thread keeps running until the upstream returns or
+    naturally dies. True adapter-level cancellation (httpx/requests
+    timeout, subprocess.Popen.kill on deadline) is provider-specific
+    and tracked separately. For the orchestrator's purposes — emitting
+    a timeout event and moving on — this Python-level fence is
+    sufficient and self-contained.
+    """
+
+    def __init__(self, tool_name: str, timeout_seconds: float) -> None:
+        super().__init__(
+            f"Tool {tool_name!r} did not return within {timeout_seconds:.1f}s wall-clock budget."
+        )
+        self.tool_name = tool_name
+        self.timeout_seconds = timeout_seconds
+
+
 def _contains_word(text: str, *keywords: str) -> bool:
     return any(re.search(rf"\b{re.escape(keyword)}\b", text) for keyword in keywords)
 
@@ -7214,7 +7239,23 @@ class PrimaryOrchestrator:
         role: RoleName,
         approval_id: str | None,
         pipeline_state: dict[str, object],
+        timeout_seconds: float | None = None,
     ) -> dict[str, object] | None:
+        """Execute a tool via the gateway with optional wall-clock budget.
+
+        When ``timeout_seconds`` is set (>0), the inner ``tool_gateway.execute``
+        call is run on a worker thread and joined with
+        ``Future.result(timeout=...)``. If the deadline elapses, the
+        method raises :class:`DevelopToolTimeout` so the caller (compile
+        repair, action stage, …) can record a structured timeout event
+        and move on. Without this fence a single hung provider socket
+        leaves the orchestrator in an unbounded state — the C7 liveness
+        defect this guard closes.
+
+        Caveat: this is a Python-level deadline only. The worker thread
+        keeps running until the upstream returns or dies; true socket
+        cancellation needs adapter-level timeouts (tracked separately).
+        """
         record_event(
             self.db,
             task_id=task.id,
@@ -7227,19 +7268,54 @@ class PrimaryOrchestrator:
             payload={
                 "approval_id": approval_id,
                 "payload_preview": self._preview_develop_payload(payload),
+                "timeout_seconds": timeout_seconds,
             },
         )
         try:
-            result = self.tool_gateway.execute(
-                task_id=task.id,
-                tool_name=tool_name,
-                payload=payload,
-                actor_context={"actor_name": actor_name, "task_id": task.id},
-                session_id=task.session_id,
-                stage=stage,
-                role=role,
-                approval_id=approval_id,
-            )
+            if timeout_seconds is not None and timeout_seconds > 0:
+                import concurrent.futures as _cf
+                # max_workers=1 plus context-manager teardown is fine —
+                # the worker thread keeps running on timeout but we
+                # don't block on it after release. The pool dies when
+                # the with-block exits (after the worker eventually
+                # returns/dies). Treating the call as a fire-and-cancel
+                # at the Python level.
+                _executor = _cf.ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix=f"develop_tool_{tool_name.replace('.', '_')}",
+                )
+                _future = _executor.submit(
+                    self.tool_gateway.execute,
+                    task_id=task.id,
+                    tool_name=tool_name,
+                    payload=payload,
+                    actor_context={"actor_name": actor_name, "task_id": task.id},
+                    session_id=task.session_id,
+                    stage=stage,
+                    role=role,
+                    approval_id=approval_id,
+                )
+                # shutdown(wait=False) so we don't block the orchestrator
+                # if the worker is still running after timeout.
+                _executor.shutdown(wait=False)
+                try:
+                    result = _future.result(timeout=float(timeout_seconds))
+                except _cf.TimeoutError as _to_exc:
+                    raise DevelopToolTimeout(
+                        tool_name=tool_name,
+                        timeout_seconds=float(timeout_seconds),
+                    ) from _to_exc
+            else:
+                result = self.tool_gateway.execute(
+                    task_id=task.id,
+                    tool_name=tool_name,
+                    payload=payload,
+                    actor_context={"actor_name": actor_name, "task_id": task.id},
+                    session_id=task.session_id,
+                    stage=stage,
+                    role=role,
+                    approval_id=approval_id,
+                )
             self._sync_retry_count(task)
         except ToolApprovalRequired as exc:
             self._sync_retry_count(task)
@@ -7258,17 +7334,28 @@ class PrimaryOrchestrator:
             return None
         except Exception as exc:
             self._sync_retry_count(task)
+            is_call_timeout = isinstance(exc, DevelopToolTimeout)
+            is_adapter_timeout = (
+                isinstance(exc, ToolInvocationError) and exc.timed_out
+            )
             failed_event_type = (
                 EventType.TOOL_TIMED_OUT
-                if isinstance(exc, ToolInvocationError) and exc.timed_out
+                if (is_call_timeout or is_adapter_timeout)
                 else EventType.TOOL_FAILED
             )
             failure_payload = {"error": str(exc), "approval_id": approval_id}
             if failed_event_type == EventType.TOOL_TIMED_OUT:
                 failure_payload.update(
                     {
-                        "reason": "external_api_timeout",
+                        "reason": (
+                            "develop_tool_call_timeout"
+                            if is_call_timeout
+                            else "external_api_timeout"
+                        ),
                         "provider_name": tool_name.split(".", 1)[0],
+                        "timeout_seconds": (
+                            exc.timeout_seconds if is_call_timeout else None
+                        ),
                     }
                 )
             record_event(
@@ -8684,6 +8771,39 @@ class PrimaryOrchestrator:
         if timeout_seconds is not None and timeout_seconds > 0:
             deadline = time.monotonic() + float(timeout_seconds)
 
+        # C7 liveness fix (2026-05-12): per-call timeout config. Each
+        # develop-tool invocation inside this round is bounded by
+        # min(configured, remaining_round_budget - safety_margin) so a
+        # single hung provider/tool socket can't bypass the round
+        # deadline (which is only checked between file iterations).
+        _settings_for_repair = self.tool_gateway.settings
+        per_call_timeout_cfg = float(
+            getattr(
+                _settings_for_repair,
+                "codegen_repair_per_call_timeout_seconds",
+                120.0,
+            )
+        )
+        call_safety_margin = float(
+            getattr(
+                _settings_for_repair,
+                "codegen_repair_call_safety_margin_seconds",
+                5.0,
+            )
+        )
+
+        def _compute_call_timeout() -> float:
+            """Per-call deadline = min(configured, remaining_round_budget - margin).
+
+            Falls back to the configured value when the round itself has
+            no deadline. Floored at 1.0s so the executor doesn't fire
+            immediately on rounding noise.
+            """
+            if deadline is None:
+                return per_call_timeout_cfg
+            remaining = deadline - time.monotonic()
+            return max(1.0, min(per_call_timeout_cfg, remaining - call_safety_margin))
+
         for err in compile_errors[:per_round_cap]:
             if deadline is not None and time.monotonic() >= deadline:
                 raise RepairRoundTimeout(
@@ -8696,6 +8816,32 @@ class PrimaryOrchestrator:
                 continue
             if allowed_paths is not None and rel_path not in allowed_paths:
                 continue
+
+            # C7: per-file progress event so external observers can
+            # distinguish stuck-in-LLM-call from stuck-in-orchestrator.
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_CALL_REQUESTED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="compile_repair.file_started",
+                message=f"Compile repair starting for {rel_path}.",
+                payload={
+                    "file": rel_path,
+                    "remaining_round_budget_seconds": (
+                        round(deadline - time.monotonic(), 2)
+                        if deadline is not None
+                        else None
+                    ),
+                },
+            )
+            self._workspace_append_audit(
+                task,
+                "compile_repair.file_started",
+                {"file": rel_path},
+            )
 
             full = sandbox_dir / rel_path.replace("/", "\\") if "\\" in str(sandbox_dir) else sandbox_dir / rel_path
             if not full.exists():
@@ -8934,9 +9080,14 @@ class PrimaryOrchestrator:
                 message=f"Attempting per-file syntax repair for {rel_path}",
             )
 
-            # Cooldown before repair CLI call — avoids rate limiting from
-            # the preceding codegen + retry batches.
-            time.sleep(15)
+            # Tactical cooldown before repair call — soft rate-limit guard
+            # carried over from the original implementation. C7 (2026-05-12)
+            # reduced 15s → 3s: 5 files × 15s = 75s wall-clock burnt for
+            # zero forward progress. The correct long-term design is a
+            # provider-side token bucket triggered by actual 429
+            # responses, tracked separately. Keep this short until that
+            # lands.
+            time.sleep(3)
 
             repair_payload = {
                 "plan_json": {"objective": f"Fix syntax errors in {rel_path}", "steps": []},
@@ -8944,7 +9095,35 @@ class PrimaryOrchestrator:
                 "task_description": repair_prompt,
             }
             repair_result = None
-            for _repair_attempt in range(2):  # 1 retry on failure
+            file_call_timed_out = False
+            for _repair_attempt in range(2):  # 1 retry on non-timeout failure
+                # Round deadline check before EVERY attempt (C7 acceptance #4).
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise RepairRoundTimeout(
+                        f"Repair round exceeded {timeout_seconds:.1f}s deadline "
+                        f"before attempt {_repair_attempt + 1} on {rel_path}."
+                    )
+                _per_call_timeout = _compute_call_timeout()
+                # C7: per-attempt progress event so the timeline shows
+                # the retry decision, not just the final outcome.
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_CALL_REQUESTED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="compile_repair.attempt_started",
+                    message=(
+                        f"Compile repair attempt {_repair_attempt + 1}/2 for "
+                        f"{rel_path} (call timeout {_per_call_timeout:.1f}s)."
+                    ),
+                    payload={
+                        "file": rel_path,
+                        "attempt": _repair_attempt + 1,
+                        "call_timeout_seconds": round(_per_call_timeout, 2),
+                    },
+                )
                 try:
                     repair_result = self._execute_develop_tool(
                         task=task,
@@ -8955,11 +9134,50 @@ class PrimaryOrchestrator:
                         role=RoleName.REVIEWER,
                         approval_id=approval_id,
                         pipeline_state=pipeline_state,
+                        timeout_seconds=_per_call_timeout,
                     )
                     break  # Success
+                except DevelopToolTimeout as exc:
+                    # C7 acceptance #5: do NOT retry timeout-kind failures.
+                    # A hung provider/tool socket does not get unstuck by
+                    # an immediate second call. Record the timeout event
+                    # and let the file move on (will be re-queued next
+                    # round if compile still fails).
+                    file_call_timed_out = True
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_TIMED_OUT,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="compile_repair.tool_call_timeout",
+                        message=(
+                            f"Repair call for {rel_path} exceeded "
+                            f"{exc.timeout_seconds:.1f}s; not retrying in this round."
+                        ),
+                        payload={
+                            "file": rel_path,
+                            "attempt": _repair_attempt + 1,
+                            "timeout_seconds": exc.timeout_seconds,
+                        },
+                    )
+                    self._workspace_append_audit(
+                        task,
+                        "compile_repair.tool_call_timeout",
+                        {
+                            "file": rel_path,
+                            "attempt": _repair_attempt + 1,
+                            "timeout_seconds": exc.timeout_seconds,
+                        },
+                    )
+                    break
                 except Exception as exc:
                     if _repair_attempt == 0:
-                        time.sleep(20)  # Cool down before retry
+                        # Tactical cooldown before retry (non-timeout failures
+                        # are usually transient — rate limit, malformed
+                        # response, etc.). 20s → 5s per C7 tactical pass.
+                        time.sleep(5)
                         continue
                     record_event(
                         self.db,
@@ -8972,6 +9190,32 @@ class PrimaryOrchestrator:
                         message=f"Syntax repair codegen failed for {rel_path}: {exc}",
                     )
             if repair_result is None:
+                # C7: file_failed event so the timeline distinguishes
+                # "tool call timed out" from "tool call returned but
+                # produced no usable diff" downstream.
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_FAILED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="compile_repair.file_failed",
+                    message=(
+                        f"Repair gave up on {rel_path} "
+                        + ("(call timeout)" if file_call_timed_out else "(no result)")
+                        + "."
+                    ),
+                    payload={
+                        "file": rel_path,
+                        "timed_out": file_call_timed_out,
+                    },
+                )
+                self._workspace_append_audit(
+                    task,
+                    "compile_repair.file_failed",
+                    {"file": rel_path, "timed_out": file_call_timed_out},
+                )
                 continue
 
             if not repair_result:
@@ -9289,6 +9533,23 @@ class PrimaryOrchestrator:
                     tool_name="codegen.repair",
                     message=f"Syntax repair applied to {rel_path}.",
                 )
+                # C7: per-file completion event paired with file_started.
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_SUCCEEDED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="compile_repair.file_completed",
+                    message=f"Compile repair completed for {rel_path}.",
+                    payload={"file": rel_path},
+                )
+                self._workspace_append_audit(
+                    task,
+                    "compile_repair.file_completed",
+                    {"file": rel_path},
+                )
             except Exception as exc:
                 record_event(
                     self.db,
@@ -9299,6 +9560,24 @@ class PrimaryOrchestrator:
                     role=RoleName.REVIEWER,
                     tool_name="codegen.repair",
                     message=f"Repair diff apply failed for {rel_path}: {exc}",
+                )
+                # C7: emit file_failed paired with file_started so external
+                # observers always see one terminal event per file.
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_FAILED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="compile_repair.file_failed",
+                    message=f"Compile repair gave up on {rel_path} (apply error).",
+                    payload={"file": rel_path, "reason": "apply_error"},
+                )
+                self._workspace_append_audit(
+                    task,
+                    "compile_repair.file_failed",
+                    {"file": rel_path, "reason": "apply_error"},
                 )
                 continue
 

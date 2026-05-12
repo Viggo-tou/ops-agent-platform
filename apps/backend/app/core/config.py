@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     resumability_max_age_hours: int = 6
     resumability_orphan_threshold_hours: int = 6
     primary_agent_provider: Literal["auto", "mock", "openai", "minimax", "anthropic", "deepseek", "ollama", "claude_code", "codex"] = "auto"
-    planner_provider: Literal["auto", "claude_code", "anthropic", "openai", "minimax", "mock"] | None = None
+    planner_provider: Literal["auto", "claude_code", "anthropic", "openai", "minimax", "deepseek", "mock"] | None = None
     codegen_provider: Literal["auto", "claude_code", "codex", "anthropic", "openai", "minimax", "deepseek", "ollama", "mock"] | None = None
     # Codegen output format. "auto" picks per-provider: deepseek + openai
     # → aider_blocks (15-25 pp gain on mid-tier per Aider data); others
@@ -89,6 +89,52 @@ class Settings(BaseSettings):
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     deepseek_model: str = "deepseek-coder"
     deepseek_timeout_seconds: float = 120.0
+    # Phase A.2 (2026-05-11): DeepSeek V4-Pro thinking-mode config.
+    # Per DeepSeek docs: low/medium → high; xhigh → max. We map our
+    # stages explicitly so planner / codegen / synth each get the
+    # right effort without depending on the implicit default.
+    deepseek_reasoning_effort_planner: Literal["low", "medium", "high", "max"] = "max"
+    deepseek_reasoning_effort_codegen: Literal["low", "medium", "high", "max"] = "high"
+    deepseek_reasoning_effort_synth: Literal["low", "medium", "high", "max"] = "high"
+    # max_tokens bumped (was 8K). V4-Pro outputs up to 384K; long
+    # patches + reasoning_content easily fit in 32K, and the old 8K
+    # caused empty-response cliffs (v14 agent loop turn 8).
+    deepseek_max_tokens_planner: int = 16384
+    deepseek_max_tokens_codegen: int = 32768
+    deepseek_max_tokens_agent_loop: int = 32768
+    # Phase B (2026-05-11): per-file byte budget the codegen pipeline
+    # uses for AST truncation. 500K bumps the old 18K cap so DeepSeek-
+    # V4-Pro's 1M input window can actually carry full files. Only
+    # files larger than this still go through AST truncation as
+    # emergency fallback.
+    codegen_per_file_byte_budget: int = 500_000
+    # Phase B.2 (2026-05-11): total bytes the codegen evidence pack may
+    # consume across all included files. Independent from the planner's
+    # tighter ``evidence_pack_max_total_bytes`` so codegen can take 4-8
+    # full must_touch files (e.g. 4 Kotlin Composables of 60 KB each)
+    # without overflowing the model context. 2 MB is well under the
+    # DeepSeek-V4-Pro 1M-token reliable window once prompt overhead is
+    # accounted for.
+    codegen_total_file_byte_budget: int = 2_000_000
+    # v15 Ticket 3 (2026-05-11): preplan_discover -> evidence manifest
+    # bridge. The candidates returned by preplan_discover are written
+    # as cc_read EvidenceItems so evidence_chain can close even when
+    # the heavier knowledge.search path wasn't taken. ``snippet_bytes``
+    # is how many bytes of real file content to embed per item.
+    evidence_preplan_candidate_limit: int = 10
+    evidence_preplan_snippet_bytes: int = 1024
+    # v15 Ticket 5 (2026-05-11): semantic_review JSON hardening. v14
+    # showed the reviewer returning invalid JSON and the harness
+    # silently skipping the gate. New flow: 1 review attempt; on
+    # parse-fail run 1 focused JSON-repair pass that re-shapes the
+    # prior output without re-running the review; if repair still
+    # fails, the gate is recorded as ``status=unavailable`` rather
+    # than masquerading as ``skipped``/``passed``. raw_preview keeps
+    # ~500 chars of the bad output for audit; longer values bloat
+    # event payloads without adding insight.
+    semantic_review_max_review_attempts: int = 1
+    semantic_review_max_repair_attempts: int = 1
+    semantic_review_raw_preview_chars: int = 500
     ollama_base_url: str = "http://localhost:11434/v1"
     ollama_model: str = "qwen3.5"
     ollama_timeout_seconds: float = 600.0
@@ -131,6 +177,11 @@ class Settings(BaseSettings):
     codegen_react_loop_enabled: bool = False
     codegen_self_validation_enabled: bool = True
     codegen_self_validation_max_retries: int = 1
+    # v16 P0 #8: per-batch deadline so a single stuck codegen batch can't
+    # hold the action-stage clock past the 30-min watchdog. Batches that
+    # exceed this get a tool_timed_out event and the coverage gate runs
+    # on the partial result.
+    codegen_batch_deadline_seconds: float = 720.0
     codegen_repair_files_per_round: int = 5
     # Bumped from 180s. Empirically a single codegen.generate_patch call
     # via Claude Code CLI takes 3-4 min (~180-240s). The 180s deadline
@@ -140,6 +191,23 @@ class Settings(BaseSettings):
     # → timed out again" loop. 600s gives one codegen call comfortable
     # headroom AND room for a second pass when the round queues 2+ files.
     codegen_repair_round_timeout_seconds: float = 600.0
+    # C7 liveness fix (2026-05-12): per-call wall-clock limit inside the
+    # repair round. Without this, a single hung provider/tool socket
+    # bypasses the round deadline (which is only checked between files)
+    # and the whole compile_repair stage loses its bounded-terminal
+    # guarantee. The actual timeout at runtime is
+    # ``min(this, remaining_round_budget - safety_margin)`` so the
+    # per-call cap can never overshoot the round deadline. Empirically
+    # 120s is generous for Claude Code / DeepSeek-V4-Pro repair calls
+    # (median 30–60s, p95 ~90s) while still letting a 5-file round
+    # complete within the 600s round deadline.
+    codegen_repair_per_call_timeout_seconds: float = 120.0
+    # Safety margin subtracted from the remaining round budget before
+    # computing each call timeout. Prevents the call deadline from
+    # racing the round deadline and the round emitting both
+    # tool_call_timeout AND round_timed_out for the same wall-clock
+    # instant.
+    codegen_repair_call_safety_margin_seconds: float = 5.0
     codegen_repair_cap_exceeded_to_approval: bool = True
     repair_intent_preservation_threshold: float = 0.4
     verification_compile_fail_to_approval: bool = False  # Stage 25 contract: cap-exceeded -> fail
@@ -161,6 +229,13 @@ class Settings(BaseSettings):
     knowledge_source_name: str = "handymanapp"
     knowledge_source_path: str | None = None
     knowledge_source_specs: str | None = None
+    # P0-3 (2026-05-11): deterministic Jira project key → KB source map.
+    # Format: "P69:handymanapp;ABC:hosteddashboard". When a request
+    # references a Jira issue like "P69-19" and source_name is not
+    # explicitly set, the task router picks the mapped source instead
+    # of falling back to env default. Avoids the v1 failure where P69-*
+    # got routed to hosteddashboard (admin web) and anchor lookup fails.
+    jira_project_source_map: str | None = None
     knowledge_top_k: int = 4
     knowledge_max_file_bytes: int = 120_000
     knowledge_chunk_max_lines: int = 300
