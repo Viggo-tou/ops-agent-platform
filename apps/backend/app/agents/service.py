@@ -31,10 +31,19 @@ from app.agents.schemas import (
     ReviewGenerationResult,
 )
 from app.core.config import Settings, get_settings
-from app.core.enums import RiskLevel, RoleName, TaskStatus, ToolPermissionCategory
+from app.core.enums import (
+    EventSource,
+    EventType,
+    RiskLevel,
+    RoleName,
+    TaskStatus,
+    ToolPermissionCategory,
+    WorkflowStage,
+)
 from app.core.jira import extract_jira_issue_reference
 from app.core.timeouts import external_http_timeout
 from app.models.knowledge_document import KnowledgeDocument
+from app.services.events import record_event
 from app.services.llm_telemetry import LlmCall, record_llm_call
 from app.tools.registry import ToolRegistry
 
@@ -822,6 +831,15 @@ def build_fallback_plan_payload(
     )
 
 
+class PlanTargetsDroppedToEmpty(Exception):
+    """Phase 1.3 (2026-05-11): the planner emitted must_touch_files but
+    every one of them was filtered out by KB validation, and there are
+    no expected_new_files to compensate. Surfacing this distinct from
+    a generic "empty plan" lets the operator see the real cause:
+    wrong source / hallucinated paths / unsynced KB.
+    """
+
+
 class PrimaryAgentPlanner:
     def __init__(self, settings: Settings | None = None, *, db: Session | None = None):
         self.settings = settings or get_settings()
@@ -837,6 +855,186 @@ class PrimaryAgentPlanner:
             return self.settings.semantic_translator_model
         return configured_model
 
+    # ----- T-LEARNING-LOOP-V1 Phase 2 — planner failure-memory injection ---
+    #
+    # Before the planner LLM call, retrieve the top-3 most relevant
+    # ``failure_observation`` rows from agent_memory and render them
+    # into a ``prior_failures_block`` that gets appended to the user
+    # message. The block is labeled "risk warnings only — not verified
+    # fixes" so the LLM doesn't treat past failures as repair recipes.
+    #
+    # Scoring (per the ticket spec):
+    #   task_family_match * 5  + scope_match * 3
+    #   + keyword_similarity * 2 + trust_level_weight + recency_weight
+    #
+    # Trust ladder: verified > human_confirmed > auto_classified.
+    # prompt_eligible whitelist enforced — rows lacking
+    # ``planner_warning`` in their eligible list are dropped.
+    #
+    # Empty pool / no DB / disabled memory → returns "" and the planner
+    # prompt is byte-identical to the pre-Phase-2 version.
+
+    _SCOPE_FOR_PLANNER = (
+        "gate:must_touch",
+        "gate:contract_coverage",
+        "gate:compile_repair",
+        "provider:liveness",
+        "provider:codegen",
+    )
+
+    _TRUST_WEIGHT = {
+        "verified": 3.0,
+        "human_confirmed": 2.0,
+        "auto_classified": 1.0,
+    }
+
+    def _build_prior_failures_block(
+        self,
+        *,
+        request_text: str,
+        scenario: str,
+        candidate_files: list[dict] | None,
+        top_k: int = 3,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Return (rendered_text, audit_payload) for planner injection.
+
+        On any error or when memory is unavailable, returns ("", []).
+        Audit payload is a list of dicts with ``memory_id``,
+        ``failure_class``, ``task_family``, ``trust_level``, and
+        ``score`` for the orchestrator's ``planner.failure_memory_injected``
+        event.
+        """
+        if self.db is None or not bool(getattr(self.settings, "memory_enabled", True)):
+            return "", []
+        try:
+            from app.services.failure_classifier import detect_task_family
+            from app.services.memory import MemoryService
+
+            inferred_family = detect_task_family(
+                request_text=request_text,
+                plan_json={"objective": request_text, "must_touch_files": [
+                    str(c.get("path") or c.get("file") or "")
+                    for c in (candidate_files or [])
+                    if isinstance(c, dict)
+                ]},
+            )
+
+            svc = MemoryService(self.db)
+            candidates: list[Any] = []
+            for scope in self._SCOPE_FOR_PLANNER:
+                # Pull WITHOUT task_family filter so we still surface
+                # cross-family observations when no family match exists.
+                # We re-rank afterwards.
+                got = svc.query(
+                    scope=scope,
+                    memory_kind="failure_observation",
+                    prompt_context="planner_warning",
+                    text_hint=(request_text or "")[:200],
+                    top_n=10,
+                )
+                candidates.extend(got)
+            # Deduplicate by memory id (an aggressive scope sweep can
+            # return the same row twice if it lives at the boundary).
+            seen: set[str] = set()
+            unique: list[Any] = []
+            for m in candidates:
+                if m.id in seen:
+                    continue
+                seen.add(m.id)
+                unique.append(m)
+            if not unique:
+                return "", []
+
+            # Score per the ticket: family * 5 + scope_match * 3
+            # + keyword_similarity * 2 + trust + recency.
+            req_lower = (request_text or "").lower()
+            scored: list[tuple[float, Any]] = []
+            for m in unique:
+                family_match = (
+                    5.0 if (inferred_family and m.task_family == inferred_family) else 0.0
+                )
+                scope_match = 3.0 if m.scope in self._SCOPE_FOR_PLANNER else 0.0
+                # Lightweight keyword overlap on observation text.
+                obs_lower = (m.observation or "").lower()
+                keyword_hits = sum(
+                    1 for w in re.findall(r"[a-z][a-z0-9_]{3,}", req_lower)
+                    if w in obs_lower
+                )
+                keyword_similarity = min(2.0, 0.5 * keyword_hits)
+                trust = self._TRUST_WEIGHT.get(m.trust_level or "", 0.0)
+                # Recency: rough 7-day half-life. Avoid datetime import
+                # ordering surprises — older rows still surface, just lower.
+                recency = 1.0
+                try:
+                    if m.created_at is not None:
+                        from datetime import datetime, timezone, timedelta
+                        age = datetime.now(timezone.utc) - (
+                            m.created_at if m.created_at.tzinfo else m.created_at.replace(tzinfo=timezone.utc)
+                        )
+                        if age < timedelta(days=7):
+                            recency = 1.5
+                        elif age > timedelta(days=30):
+                            recency = 0.5
+                except Exception:  # noqa: BLE001
+                    recency = 1.0
+                score = family_match + scope_match + keyword_similarity + trust + recency
+                scored.append((score, m))
+            scored.sort(key=lambda pair: pair[0], reverse=True)
+            # Strict family filter: only surface rows whose task_family
+            # matches the inferred family of the current request. Cross-
+            # family observations introduce noise more often than they
+            # produce signal (a Python refactor task shouldn't be warned
+            # about Android map_location failures). If no family is
+            # inferred, fall back to "scope-only" retrieval but require
+            # a much higher score floor (verified trust + scope match +
+            # keyword similarity together).
+            if inferred_family:
+                eligible = [(s, m) for (s, m) in scored if m.task_family == inferred_family]
+                threshold = 1.0
+            else:
+                eligible = scored
+                threshold = 7.0  # essentially: verified + scope + keywords
+            chosen = eligible[: max(1, top_k)]
+            if not chosen or chosen[0][0] < threshold:
+                return "", []
+
+            lines: list[str] = ["Relevant prior failure observations:"]
+            audit_rows: list[dict[str, Any]] = []
+            for idx, (score, m) in enumerate(chosen, start=1):
+                lines.append(
+                    f"{idx}. [{m.trust_level or 'auto_classified'}] "
+                    f"{m.failure_class or 'unspecified'} / "
+                    f"{m.task_family or 'cross-family'} "
+                    f"(scope: {m.scope})"
+                )
+                # Observation = what happened; resolution = the lesson.
+                # Render both because the planner needs the lesson but
+                # the observation grounds it ("we have ev that...").
+                obs_snip = (m.observation or "").splitlines()[0][:280]
+                if obs_snip:
+                    lines.append(f"   Observation: {obs_snip}")
+                lesson_snip = " ".join((m.resolution or "").split())[:480]
+                if lesson_snip:
+                    lines.append(f"   Lesson for planning: {lesson_snip}")
+                audit_rows.append({
+                    "memory_id": m.id,
+                    "failure_class": m.failure_class,
+                    "task_family": m.task_family,
+                    "trust_level": m.trust_level,
+                    "score": round(float(score), 2),
+                })
+            lines.append("")
+            lines.append(
+                "Planner instruction: treat these as risk warnings only — "
+                "they are NOT verified fixes. If relevant, strengthen "
+                "must_touch_files, required_contracts, and acceptance_tests "
+                "so the patch covers the surface the previous run missed."
+            )
+            return "\n".join(lines), audit_rows
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("planner failure-memory retrieval failed (non-fatal): %s", exc)
+            return "", []
+
     def generate_plan(
         self,
         *,
@@ -847,8 +1045,15 @@ class PrimaryAgentPlanner:
         semantic_translation: GeneratedSemanticTranslation | None = None,
         planning_knowledge: dict[str, Any] | None = None,
         issue_context: dict[str, Any] | None = None,
+        candidate_files: list[dict] | None = None,
     ) -> PlanGenerationResult:
-        """Generate a plan using the provider chain. On failure, cascade to the next provider."""
+        """Generate a plan using the provider chain. On failure, cascade to the next provider.
+
+        Phase B.2.a (2026-05-11): ``candidate_files`` is the pre-plan
+        repository discovery result. Surfaced into the planner prompt
+        so DeepSeek (which can't browse the repo) has a concrete file
+        menu to pick must_touch_files from.
+        """
         # UI-set per-stage override (runtime_overrides.json) wins over .env.
         # When unset, falls through bytewise to the historical .env-driven path.
         from app.services.runtime_override import effective_provider
@@ -865,6 +1070,7 @@ class PrimaryAgentPlanner:
         anthropic_api_key = getattr(self.settings, "anthropic_api_key", None)
         openai_api_key = getattr(self.settings, "openai_api_key", None)
         minimax_api_key = getattr(self.settings, "minimax_api_key", None)
+        deepseek_api_key = getattr(self.settings, "deepseek_api_key", None)
 
         # Build ordered provider chain
         providers: list[str] = []
@@ -875,6 +1081,8 @@ class PrimaryAgentPlanner:
                 providers.append("anthropic")
             if openai_api_key:
                 providers.append("openai")
+            if deepseek_api_key:
+                providers.append("deepseek")
             if minimax_api_key:
                 providers.append("minimax")
         elif provider_mode == "codex":
@@ -892,6 +1100,42 @@ class PrimaryAgentPlanner:
             issue_context=issue_context,
         )
 
+        # T-LEARNING-LOOP-V1 Phase 2 — retrieve failure_observation rows
+        # ONCE, before the provider loop. The same block is presented to
+        # whichever provider eventually answers, so the planner cannot
+        # see different failure context depending on which fallback
+        # provider fires. Empty-string return when memory is unavailable.
+        prior_failures_block, _injected_audit = self._build_prior_failures_block(
+            request_text=request_text,
+            scenario=scenario,
+            candidate_files=candidate_files,
+        )
+        if _injected_audit and self.db is not None:
+            try:
+                record_event(
+                    self.db,
+                    task_id=task_id,
+                    event_type=EventType.TOOL_SUCCEEDED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.PLANNING,
+                    role=RoleName.PLANNER,
+                    tool_name="planner.failure_memory_injected",
+                    message=(
+                        f"Injected {len(_injected_audit)} prior failure observation(s) "
+                        "into planner prompt as risk warnings."
+                    ),
+                    payload={
+                        "count": len(_injected_audit),
+                        "memory_ids": [r["memory_id"] for r in _injected_audit],
+                        "rows": _injected_audit,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "planner.failure_memory_injected event emit failed (non-fatal): %s",
+                    exc,
+                )
+
         last_error: str | None = None
         prompt_fingerprint = hashlib.sha256(f"{scenario}\n{request_text}".encode("utf-8")).hexdigest()[:10]
         for fallback_step, provider_name in enumerate(providers):
@@ -904,6 +1148,9 @@ class PrimaryAgentPlanner:
                     scenario=scenario,
                     actor_name=actor_name,
                     default_payload=default_payload,
+                    issue_context=issue_context,
+                    candidate_files=candidate_files,
+                    prior_failures_block=prior_failures_block,
                 )
                 self._record_plan_call(
                     task_id=task_id,
@@ -993,8 +1240,19 @@ class PrimaryAgentPlanner:
         scenario: str,
         actor_name: str,
         default_payload: dict[str, Any],
+        issue_context: dict[str, Any] | None = None,
+        candidate_files: list[dict] | None = None,
+        prior_failures_block: str = "",
     ) -> PlanGenerationResult:
-        """Attempt plan generation with a single provider. Raises on failure."""
+        """Attempt plan generation with a single provider. Raises on failure.
+
+        P0-1 fix (2026-05-11): ``issue_context`` is now plumbed through
+        to every provider method so the planner LLM actually sees Jira
+        summary/description, not just the bare key. Previously the
+        fetched issue context was used only by the fallback payload
+        builder; LLM planners saw `request_text="P69-19"` and gave
+        generic stub plans.
+        """
         model_name = self._resolve_model_name(provider_name)
 
         if provider_name == "claude_code":
@@ -1003,6 +1261,9 @@ class PrimaryAgentPlanner:
                 scenario=scenario,
                 actor_name=actor_name,
                 default_payload=default_payload,
+                issue_context=issue_context,
+                candidate_files=candidate_files,
+                prior_failures_block=prior_failures_block,
             )
             mode = "claude_code_cli"
             model_name = "claude-code"
@@ -1013,6 +1274,9 @@ class PrimaryAgentPlanner:
                 actor_name=actor_name,
                 model_name=model_name,
                 default_payload=default_payload,
+                issue_context=issue_context,
+                candidate_files=candidate_files,
+                prior_failures_block=prior_failures_block,
             )
             mode = "messages_api"
         elif provider_name == "openai":
@@ -1022,6 +1286,9 @@ class PrimaryAgentPlanner:
                 actor_name=actor_name,
                 model_name=model_name,
                 default_payload=default_payload,
+                issue_context=issue_context,
+                candidate_files=candidate_files,
+                prior_failures_block=prior_failures_block,
             )
             mode = "responses_api"
         elif provider_name == "minimax":
@@ -1031,8 +1298,23 @@ class PrimaryAgentPlanner:
                 actor_name=actor_name,
                 model_name=model_name,
                 default_payload=default_payload,
+                issue_context=issue_context,
+                candidate_files=candidate_files,
+                prior_failures_block=prior_failures_block,
             )
             mode = "chatcompletion_v2"
+        elif provider_name == "deepseek":
+            plan_payload = self._generate_plan_with_deepseek(
+                request_text=request_text,
+                scenario=scenario,
+                actor_name=actor_name,
+                model_name=model_name,
+                default_payload=default_payload,
+                issue_context=issue_context,
+                candidate_files=candidate_files,
+                prior_failures_block=prior_failures_block,
+            )
+            mode = "chatcompletion_openai_compat"
         else:
             raise ValueError(f"Unknown plan provider: {provider_name}")
 
@@ -1052,14 +1334,115 @@ class PrimaryAgentPlanner:
             model_name=model_name,
         )
 
+    @staticmethod
+    def _format_candidate_files_for_prompt(
+        candidate_files: list[dict] | None,
+    ) -> str:
+        """Phase B.2.a (2026-05-11): render candidate-file list for the
+        planner prompt. The planner LLM (esp. DeepSeek API) doesn't
+        browse the repository on its own; without an explicit file
+        menu it returns empty must_touch_files. This block forces a
+        bounded set of real paths into the prompt so the planner
+        chooses from them (or explicitly says needs_more_context).
+        """
+        if not candidate_files:
+            return ""
+        lines = [
+            "Candidate files (pre-plan repository search; pick must_touch from here):",
+        ]
+        for idx, cand in enumerate(candidate_files[:10], start=1):
+            path = str(cand.get("path") or "").strip()
+            score = cand.get("score")
+            terms = cand.get("matched_terms") or []
+            reason = str(cand.get("reason") or "").strip()
+            terms_str = ", ".join([str(t) for t in terms[:5]])
+            if path:
+                lines.append(
+                    f"  {idx}. {path}  [score={score}, matches: {terms_str}]"
+                )
+                if reason:
+                    lines.append(f"     reason: {reason}")
+        lines.append(
+            "Rules: choose must_touch_files only from this list. If none "
+            "fit, set must_touch_files=[] and explain in change_summary "
+            "what additional context is needed. Do NOT invent paths."
+        )
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _format_issue_context_for_prompt(
+        issue_context: dict[str, Any] | None,
+    ) -> str:
+        """Render Jira issue context as a stable prompt section. P0-1 fix
+        (2026-05-11): planner methods were previously only seeing the
+        bare request_text (e.g. "P69-19"), giving generic stub plans.
+        This helper extracts summary / description / acceptance / status
+        and formats them in a consistent, cache-friendly way so every
+        provider gets the same surface.
+        """
+        if not issue_context:
+            return ""
+        parts: list[str] = []
+        issue_key = str(issue_context.get("issue_key") or "").strip()
+        summary = str(issue_context.get("summary") or "").strip()
+        description = str(issue_context.get("description") or "").strip()
+        status = str(issue_context.get("issue_status") or "").strip()
+        acceptance = str(issue_context.get("acceptance_criteria") or "").strip()
+        if issue_key:
+            parts.append(f"Jira issue: {issue_key}")
+        if summary:
+            parts.append(f"Summary: {summary}")
+        if status:
+            parts.append(f"Status: {status}")
+        if description:
+            parts.append("Description:")
+            parts.append(description)
+        if acceptance:
+            parts.append("Acceptance criteria:")
+            parts.append(acceptance)
+        return "\n".join(parts).strip()
+
     def _validate_plan_targets(self, plan_payload: GeneratedPlanPayload) -> GeneratedPlanPayload:
         must_touch = list(plan_payload.must_touch_files or [])
+        expected_new = list(plan_payload.expected_new_files or [])
+        # Phase 1.3 (2026-05-11): no-silent-drop. The previous validator
+        # silently dropped any must_touch entry not found in the KB,
+        # which made "planner picked wrong paths" indistinguishable
+        # from "planner picked no paths" downstream. Now we log raw /
+        # validated / dropped separately, and if validation collapses
+        # must_touch to empty (when the planner DID emit paths), we
+        # raise PLAN_TARGETS_DROPPED_TO_EMPTY so the orchestrator can
+        # surface the actionable error instead of falling into the
+        # downstream "no files in plan" cascade.
+        logger.warning(
+            "plan_validate raw_must_touch=%s expected_new=%s",
+            must_touch,
+            expected_new,
+        )
+        dropped: list[str] = []
         if self.db is not None and must_touch:
             kept, dropped = _validate_must_touch_against_kb(must_touch, self.db)
             if dropped:
-                logger.warning("must_touch_files entries dropped (not in KB): %s", dropped)
+                logger.warning(
+                    "plan_validate dropped (not in KB): paths=%s kept=%s",
+                    dropped, kept,
+                )
             if kept != must_touch:
                 plan_payload = plan_payload.model_copy(update={"must_touch_files": kept})
+            # If the planner DID emit paths but all of them were dropped
+            # AND no expected_new_files compensate → raise so the
+            # operator sees the real cause (path-format mismatch /
+            # wrong source / hallucinated paths) instead of a generic
+            # "codegen had nothing to do" further down the pipeline.
+            if dropped and not kept and not expected_new:
+                raise PlanTargetsDroppedToEmpty(
+                    f"All planner must_touch_files were dropped during KB "
+                    f"validation. Raw: {dropped[:10]}. This usually means "
+                    f"the planner is using paths that don't match the active "
+                    f"source layout (e.g. emitting React paths on an Android "
+                    f"repo) or the KB is not synced. Check active source: "
+                    f"{getattr(self.settings, 'knowledge_source_name', '?')}."
+                )
 
         _log_plan_target_warnings(
             scenario=plan_payload.scenario,
@@ -1076,10 +1459,29 @@ class PrimaryAgentPlanner:
         actor_name: str,
         model_name: str,
         default_payload: GeneratedPlanPayload | None = None,
+        issue_context: dict[str, Any] | None = None,
+        candidate_files: list[dict] | None = None,
+        prior_failures_block: str = "",
     ) -> GeneratedPlanPayload:
         if not self.settings.openai_api_key:
             raise RuntimeError("OPS_AGENT_OPENAI_API_KEY is not configured")
 
+        issue_block = self._format_issue_context_for_prompt(issue_context)
+        candidates_block = self._format_candidate_files_for_prompt(candidate_files)
+        extras = "".join(
+            [
+                f"{issue_block}\n\n" if issue_block else "",
+                f"{candidates_block}\n\n" if candidates_block else "",
+                f"{prior_failures_block}\n\n" if prior_failures_block else "",
+            ]
+        )
+        user_text = (
+            f"Actor: {actor_name}\n"
+            f"Scenario: {scenario}\n"
+            f"Request:\n{request_text}\n\n"
+            f"{extras}"
+            "Return only the structured execution plan."
+        )
         payload = {
             "model": model_name,
             "instructions": self._build_planning_instructions(),
@@ -1089,12 +1491,7 @@ class PrimaryAgentPlanner:
                     "content": [
                         {
                             "type": "input_text",
-                            "text": (
-                                f"Actor: {actor_name}\n"
-                                f"Scenario: {scenario}\n"
-                                f"Request:\n{request_text}\n\n"
-                                "Return only the structured execution plan."
-                            ),
+                            "text": user_text,
                         }
                     ],
                 }
@@ -1140,10 +1537,29 @@ class PrimaryAgentPlanner:
         actor_name: str,
         model_name: str,
         default_payload: GeneratedPlanPayload | None = None,
+        issue_context: dict[str, Any] | None = None,
+        candidate_files: list[dict] | None = None,
+        prior_failures_block: str = "",
     ) -> GeneratedPlanPayload:
         if not self.settings.anthropic_api_key:
             raise RuntimeError("OPS_AGENT_ANTHROPIC_API_KEY is not configured")
 
+        issue_block = self._format_issue_context_for_prompt(issue_context)
+        candidates_block = self._format_candidate_files_for_prompt(candidate_files)
+        extras = "".join(
+            [
+                f"{issue_block}\n\n" if issue_block else "",
+                f"{candidates_block}\n\n" if candidates_block else "",
+                f"{prior_failures_block}\n\n" if prior_failures_block else "",
+            ]
+        )
+        user_text = (
+            f"Actor: {actor_name}\n"
+            f"Scenario: {scenario}\n"
+            f"Request:\n{request_text}\n\n"
+            f"{extras}"
+            "Return only valid JSON that matches the requested plan schema."
+        )
         payload = {
             "model": model_name,
             "max_tokens": 8192,
@@ -1151,12 +1567,7 @@ class PrimaryAgentPlanner:
             "messages": [
                 {
                     "role": "user",
-                    "content": (
-                        f"Actor: {actor_name}\n"
-                        f"Scenario: {scenario}\n"
-                        f"Request:\n{request_text}\n\n"
-                        "Return only valid JSON that matches the requested plan schema."
-                    ),
+                    "content": user_text,
                 }
             ],
             "temperature": 0.2,
@@ -1193,6 +1604,9 @@ class PrimaryAgentPlanner:
         scenario: str,
         actor_name: str,
         default_payload: GeneratedPlanPayload | None = None,
+        issue_context: dict[str, Any] | None = None,
+        candidate_files: list[dict] | None = None,
+        prior_failures_block: str = "",
     ) -> GeneratedPlanPayload:
         """Invoke Claude Code CLI (``claude --print``) as the planner."""
         claude_cmd = shutil.which(self.settings.claude_code_command)
@@ -1200,11 +1614,16 @@ class PrimaryAgentPlanner:
         if not claude_cmd:
             raise RuntimeError(f"Claude Code CLI not found: {self.settings.claude_code_command}")
 
+        issue_block = self._format_issue_context_for_prompt(issue_context)
+        candidates_block = self._format_candidate_files_for_prompt(candidate_files)
         user_prompt = (
             f"Actor: {actor_name}\n"
             f"Scenario: {scenario}\n"
             f"Request:\n{request_text}\n\n"
-            "Return ONLY valid JSON that matches the requested plan schema. "
+            + (f"{issue_block}\n\n" if issue_block else "")
+            + (f"{candidates_block}\n\n" if candidates_block else "")
+            + (f"{prior_failures_block}\n\n" if prior_failures_block else "")
+            + "Return ONLY valid JSON that matches the requested plan schema. "
             "No markdown fences, no explanations, no commentary — pure JSON only."
         )
 
@@ -1313,10 +1732,23 @@ class PrimaryAgentPlanner:
         actor_name: str,
         model_name: str,
         default_payload: GeneratedPlanPayload | None = None,
+        issue_context: dict[str, Any] | None = None,
+        candidate_files: list[dict] | None = None,
+        prior_failures_block: str = "",
     ) -> GeneratedPlanPayload:
         if not self.settings.minimax_api_key:
             raise RuntimeError("OPS_AGENT_MINIMAX_API_KEY is not configured")
 
+        issue_block = self._format_issue_context_for_prompt(issue_context)
+        candidates_block = self._format_candidate_files_for_prompt(candidate_files)
+        user_content = (
+            f"Scenario: {scenario}\n"
+            f"Request:\n{request_text}\n\n"
+            + (f"{issue_block}\n\n" if issue_block else "")
+            + (f"{candidates_block}\n\n" if candidates_block else "")
+            + (f"{prior_failures_block}\n\n" if prior_failures_block else "")
+            + "Return only valid JSON that matches the requested plan schema."
+        )
         payload = {
             "model": model_name,
             "messages": [
@@ -1328,11 +1760,7 @@ class PrimaryAgentPlanner:
                 {
                     "role": "user",
                     "name": actor_name,
-                    "content": (
-                        f"Scenario: {scenario}\n"
-                        f"Request:\n{request_text}\n\n"
-                        "Return only valid JSON that matches the requested plan schema."
-                    ),
+                    "content": user_content,
                 },
             ],
         }
@@ -1357,6 +1785,99 @@ class PrimaryAgentPlanner:
             response_payload = response.json()
 
         content = self._extract_minimax_content(response_payload)
+        raw_plan = self._parse_json_content(content)
+        if default_payload is not None:
+            raw_plan = self._merge_plan_payload_with_defaults(raw_plan, default_payload)
+        sanitized = self._sanitize_plan_payload(raw_plan)
+        if default_payload is not None:
+            sanitized = self._fill_empty_fields_from_default(sanitized, default_payload)
+        return GeneratedPlanPayload.model_validate(sanitized)
+
+    def _generate_plan_with_deepseek(
+        self,
+        *,
+        request_text: str,
+        scenario: str,
+        actor_name: str,
+        model_name: str,
+        default_payload: GeneratedPlanPayload | None = None,
+        issue_context: dict[str, Any] | None = None,
+        candidate_files: list[dict] | None = None,
+        prior_failures_block: str = "",
+    ) -> GeneratedPlanPayload:
+        """Plan generation via DeepSeek's OpenAI-compatible chat-
+        completions endpoint. 2026-05-11: added so the harness can run
+        100% DeepSeek (planner + codegen + reviewer) for the
+        DeepSeek-special baseline.
+        """
+        if not self.settings.deepseek_api_key:
+            raise RuntimeError("OPS_AGENT_DEEPSEEK_API_KEY is not configured")
+
+        issue_block = self._format_issue_context_for_prompt(issue_context)
+        candidates_block = self._format_candidate_files_for_prompt(candidate_files)
+        user_content = (
+            f"Actor: {actor_name}\n"
+            f"Scenario: {scenario}\n"
+            f"Request:\n{request_text}\n\n"
+            + (f"{issue_block}\n\n" if issue_block else "")
+            + (f"{candidates_block}\n\n" if candidates_block else "")
+            + (f"{prior_failures_block}\n\n" if prior_failures_block else "")
+            + "Return ONLY valid JSON that matches the requested plan "
+            "schema. No markdown fences, no explanations, no "
+            "commentary — pure JSON only."
+        )
+        body = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": self._build_planning_instructions()},
+                {"role": "user", "content": user_content},
+            ],
+            # Temperature is ignored under DeepSeek thinking mode but
+            # left here for non-thinking variants and audit clarity.
+            "temperature": 0.2,
+            "max_tokens": int(
+                getattr(self.settings, "deepseek_max_tokens_planner", 16384)
+            ),
+            # Phase A.2 (2026-05-11): planner is the hardest reasoning
+            # stage in the harness — cross-file plan generation needs
+            # `max` effort, not the implicit `high` default.
+            "reasoning_effort": str(
+                getattr(self.settings, "deepseek_reasoning_effort_planner", "max")
+            ),
+        }
+
+        # DeepSeek uses an OpenAI-compatible /v1/chat/completions endpoint;
+        # base_url is configured per .env (defaults to api.deepseek.com).
+        base_url = (
+            self.settings.deepseek_base_url.rstrip("/")
+            .replace("/anthropic", "")  # Anthropic-compat alias used by
+            # codegen path; planner stays on the OpenAI-compatible route.
+        )
+        url = f"{base_url}/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.settings.deepseek_api_key}",
+            "Content-Type": "application/json",
+        }
+        response = httpx.post(
+            url,
+            headers=headers,
+            json=body,
+            timeout=external_http_timeout(
+                max(self.settings.primary_agent_timeout_seconds, 120)
+            ),
+        )
+        response.raise_for_status()
+        response_payload = response.json()
+
+        choices = response_payload.get("choices") or []
+        if not choices:
+            raise RuntimeError("DeepSeek response had no choices")
+        content = (
+            choices[0].get("message", {}).get("content", "") or ""
+        ).strip()
+        if not content:
+            raise RuntimeError("DeepSeek returned empty content for planner")
+
         raw_plan = self._parse_json_content(content)
         if default_payload is not None:
             raw_plan = self._merge_plan_payload_with_defaults(raw_plan, default_payload)
@@ -1454,7 +1975,7 @@ class PrimaryAgentPlanner:
             if isinstance(value, list) and value:
                 merged[field_name] = value
 
-        for field_name in ("affected_code_locations", "must_touch_files", "expected_new_files", "tools", "steps", "acceptance_tests"):
+        for field_name in ("affected_code_locations", "must_touch_files", "expected_new_files", "must_inspect_files", "likely_touch_files", "tools", "steps", "acceptance_tests"):
             value = raw.get(field_name)
             if isinstance(value, list) and value:
                 merged[field_name] = value
@@ -1529,7 +2050,12 @@ class PrimaryAgentPlanner:
                 limit=limit,
             )
 
-        for field_name, limit in (("must_touch_files", 12), ("expected_new_files", 8)):
+        for field_name, limit in (
+            ("must_touch_files", 12),
+            ("expected_new_files", 8),
+            ("must_inspect_files", 12),
+            ("likely_touch_files", 12),
+        ):
             raw_values = sanitized.get(field_name)
             if not isinstance(raw_values, list):
                 sanitized[field_name] = []
@@ -1756,6 +2282,10 @@ class PrimaryAgentPlanner:
             "- internal_db_query / internal_api_request / slack_message. "
             "DO NOT include test files (paths under tests/, test_*.py, *_test.py, conftest.py) in must_touch_files for jira_issue_develop or bug_fix scenarios. "
             "The fix lives in source code, not in a new or edited test file. Editing a test file as 'the fix' is a hallucination pattern (Class E); the harness will strip such entries from must_touch_files automatically. "
+            "Phase 2 scope levels (2026-05-11): in addition to must_touch_files and expected_new_files, populate two new read-only/uncertain scope levels for code-change scenarios: "
+            "must_inspect_files — READ-ONLY context files you depend on to ground the patch (you will NOT modify them). Typical examples: build.gradle for SDK/dependency lookup, AndroidManifest.xml for permission/feature tags, nav_graph.xml for route registration, package.json for module version. List these when the patch's correctness depends on inspecting their content (e.g. confirming a SDK version, or a registered route name). The codegen step receives them as read-only context and the harness does NOT require them to appear in the diff. "
+            "likely_touch_files — files that probably need modification but evidence is currently inconclusive (filename matches keywords but content not yet read; one of several plausible Composables; etc.). The harness MAY upgrade these to must_touch after deeper inspection; do not promote a file here to must_touch unless you are confident it will be edited. "
+            "Discipline: pick must_inspect_files / likely_touch_files / must_touch_files ONLY from the Candidate files block when one is provided in the prompt. Do not invent paths. If the candidate menu is insufficient, leave the lists empty and explain in change_summary what additional context is needed. "
             "For expected_new_files, list any files that MUST BE CREATED to satisfy the task and that do not yet exist in the repository. "
             "Examples: a new Firebase rules file (database.rules.json), a new config file (firebase.json), a new migration, a new schema, a new test fixture. "
             "Infer new file paths from the request text when the task is clearly asking for a new artifact (keywords: create, add new file, write a new, set up, introduce). "
@@ -2069,6 +2599,45 @@ class ReviewerAgent:
                     action_name=plan.tools[0].tool_name,
                     reason="Planner marked the task as approval-required.",
                     approver_role="team_lead",
+                )
+            )
+
+        # P0-2 gate (2026-05-11): codegen-style scenarios must have at
+        # least one file target (must_touch or expected_new). Planner
+        # returning empty arrays is a generic-stub signal — proceeding
+        # to action wastes a codegen call and downstream gates produce
+        # confusing "file not in plan" errors. Reject at review.
+        _scenario = (getattr(plan, "scenario", "") or "").lower()
+        _codegen_scenarios = {
+            "jira_issue_develop",
+            "bug_fix",
+            "feature_implementation",
+            "refactor",
+            "code_change",
+        }
+        _must_touch = list(getattr(plan, "must_touch_files", []) or [])
+        _expected_new = list(getattr(plan, "expected_new_files", []) or [])
+        if (
+            _scenario in _codegen_scenarios
+            and not _must_touch
+            and not _expected_new
+        ):
+            findings.append(
+                ReviewFinding(
+                    code="plan_empty_targets",
+                    severity="error",
+                    message=(
+                        f"Plan has empty must_touch/expected_new for "
+                        f"{_scenario}; codegen has no targets."
+                    ),
+                    field="must_touch_files",
+                )
+            )
+            policy_checks.append(
+                PolicyCheck(
+                    name="plan_targets_non_empty",
+                    status="failed",
+                    detail="Plan has zero file targets for a codegen scenario.",
                 )
             )
 
