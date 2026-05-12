@@ -1,0 +1,153 @@
+{
+  "acceptance_tests": [
+    {
+      "file": null,
+      "function": null,
+      "kind": "diff_contains_pattern",
+      "pattern": "MapView|SupportMapFragment|AndroidView\\s*\\(",
+      "rationale": "A map UI component must be introduced.",
+      "scope": "app/src/main/java/com/example/handyman/**"
+    },
+    {
+      "file": null,
+      "function": null,
+      "kind": "diff_contains_pattern",
+      "pattern": "setOnMapClickListener|onMapTap|setOnMarkerDragListener|Marker\\(",
+      "rationale": "User must be able to select a location on the map.",
+      "scope": "app/src/main/java/com/example/handyman/**"
+    },
+    {
+      "file": null,
+      "function": null,
+      "kind": "diff_contains_pattern",
+      "pattern": "Geocoder|getFromLocation|reverseGeocode",
+      "rationale": "Selected location must update address fields via reverse geocoding.",
+      "scope": "app/src/main/java/com/example/handyman/**"
+    },
+    {
+      "file": null,
+      "function": null,
+      "kind": "diff_contains_pattern",
+      "pattern": "\"latitude\"|\"longitude\"|updateChildren|child\\(",
+      "rationale": "Selected coordinates must be saved to user profile.",
+      "scope": "app/src/main/java/com/example/handyman/**"
+    },
+    {
+      "file": null,
+      "function": null,
+      "kind": "diff_contains_pattern",
+      "pattern": "org\\.osmdroid\\.",
+      "rationale": "Only osmdroid imports are allowed, not Google Maps.",
+      "scope": "app/src/main/java/com/example/handyman/**"
+    },
+    {
+      "file": null,
+      "function": null,
+      "kind": "forbids_pattern_in_diff",
+      "pattern": "com\\.google\\.android\\.gms\\.maps|com\\.google\\.android\\.libraries\\.maps",
+      "rationale": "Google Maps SDK not allowed; must use osmdroid.",
+      "scope": null
+    },
+    {
+      "file": null,
+      "function": null,
+      "kind": "diff_contains_pattern",
+      "pattern": "Geocoder\\s*\\([^,)]+,\\s*Locale",
+      "rationale": "Geocoder must be constructed with Locale to avoid deprecation and ensure safe lifecycle.",
+      "scope": "app/src/main/java/com/example/handyman/**"
+    }
+  ],
+  "affected_code_locations": [],
+  "approval_reasons": [],
+  "assumptions": [
+    "The referenced Jira issue exists and contains enough context to generate code.",
+    "Affected source files can be read from the knowledge index or sandbox."
+  ],
+  "change_explanation": "The user story 'Map Integration: Dual Options' (P69-19) asks for dual manual/map address entry during account creation. Current flow is text-only. We'll embed an osmdroid MapView inside the signup screens using AndroidView, add a map click listener to capture coordinates, perform reverse geocoding via Geocoder (with Locale, on a background dispatcher), update the address form fields (lat/lng and text), and include the coordinates in the Firebase Realtime Database user profile write. The implementation will be consistent with existing osmdroid usage seen in job details fragments. If osmdroid dependency is missing, the codegen step will add it to build.gradle. No Google Maps SDK usage is permitted.",
+  "change_summary": "Add map-based address selection to the account signup flow by modifying CustomerSignup, CustomerKYCAddressForm, HandymanSignup, and HandymanKYCAddressForm to include an osmdroid MapView, a tap-to-select interaction, reverse geocoding, and wiring coordinates into the existing profile storage write.",
+  "expected_new_files": [],
+  "final_output_contract": {
+    "required_fields": [
+      "issue_key",
+      "files_changed",
+      "diff",
+      "summary"
+    ],
+    "type": "jira_issue_develop"
+  },
+  "likely_touch_files": [
+    "app/src/main/java/com/example/handyman/handyman_pages/HandymanSignup.kt",
+    "app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCAddressForm.kt"
+  ],
+  "missing_information": [],
+  "must_inspect_files": [
+    "app/src/main/java/com/example/handyman/CustomerJobDetailsFragment.kt",
+    "app/src/main/java/com/example/handyman/HandymanJobListDetailsFragment.kt"
+  ],
+  "must_touch_files": [
+    "app/src/main/java/com/example/handyman/customer_pages/CustomerSignup.kt",
+    "app/src/main/java/com/example/handyman/customer_pages/CustomerKYCAddressForm.kt"
+  ],
+  "objective": "Implement the Jira issue by generating code changes, applying patches, running tests, and reviewing results.",
+  "plan_id": "plan_4eb7c239-0dbe-40bd-bdc9-73c8b766e6d6",
+  "provider": {
+    "mode": "chatcompletion_openai_compat",
+    "model": "deepseek-v4-pro",
+    "name": "deepseek"
+  },
+  "request_summary": "finish p69-19 ## DOMAIN PLAYBOOK MATCHED: android_map_location The user's request matches a known domain. Your `accep...",
+  "requires_approval": false,
+  "risk_level": "medium",
+  "scenario": "jira_issue_develop",
+  "schema_version": "phase2.plan.v2",
+  "steps": [
+    {
+      "depends_on": [],
+      "expected_output": "Identification of signup flow files (CustomerSignup, CustomerKYCAddressForm, HandymanSignup, HandymanKYCAddressForm); confirmation that osmdroid is available; list of required UI components: MapView, address fields, reverse geocoding logic.",
+      "kind": "analysis",
+      "owner_role": "planner",
+      "step_id": "step-1",
+      "success_criteria": "All target files listed; no missing dependencies.",
+      "title": "Analyze Jira issue and identify affected files",
+      "tool_name": null
+    },
+    {
+      "depends_on": [],
+      "expected_output": "Unified diff that modifies the four signup screens to embed a MapView, handle map taps, reverse geocode the tapped location with Geocoder on IO dispatcher, update address form state, and persist latitude/longitude in Firebase user profile.",
+      "kind": "action",
+      "owner_role": "action",
+      "step_id": "step-2",
+      "success_criteria": "Patch introduces osmdroid MapView, map tap listener, Geocoder usage with Locale, and writes coordinates to Firebase.",
+      "title": "Generate code patch for map integration",
+      "tool_name": "codegen.generate_patch"
+    },
+    {
+      "depends_on": [],
+      "expected_output": "Build and test report showing compilation success and no regression failures.",
+      "kind": "action",
+      "owner_role": "action",
+      "step_id": "step-3",
+      "success_criteria": "Project compiles; all existing unit and instrumentation tests pass.",
+      "title": "Apply patch and run tests in sandbox",
+      "tool_name": null
+    },
+    {
+      "depends_on": [],
+      "expected_output": "Review report confirming feature completeness, code style consistency, and compliance with all acceptance tests.",
+      "kind": "review",
+      "owner_role": "reviewer",
+      "step_id": "step-4",
+      "success_criteria": "All acceptance tests pass; reviewer approves.",
+      "title": "Review the generated changes",
+      "tool_name": null
+    }
+  ],
+  "task_id": "cf2b0a81-b855-4ece-91a9-3a6def8e1b1e",
+  "tools": [
+    {
+      "permission_category": "write",
+      "purpose": "Generate code changes that implement the Jira issue requirements.",
+      "tool_name": "codegen.generate_patch"
+    }
+  ]
+}

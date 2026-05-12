@@ -1,0 +1,173 @@
+# Android map/location domain playbook (v16.1)
+#
+# The first hand-authored domain playbook. Defines the *contracts* a
+# planner must emit `acceptance_tests` for when the harness's domain
+# classifier identifies a Jira as Android map/location work. Acts as the
+# completeness backstop for C1 (plan_under_specified) and C2
+# (polish_passing_as_feature) in this domain.
+#
+# Schema invariants:
+#   id                 : domain id (matches the filename stem)
+#   triggers           : signals the domain classifier looks for in the
+#                        Jira request_text (keyword matching for v1; LLM
+#                        upgrade later). At least one of `summary_keywords`
+#                        or `project_tags` must match for the playbook
+#                        to be selected.
+#   required_contracts : list of contracts the planner MUST cover. Each
+#                        contract has signal-level prose (what must exist)
+#                        plus 1+ verification patterns (how the harness
+#                        empirically checks). Signal is the contract;
+#                        patterns are evidence.
+#   completeness_rule  : minimum contracts the planner must reference in
+#                        acceptance_tests for the plan to clear the
+#                        empty-acceptance gate. NOT all required —
+#                        partial coverage is allowed if the planner
+#                        explicitly excludes a contract via plan field.
+
+id: android_map_location
+
+triggers:
+  summary_keywords:
+    - map
+    - mapview
+    - geocode
+    - geocoding
+    - geocoder
+    - osmdroid
+    - "google maps"
+    - "address picker"
+    - "location picker"
+    - "pin location"
+    - "select on map"
+    - latitude
+    - longitude
+  project_tags:
+    - handymanapp
+
+# Minimum contracts the planner must produce acceptance_tests for. Each
+# contract carries a unique id so the planner can map files to it
+# (v16.2+ work) and so the failure_taxonomy can reference it across runs.
+required_contracts:
+  - id: map_ui_present
+    signal: >
+      The patch must introduce a map UI component the user can see and
+      interact with. Either a MapView embedded via AndroidView, a
+      MapEventsOverlay attached to one, or an equivalent Compose
+      wrapper. Geocoder calls alone do NOT satisfy this — the user must
+      be able to look at a map, not just have address text resolved
+      under the hood.
+    verifications:
+      - kind: diff_contains_pattern
+        pattern: "MapView|SupportMapFragment|AndroidView\\s*\\("
+      - kind: diff_contains_pattern
+        pattern: "MapEventsOverlay|MapEventsReceiver|singleTapConfirmedHelper"
+
+  - id: user_can_select_location
+    signal: >
+      The patch must add a way for the user to indicate "this is my
+      address" by interacting with the map — typically a tap handler
+      via MapEventsReceiver, a draggable Marker, or a confirm button
+      bound to the most-recent tap location. A map that only displays
+      without accepting input does not satisfy this contract.
+    verifications:
+      - kind: diff_contains_pattern
+        pattern: "singleTapConfirmedHelper|onMapLongClick|setOnMarkerDragListener|Marker\\(.*\\)\\.position"
+      - kind: diff_contains_pattern
+        pattern: "selectedLat|selectedLng|selectedGeoPoint|selectedLocation|pinnedLocation"
+
+  - id: location_updates_form_state
+    signal: >
+      Selecting a location on the map must update the address form's
+      state (latitude/longitude vars, or address-field text via reverse
+      geocoding). Without this the map is decorative — the user pins a
+      spot but the form still submits whatever they typed manually.
+    verifications:
+      - kind: diff_contains_pattern
+        pattern: "reverseGeocode|getFromLocation\\s*\\("
+      - kind: diff_contains_pattern
+        pattern: "(latitude|longitude|street|city|country)\\s*=\\s*"
+
+  - id: persisted_to_storage
+    signal: >
+      The selected coordinates / address fields must reach whatever
+      persistence path the existing signup flow uses (Firebase
+      updateChildren, Firestore set, REST POST body, etc.). The patch
+      must wire the new state into the existing write call OR add a
+      write call that includes them. Critically, the patch must NOT
+      drop pre-existing payload fields (C9 — payload_field_loss).
+      v16.2.1 (2026-05-12): widened the verifier to also recognize the
+      "diff modifies payload, existing unchanged sink consumes it"
+      pattern that round-6 (90b5f433) misclassified as
+      CONTRACT_COVERAGE_LIE. The new any_of accepts EITHER a direct
+      sink call in the diff OR (lat/lng payload binding changed in
+      diff AND a sink call lives in the same function scope of the
+      patched file).
+    verifications:
+      - kind: any_of
+        rules:
+          # Path A — diff directly adds/changes a storage sink call.
+          - kind: diff_contains_pattern
+            pattern: "(updateChildren|setValue|set\\s*\\(|put\\s*\\(\"latitude\"|put\\s*\\(\"longitude\")"
+          # Path B — diff binds lat/lng payload to a non-zero state var
+          # AND the same function still contains a sink that consumes the payload.
+          - kind: all_of
+            rules:
+              - kind: diff_contains_pattern
+                pattern: "\"latitude\"\\s+to\\s+(?!0(?:\\.0)?\\b)[A-Za-z_][A-Za-z0-9_]*"
+              - kind: diff_contains_pattern
+                pattern: "\"longitude\"\\s+to\\s+(?!0(?:\\.0)?\\b)[A-Za-z_][A-Za-z0-9_]*"
+              - kind: final_context_contains_pattern
+                anchor: changed_hunk
+                scope: same_function
+                pattern: "(setValue|updateChildren|\\.set\\s*\\()"
+
+  - id: installed_library_only
+    signal: >
+      The patch must use libraries that are actually in build.gradle.
+      For this project (handymanapp) that means org.osmdroid.*. Imports
+      of com.google.android.gms.maps.* or com.google.android.libraries.maps.*
+      are forbidden — those SDKs are not declared as dependencies and
+      will fail compile with 50+ unresolved references (C4 —
+      library_api_hallucination).
+    verifications:
+      # Positive: uses OSMDroid namespace.
+      - kind: diff_contains_pattern
+        pattern: "org\\.osmdroid\\."
+      # Negative: forbidden imports must NOT appear. This is a guard
+      # the planner/codegen prompt enforces; gate-side this is also
+      # enforced by `library_cards.forbidden_import_prefixes_for_project`.
+    forbidden_patterns:
+      - "com\\.google\\.android\\.gms\\.maps"
+      - "com\\.google\\.android\\.libraries\\.maps"
+
+  - id: geocoder_lifecycle_safe
+    signal: >
+      Geocoder.getFromLocation / getFromLocationName are blocking
+      network calls. The patch must run them off the main thread
+      (Dispatchers.IO via coroutineScope.launch or withContext) and
+      must construct Geocoder with a Locale: `Geocoder(context,
+      Locale.getDefault())`. The bare-context constructor is deprecated
+      and the bare main-thread call throws NetworkOnMainThreadException
+      in tests.
+    verifications:
+      - kind: diff_contains_pattern
+        pattern: "Geocoder\\s*\\([^,)]+,\\s*Locale"
+      - kind: diff_contains_pattern
+        pattern: "Dispatchers\\.IO|withContext\\s*\\("
+
+# Completeness rule for the empty-acceptance gate (v16.1).
+#
+# `minimum_contracts_referenced` is the smallest number of these
+# required_contracts the planner's `acceptance_tests` must mention by
+# id (or by matching a verification pattern) before codegen is allowed
+# to run. Set to 3 for the v1: catches plans like b5d0a085's
+# acceptance_tests=[] without being so strict that legitimate small
+# patches are blocked.
+#
+# Once the v16.2 ChangeIntent ledger lands, this rule upgrades to
+# "every required_contract must be either implemented or explicitly
+# declared as `excluded_with_reason` in the plan".
+completeness_rule:
+  minimum_contracts_referenced: 3
+  on_failure: PLAN_UNDER_SPECIFIED
+  retry_planner_once: true

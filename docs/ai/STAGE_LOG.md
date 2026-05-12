@@ -21,6 +21,8 @@
 **Status:** OPEN | DISPATCHED | CLOSED-DONE | CLOSED-DROPPED | BLOCKED
 **Layer:** L1 | L2 | L3 | L4 (按 2026-04-28 issue 分层；见底部解释)
 **Trigger:** 为啥开这个 stage（一句话）
+**Failure classes addressed:** C1, C3 (per `docs/ai/failure_taxonomy.md`)
+**Failure classes NOT addressed (deferred):** C2 — explicitly deferred, ticket name
 
 #### 步骤
 - HH:MM 做了什么（事实，不是计划）
@@ -36,6 +38,14 @@
 
 ---
 ```
+
+> **Failure-class tagging (added 2026-05-12)**: every stage must declare
+> which failure classes from `docs/ai/failure_taxonomy.md` it addresses
+> AND which it deliberately defers. When the same class shows up in 2+
+> consecutive stages' `addressed` line, the next stage's `Trigger:` must
+> reference it explicitly as "consolidate Cx — N rounds of止血 stacked;
+> build the structural fix". This prevents the patch-pile risk: same
+> class fixed 3 times with no abstraction is the smell.
 
 ## Layer 分类（2026-04-28 定，对应 issue 分层）
 
@@ -1624,4 +1634,173 @@ User reframed the project goal: **the harness is the product, the model is inter
 - Tier 4-H tool-use loop, Tier 3 layered RAG, Postgres Phase 2 — explicitly deferred.
 
 **Lesson**: When user said "继续迭代 don't stop" with a hung validation task in flight, the right move was to call task 4 dead, ship the queue, and queue the validation rerun for after the wave of features. Trying to wait for task 4 (which had been hung 21h with no possibility of recovery) would have stalled the whole queue. This is consistent with the harness-first product strategy memory: the structural improvements compound and the per-run measurement is downstream.
+
+
+
+## Stage 32 (2026-05-12) — v16 chat UX + Day-1 P0 observability + repair-intent v16.0 — CLOSED-DONE
+
+**Layer**: L3 (frontend SSE rendering) + L4 (orchestrator/codegen pipeline)
+
+**Trigger**: User picked up recording for v15 demo; observed pipeline kept failing on `finish Jira P69-19` retries. Goals: (a) clean up chat UX so the SSE flow renders inside the AI bubble per `references/SSE.jpg`; (b) instrument backend so failures stop being black-box; (c) start fixing the codegen-shape bugs surfaced by yesterday's failures; (d) react to a NEW failure class (repair stripping intent) caught by acceptance_check.
+
+**Status**: CLOSED-DONE — backend & frontend changes shipped + 47 new unit tests green. Live run today confirmed Day-1 observability + bug-fix patterns work and surfaced one structurally new failure: compile_repair regenerates whole sections to silence one bad API call, dropping the feature along with the bad line. Written up in `docs/ai/incidents/2026-05-12-a34a94b5-repair-strips-intent.md`. v16.0 (止血层 for repair-strips-intent) shipped same day.
+
+### 步骤
+
+| time (UTC+10) | step | fact |
+|---|---|---|
+| 早上 | chat SSE UX | `EventTimeline.tsx` rewritten — tool calls → status cards (`.chat-tool-call`), stage starts/ends → stage cards with left-rail accent + spinner during running, reasoning events → inline text. Moved inside the AI message bubble (was a separate block above). Status feed at page bottom deleted (`ul.status-feed` removed from `ChatPage.tsx`) since it duplicated in-bubble events. Approve / Reject buttons hidden once their approval is granted/rejected (read from event stream, survives page refresh). 18 i18n keys rewritten to conversational first-person. Stage-card dedup so paused-then-resumed Executor doesn't render twice. |
+| 中段 | backend log capture | `scripts/start-backend.ps1` now redirects stdout/stderr to `apps/backend/logs/backend-current.{out,err}.log` + timestamped archive. `PYTHONUNBUFFERED=1` set. Caught my own `self.settings` regression in <60s from the err.log — would otherwise have been a 3-minute fail loop without diagnosis. |
+| 中段 | chat reliability fix | Earlier session's heartbeat fix preserved: backend emits `heartbeat` SSE events every 5s during slow MCP tool calls so the frontend's 30s watchdog doesn't fire mid-call. System prompt switched to English-first with "mirror user language" rule and "skip filesystem exploration for clear develop_task signals — emit TASK_INTENT immediately". Empirically: chat -> task_created in 8.3s (was 60s+/never). |
+| 中段 | codegen error classification | New `classify_apply_error(stderr)` in `app/services/codegen_self_validate.py` returns `MISSING_NEW_FILE | HUNK_DRIFT | CORRUPT_PATCH | REWRITE_AS_NEW | UNKNOWN`. `ValidationResult` gains `error_kind` field. Self-validate retry now injects a `TARGETED FIX:` section when `error_kind == MISSING_NEW_FILE` — instructs the model to emit `new file mode 100644 / --- /dev/null / +++ b/<path>` headers, with the plan's `expected_new_files` list inline. 7 new unit tests in `test_codegen_self_validate.py` (total 32/32 green). |
+| 中段 | per-batch codegen deadline | `orchestrator/service.py` codegen parallel loop now uses `wait(pending, timeout=720s, FIRST_COMPLETED)` instead of unbounded `as_completed`. On expiry: cancel pending futures, emit `tool_timed_out` per stuck batch with classification -> coverage gate runs on partial. Setting: `codegen_batch_deadline_seconds: float = 720.0` in `app/core/config.py`. |
+| 下午 | live run #1 (a34a94b5) | Task ran 26 min, **failed at `acceptance_check.evaluate`** post-compile. Pipeline progressed cleanly through batch_coverage + codegen_evidence + diff_shape + patch_budget + sandbox.apply_patch + compile_repair (round 1, 2 files repaired, round timeout at 720s). compile_gate ✓ then acceptance_check ✗ on all 3 patterns. |
+| 下午 | root-cause analysis | Pulled `plan_generated`, `compile_failed.errors`, every `codegen.generate_patch` payload. Initial codegen wrote correct OSMDroid map UI in CustomerSignup.kt — all 3 acceptance markers present in `+` lines (MapView, showMap, geocoder). Compile failed on a single line: `mapView.setOnMapClickListener` is a Google Maps API, not OSMDroid. Repair round regenerated the whole map block with 0 mentions of MapView/showMap/Geocoder, dropping the feature along with the bad line. compile_gate then passed trivially; acceptance_check correctly caught the silent strip. |
+| 下午 | incident report | `docs/ai/incidents/2026-05-12-a34a94b5-repair-strips-intent.md` (220 lines) with full UTC timeline, root-cause walkthrough (codegen output -> compile error -> repair drop -> compile pass -> acceptance fail), explanation of why v15 reference (78fd9ef2) didn't hit this (acceptance_check landed in commit `45ca755` after v15), 5 fix candidates F1–F5. |
+| 下午 | architectural pushback | User pushed back on F1/F2 as止血-only, not地基. Concrete proposal: ChangeIntent ledger as evidence_chain extension + diagnostic-scoped JSON repair edits + library API contract cards as structured YAML (not free-text). Agreed schedule: today ships止血 (F1 prompt + F2 invariants gate + OSMDroid YAML card), then real ledger work over 1-2 weeks. No more live `finish Jira P69-19` runs until止血 is in. |
+| 黄昏 | v16.0止血 ship | (1) Structured `apps/backend/data/library_cards/osmdroid.yaml` (~150 lines, schema covers `classes.methods_NOT_provided` with `replacement_pattern` + `required_imports`, `conflicts_with.forbidden_import_prefixes`, lifecycle, idioms). (2) Loader `app/services/library_cards.py` (`load_card`, `cards_for_project`, `format_card_for_prompt`, `forbidden_import_prefixes_for_project`). (3) `_project_library_constraint` in orchestrator now prefers YAML cards, falls back to old `_PROJECT_LIBRARY_CONSTRAINTS` dict for projects without a card. (4) F1: `_extract_protected_symbols(first_attempt_diff, rel_path, acceptance_patterns)` with precise rule (acceptance-matched tokens U non-stdlib import leaves U state vars referencing protected imports). Injected as explicit `PROTECTED SYMBOLS:` block in `compile_repair` prompt. (5) F2: parallel symbol-level check after the existing line-ratio gate — if any protected symbol disappears from post-repair file content, treat as intent drop and trigger the existing retry path with both `dropped_lines` + `protected_dropped` symbols listed in the second-chance prompt. 7 library-card tests + 8 protected-symbols tests, 15/15 green. |
+
+### Close 摘要
+
+**结果**: v16.0 (止血层) shipped end-to-end same day as the new failure was diagnosed. Backend boots clean; all new unit tests green. One live run done, one new failure class diagnosed, one止血 layer shipped, zero additional live runs burned. Next live `finish Jira P69-19` will be the empirical test of止血; until then no more rolls of the dice.
+
+**产出文件** (新文件):
+- `apps/backend/data/library_cards/osmdroid.yaml` (+155 lines)
+- `apps/backend/app/services/library_cards.py` (+185 lines)
+- `apps/backend/tests/services/test_library_cards.py` (+85 lines)
+- `apps/backend/tests/services/test_protected_symbols.py` (+200 lines)
+- `docs/ai/incidents/2026-05-12-a34a94b5-repair-strips-intent.md` (+220 lines)
+
+**产出文件** (修改):
+- `apps/backend/app/orchestrator/service.py` — `_project_library_constraint` reads cards first; `_extract_protected_symbols` + `_repair_dropped_protected_symbols` helpers; PROTECTED SYMBOLS section in repair prompt; F2 symbol-level gate parallel to existing line-ratio gate; per-batch codegen deadline via `wait()` instead of `as_completed()`; bugfix `self.settings` -> `get_settings()`.
+- `apps/backend/app/services/codegen.py` — provider-call timing logs; `error_kind` in failed `attempts` history; targeted MISSING_NEW_FILE retry hint.
+- `apps/backend/app/services/codegen_self_validate.py` — `error_kind` field on `ValidationResult`; `classify_apply_error(stderr)` helper.
+- `apps/backend/app/core/config.py` — `codegen_batch_deadline_seconds: float = 720.0`.
+- `scripts/start-backend.ps1` — stdout/stderr redirect to logfile + timestamped archive + `PYTHONUNBUFFERED=1`.
+- `apps/web/src/components/chat/EventTimeline.tsx` — full rewrite (tool cards + stage cards + reasoning lines + approval gating).
+- `apps/web/src/components/chat/MessageList.tsx` — events moved INSIDE assistant bubble.
+- `apps/web/src/components/chat/ApprovalActions.tsx` — English buttons.
+- `apps/web/src/components/chat/ThinkingIndicator.tsx`, `ReservationsBlock.tsx` — English.
+- `apps/web/src/pages/chat/ChatPage.tsx` — status feed removed.
+- `apps/web/src/pages/tasks/TaskDetailPage.tsx` — LiveBadge English.
+- `apps/web/src/lib/i18n.ts` — conversational reasoning labels + approval keys + stage labels.
+- `apps/web/src/lib/api.ts` — `heartbeat` SSE event type.
+
+**没做的**:
+- v16.1 — ChangeIntent ledger as evidence_chain extension (planner emits intent_id per acceptance_test, codegen populates protected_symbols at intent granularity, acceptance_check reads ledger instead of re-deriving from raw diff). Needs 1 week's design + implementation.
+- v16.2 — diagnostic-scoped JSON repair (model outputs `{ edits: [{anchor_line, anchor_substring, operation, content, intent_id}] }` instead of raw diff). Needs ledger from v16.1 to be load-bearing. 2 weeks.
+- v16.3 — repair escalation request (`{ status: needs_human_review, reason_kind, affected_intents, proposed_change }`) for genuine large-surgery cases.
+- v16 P0-1 T-DEPENDENCY-FINGERPRINT — auto build.gradle / package.json / requirements.txt scan to replace the hand-tagged `project_tags: [handymanapp]` in the card.
+- v16 P0-3 T-IMPORT-DEPENDENCY-GATE — wire `forbidden_import_prefixes_for_project()` into a post-patch fail-fast check.
+- v16 P0-4 T-COMPILE-ERROR-MEMORY — write-only-on-verified-success.
+- Verification live run of v16.0止血 — user explicitly said "no live `finish Jira P69-19` until止血 is in"; now it is, but didn't fire one in this stage.
+
+**Lesson**:
+1. Pushback from user landed a sharper architecture. I framed F1/F2 as the fix; user correctly identified them as止血 only and named the real地基 (intent state + scoped edit authority). Took the structured-YAML version of the card and the precise protected-symbols rule directly from that exchange.
+2. stdout logging paid for itself in 1 hour. Caught the `self.settings` regression from the err.log in <60s. Without it, the live run would have been a 26-min black box failing for an unrelated reason and the diagnostic would have to rebuild the orchestrator state.
+3. `acceptance_check.evaluate` (commit 45ca755) caught a class of silent regression v15 didn't have a gate for. Repair stripping intent looks identical to "compile pass" without it. Don't soft-fail this gate; instead fix the upstream cause.
+4. The line-ratio intent-preservation gate that already existed had a coverage gap: it passes at 40% line preservation even when the 60% dropped were the load-bearing identifiers. Adding a parallel symbol-level check fixes the gap without removing the line-level signal.
+5. Per-batch deadline replaces the 30-min stage watchdog as the proximate fail-fast mechanism. A single stuck batch can no longer dominate the stage budget; coverage gate runs on partial result; pipeline transitions in seconds, not minutes.
+
+---
+
+### Stage 26 — v16.1 + v16.2 contract coverage (Cn polish_passing_as_feature defense)
+
+**Open:** 2026-05-12 (UTC+10) by Claude session
+**Status:** OPEN (round 6 in flight — task `90b5f433`)
+**Layer:** L2 (planner/codegen协议级；harness-side structural fix)
+**Trigger:** Live run a34a94b5 + ff93ac6f exposed C2 — model emits NO_CHANGE_NEEDED_VERIFIED satisfying narrow textual signals while missing the actual feature contract. v16.1 = domain playbook injection + plan-codegen-conflict approval path (止血层). v16.2 = required_contracts + per-batch contract_coverage block + verify_coverage harness gate (结构层 fix).
+**Failure classes addressed:** C2 (polish_passing_as_feature)
+**Failure classes NOT addressed (deferred):** C5 (new_file_patch_malformed — kind=create JSON batches deferred to v16.4), C7 (compile_repair stuck on infra errors — see round 5 root cause)
+
+#### 步骤
+- v16.1 stage: `_augment_with_domain_playbook` single canonical site, `_matched_playbook` hoisted, plan-codegen-conflict approval routing on incomplete coverage.
+- v16.2 stage: `contract_coverage.py` (340 lines), `parse_coverage_block`, `verify_coverage(declaration, required, diff_text, file_snapshots)`, `RequiredContract / CoverageClaim / CoverageDeclaration.merge() / CoverageVerdict`; 16 unit tests including `test_b5d0a085_regression_lat_lng_persisted_but_no_map_ui`.
+- 03:16:22 live verification on ff93ac6f: `contract_coverage.check ✓ [v16.2 OK kind=complete]` — gate validated end-to-end.
+- 03:18:43 ff93ac6f hit `compile_failed` → 03:20:50 `compile_repair.stuck` → 03:21:36 TERMINAL failed (C7 cap_exceeded).
+- 03:30 root cause analysis: source repo `d:/项目/HandymanApp-fresh/gradle.properties:23` corrupted by earlier手动 `Add-Content` (no leading newline) — `android.nonTransitiveRClass=trueandroid.overridePathCheck=true`. Plugin-apply level error, no file:line, `compile_repair.round_started` `files_queued=[]` 3 rounds, signature match → stuck. Not a model code defect.
+- 03:35 fix: revert line 23 to `android.nonTransitiveRClass=true` (dropped useless override, was added trying to bypass non-ASCII path check which fires before properties read anyway).
+- 03:36:08 round 6 task `90b5f433` POSTed via `/api/tasks` with `scenario_override=jira_issue_develop`, `source_name=handymanapp`.
+
+#### Live verification artefacts (round 5 — task `ff93ac6f`)
+- v16.2 contract_coverage.check ✓ at 03:16:22 (`[v16.2 OK kind=complete]`)
+- Model diff (`attempts/001/diff.patch`): 4 .kt files, map UI + lat/lng wiring, semantically complete.
+- Independent verification: same `024338a` source compiles cleanly at ASCII path (`D:/handyman-after/...`) → `BUILD SUCCESSFUL in 2m12s`. So model code is correct.
+- Failure 100% attributable to infra (gradle.properties).
+
+#### Pending (round 6 in flight, fill on close)
+- TBD: round 6 verdict (expect: contract_coverage ✓ → compile ✓ → semantic_review → AWAITING_APPROVAL).
+
+
+---
+
+### Stage 27 — v16.2.1 Live Verification (round 7b, task cf2b0a81)
+
+**Open:** 2026-05-12 17:32 (UTC+10) by Tomonkyo+Claude session
+**Status:** CLOSED-DONE (target gate); BLOCKED-SEPARATELY (compile_repair, tracked as C7)
+**Layer:** L2 (verifier protocol)
+**Trigger:** Verify v16.2.1 Contract Coverage Output + diff-anchored final-tree verification on the live production path. Round 6 (90b5f433) classified persisted_to_storage as CONTRACT_COVERAGE_LIE; needed empirical confirmation the v16.2.1 refactor lands correctly in production code path, not just unit tests.
+**Failure classes addressed:** C2 (polish_passing_as_feature) — specifically the false-positive sub-case where diff modifies payload of an unchanged sink call.
+**Failure classes NOT addressed (deferred):** C7 (compile errors in codegen output) — surfaced downstream during this run, tracked separately as a new ticket.
+
+#### Result
+
+**PASS at contract_coverage gate.**
+
+Coverage verdict (from pipeline_state.contract_coverage_verdict, task `cf2b0a81-b855-4ece-91a9-3a6def8e1b1e`):
+
+- `verdict_kind: complete`
+- `ok: true`
+- `verified_implemented: 6/6`
+- `lies: []`
+- `missing: []`
+
+Verified contracts (all 6):
+- map_ui_present
+- user_can_select_location
+- location_updates_form_state
+- **persisted_to_storage** ← the round-6 false-positive culprit, now verified
+- installed_library_only
+- geocoder_lifecycle_safe
+
+#### Regression cleared
+
+Round 6 incorrectly classified `persisted_to_storage` as `CONTRACT_COVERAGE_LIE` because the verifier only scanned ADDED diff lines and missed the unchanged `setValue(userData)` sink. The model HAD wired lat/lng into persistence — by modifying the payload that flows into an existing, unchanged sink call — but the legacy diff-only verifier could not see this.
+
+Round 7b verified `persisted_to_storage` correctly through the v16.2.1 **Path B** rule:
+- diff_contains_pattern: `"latitude" to <non-zero state var>` ✓
+- diff_contains_pattern: `"longitude" to <non-zero state var>` ✓
+- final_context_contains_pattern: `setValue|updateChildren|.set(` within same_function scope of the changed hunk ✓
+- Composite `all_of` rule passed → `any_of` parent rule passed → contract verified with `evidence_mode = diff_modified_payload_existing_sink`
+
+#### Phase live-verification matrix
+
+| Phase | Component | Live-verified |
+|-------|-----------|---------------|
+| A | CoverageClaim new fields (evidence_mode / diff_evidence / context_evidence) + verdict_kind tri-state in plan_json | ✓ (6 contracts injected via required_contracts_from_playbook) |
+| B | Unified diff hunk parser + same-function scope resolver + composite rule evaluator | ✓ (production path executed full evaluator on 6 contracts) |
+| C | android_map_location.yaml `any_of` Path B rule | ✓ (matched persisted_to_storage via diff_modified_payload_existing_sink) |
+
+#### Boundary statement
+
+Pipeline progressed past `contract_coverage` and entered `compile_repair`. `compile_repair.round_started` fired at 07:43:33; remained active without progress events until manual abort at 07:51-ish.
+
+**This is NOT treated as a v16.2.1 failure. It is tracked separately as C7.**
+
+Do not write "pipeline complete" — full end-to-end approval path was not completed in this run. Run was manually aborted during compile_repair to avoid conflating C7 with v16.2.1 verification.
+
+#### Action taken
+
+1. Frozen evidence to `docs/incidents/2026-05-12-v16.2.1-live-verification/`:
+   - audit.jsonl (8 events)
+   - plan.json (DeepSeek-V4-Pro planner output, 2 must_touch + 4 likely_touch + 7 acceptance_tests + 6 required_contracts)
+   - contract_coverage_verdict.json (the 6/6 PASS verdict)
+   - codegen_diff.patch (112 lines, attempt 1 output before compile_repair entered)
+2. Manual abort of task `cf2b0a81-b855-4ece-91a9-3a6def8e1b1e` with reason `manual_abort_after_target_gate_success`.
+3. Commit Phase A/B/C source changes (contract_coverage.py rewrite, codegen.py prompt, orchestrator routing, YAML composite, 5 regression tests).
+4. Open separate C7 investigation: compile_repair stall behavior — does generated Kotlin fail compile, does repair loop lack progress events, is per-batch deadline telemetry missing.
+
+#### Lesson
+
+Do not let an unrelated downstream gate failure pollute the verification record of an upstream gate fix. v16.2.1 ships clean; C7 opens new.
 

@@ -1,0 +1,16 @@
+{
+  "ok": true,
+  "verdict_kind": "complete",
+  "verified_implemented": [
+    "map_ui_present",
+    "user_can_select_location",
+    "location_updates_form_state",
+    "persisted_to_storage",
+    "installed_library_only",
+    "geocoder_lifecycle_safe"
+  ],
+  "verified_no_change": [],
+  "missing": [],
+  "lies": [],
+  "summary": "All 6 required contract(s) covered: 6 implemented, 0 verified no-change."
+}

@@ -6,7 +6,7 @@ import re
 import shutil
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
 from typing import Any
 
@@ -291,6 +291,147 @@ def _changed_lines_from_diff(diff: str, rel_path: str, marker: str) -> list[str]
 
 def _intent_lines_from_first_attempt(first_attempt_diff: str, rel_path: str) -> list[str]:
     return _changed_lines_from_diff(first_attempt_diff, rel_path, "+")
+
+
+# v16.0 (2026-05-12) — symbol-level intent preservation. The existing
+# line-ratio check (_compile_repair_intent_dropped) only counts how
+# many of the first-attempt + lines survive repair. That passes when
+# repair keeps Spacer/Button/Modifier filler but drops the actual
+# feature-defining identifiers (a34a94b5 case: MapView, showMap,
+# Geocoder all gone, ratio still ≥0.4 because the surrounding Compose
+# scaffolding survived).
+#
+# Protected symbols rule:
+#   = (identifiers matched by any acceptance_test regex)
+#   ∪ (capitalized identifiers in `+import …` lines that resolve to
+#      non-stdlib packages — these are the libraries the patch is
+#      pulling in, so they're load-bearing for the feature)
+#   ∪ (new `+var X` / `+val X` declarations whose initializer
+#      references a protected import)
+import re as _ps_re
+
+_STDLIB_IMPORT_PREFIXES = (
+    "java.",
+    "javax.",
+    "kotlin.",
+    "kotlinx.",
+    "androidx.compose.",
+    "androidx.lifecycle.",
+    "androidx.core.",
+    "android.os.",
+    "android.util.",
+    "android.view.",
+    "android.widget.",
+    "android.content.",  # context, intent — too generic to protect
+)
+
+
+def _extract_protected_symbols(
+    first_attempt_diff: str,
+    rel_path: str,
+    acceptance_patterns: list[str] | None = None,
+) -> list[str]:
+    """Return identifiers from the first-attempt diff that are
+    feature-critical (per the rule above). Used by both the repair
+    prompt (as an explicit "must preserve" list) and the post-repair
+    gate (as a symbol-level invariant check)."""
+    if not first_attempt_diff or not rel_path:
+        return []
+    sections = first_attempt_diff.split("diff --git ")
+    target_section = None
+    for s in sections:
+        if not s.strip():
+            continue
+        if rel_path in s.split("\n", 1)[0]:
+            target_section = s
+            break
+    if target_section is None:
+        return []
+    added_lines = [
+        line[1:]
+        for line in target_section.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+
+    protected: set[str] = set()
+
+    # 1) Acceptance pattern matches — extract literal alternation tokens.
+    for pat in acceptance_patterns or []:
+        if not pat or not isinstance(pat, str):
+            continue
+        for alt in pat.split("|"):
+            alt = alt.strip()
+            if not alt:
+                continue
+            # Use it as a literal substring search across added lines.
+            for line in added_lines:
+                if alt in line:
+                    # Pull the actual identifier-shaped token from the line.
+                    # E.g. line `+var showMap by remember {…}` → `showMap`.
+                    # The alt itself is often the token we want.
+                    if _ps_re.match(r"[A-Za-z_][A-Za-z0-9_]*$", alt):
+                        protected.add(alt)
+                        break
+                    # Else fall back to a token-shape extraction near alt.
+                    m = _ps_re.search(
+                        r"\b(" + _ps_re.escape(alt) + r")\b", line
+                    )
+                    if m:
+                        protected.add(m.group(1))
+                        break
+
+    # 2) Non-stdlib imports → take the final class/name segment.
+    for line in added_lines:
+        m = _ps_re.match(r"\s*import\s+([A-Za-z_][A-Za-z0-9_.]*)", line)
+        if not m:
+            continue
+        fqn = m.group(1)
+        if any(fqn.startswith(p) for p in _STDLIB_IMPORT_PREFIXES):
+            continue
+        # Get the leaf (class name) — that's what shows up in code.
+        leaf = fqn.split(".")[-1]
+        if _ps_re.match(r"[A-Z][A-Za-z0-9_]*$", leaf):
+            protected.add(leaf)
+
+    # 3) New `+var X` / `+val X` declarations whose initializer references
+    # a previously-collected protected symbol. Kotlin supports both
+    # `var X = …`, `var X: T = …`, AND delegated `var X by …` — match
+    # the name, then scan the entire rest of the line for references.
+    if protected:
+        decl_re = _ps_re.compile(
+            r"\s*(?:var|val)\s+([A-Za-z_][A-Za-z0-9_]*)\b"
+        )
+        for line in added_lines:
+            m = decl_re.match(line)
+            if not m:
+                continue
+            decl_name = m.group(1)
+            # Whatever follows the name — RHS of `=`, type + initializer
+            # after `:`, or `by …` delegation. Scan it all.
+            rest = line[m.end():]
+            if any(
+                _ps_re.search(r"\b" + _ps_re.escape(s) + r"\b", rest)
+                for s in protected
+            ):
+                protected.add(decl_name)
+
+    return sorted(protected)
+
+
+def _repair_dropped_protected_symbols(
+    *,
+    protected: list[str],
+    repaired_file_content: str,
+) -> list[str]:
+    """Of the symbols in *protected*, return those NOT present anywhere in
+    the post-repair file content. Empty list = all preserved."""
+    if not protected or not repaired_file_content:
+        return list(protected) if protected else []
+    missing: list[str] = []
+    for sym in protected:
+        if not _ps_re.search(r"\b" + _ps_re.escape(sym) + r"\b", repaired_file_content):
+            missing.append(sym)
+    return missing
 
 
 def _count_intent_preservation(
@@ -827,9 +968,72 @@ class PrimaryOrchestrator:
             _set_span_attribute(span, "task.trace_id", task.trace_id)
             return self._bootstrap_task_impl(task=task, actor_name=actor_name)
 
+    def _augment_with_domain_playbook(
+        self,
+        *,
+        task: Task,
+        planning_request_text: str,
+    ) -> tuple[str, dict | None]:
+        """v16.1 helper: classify the request against the playbooks dir,
+        append the matched playbook's required_contracts block to the
+        planner request, emit a `domain_classifier.classify` event. Used
+        by every ``_augment_request_with_context`` call site in
+        ``_bootstrap_task_impl`` so the playbook injection isn't gated
+        on which branch (Jira-fetched / synthesised / translation-only)
+        the planner happens to take.
+
+        Returns the (possibly augmented) request text plus the matched
+        playbook dict (None if no domain matched) so the post-plan
+        completeness gate can read it.
+        """
+        try:
+            from app.services.domain_classifier import (
+                classify_domain,
+                format_playbook_for_planner_prompt,
+            )
+            playbook = classify_domain(
+                request_text=task.request_text or "",
+                project_tag=getattr(task, "source_name", None),
+            )
+            if playbook:
+                block = format_playbook_for_planner_prompt(playbook)
+                if block:
+                    planning_request_text = (
+                        planning_request_text + "\n\n" + block
+                    )
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_SUCCEEDED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.PLANNING,
+                    role=RoleName.PLANNER,
+                    tool_name="domain_classifier.classify",
+                    message=(
+                        f"Matched domain playbook: "
+                        f"{playbook.get('id', '?')}"
+                    ),
+                    payload={
+                        "domain_id": playbook.get("id"),
+                        "minimum_contracts": (
+                            playbook.get("completeness_rule") or {}
+                        ).get("minimum_contracts_referenced", 0),
+                    },
+                )
+            return planning_request_text, playbook
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "domain_classifier injection failed (non-fatal): %s", exc,
+            )
+            return planning_request_text, None
+
     def _bootstrap_task_impl(self, task: Task, *, actor_name: str) -> None:
         self._workspace_write_intent(task)
         planning_request_text = task.request_text
+        # v16.1: set early so all augmentation paths can populate it and
+        # the post-plan_generated completeness gate has a single point of
+        # truth. Stays None when no domain playbook matches.
+        _matched_playbook: dict | None = None
         semantic_translation = self._translate_request(task=task, actor_name=actor_name, issue_context=None)
         self._apply_jira_issue_key_fallback(task=task, semantic_translation=semantic_translation)
         task.translation_json = semantic_translation.model_dump(mode="json")
@@ -998,6 +1202,38 @@ class PrimaryOrchestrator:
                 ),
             )
 
+        # v16.1: domain playbook injection happens here, in the common
+        # path after every if/elif branch has had its chance to populate
+        # `planning_request_text`. The Jira-fetched develop branch (line
+        # ~1059) doesn't call `_augment_request_with_context` at all
+        # (issue_context flows separately into generate_plan), so
+        # instrumenting only the augmentation call sites missed that
+        # path entirely. Single call here = exactly one classify+emit
+        # per task, regardless of branch.
+        planning_request_text, _matched_playbook = self._augment_with_domain_playbook(
+            task=task, planning_request_text=planning_request_text,
+        )
+        # v16.2: pre-compute the typed required_contracts list so the
+        # planner-side completeness gate AND the codegen-side coverage
+        # gate share one source of truth (the matched playbook). Stored
+        # on the orchestrator instance for the duration of this task; the
+        # codegen prompt also reads it via plan_json after plan_generated
+        # (see the post-plan injection below).
+        _required_contracts: list = []
+        if _matched_playbook is not None:
+            try:
+                from app.services.contract_coverage import (
+                    required_contracts_from_playbook,
+                )
+                _required_contracts = required_contracts_from_playbook(
+                    _matched_playbook
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "required_contracts_from_playbook failed (non-fatal): %s",
+                    exc,
+                )
+
         # --- Defense line 2: anchor pre-check ---
         # If translation extracted grounding_terms/anchors, verify at least one
         # exists in the knowledge source tree. If ALL are missing, the task is
@@ -1025,6 +1261,134 @@ class PrimaryOrchestrator:
             payload={"actor_name": actor_name},
         )
 
+        # Phase B.2.a (2026-05-11): pre-plan candidate discovery. The
+        # planner LLM (esp. DeepSeek) doesn't browse the repo on its
+        # own, so it returns empty must_touch_files unless we hand it
+        # the file menu up front. Discovery runs FTS-style keyword
+        # scoring over the active source's KB docs and forwards the
+        # top hits into the planner prompt.
+        candidate_files: list[dict] = []
+        if isinstance(task.source_name, str) and task.source_name.strip():
+            try:
+                from app.services.preplan_discover import (
+                    preplan_discover_files,
+                )
+                issue_text_parts: list[str] = []
+                if isinstance(issue_context, dict):
+                    for key in ("summary", "description", "acceptance_criteria"):
+                        v = str(issue_context.get(key) or "").strip()
+                        if v:
+                            issue_text_parts.append(v)
+                if not issue_text_parts:
+                    issue_text_parts.append(planning_request_text or "")
+                discovered = preplan_discover_files(
+                    issue_text="\n".join(issue_text_parts),
+                    source_name=task.source_name.strip(),
+                    db=self.db,
+                    top_n=10,
+                )
+                candidate_files = [
+                    {
+                        "path": c.path,
+                        "score": c.score,
+                        "matched_terms": c.matched_terms,
+                        "reason": c.reason,
+                    }
+                    for c in discovered
+                ]
+                # v15 Ticket 3 (2026-05-11): preplan -> evidence manifest
+                # bridge. Without this, the preplan path leaves the
+                # workspace manifest empty and evidence_chain blocks
+                # with "no EvidenceItems" even when the rest of the
+                # pipeline succeeds (the v14 P69-19 failure mode).
+                try:
+                    from app.services.preplan_evidence import (
+                        build_preplan_evidence_items,
+                    )
+
+                    _settings = self.tool_gateway.settings
+                    _evidence_items = build_preplan_evidence_items(
+                        candidates=candidate_files,
+                        source_name=task.source_name.strip(),
+                        db=self.db,
+                        task_id=task.id,
+                        limit=int(
+                            getattr(
+                                _settings,
+                                "evidence_preplan_candidate_limit",
+                                10,
+                            ) or 10
+                        ),
+                        snippet_bytes=int(
+                            getattr(
+                                _settings,
+                                "evidence_preplan_snippet_bytes",
+                                1024,
+                            ) or 1024
+                        ),
+                    )
+                    if _evidence_items:
+                        self._workspace_call(
+                            task,
+                            lambda workspace: workspace.add_evidence(
+                                _evidence_items
+                            ),
+                        )
+                        self._workspace_append_audit(
+                            task,
+                            "preplan_evidence.write",
+                            {
+                                "count": len(_evidence_items),
+                                "source": task.source_name.strip(),
+                                "paths": [
+                                    ev.file_path for ev in _evidence_items[:10]
+                                ],
+                            },
+                        )
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_SUCCEEDED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.PLANNING,
+                            role=RoleName.KNOWLEDGE,
+                            tool_name="preplan_evidence.write",
+                            message=(
+                                f"Wrote {len(_evidence_items)} preplan "
+                                "candidate(s) to evidence manifest "
+                                "(source=cc_read, producer=preplan_discover)."
+                            ),
+                            payload={
+                                "count": len(_evidence_items),
+                                "snippet_bytes": int(
+                                    getattr(
+                                        _settings,
+                                        "evidence_preplan_snippet_bytes",
+                                        1024,
+                                    )
+                                    or 1024
+                                ),
+                                "paths": [
+                                    ev.file_path
+                                    for ev in _evidence_items[:10]
+                                ],
+                            },
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    # Bridge failure must NOT block planning. Log and
+                    # continue — evidence_chain will fall back to its
+                    # weak-evidence message, which is still better than
+                    # the planner aborting.
+                    logger.warning(
+                        "preplan_evidence bridge failed (non-fatal): %s", exc,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                # Discovery is a best-effort planner aid. Failure is
+                # logged but never blocks the planning stage.
+                logger.warning(
+                    "preplan_discover failed (non-fatal): %s", exc,
+                )
+
         with get_tracer().start_as_current_span("task.plan") as span:
             _set_task_span_attributes(span, task=task, actor_name=actor_name)
             planning_result = self.primary_agent.generate_plan(
@@ -1035,9 +1399,22 @@ class PrimaryOrchestrator:
                 semantic_translation=semantic_translation,
                 planning_knowledge=planning_knowledge_context,
                 issue_context=issue_context,
+                candidate_files=candidate_files,
             )
         plan_document = planning_result.plan
         task.plan_json = plan_document.model_dump(mode="json")
+
+        # v16.2: inject required_contracts (from the matched playbook,
+        # NOT planner-decided) into the plan dict. Codegen reads
+        # `plan_json["required_contracts"]` and mandates a structured
+        # CONTRACT_COVERAGE block in its response when present. Keeping
+        # this in the plan_json keeps the data path uniform — every gate
+        # that already consumes plan_json picks up the new field
+        # automatically.
+        if _required_contracts and isinstance(task.plan_json, dict):
+            task.plan_json["required_contracts"] = [
+                c.to_dict() for c in _required_contracts
+            ]
 
         record_event(
             self.db,
@@ -1070,6 +1447,79 @@ class PrimaryOrchestrator:
             ),
         )
         commit_checkpoint(self.db, label="plan_generated")
+
+        # v16.1 (2026-05-12): empty-acceptance gate (C1 mitigation). When
+        # the domain classifier matched a playbook AND the user's request
+        # looks like a feature add, require the planner's acceptance_tests
+        # to cover at least the playbook's minimum_contracts_referenced.
+        # Without this gate, b5d0a085-class polish-only patches reach
+        # AWAITING_APPROVAL claiming "done" with no feature implementation.
+        if _matched_playbook is not None:
+            try:
+                from app.services.domain_classifier import (
+                    evaluate_acceptance_completeness,
+                    is_feature_task,
+                )
+                _request_for_classification = (task.request_text or "")
+                if is_feature_task(_request_for_classification):
+                    _plan_dict = task.plan_json or {}
+                    _acc = _plan_dict.get("acceptance_tests") or []
+                    _verdict = evaluate_acceptance_completeness(
+                        playbook=_matched_playbook,
+                        acceptance_tests=_acc,
+                    )
+                    if not _verdict["ok"]:
+                        _payload = {
+                            "domain_id": _matched_playbook.get("id"),
+                            "minimum_required": _verdict["minimum_required"],
+                            "matched_contracts": _verdict["matched_contracts"],
+                            "missing_contracts": _verdict["missing_contracts"],
+                            "reason": _verdict["reason"],
+                            "verdict": _verdict["on_failure"] or "PLAN_UNDER_SPECIFIED",
+                        }
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_FAILED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.PLANNING,
+                            role=RoleName.PLANNER,
+                            tool_name="acceptance_completeness.evaluate",
+                            message=(
+                                f"PLAN_UNDER_SPECIFIED: planner emitted "
+                                f"{len(_verdict['matched_contracts'])} of "
+                                f"{_verdict['minimum_required']} required "
+                                f"contracts for domain "
+                                f"{_matched_playbook.get('id', '?')}. "
+                                f"Missing: "
+                                f"{', '.join(_verdict['missing_contracts'][:5])}"
+                            ),
+                            payload=_payload,
+                        )
+                        self._fail_develop_pipeline(
+                            task=task,
+                            message=(
+                                f"PLAN_UNDER_SPECIFIED — the plan must "
+                                f"declare acceptance_tests covering at "
+                                f"least {_verdict['minimum_required']} "
+                                f"of the {len(_matched_playbook.get('required_contracts') or [])} "
+                                f"contracts for the matched domain "
+                                f"({_matched_playbook.get('id', '?')}). "
+                                f"Matched: "
+                                f"{_verdict['matched_contracts']}; "
+                                f"Missing: {_verdict['missing_contracts']}"
+                            ),
+                            payload={
+                                "plan_under_specified": _payload,
+                                "plan_id": getattr(plan_document, "plan_id", None),
+                            },
+                        )
+                        return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "acceptance_completeness gate raised (non-fatal): %s",
+                    exc,
+                )
 
         set_task_status(
             self.db,
@@ -1498,6 +1948,9 @@ class PrimaryOrchestrator:
             message="Planner role resumed structured plan generation.",
             payload={"actor_name": actor_name, "resumed_from_stage": checkpoint.stage},
         )
+        # Resumed planner: skip discovery (would be redundant for a
+        # resumed flow; the original plan already used the same context
+        # at first generation).
         planning_result = self.primary_agent.generate_plan(
             task_id=task.id,
             request_text=planning_request_text,
@@ -1506,6 +1959,7 @@ class PrimaryOrchestrator:
             semantic_translation=semantic_translation,
             planning_knowledge=planning_knowledge_context,
             issue_context=issue_context,
+            candidate_files=[],
         )
         plan_document = planning_result.plan
         task.plan_json = plan_document.model_dump(mode="json")
@@ -3517,6 +3971,41 @@ class PrimaryOrchestrator:
                         return b_idx, None, exc
 
             results_by_idx: dict[int, dict] = {}
+            # v15 Ticket 2B: track per-file outcome for the coverage gate.
+            # New-file / combined batches include grounding companions
+            # alongside their actual targets; we only classify the files
+            # whose plan role is must_touch or expected_new so context
+            # files don't pollute the gate.
+            from app.services.batch_coverage import (
+                BatchOutcome,
+                check_coverage,
+                classify_batch_outcome,
+                role_for_path,
+            )
+            batch_outcomes_by_file: dict[str, BatchOutcome] = {}
+
+            def _targets_in_batch(b_files: list[str]) -> list[str]:
+                targets: list[str] = []
+                for path in b_files:
+                    role = role_for_path(path, plan)
+                    if role in {"must_touch", "expected_new"}:
+                        targets.append(path)
+                # If the batch carries no planner-declared targets at
+                # all (legacy single-batch path), keep the first file as
+                # the nominal target so the outcome still records the
+                # batch outcome — it just won't influence coverage rules.
+                if not targets and b_files:
+                    targets = [b_files[0]]
+                return targets
+            # v16 P0 #8 (fail-fast on hung batches): the parallel codegen
+            # loop must not let a single slow batch block the stage past the
+            # 30-min watchdog. Each codegen call already has its own retry +
+            # provider chain inside _try_provider, so a per-batch deadline of
+            # ~12 min should never trip on healthy traffic but will surface
+            # a stuck batch in time to fail the stage cleanly.
+            _BATCH_DEADLINE_S = float(
+                getattr(get_settings(), "codegen_batch_deadline_seconds", 720.0)
+            )
             with ThreadPoolExecutor(
                 max_workers=parallel_max, thread_name_prefix="codegen"
             ) as pool:
@@ -3524,44 +4013,116 @@ class PrimaryOrchestrator:
                     pool.submit(_worker_codegen, i, batches[i])
                     for i in range(len(batches))
                 ]
-                for fut in as_completed(futures):
-                    batch_idx, batch_result, err = fut.result()
-                    batch_label = f"batch {batch_idx + 1}/{len(batches)}"
-                    if err is not None:
-                        record_event(
-                            self.db,
-                            task_id=task.id,
-                            event_type=EventType.TOOL_FAILED,
-                            source=EventSource.TOOL_GATEWAY,
-                            stage=WorkflowStage.ACTION,
-                            role=RoleName.ACTION,
-                            tool_name="codegen.generate_patch",
-                            message=f"Codegen {batch_label} failed: {err}",
-                            payload={
-                                "batch": batch_idx,
-                                "files": list(batches[batch_idx].keys()),
-                                "error": str(err)[:500],
-                            },
-                        )
-                    elif batch_result is not None:
-                        results_by_idx[batch_idx] = batch_result
-                        record_event(
-                            self.db,
-                            task_id=task.id,
-                            event_type=EventType.TOOL_SUCCEEDED,
-                            source=EventSource.TOOL_GATEWAY,
-                            stage=WorkflowStage.ACTION,
-                            role=RoleName.ACTION,
-                            tool_name="codegen.generate_patch",
-                            message=(
-                                f"Codegen {batch_label} done "
-                                f"({len(batch_result.get('files_changed') or [])} files)"
-                            ),
-                            payload=batch_result,
-                        )
-                    commit_checkpoint(
-                        self.db, label=f"codegen_batch_{batch_idx}_done"
+                future_to_batch = {fut: i for i, fut in enumerate(futures)}
+                pending = set(futures)
+                _loop_t0 = time.monotonic()
+                while pending:
+                    elapsed = time.monotonic() - _loop_t0
+                    remaining = max(_BATCH_DEADLINE_S - elapsed, 0.0)
+                    if remaining == 0.0:
+                        # Deadline blew; synthesize timeout errors for all
+                        # still-running batches so the coverage gate can rule
+                        # on partial results instead of waiting forever.
+                        for stale_fut in list(pending):
+                            stale_fut.cancel()
+                            stale_idx = future_to_batch[stale_fut]
+                            stale_label = f"batch {stale_idx + 1}/{len(batches)}"
+                            stale_files = list(batches[stale_idx].keys())
+                            logger.warning(
+                                "codegen %s exceeded per-batch deadline %.0fs — marking failed",
+                                stale_label, _BATCH_DEADLINE_S,
+                            )
+                            timeout_err = TimeoutError(
+                                f"codegen batch exceeded deadline {_BATCH_DEADLINE_S:.0f}s"
+                            )
+                            for target_path in _targets_in_batch(stale_files):
+                                outcome = classify_batch_outcome(
+                                    file_path=target_path,
+                                    plan=plan,
+                                    batch_result=None,
+                                    error=timeout_err,
+                                    batch_id=stale_label,
+                                )
+                                batch_outcomes_by_file[outcome.file_path] = outcome
+                            record_event(
+                                self.db,
+                                task_id=task.id,
+                                event_type=EventType.TOOL_TIMED_OUT,
+                                source=EventSource.ORCHESTRATOR,
+                                stage=WorkflowStage.ACTION,
+                                role=RoleName.ACTION,
+                                tool_name="codegen.generate_patch",
+                                message=(
+                                    f"Codegen {stale_label} timed out after "
+                                    f"{_BATCH_DEADLINE_S:.0f}s "
+                                    f"(per-batch deadline)"
+                                ),
+                                payload={
+                                    "batch": stale_idx,
+                                    "files": stale_files,
+                                    "error": str(timeout_err),
+                                    "deadline_seconds": _BATCH_DEADLINE_S,
+                                },
+                            )
+                        break
+                    done, pending = wait(
+                        pending, timeout=remaining, return_when=FIRST_COMPLETED
                     )
+                    if not done:
+                        continue
+                    for fut in done:
+                        batch_idx, batch_result, err = fut.result()
+                        batch_label = f"batch {batch_idx + 1}/{len(batches)}"
+                        batch_files_targeted = list(batches[batch_idx].keys())
+                        for target_path in _targets_in_batch(batch_files_targeted):
+                            outcome = classify_batch_outcome(
+                                file_path=target_path,
+                                plan=plan,
+                                batch_result=batch_result,
+                                error=err,
+                                batch_id=batch_label,
+                            )
+                            batch_outcomes_by_file[outcome.file_path] = outcome
+                        if err is not None:
+                            record_event(
+                                self.db,
+                                task_id=task.id,
+                                event_type=EventType.TOOL_FAILED,
+                                source=EventSource.TOOL_GATEWAY,
+                                stage=WorkflowStage.ACTION,
+                                role=RoleName.ACTION,
+                                tool_name="codegen.generate_patch",
+                                message=f"Codegen {batch_label} failed: {err}",
+                                payload={
+                                    "batch": batch_idx,
+                                    "files": batch_files_targeted,
+                                    "error": str(err)[:500],
+                                },
+                            )
+                        elif batch_result is not None:
+                            results_by_idx[batch_idx] = batch_result
+                            record_event(
+                                self.db,
+                                task_id=task.id,
+                                event_type=EventType.TOOL_SUCCEEDED,
+                                source=EventSource.TOOL_GATEWAY,
+                                stage=WorkflowStage.ACTION,
+                                role=RoleName.ACTION,
+                                tool_name="codegen.generate_patch",
+                                message=(
+                                    f"Codegen {batch_label} done "
+                                    f"({len(batch_result.get('files_changed') or [])} files)"
+                                ),
+                                payload=batch_result,
+                            )
+                        commit_checkpoint(
+                            self.db, label=f"codegen_batch_{batch_idx}_done"
+                        )
+            # Persist outcomes for the coverage gate (and for UI / debug).
+            pipeline_state["batch_outcomes"] = {
+                path: outcome.to_payload()
+                for path, outcome in batch_outcomes_by_file.items()
+            }
 
             # Merge by batch index so downstream file ordering is stable.
             for batch_idx in sorted(results_by_idx):
@@ -3598,6 +4159,39 @@ class PrimaryOrchestrator:
                 )
 
             if not merged_diff_parts:
+                # v15 Ticket 2B (2026-05-11) FIXED: when all batches end with
+                # verified_no_change, the older "no diff" failure path used to
+                # kill the pipeline before the coverage gate could route the
+                # situation to PLAN_CODEGEN_CONFLICT \u2192 AWAITING_APPROVAL.
+                # Check the outcomes first: if any must_touch is verified-no-
+                # change, that's a planner/codegen conflict for humans, not a
+                # codegen failure.
+                try:
+                    _early_outcomes = list(batch_outcomes_by_file.values())
+                except NameError:
+                    _early_outcomes = []
+                if _early_outcomes:
+                    _early_verdict = check_coverage(_early_outcomes, plan)
+                    if _early_verdict.kind == "plan_codegen_conflict":
+                        pipeline_state["coverage_verdict"] = _early_verdict.to_payload()
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_FAILED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.ACTION,
+                            role=RoleName.ACTION,
+                            tool_name="batch_coverage.check",
+                            message=_early_verdict.summary[:400],
+                            payload=_early_verdict.to_payload(),
+                        )
+                        self._request_plan_codegen_conflict_approval(
+                            task=task,
+                            plan=plan,
+                            pipeline_state=pipeline_state,
+                            verdict=_early_verdict,
+                        )
+                        return
                 self._fail_develop_pipeline(
                     task=task,
                     message="\u4ee3\u7801\u751f\u6210\u5931\u8d25\uff1a\u6240\u6709\u6279\u6b21\u5747\u672a\u751f\u6210\u6709\u6548\u7684 diff\u3002",
@@ -3657,6 +4251,317 @@ class PrimaryOrchestrator:
             )
             return
         pipeline_state.setdefault("diff", diff)
+
+        # v15 Ticket 2B: must_touch / expected_new coverage gate.
+        # Runs AFTER all batches finish and the diff is assembled, BEFORE
+        # any downstream gate (diff_shape / compile). Blocks the v14
+        # partial-success path (1/2 must_touch patched, 1/2 phantom no-
+        # change \u2192 don't continue) and routes verified plan/codegen
+        # conflicts to awaiting_approval rather than pretending success.
+        try:
+            outcomes_list = list(batch_outcomes_by_file.values())
+        except NameError:
+            # When the pre-existing codegen result already populated
+            # pipeline_state['batch_outcomes'] from a prior attempt
+            # (resume path), reconstruct outcomes from the payload.
+            outcomes_list = []
+            for entry in (pipeline_state.get("batch_outcomes") or {}).values():
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    outcomes_list.append(BatchOutcome(**{  # type: ignore[arg-type]
+                        k: v for k, v in entry.items()
+                        if k in BatchOutcome.__dataclass_fields__
+                    }))
+                except Exception:  # noqa: BLE001
+                    continue
+        coverage_verdict = check_coverage(outcomes_list, plan)
+        pipeline_state["coverage_verdict"] = coverage_verdict.to_payload()
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=(
+                EventType.TOOL_SUCCEEDED
+                if coverage_verdict.ok
+                else EventType.TOOL_FAILED
+            ),
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.ACTION,
+            role=RoleName.ACTION,
+            tool_name="batch_coverage.check",
+            message=coverage_verdict.summary[:400],
+            payload=coverage_verdict.to_payload(),
+        )
+
+        # v16.2 — Contract Coverage gate runs HERE, before batch_coverage's
+        # early-return paths fire, so a `claims_unverified` verdict can
+        # override an otherwise-passing batch_coverage. Order of authority:
+        #   1. contract_coverage.claims_unverified (model lied)  → hard fail
+        #   2. batch_coverage hard failure (phantom / missing)   → hard fail
+        #   3. contract_coverage.incomplete                       → approval
+        #   4. batch_coverage.plan_codegen_conflict               → approval
+        #   5. all clear                                          → continue
+        _cc_verdict = None
+        _plan_dict_for_cc = task.plan_json if isinstance(task.plan_json, dict) else {}
+        _plan_required_contracts_raw = _plan_dict_for_cc.get("required_contracts") or []
+        if _plan_required_contracts_raw:
+            try:
+                from app.services.contract_coverage import (
+                    CoverageDeclaration,
+                    CoverageClaim,
+                    RequiredContract,
+                    verify_coverage,
+                )
+                # v16.2.1: also rehydrate the typed `verifications` tree
+                # that planner injected into plan_json. When present, the
+                # contract_coverage verifier runs the diff-anchored
+                # evaluator (supports any_of / all_of /
+                # final_context_contains_pattern); when absent, falls back
+                # to the legacy flat verification_patterns scan.
+                from app.services.contract_coverage import _rule_from_dict  # type: ignore[attr-defined]
+                _req_contracts: list[RequiredContract] = []
+                for _rc in _plan_required_contracts_raw:
+                    if not isinstance(_rc, dict):
+                        continue
+                    _cid = str(_rc.get("contract_id") or _rc.get("id") or "").strip()
+                    if not _cid:
+                        continue
+                    _verifications_raw = _rc.get("verifications") or []
+                    _verifications = []
+                    if isinstance(_verifications_raw, list):
+                        for _v in _verifications_raw:
+                            _built = _rule_from_dict(_v)
+                            if _built is not None:
+                                _verifications.append(_built)
+                    _req_contracts.append(RequiredContract(
+                        contract_id=_cid,
+                        signal=str(_rc.get("signal") or ""),
+                        verification_patterns=list(_rc.get("verification_patterns") or []),
+                        forbidden_patterns=list(_rc.get("forbidden_patterns") or []),
+                        verifications=_verifications,
+                    ))
+
+                _agg = CoverageDeclaration()
+                for _bidx in sorted(results_by_idx):
+                    _br = results_by_idx[_bidx]
+                    _cov_dict = _br.get("contract_coverage") if isinstance(_br, dict) else None
+                    if not isinstance(_cov_dict, dict):
+                        continue
+                    for _key, _lst in (
+                        ("implemented_contracts", _agg.implemented_contracts),
+                        ("verified_no_change_contracts", _agg.verified_no_change_contracts),
+                        ("unimplemented_contracts", _agg.unimplemented_contracts),
+                    ):
+                        for _item in _cov_dict.get(_key) or []:
+                            if not isinstance(_item, dict):
+                                continue
+                            _lst.append(CoverageClaim(
+                                contract_id=str(_item.get("contract_id") or _item.get("id") or "").strip(),
+                                file_path=str(_item.get("file_path") or _item.get("file") or "").strip(),
+                                evidence_quote=str(_item.get("evidence_quote") or _item.get("quote") or "").strip(),
+                                reason=str(_item.get("reason") or "").strip(),
+                            ))
+
+                _file_snapshots: dict[str, str] = {}
+                for _bidx, _bfiles in enumerate(batches):
+                    for _fp, _fcontent in (_bfiles or {}).items():
+                        if _fcontent and _fp not in _file_snapshots:
+                            _file_snapshots[_fp] = _fcontent
+
+                _merged_diff_text = "\n".join(merged_diff_parts)
+                # v16.2.1: pass pre-patch snapshots ALSO as the
+                # `patched_files` approximation. Justification: the new
+                # `final_context_contains_pattern` rule looks for an
+                # UNCHANGED sink line in the function scope around a
+                # changed hunk. Unchanged means it appears identically
+                # in pre-patch and post-patch, so the pre-patch snapshot
+                # is sufficient evidence as long as the diff doesn't
+                # delete the sink line. The scope resolver finds the
+                # enclosing `fun` declaration via brace-counting; small
+                # line drift between pre- and post-patch is tolerated.
+                # A future Phase D may apply the diff in-memory for
+                # exact line alignment; not load-bearing today.
+                _cc_verdict = verify_coverage(
+                    declaration=_agg,
+                    required=_req_contracts,
+                    diff_text=_merged_diff_text,
+                    file_snapshots=_file_snapshots,
+                    patched_files=_file_snapshots,
+                )
+                pipeline_state["contract_coverage_verdict"] = _cc_verdict.to_dict()
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=(
+                        EventType.TOOL_SUCCEEDED
+                        if _cc_verdict.ok
+                        else EventType.TOOL_FAILED
+                    ),
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.ACTION,
+                    role=RoleName.ACTION,
+                    tool_name="contract_coverage.check",
+                    message=_cc_verdict.summary[:400],
+                    payload=_cc_verdict.to_dict(),
+                )
+                # PRIORITY 1: hard-fail verdicts (model demonstrably wrong).
+                # v16.2.1 splits the old `claims_unverified` into three
+                # severities. The orchestrator routes them differently:
+                #   - `lie` / `contradicted` → hard fail (CONTRACT_COVERAGE_*)
+                #   - `unverified` → soft fail, route to human review
+                #   - `claims_unverified` (legacy) → hard fail for back-compat
+                _hard_fail_kinds = {"lie", "contradicted", "claims_unverified"}
+                if (not _cc_verdict.ok
+                    and _cc_verdict.verdict_kind in _hard_fail_kinds):
+                    _label = {
+                        "lie": "CONTRACT_COVERAGE_LIE",
+                        "contradicted": "CONTRACT_COVERAGE_CONTRADICTED",
+                        "claims_unverified": "CONTRACT_COVERAGE_LIE",
+                    }[_cc_verdict.verdict_kind]
+                    self._fail_develop_pipeline(
+                        task=task,
+                        message=f"{_label}: {_cc_verdict.summary}",
+                        payload={
+                            "contract_coverage_verdict": _cc_verdict.to_dict(),
+                            "plan_id": plan.plan_id,
+                        },
+                    )
+                    return
+                # PRIORITY 1b: `unverified` — verifier could not confirm
+                # the claim, but the artifact does not directly contradict
+                # it. Treat as soft fail and route to human review rather
+                # than calling the model a liar (round 6 lesson).
+                if (not _cc_verdict.ok
+                    and _cc_verdict.verdict_kind == "unverified"):
+                    self._request_plan_codegen_conflict_approval(
+                        task=task,
+                        plan=plan,
+                        pipeline_state=pipeline_state,
+                        verdict=coverage_verdict,
+                    )
+                    return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "contract_coverage gate raised (non-fatal): %s", exc,
+                )
+                _cc_verdict = None
+
+        if not coverage_verdict.ok:
+            if coverage_verdict.kind == "plan_codegen_conflict":
+                # Soft landing: human reviewer decides whether the planner
+                # over-scoped or codegen under-implemented.
+                self._request_plan_codegen_conflict_approval(
+                    task=task,
+                    plan=plan,
+                    pipeline_state=pipeline_state,
+                    verdict=coverage_verdict,
+                )
+                return
+            # Hard blockers (phantom / missing) \u2014 fail the pipeline.
+            self._fail_develop_pipeline(
+                task=task,
+                message=coverage_verdict.summary,
+                payload={
+                    "coverage_verdict": coverage_verdict.to_payload(),
+                    "plan_id": plan.plan_id,
+                },
+            )
+            return
+
+        # v16.2: contract_coverage's `incomplete` verdict at this point
+        # in the flow (batch_coverage passed) still routes to human
+        # review. The check runs even when batch_coverage was happy \u2014
+        # because batch_coverage measures must_touch line-level coverage
+        # while contract_coverage measures feature-signal completeness,
+        # which can diverge (b5d0a085: every must_touch was patched
+        # technically, but no map UI was actually added).
+        if _cc_verdict is not None and not _cc_verdict.ok:
+            # claims_unverified was already hard-failed above. Remaining
+            # case is incomplete: route to plan_codegen_conflict approval.
+            self._request_plan_codegen_conflict_approval(
+                task=task,
+                plan=plan,
+                pipeline_state=pipeline_state,
+                verdict=coverage_verdict,
+            )
+            return
+
+        # v15 Ticket 4: codegen changed-file evidence bridge. Coverage
+        # gate passed, so every patched outcome is legitimate; emit one
+        # spec_anchor EvidenceItem per changed file, anchored to its
+        # diff hunk. Companion to Ticket 3's preplan evidence \u2014 together
+        # they give evidence_chain a non-empty manifest that explains
+        # both "why we read these files" and "why we changed THIS subset".
+        try:
+            from app.services.codegen_evidence import (
+                build_codegen_changed_file_evidence,
+            )
+
+            _patched_outcomes = [
+                o for o in outcomes_list if o.status == "patched"
+            ]
+            if _patched_outcomes:
+                _acceptance_count = len(
+                    getattr(plan, "acceptance_tests", []) or []
+                )
+                _change_summary = str(
+                    getattr(plan, "change_summary", "") or ""
+                )[:240]
+                _codegen_items = build_codegen_changed_file_evidence(
+                    outcomes=_patched_outcomes,
+                    plan=plan,
+                    diff_text=diff,
+                    task_id=task.id,
+                    change_summary=_change_summary,
+                    acceptance_test_count=_acceptance_count,
+                )
+                if _codegen_items:
+                    self._workspace_call(
+                        task,
+                        lambda workspace: workspace.add_evidence(
+                            _codegen_items
+                        ),
+                    )
+                    self._workspace_append_audit(
+                        task,
+                        "codegen_evidence.write",
+                        {
+                            "count": len(_codegen_items),
+                            "paths": [
+                                it.file_path for it in _codegen_items[:10]
+                            ],
+                        },
+                    )
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_SUCCEEDED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.ACTION,
+                        role=RoleName.ACTION,
+                        tool_name="codegen_evidence.write",
+                        message=(
+                            f"Wrote {len(_codegen_items)} codegen "
+                            "changed-file EvidenceItem(s) (source="
+                            "spec_anchor, producer=codegen_evidence_bridge)."
+                        ),
+                        payload={
+                            "count": len(_codegen_items),
+                            "paths": [
+                                it.file_path for it in _codegen_items[:10]
+                            ],
+                            "verified": sum(
+                                1
+                                for it in _codegen_items
+                                if it.metadata.get("quote_verified")
+                            ),
+                        },
+                    )
+        except Exception as exc:  # noqa: BLE001
+            # Audit bridge failure must not block compile / review.
+            logger.warning(
+                "codegen_evidence bridge failed (non-fatal): %s", exc,
+            )
 
         # Static shape pre-gate (Stage X.1): catches destructive empty patches
         # (pure-deletion of must_touch files) before any LLM gate runs.
@@ -5021,9 +5926,13 @@ class PrimaryOrchestrator:
                             timeout_seconds=90.0,
                         )
                     except SemanticReviewError as exc:
-                        # LLM call failure is non-blocking — log + skip
-                        # the gate (do NOT fail the pipeline on infra
-                        # errors of an advisory gate).
+                        # Infrastructure error (provider unreachable / auth /
+                        # timeout) — non-blocking; the gate is advisory.
+                        # v15 Ticket 5: this branch only fires for real
+                        # infra failures now. JSON-parse failures are
+                        # handled by sr_report.is_unavailable below
+                        # (semantic_review degrades to status=unavailable
+                        # rather than raising).
                         record_event(
                             self.db, task_id=task.id,
                             event_type=EventType.TOOL_FAILED,
@@ -5031,10 +5940,39 @@ class PrimaryOrchestrator:
                             stage=WorkflowStage.REVIEW,
                             role=RoleName.REVIEWER,
                             tool_name="semantic_review.evaluate",
-                            message=f"Semantic review errored (skipped): {exc}",
+                            message=f"Semantic review provider error: {exc}",
                             payload={"error": str(exc)[:500]},
                         )
-                        pipeline_state["semantic_review_skipped"] = "errored"
+                        pipeline_state["semantic_review_skipped"] = "provider_error"
+                        sr_report = None
+                        break
+
+                    # v15 Ticket 5: unavailable status — gate ran but
+                    # reviewer output was unparseable JSON even after
+                    # the focused repair pass. NOT pass, NOT fail, NOT
+                    # silently skipped. Visible in latest_result_json
+                    # so Ticket 6 (terminal state mapper) can decide
+                    # whether to route to awaiting_approval.
+                    if getattr(sr_report, "is_unavailable", False):
+                        unavailable_payload = sr_report.to_payload()
+                        record_event(
+                            self.db, task_id=task.id,
+                            event_type=EventType.TOOL_SUCCEEDED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            tool_name="semantic_review.unavailable",
+                            message=(
+                                "Semantic review unavailable: "
+                                f"{sr_report.unavailable_reason} "
+                                f"(provider={sr_report.provider_name}, "
+                                f"review_attempts={sr_report.review_attempts}, "
+                                f"repair_attempted={sr_report.repair_attempted})"
+                            ),
+                            payload=unavailable_payload,
+                        )
+                        pipeline_state["semantic_review"] = unavailable_payload
+                        pipeline_state["semantic_review_unavailable"] = True
                         sr_report = None
                         break
 
@@ -6089,6 +7027,85 @@ class PrimaryOrchestrator:
             payload={"jira_writeback": jira_writeback},
         )
 
+    @staticmethod
+    def _summarize_hard_gates(
+        pipeline_state: dict[str, object],
+    ) -> dict[str, str]:
+        """v15 Ticket 6 (2026-05-11): return a flat ``{gate: status}`` map
+        for the approval payload.
+
+        Only emits an entry when ``pipeline_state`` actually contains a
+        signal for that gate — we never invent ``"passed"`` for a gate
+        that wasn't run, because that would make the approval payload
+        lie about coverage. Status is derived from the gate's own state
+        keys; the orchestrator sets these throughout the pipeline.
+        """
+        summary: dict[str, str] = {}
+
+        # batch_coverage (Ticket 2B)
+        cv = pipeline_state.get("coverage_verdict")
+        if isinstance(cv, dict) and cv.get("kind"):
+            summary["batch_coverage"] = "passed" if cv.get("kind") == "ok" else str(cv.get("kind"))
+
+        # compile_gate
+        if pipeline_state.get("compile_gate_done"):
+            summary["compile_gate"] = (
+                "passed" if not pipeline_state.get("compile_gate_failed") else "failed"
+            )
+
+        # symbol_graph
+        sg = pipeline_state.get("symbol_graph")
+        if isinstance(sg, dict):
+            violations = sg.get("violations") or sg.get("violation_count") or 0
+            try:
+                summary["symbol_graph"] = "passed" if int(violations) == 0 else "warnings"
+            except (TypeError, ValueError):
+                summary["symbol_graph"] = "passed"
+        elif pipeline_state.get("symbol_graph_skipped"):
+            summary["symbol_graph"] = f"skipped:{pipeline_state['symbol_graph_skipped']}"
+
+        # runtime_validation
+        rv = pipeline_state.get("runtime_validation")
+        if isinstance(rv, dict):
+            summary["runtime_validation"] = "passed" if rv.get("passed", True) else "failed"
+
+        # diff_reviewer
+        if pipeline_state.get("diff_reviewer_done"):
+            summary["diff_reviewer"] = (
+                "passed" if not pipeline_state.get("diff_reviewer_failed") else "failed"
+            )
+
+        # spec_conformance
+        cr = pipeline_state.get("conformance_report")
+        if isinstance(cr, dict):
+            summary["spec_conformance"] = "passed" if cr.get("passed", True) else "failed"
+
+        # goal_attestation / goal_decomposition
+        ga = pipeline_state.get("goal_attestation")
+        if isinstance(ga, dict):
+            summary["goal_attestation"] = (
+                "passed" if ga.get("all_goals_met", True) else "warnings"
+            )
+        gd = pipeline_state.get("goal_decomposition")
+        if isinstance(gd, dict):
+            summary["goal_decomposition"] = (
+                "passed" if gd.get("all_met", True) else "warnings"
+            )
+
+        # artifact_existence
+        ae = pipeline_state.get("artifact_existence")
+        if isinstance(ae, dict):
+            summary["artifact_existence"] = (
+                "passed" if int(ae.get("blocking_count", 0) or 0) == 0 else "blocked"
+            )
+
+        # evidence_chain
+        ec = pipeline_state.get("evidence_chain")
+        if isinstance(ec, dict):
+            summary["evidence_chain"] = "passed" if ec.get("closed", False) else "broken"
+
+        return summary
+
     def _build_develop_summary(self, pipeline_state: dict[str, object]) -> str:
         """Build a human-readable summary of the develop pipeline execution."""
         zh = pipeline_state.get("user_lang") == "zh"
@@ -6143,6 +7160,20 @@ class PrimaryOrchestrator:
         else:
             parts.append(f"- {'Tests: passed' if zh else 'Tests: passed'}")
         parts.append(f"- {'Review: ' if zh else 'Review: '}{pipeline_state.get('review_verdict', 'N/A')}")
+
+        # v15 Ticket 6 (2026-05-11): surface semantic_review status when
+        # the gate degraded to "unavailable" (invalid JSON after repair).
+        # This is NOT a failure — the gate just couldn't be evaluated —
+        # but the human reviewer needs to know it before approving the
+        # Jira transition.
+        sr_state = pipeline_state.get("semantic_review")
+        if isinstance(sr_state, dict) and sr_state.get("status") == "unavailable":
+            sr_reason = str(sr_state.get("unavailable_reason") or sr_state.get("reason") or "unknown")
+            parts.append(
+                f"- {'Semantic review: ' if zh else 'Semantic review: '}"
+                f"⚠ unavailable ({sr_reason}) — "
+                f"{'requires human review' if zh else 'human review required'}"
+            )
 
         jira_writeback = pipeline_state.get("jira_writeback")
         if isinstance(jira_writeback, dict) and jira_writeback.get("transition"):
@@ -6314,8 +7345,50 @@ class PrimaryOrchestrator:
                 context_files[relative_path] = content
                 priority_map[relative_path] = 1
 
+        # --- Strategy 0.5: must_inspect_files (Phase 2.3, 2026-05-11) ---
+        # Read-only context: planner says the patch depends on inspecting
+        # these (build.gradle / Manifest / nav_graph), but they are NOT
+        # edit targets. Pull them with priority just below must_touch so
+        # the codegen LLM has them in front of it; the codegen prompt
+        # marks them as do-not-modify and the orchestrator's allowed-set
+        # excludes them from the diff-shape allowlist.
+        must_inspect = getattr(plan, "must_inspect_files", None) or []
+        for mi_path in must_inspect:
+            relative_path = self._normalize_codegen_path(mi_path)
+            if not relative_path or relative_path in context_files:
+                continue
+            content = self._read_context_file(
+                source_path=source_path,
+                sandbox_dir=sandbox_dir,
+                relative_path=relative_path,
+            )
+            if content is not None:
+                context_files[relative_path] = content
+                priority_map[relative_path] = 1
+
+        # --- Strategy 0.7: likely_touch_files (Phase 2.3, 2026-05-11) ---
+        # Uncertain candidates: filename matches keywords but evidence is
+        # not yet conclusive. Treat as mid-priority context so the LLM
+        # can decide whether to edit them based on actual content.
+        likely_touch = getattr(plan, "likely_touch_files", None) or []
+        for lt_path in likely_touch:
+            relative_path = self._normalize_codegen_path(lt_path)
+            if not relative_path or relative_path in context_files:
+                continue
+            content = self._read_context_file(
+                source_path=source_path,
+                sandbox_dir=sandbox_dir,
+                relative_path=relative_path,
+            )
+            if content is not None:
+                context_files[relative_path] = content
+                priority_map[relative_path] = 2
+
         # --- Strategy 1: grep keywords in source tree ---
-        grep_keywords = self._extract_grep_keywords(task)
+        # Phase 1.1 (2026-05-11): pass plan so acceptance_tests can
+        # contribute keywords (com.google.android.gms.maps surfaces
+        # build.gradle; onMapReady surfaces map fragments; etc.).
+        grep_keywords = self._extract_grep_keywords(task, plan)
         grep_hits: dict[str, list[int]] = {}
         if source_path and grep_keywords:
             grep_hits = self._grep_source_tree(source_path, grep_keywords)
@@ -6422,11 +7495,22 @@ class PrimaryOrchestrator:
         ]
         pack = build_evidence_pack(evidence_inputs, budget)
 
+        # Phase B.2 (2026-05-11): warn loudly when a must_touch file got
+        # truncated by the evidence_pack budget. The patch can still
+        # proceed (codegen sometimes succeeds on big files via aggressive
+        # AST truncation + pinned symbols), but the operator needs to
+        # see this on the timeline because it is by far the most
+        # frequent cause of EVIDENCE_GAP_REQUEST failures.
+        truncated_must_touch = pack.metrics.get("truncated_must_touch") or []
         try:
             record_event(
                 self.db,
                 task_id=task.id,
-                event_type=EventType.TOOL_SUCCEEDED,
+                event_type=(
+                    EventType.TOOL_FAILED
+                    if truncated_must_touch
+                    else EventType.TOOL_SUCCEEDED
+                ),
                 source=EventSource.ORCHESTRATOR,
                 stage=WorkflowStage.ACTION,
                 role=RoleName.ACTION,
@@ -6434,12 +7518,29 @@ class PrimaryOrchestrator:
                 message=(
                     f"Evidence pack built: {pack.metrics['files_included']} files / "
                     f"{pack.metrics['bytes_used']} bytes "
-                    f"(dropped {pack.metrics['files_dropped']})."
+                    f"(dropped {pack.metrics['files_dropped']}, "
+                    f"must_touch_truncated={len(truncated_must_touch)})."
                 ),
                 payload={**pack.metrics, "dropped": [d.path for d in pack.dropped]},
             )
         except Exception:  # noqa: BLE001 — never let evidence_pack telemetry break codegen
             pass
+
+        if truncated_must_touch:
+            try:
+                paths = ", ".join(
+                    str(d.get("path") or "?")
+                    + f" ({d.get('original_bytes')}>>{d.get('included_bytes')} via {d.get('cap_name')})"
+                    for d in truncated_must_touch
+                )
+                logger.warning(
+                    "MUST_TOUCH_FILE_TRUNCATED: %s "
+                    "(increase codegen_per_file_byte_budget or move file to "
+                    "must_inspect_files if it should be read-only context)",
+                    paths,
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
         return {ev.path: ev.content for ev in pack.included_files}
 
@@ -6638,7 +7739,7 @@ class PrimaryOrchestrator:
         }
 
     @staticmethod
-    def _extract_grep_keywords(task: Task) -> list[str]:
+    def _extract_grep_keywords(task: Task, plan: "GeneratedPlan | None" = None) -> list[str]:
         """Extract concrete grep-able keywords from task context.
 
         Sources (in priority order):
@@ -6646,6 +7747,12 @@ class PrimaryOrchestrator:
         2. search_queries from semantic translation (multi-query).
         3. grounding_terms from semantic translation.
         4. CamelCase / PascalCase identifiers from the request text.
+        5. Phase 1.1 (2026-05-11): planner's acceptance_tests patterns +
+           rationale. Acceptance often names the concrete SDK / class /
+           callback the patch must use (com.google.android.gms.maps,
+           onMapReady, MapView), so feeding those into grep surfaces
+           build.gradle / Manifest / existing-map-component files the
+           model otherwise can't find on its own.
         """
         keywords: list[str] = []
         seen_lower: set[str] = set()
@@ -6685,7 +7792,38 @@ class PrimaryOrchestrator:
         for match in re.finditer(r"\b([A-Z][a-z]{2,}(?:[A-Z][a-z]*)*)\b", request_text):
             _add(match.group(1))
 
-        return keywords[:16]
+        # 6. Phase 1.1: acceptance_tests → SDK / class / callback names.
+        acceptance_tests = []
+        if plan is not None:
+            acceptance_tests = list(getattr(plan, "acceptance_tests", None) or [])
+        for test in acceptance_tests:
+            if not isinstance(test, dict) and not hasattr(test, "pattern"):
+                continue
+            for key in ("pattern", "rationale"):
+                v = getattr(test, key, None) if hasattr(test, key) else (
+                    test.get(key) if isinstance(test, dict) else None
+                )
+                v = str(v or "")
+                if not v:
+                    continue
+                # Strip regex metachars; keep dotted FQNs so we can grep
+                # `com.google.android.gms` directly.
+                cleaned = re.sub(r"[\\^$|()\[\]{}*+?]", " ", v)
+                # Yield each whitespace token plus dotted-suffix slices
+                # (e.g. "com.google.android.gms.maps" → adds "maps").
+                for raw in cleaned.split():
+                    raw = raw.strip(".,;:")
+                    if not raw:
+                        continue
+                    if "." in raw and len(raw) > 4:
+                        _add(raw)
+                        tail = raw.rsplit(".", 1)[-1]
+                        if tail and tail != raw:
+                            _add(tail)
+                    elif len(raw) >= 4:
+                        _add(raw)
+
+        return keywords[:24]
 
     def _grep_source_tree(
         self, source_path: Path, keywords: list[str],
@@ -6871,6 +8009,31 @@ class PrimaryOrchestrator:
             pipeline_state["compile_gate_done"] = True
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
             return "errored"
+
+        # M2 (2026-05-11): same-failure-signature guard for repair loop.
+        # Build a normalized signature per round from the compile-error
+        # set (file + first-line of message). If the same signature
+        # repeats 3 times consecutively WITHOUT any files getting
+        # repaired, we are stuck — exit with PATCH_REPAIR_STUCK_SAME_ERROR
+        # instead of letting the 30-min watchdog kill the task (v9 root
+        # cause: the loop burned 28 min retrying the same `patch does
+        # not apply` before watchdog stale-killed it).
+        _failure_signature_history: list[str] = []
+        _max_same_failure = 3
+
+        def _build_failure_signature(errors: list) -> str:
+            sig_parts: list[str] = []
+            for err in (errors or [])[:10]:
+                if not isinstance(err, dict):
+                    continue
+                file_ = str(err.get("file") or "").strip()
+                msg = str(err.get("message") or err.get("error") or "").strip()
+                # Strip line numbers / paths so signatures collapse
+                # across "same error, different line".
+                msg_norm = re.sub(r":\d+", ":<line>", msg.lower())
+                msg_norm = re.sub(r"\s+", " ", msg_norm)[:200]
+                sig_parts.append(f"{file_}|{msg_norm}")
+            return ";".join(sig_parts)
 
         for round_index in range(max_rounds + 1):
             if compile_passed:
@@ -7138,6 +8301,48 @@ class PrimaryOrchestrator:
 
             if repaired:
                 changed = list({*changed, *files_touched})
+                # Clear stuck history on actual progress.
+                _failure_signature_history = []
+            else:
+                # M2 guard: same failure signature 3x in a row → exit.
+                signature = _build_failure_signature(compile_errors)
+                _failure_signature_history.append(signature)
+                # Only count the consecutive tail.
+                tail = _failure_signature_history[-_max_same_failure:]
+                if (
+                    len(tail) >= _max_same_failure
+                    and signature
+                    and all(s == signature for s in tail)
+                ):
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_FAILED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="compile_repair.stuck",
+                        message=(
+                            f"PATCH_REPAIR_STUCK_SAME_ERROR: same compile-error "
+                            f"signature repeated {_max_same_failure} rounds — "
+                            f"exiting repair loop early to avoid watchdog timeout."
+                        ),
+                        payload={
+                            "round_index": round_label,
+                            "signature": signature[:300],
+                            "consecutive_count": len(tail),
+                        },
+                    )
+                    self._workspace_append_audit(
+                        task,
+                        "compile_repair.stuck",
+                        {
+                            "round_index": round_label,
+                            "signature": signature[:300],
+                            "consecutive_count": len(tail),
+                        },
+                    )
+                    break
             # Loop continues — next iteration re-runs compile_gate.
 
         if compile_passed:
@@ -7537,6 +8742,46 @@ class PrimaryOrchestrator:
                     "=== END FIRST ATTEMPT ===\n\n"
                 )
 
+            # v16.0 (2026-05-12) F1: explicit protected-symbols list. The
+            # diff text alone in first_attempt_section gets lost inside
+            # 6KB of context — repair LLMs read it but still strip the
+            # feature-defining identifiers (a34a94b5: MapView, showMap,
+            # Geocoder all dropped). Pull the load-bearing symbols out
+            # and surface them as a top-line constraint.
+            protected_symbols_section = ""
+            protected_symbols: list[str] = []
+            if first_attempt_diff:
+                acceptance_patterns: list[str] = []
+                try:
+                    acc_tests = list(getattr(plan, "acceptance_tests", []) or [])
+                    for t in acc_tests:
+                        if isinstance(t, dict):
+                            p = t.get("pattern")
+                        else:
+                            p = getattr(t, "pattern", None)
+                        if isinstance(p, str) and p.strip():
+                            acceptance_patterns.append(p)
+                except Exception:  # noqa: BLE001
+                    pass
+                protected_symbols = _extract_protected_symbols(
+                    first_attempt_diff,
+                    rel_path,
+                    acceptance_patterns=acceptance_patterns,
+                )
+                if protected_symbols:
+                    protected_symbols_section = (
+                        "PROTECTED SYMBOLS (v16.0 — F1 intent preservation):\n"
+                        "These identifiers were added by the FIRST attempt and "
+                        "define the feature the user asked for. Your repair "
+                        "MUST keep all of them present in the post-patch file. "
+                        "Fix the compile errors by adjusting surrounding code "
+                        "(or replacing broken API calls with correct ones from "
+                        "the library contract above) — do NOT delete any of "
+                        "these:\n"
+                        + "\n".join(f"  - {s}" for s in protected_symbols)
+                        + "\n\n"
+                    )
+
             objective_section = (
                 "ORIGINAL TASK OBJECTIVE:\n"
                 f"- Objective: {_truncate_text(getattr(plan, 'objective', ''), limit=1000)}\n"
@@ -7558,6 +8803,36 @@ class PrimaryOrchestrator:
                 allowed_paths=allowed_paths,
                 sandbox_dir=sandbox_dir,
             )
+
+            # T-TYPE-AWARE-COMPILE-REPAIR-V1 (2026-05-11): classify the
+            # compile error into a structured hint BEFORE the generic
+            # repair guidance. Catches type mismatches (the v13 OSMDroid
+            # IGeoPoint vs GeoPoint case) that previously dragged the
+            # repair loop through 3+ futile rounds because the LLM only
+            # saw raw compiler text and "fixed" the wrong layer (e.g.
+            # ripping out the import).
+            classified_hint_section = ""
+            try:
+                from app.services.compile_error_classifier import classify
+
+                _line = err.get("line") or 0
+                try:
+                    _line_int = int(_line)
+                except (TypeError, ValueError):
+                    _line_int = 0
+                classified = classify(
+                    str(error_msg),
+                    file=rel_path,
+                    line=_line_int,
+                )
+                if classified.kind != "unknown" and classified.repair_hint:
+                    classified_hint_section = (
+                        "STRUCTURED COMPILE ERROR ANALYSIS (T-TYPE-AWARE-V1):\n"
+                        + classified.repair_hint
+                        + "\n"
+                    )
+            except Exception:  # noqa: BLE001
+                pass
 
             unresolved_lock_rules = ""
             if "unresolved reference" in str(error_msg).lower():
@@ -7617,6 +8892,8 @@ class PrimaryOrchestrator:
             repair_prompt = (
                 f"STRUCTURAL REPAIR TASK - fix ONE broken file: {rel_path}\n\n"
                 + objective_section
+                + protected_symbols_section
+                + classified_hint_section
                 + symbol_verifier_section
                 + "These compile errors must be fixed without changing task scope.\n"
                 + scope_section
@@ -7760,14 +9037,65 @@ class PrimaryOrchestrator:
                     baseline_content=orig_content,
                     threshold=intent_threshold,
                 )
-                if intent_dropped:
+                # v16.0 (2026-05-12) F2: symbol-level check that
+                # complements the line-ratio gate. The line-ratio passes
+                # when repair keeps enough Spacer/Button filler even if
+                # the actual feature-defining identifiers (a34a94b5:
+                # MapView/showMap/Geocoder) are gone. Compute symbol-level
+                # drops from the protected list we built for F1 — if any
+                # of those are missing post-repair, treat as intent drop
+                # even when the line ratio is happy.
+                protected_dropped: list[str] = []
+                if protected_symbols:
+                    # Approximate post-repair file content. We don't fully
+                    # apply the diff in-memory; we use a conservative
+                    # heuristic: post = broken_content - removed_lines +
+                    # added_lines. This will only false-positive when a
+                    # symbol existed in multiple places and only one was
+                    # touched (then it's present elsewhere and survives).
+                    removed_repair_lines = _changed_lines_from_diff(
+                        repair_diff, rel_path, "-"
+                    )
+                    added_repair_lines = _changed_lines_from_diff(
+                        repair_diff, rel_path, "+"
+                    )
+                    post_repair_approx = broken_content
+                    for rl in removed_repair_lines:
+                        if rl:
+                            post_repair_approx = post_repair_approx.replace(rl, "")
+                    post_repair_approx = (
+                        post_repair_approx + "\n" + "\n".join(added_repair_lines)
+                    )
+                    protected_dropped = _repair_dropped_protected_symbols(
+                        protected=protected_symbols,
+                        repaired_file_content=post_repair_approx,
+                    )
+
+                if intent_dropped or protected_dropped:
                     intent_payload = {
                         "file": rel_path,
                         "intent_preservation_ratio": round(intent_ratio, 3),
                         "threshold": intent_threshold,
                         "intent_line_count": intent_count,
+                        # F2 additions:
+                        "protected_symbols_total": len(protected_symbols),
+                        "protected_symbols_dropped": protected_dropped,
+                        "trigger": (
+                            "line_ratio" if intent_dropped and not protected_dropped
+                            else "symbols" if protected_dropped and not intent_dropped
+                            else "both"
+                        ),
                     }
                     pipeline_state["compile_repair_intent_dropped"] = intent_payload
+                    msg_extra = ""
+                    if protected_dropped:
+                        msg_extra = (
+                            f" Protected symbols dropped: "
+                            f"{', '.join(protected_dropped[:5])}"
+                            + (f" (+{len(protected_dropped)-5} more)"
+                               if len(protected_dropped) > 5 else "")
+                            + "."
+                        )
                     record_event(
                         self.db,
                         task_id=task.id,
@@ -7779,6 +9107,7 @@ class PrimaryOrchestrator:
                         message=(
                             f"Repair for {rel_path} dropped first-attempt intent "
                             f"({intent_ratio:.0%} preserved; threshold {intent_threshold:.0%})."
+                            + msg_extra
                         ),
                         payload=intent_payload,
                     )
@@ -7800,26 +9129,44 @@ class PrimaryOrchestrator:
                         repair_diff=repair_diff,
                         baseline_content=orig_content,
                     )
-                    if dropped_lines and not pipeline_state.get(
-                        f"compile_repair_intent_retry_{rel_path}"
+                    # F2 retry condition: ANY drop signal (lines OR
+                    # protected symbols) should trigger the second-chance
+                    # path. Today's a34a94b5 had line ratio ≥ threshold
+                    # but lost MapView/showMap/Geocoder — that wouldn't
+                    # have hit the old `if dropped_lines` gate.
+                    if (
+                        (dropped_lines or protected_dropped)
+                        and not pipeline_state.get(
+                            f"compile_repair_intent_retry_{rel_path}"
+                        )
                     ):
                         pipeline_state[f"compile_repair_intent_retry_{rel_path}"] = True
                         feedback_lines = "\n".join(
-                            f"  - {line[:200]}" for line in dropped_lines[:15]
-                        )
+                            f"  - {line[:200]}" for line in (dropped_lines or [])[:15]
+                        ) or "  (no specific line drops detected)"
+                        symbol_feedback = ""
+                        if protected_dropped:
+                            symbol_feedback = (
+                                "Symbols that DISAPPEARED from the file and MUST "
+                                "be restored:\n"
+                                + "\n".join(f"  - {s}" for s in protected_dropped[:15])
+                                + "\n\n"
+                            )
                         retry_prompt = (
                             repair_prompt
                             + "\n\n## INTENT-DROP RETRY GUIDANCE (you MUST read this) ##\n"
-                            "Your previous repair attempt deleted these specific lines "
+                            "Your previous repair attempt deleted lines / symbols "
                             "from the first-attempt diff that implement the user's "
-                            "requested feature:\n"
+                            "requested feature.\n\n"
+                            + symbol_feedback +
+                            "Specific lines that were dropped:\n"
                             f"{feedback_lines}\n\n"
-                            "Your repair MUST keep these lines in the post-patch file. "
-                            "Only modify the specific line(s) that contain the "
-                            "Unresolved-reference compile error. If a referenced symbol "
-                            "doesn't exist, RENAME it to a real one (or restore an "
-                            "existing one) — do NOT delete the surrounding "
-                            "feature-implementing lines.\n"
+                            "Your repair MUST keep these symbols/lines in the post-"
+                            "patch file. Only modify the specific line(s) that "
+                            "contain the Unresolved-reference compile error. If a "
+                            "referenced symbol doesn't exist, RENAME it to a real "
+                            "one (or restore an existing one) — do NOT delete the "
+                            "surrounding feature-implementing lines.\n"
                         )
                         try:
                             retry_payload = {
@@ -8020,6 +9367,71 @@ class PrimaryOrchestrator:
             )
             return ""
 
+    # v15 demo patch (2026-05-11) — TEMPORARY project-level library
+    # constraints. Each entry tells codegen which libraries the project
+    # already ships, so the model doesn't reach for a similarly-named
+    # alternative that isn't installed (the v15 P69-19 smoke regression:
+    # DeepSeek wrote ``com.google.android.gms.maps`` when the project
+    # only has OSMDroid, producing 56 unresolved imports).
+    #
+    # This is a stop-gap to unblock demo runs while v16 builds the
+    # automatic dependency-fingerprint pipeline. Delete this dict +
+    # ``_project_library_constraint`` when v16's
+    # ``T-DEPENDENCY-FINGERPRINT`` + ``T-CODEGEN-LIBRARY-CONSTRAINTS``
+    # land; the inventory will be derived from build.gradle /
+    # package.json / requirements.txt at runtime instead of hardcoded.
+    _PROJECT_LIBRARY_CONSTRAINTS: dict[str, str] = {
+        "handymanapp": (
+            "PROJECT LIBRARY CONSTRAINT (HandymanApp / Android):\n"
+            "- Map and location features in this project use OSMDroid. "
+            "Prefer imports under `org.osmdroid.*` (e.g. "
+            "`org.osmdroid.views.MapView`, `org.osmdroid.util.GeoPoint`).\n"
+            "- Do NOT introduce Google Maps SDK imports such as "
+            "`com.google.android.gms.maps.*` or `com.google.android.libraries.maps.*` "
+            "— that dependency is NOT in build.gradle and will fail "
+            "compilation with unresolved references.\n"
+            "- For reverse / forward geocoding use `android.location.Geocoder` "
+            "(stdlib). Run Geocoder calls off the main thread "
+            "(`withContext(Dispatchers.IO)`) — the API blocks the network.\n"
+            "- OSMDroid common type contracts: `Marker.position` expects "
+            "`org.osmdroid.util.GeoPoint`; a `setOnMapClickListener` "
+            "callback receives `org.osmdroid.api.IGeoPoint`, so wrap with "
+            "`GeoPoint(actual.latitude, actual.longitude)` before "
+            "assigning to `Marker.position`."
+        ),
+    }
+
+    @classmethod
+    def _project_library_constraint(cls, source_name: object) -> str:
+        """Look up the project-level library constraint string for the
+        active knowledge source. Returns empty string when no constraint
+        is registered, so callers can `if constraint: directives.append`
+        without further branching.
+
+        v16.0 (2026-05-12): prefers the structured library cards under
+        ``apps/backend/data/library_cards/*.yaml`` (see
+        ``app.services.library_cards``). The cards carry per-class facts
+        the model commonly hallucinates (e.g. OSMDroid MapView does NOT
+        have ``setOnMapClickListener`` — use MapEventsOverlay), forbidden
+        imports for conflicting libraries, and canonical idioms. Falls
+        back to the v15 hand-written ``_PROJECT_LIBRARY_CONSTRAINTS`` dict
+        when no matching card exists, so projects without a card don't
+        suddenly lose their constraint hint.
+        """
+        if not isinstance(source_name, str):
+            return ""
+        key = source_name.strip().lower()
+        if not key:
+            return ""
+        try:
+            from app.services.library_cards import format_cards_for_project
+            card_text = format_cards_for_project(key)
+        except Exception:  # noqa: BLE001
+            card_text = ""
+        if card_text:
+            return card_text
+        return cls._PROJECT_LIBRARY_CONSTRAINTS.get(key, "")
+
     def _build_codegen_task_description(
         self,
         *,
@@ -8063,6 +9475,17 @@ class PrimaryOrchestrator:
                     "provided below. Do NOT generate diffs for files you "
                     "cannot see."
                 )
+
+        # v15 demo patch (2026-05-11) — project-level library constraint.
+        # TEMPORARY: this is a per-project hint to keep the v15 demo run
+        # clean while v16 builds the proper Library-Aware Codegen pipeline
+        # (T-DEPENDENCY-FINGERPRINT + T-CODEGEN-LIBRARY-CONSTRAINTS +
+        # T-IMPORT-DEPENDENCY-GATE). When v16 lands, the auto-derived
+        # dependency inventory replaces this entire block and the
+        # PROJECT_LIBRARY_CONSTRAINTS dict should be deleted.
+        project_constraint = self._project_library_constraint(task.source_name)
+        if project_constraint:
+            directives.append(project_constraint)
 
         # Per-file parallel codegen: when batch has exactly 1 target file, add
         # a hard scope-lock directive. Otherwise CLI agents in worktree mode
@@ -8825,6 +10248,34 @@ class PrimaryOrchestrator:
                 payload={"error": str(exc)[:5000]},
             )
 
+        # v15 Ticket 6 (2026-05-11): warnings + hard_gates summary for
+        # the approval payload. ``warnings`` is a structured list the
+        # frontend can render as banners; ``hard_gates`` lets approvers
+        # see at-a-glance which quality gates actually evaluated. We
+        # specifically surface ``semantic_review_unavailable`` here so a
+        # human reviewer never approves the Jira transition without
+        # knowing the reviewer LLM couldn't parse its own output.
+        # TODO(v16): when ``develop_require_jira_approval=False`` the
+        # task currently goes straight to COMPLETED; semantic_review
+        # unavailable should be honoured via a policy-driven force-
+        # approval path. Left as v16 to keep v15 scope tight.
+        warnings: list[dict[str, str]] = []
+        sr_state = pipeline_state.get("semantic_review")
+        sr_payload_for_approval: dict | None = None
+        if isinstance(sr_state, dict) and sr_state.get("status") == "unavailable":
+            sr_payload_for_approval = dict(sr_state)
+            warnings.append(
+                {
+                    "kind": "semantic_review_unavailable",
+                    "message": (
+                        "Semantic review was unavailable due to "
+                        f"{sr_state.get('unavailable_reason') or sr_state.get('reason') or 'invalid_json'}. "
+                        "Human review is required before merge."
+                    ),
+                }
+            )
+        hard_gates = self._summarize_hard_gates(pipeline_state)
+
         preview_result = {
             "scenario": "jira_issue_develop",
             "issue_key": issue_key,
@@ -8840,7 +10291,39 @@ class PrimaryOrchestrator:
             "reservations": reservations,                      # back-compat plain text list
             "reservations_detailed": reservations_detailed,    # [{text, severity, auto_fixable, blocking}]
             "evidence_chain": evidence_chain_payload,
+            "hard_gates": hard_gates,
+            "warnings": warnings,
         }
+        if sr_payload_for_approval is not None:
+            preview_result["semantic_review"] = sr_payload_for_approval
+
+        approval_reason = (
+            "Code changes passed spec conformance and goal attestation. "
+            "Manual approval required before transitioning the Jira issue."
+        )
+        if sr_payload_for_approval is not None:
+            approval_reason = (
+                "Hard validation gates passed but semantic review was "
+                f"unavailable ({sr_payload_for_approval.get('unavailable_reason') or 'invalid_json'}). "
+                "Human review required before transitioning the Jira issue."
+            )
+
+        approval_request_payload: dict = {
+            "stage": "post_codegen_pre_jira_transition",
+            "scenario": "jira_issue_develop",
+            "issue_key": issue_key,
+            "summary_markdown": summary_md,
+            "files_changed": list(files_changed),
+            "diff": diff,
+            "review_verdict": review_result.get("verdict"),
+            "conformance_report": pipeline_state.get("conformance_report"),
+            "goal_attestation": attestation,
+            "evidence_chain": evidence_chain_payload,
+            "hard_gates": hard_gates,
+            "warnings": warnings,
+        }
+        if sr_payload_for_approval is not None:
+            approval_request_payload["semantic_review"] = sr_payload_for_approval
 
         approval = Approval(
             task_id=task.id,
@@ -8851,22 +10334,8 @@ class PrimaryOrchestrator:
             requested_by_actor_name=task.actor_name,
             risk_level=task.risk_level,
             risk_category=task.risk_category,
-            reason=(
-                "Code changes passed spec conformance and goal attestation. "
-                "Manual approval required before transitioning the Jira issue."
-            ),
-            request_payload_json={
-                "stage": "post_codegen_pre_jira_transition",
-                "scenario": "jira_issue_develop",
-                "issue_key": issue_key,
-                "summary_markdown": summary_md,
-                "files_changed": list(files_changed),
-                "diff": diff,
-                "review_verdict": review_result.get("verdict"),
-                "conformance_report": pipeline_state.get("conformance_report"),
-                "goal_attestation": attestation,
-                "evidence_chain": evidence_chain_payload,
-            },
+            reason=approval_reason,
+            request_payload_json=approval_request_payload,
             policy_snapshot_json={
                 "decision": "require_approval",
                 "source": "develop_post_conformance_gate",
@@ -9092,6 +10561,137 @@ class PrimaryOrchestrator:
         )
         self._run_failure_diagnosis(task, failure_kind="compile_repair_cap_exceeded")
         commit_checkpoint(self.db, label="awaiting_approval_compile_repair_cap")
+
+    def _request_plan_codegen_conflict_approval(
+        self,
+        *,
+        task: Task,
+        plan: GeneratedPlan,
+        pipeline_state: dict[str, object],
+        verdict: object,
+    ) -> None:
+        """v15 Ticket 2B: park the task in AWAITING_APPROVAL when the
+        planner marked one or more files as must_touch but codegen
+        returned verified NO_CHANGE_NEEDED for them.
+
+        This is NOT a model failure — codegen gave honest evidence that
+        the file already implements the requested behavior. Only a human
+        can decide whether the plan was over-scoped (drop the file from
+        must_touch) or the codegen interpretation is too shallow (force
+        the patch anyway). Either outcome is legitimate; the system must
+        not pretend success.
+        """
+        verdict_payload = (
+            verdict.to_payload() if hasattr(verdict, "to_payload") else {}
+        )
+        conflicts = verdict_payload.get("conflicts") or []
+        conflict_files = [
+            str(c.get("file_path") or "")
+            for c in conflicts
+            if isinstance(c, dict)
+        ]
+        summary = str(verdict_payload.get("summary") or "")
+        message = (
+            "Plan/codegen conflict detected. "
+            f"{len(conflict_files)} must_touch file(s) returned verified "
+            "NO_CHANGE_NEEDED. Reviewer can: (a) accept and drop them "
+            "from must_touch; (b) reject the no-change verdict and "
+            "force a patch attempt; (c) re-plan the scope."
+        )
+
+        approval_payload = {
+            "decision": "plan_codegen_conflict",
+            "conflict_files": conflict_files,
+            "summary": summary,
+            "verdict": verdict_payload,
+            "message": message,
+        }
+
+        approval = Approval(
+            task_id=task.id,
+            action_name="plan_codegen_conflict",
+            status=ApprovalStatus.PENDING,
+            requested_by_role=RoleName.REVIEWER,
+            approver_role=ActorRole.TEAM_LEAD.value,
+            requested_by_actor_name=task.actor_name,
+            risk_level=task.risk_level,
+            risk_category=task.risk_category,
+            reason=(
+                "Planner and codegen disagree on whether the listed "
+                "file(s) need modification; human approval required."
+            ),
+            request_payload_json=approval_payload,
+            policy_snapshot_json={
+                "decision": "require_approval",
+                "source": "develop_plan_codegen_conflict",
+                "tool_name": "plan_codegen_conflict",
+                "actor_name": task.actor_name,
+                "actor_role": task.actor_role.value,
+                "risk_level": task.risk_level.value,
+                "risk_category": task.risk_category.value,
+                "required_approver_role": ActorRole.TEAM_LEAD.value,
+            },
+        )
+        self.db.add(approval)
+        self.db.flush()
+
+        pipeline_state["pending_plan_codegen_conflict_approval_id"] = approval.id
+        pipeline_state["plan_codegen_conflict"] = True
+        self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+
+        task.pending_approval = True
+        task.latest_result_json = {
+            "status": TaskStatus.AWAITING_APPROVAL.value,
+            "message": message,
+            "approval_id": approval.id,
+            "result": approval_payload,
+            "pipeline_state": pipeline_state,
+        }
+        self._write_task_checkpoint(
+            task,
+            stage="awaiting_approval",
+            output_payload=self._task_checkpoint_payload(
+                task,
+                approval_id=approval.id,
+                pipeline_state=pipeline_state,
+                plan_json=task.plan_json,
+            ),
+        )
+
+        set_task_status(
+            self.db,
+            task=task,
+            new_status=TaskStatus.AWAITING_APPROVAL,
+            new_stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            source=EventSource.ORCHESTRATOR,
+            message="Awaiting human approval: plan/codegen conflict on must_touch file(s).",
+        )
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.APPROVAL_REQUESTED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            tool_name="plan_codegen_conflict",
+            message="Approval requested for plan/codegen conflict.",
+            payload={
+                "approval_id": approval.id,
+                "action_name": approval.action_name,
+                "approver_role": approval.approver_role,
+                "conflict_files": conflict_files,
+            },
+        )
+        self._workspace_append_audit(
+            task,
+            "plan_codegen_conflict",
+            {
+                "approval_id": approval.id,
+                "conflict_files": conflict_files,
+            },
+        )
+        commit_checkpoint(self.db, label="awaiting_approval_plan_codegen_conflict")
 
     def _request_semantic_review_approval(
         self,

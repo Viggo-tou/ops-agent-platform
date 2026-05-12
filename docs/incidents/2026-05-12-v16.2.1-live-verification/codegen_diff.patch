@@ -1,0 +1,113 @@
+diff --git a/app/src/main/java/com/example/handyman/customer_pages/CustomerKYCAddressForm.kt b/app/src/main/java/com/example/handyman/customer_pages/CustomerKYCAddressForm.kt
+--- a/app/src/main/java/com/example/handyman/customer_pages/CustomerKYCAddressForm.kt
++++ b/app/src/main/java/com/example/handyman/customer_pages/CustomerKYCAddressForm.kt
+@@ -28,6 +28,7 @@
+ import com.example.handyman.utils.SessionManager
+ import com.google.firebase.database.FirebaseDatabase
+ import android.widget.Toast
++import java.util.Locale
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+@@ -61,7 +62,7 @@
+     var longitude by remember { mutableStateOf(0.0) }
+     var mapViewRef by remember { mutableStateOf<MapView?>(null) }
+     val coroutineScope = rememberCoroutineScope()
+-    val geocoder = remember { Geocoder(context) }
++    val geocoder = remember { Geocoder(context, Locale.getDefault()) }
+ 
+     fun reverseGeocode(lat: Double, lng: Double) {
+         coroutineScope.launch(Dispatchers.IO) {
+diff --git a/app/src/main/java/com/example/handyman/customer_pages/CustomerSignup.kt b/app/src/main/java/com/example/handyman/customer_pages/CustomerSignup.kt
+
+--- a/app/src/main/java/com/example/handyman/customer_pages/CustomerSignup.kt
++++ b/app/src/main/java/com/example/handyman/customer_pages/CustomerSignup.kt
+@@ -31,6 +31,18 @@
+ 
+ import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.foundation.verticalScroll
++import android.location.Geocoder
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import org.osmdroid.config.Configuration
++import org.osmdroid.events.MapEventsOverlay
++import org.osmdroid.events.MapEventsReceiver
++import org.osmdroid.tileprovider.tilesource.TileSourceFactory
++import org.osmdroid.util.GeoPoint
++import org.osmdroid.views.MapView
++import org.osmdroid.views.overlay.Marker
++import androidx.compose.ui.viewinterop.AndroidView
++import androidx.preference.PreferenceManager
+ 
+ @Composable
+ fun CustomerSignup(modifier: Modifier = Modifier, navController: NavController) {
+@@ -42,6 +54,8 @@
+     var email by remember { mutableStateOf("") }
+     var password by remember { mutableStateOf("") }
+     var confirmPassword by remember { mutableStateOf("") }
++    var selectedLatitude by remember { mutableStateOf(0.0) }
++    var selectedLongitude by remember { mutableStateOf(0.0) }
+ 
+     var passwordVisible by remember { mutableStateOf(false) }
+     var confirmPasswordVisible by remember { mutableStateOf(false) }
+@@ -153,6 +167,49 @@
+             modifier = Modifier.fillMaxWidth()
+         )
+ 
++        val coroutineScope = rememberCoroutineScope()
++        AndroidView(
++            modifier = Modifier.fillMaxWidth().height(250.dp),
++            factory = { ctx ->
++                Configuration.getInstance().load(ctx, PreferenceManager.getDefaultSharedPreferences(ctx))
++                Configuration.getInstance().userAgentValue = ctx.packageName
++
++                MapView(ctx).apply {
++                    setTileSource(TileSourceFactory.MAPNIK)
++                    setMultiTouchControls(true)
++                    val mapView = this
++                    val mapEventsOverlay = MapEventsOverlay(object : MapEventsReceiver {
++                        override fun singleTapConfirmedHelper(p: GeoPoint?): Boolean {
++                            p?.let {
++                                selectedLatitude = it.latitude
++                                selectedLongitude = it.longitude
++                                val marker = Marker(this@apply).apply {
++                                    position = GeoPoint(it.latitude, it.longitude)
++                                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
++                                }
++                                mapView.overlays.clear()
++                                mapView.overlays.add(marker)
++                                coroutineScope.launch(Dispatchers.IO) {
++                                    try {
++                                        val geocoder = Geocoder(ctx, Locale.getDefault())
++                                        val addresses = geocoder.getFromLocation(it.latitude, it.longitude, 1)
++                                        if (!addresses.isNullOrEmpty()) {
++                                            // address retrieved, could update form fields but not in scope
++                                        }
++                                    } catch (e: Exception) {
++                                        // ignore
++                                    }
++                                }
++                            }
++                            return true
++                        }
++                        override fun longPressHelper(p: GeoPoint?): Boolean = false
++                    })
++                    this.overlays.add(mapEventsOverlay)
++                }
++            }
++        )
++
+         Spacer(modifier = Modifier.height(24.dp))
+ 
+         Button(
+@@ -180,8 +237,8 @@
+                     "city" to "",
+                     "country" to "",
+                     "postcode" to "",
+-                    "latitude" to 0.0,
+-                    "longitude" to 0.0,
++                    "latitude" to selectedLatitude,
++                    "longitude" to selectedLongitude,
+                     "notes" to "",
+                     "status" to "Pending",
+                     "approvedBy" to "",
