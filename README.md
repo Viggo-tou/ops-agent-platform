@@ -8,6 +8,8 @@ A human-in-the-loop LLM coding agent platform with a structural verification har
 
 ![Pipeline event timeline — codegen batches running in parallel, harness gates evaluating, a failure caught and routed into the repair loop](docs/screenshots/pipeline-event-timeline.png)
 
+▶️ **[Watch the 3-minute demo on LinkedIn](https://www.linkedin.com/posts/viggo-tao-24732740a_tired-of-llm-agents-renaming-a-variable-and-ugcPost-7459855795464155137-XvaE)** — a real Jira ticket walks through plan, codegen, gates, approval, and a before / after of the Android app.
+
 ## Problem
 
 LLM coding agents often claim a feature is complete when the patch only implements a small part of the requirement. They satisfy literal signals (one regex match, one keyword) while missing the actual user-visible behavior.
@@ -160,7 +162,7 @@ Each class has a corresponding gate that fails closed, so a gate crash never sil
 
 ## Status
 
-MVP / active development. Demo video coming soon. Open to feedback and recruiter conversations.
+MVP / active development. Open to feedback and recruiter conversations.
 
 ## License
 
