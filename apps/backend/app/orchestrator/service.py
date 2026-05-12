@@ -3865,6 +3865,41 @@ class PrimaryOrchestrator:
             if memory_context:
                 _plan_json_for_codegen["memory_context"] = memory_context
 
+            # T-LEARNING-LOOP-V1 Phase 3 — codegen failure-memory injection.
+            # Computed ONCE here (main thread) so each parallel worker
+            # gets the same directive without re-querying memory, and so
+            # the audit event fires before any worker writes to DB.
+            _codegen_warning, _codegen_warning_audit = (
+                self._build_codegen_failure_warnings(task=task, plan=plan)
+            )
+            if _codegen_warning and _codegen_warning_audit:
+                pipeline_state["codegen_failure_warnings"] = _codegen_warning
+                try:
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_SUCCEEDED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.ACTION,
+                        role=RoleName.ACTION,
+                        tool_name="codegen.failure_memory_injected",
+                        message=(
+                            f"Injected {len(_codegen_warning_audit)} prior failure "
+                            "observation(s) into codegen prompt as risk warnings."
+                        ),
+                        payload={
+                            "count": len(_codegen_warning_audit),
+                            "memory_ids": [r["memory_id"] for r in _codegen_warning_audit],
+                            "rows": _codegen_warning_audit,
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "codegen.failure_memory_injected event emit failed "
+                        "(non-fatal): %s",
+                        exc,
+                    )
+
             parallel_max = getattr(
                 self.tool_gateway.settings, "codegen_parallel_max", 2
             )
@@ -9711,6 +9746,143 @@ class PrimaryOrchestrator:
             return card_text
         return cls._PROJECT_LIBRARY_CONSTRAINTS.get(key, "")
 
+    # ----- T-LEARNING-LOOP-V1 Phase 3 — codegen failure-memory injection ---
+    #
+    # Like the planner-side helper in PrimaryAgentPlanner, but tighter:
+    #   - top_k = 1 (codegen prompts are token-bounded; one strong row beats
+    #     three diluted ones)
+    #   - scope narrowed to codegen-actionable gates only
+    #     (gate:acceptance_check, gate:must_touch). gate:compile_repair is
+    #     EXCLUDED because the codegen prompt cannot do anything about
+    #     repair-loop liveness — that warning belongs to the planner.
+    #   - prompt_context = 'codegen_warning' — rows whose whitelist lacks
+    #     this label (e.g. legacy planner-only rows) are filtered out.
+    #
+    # Returns ``(directive_text, audit_payload)``. Empty tuple when the
+    # pool has no matching row.
+
+    _CODEGEN_SCOPE_ALLOWLIST = (
+        "gate:acceptance_check",
+        "gate:must_touch",
+        "gate:contract_coverage",
+    )
+
+    def _build_codegen_failure_warnings(
+        self,
+        *,
+        task: Task,
+        plan: GeneratedPlan,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Return (directive_text, audit_payload) for codegen prompt injection.
+
+        Audit payload = list of {memory_id, failure_class, task_family,
+        trust_level, score} for the orchestrator to record one
+        ``codegen.failure_memory_injected`` event at the main-thread
+        boundary (before any worker thread fires).
+        """
+        try:
+            from app.services.failure_classifier import detect_task_family
+            from app.services.memory import MemoryService
+
+            plan_dict = task.plan_json if isinstance(task.plan_json, dict) else {}
+            inferred_family = detect_task_family(
+                request_text=task.request_text or "",
+                plan_json=plan_dict,
+            )
+            if not inferred_family:
+                return "", []
+
+            svc = MemoryService(self.db)
+            candidates: list[Any] = []
+            for scope in self._CODEGEN_SCOPE_ALLOWLIST:
+                rows = svc.query(
+                    scope=scope,
+                    memory_kind="failure_observation",
+                    prompt_context="codegen_warning",
+                    text_hint=(task.request_text or "")[:200],
+                    top_n=5,
+                )
+                # Strict family filter — codegen is too tight to absorb
+                # cross-family noise.
+                for r in rows:
+                    if r.task_family == inferred_family:
+                        candidates.append(r)
+            if not candidates:
+                return "", []
+
+            # Dedup + simple rank: prefer human_confirmed over auto,
+            # then more recent. (No keyword/scope weighting — at top_k=1
+            # the highest-trust row wins.)
+            seen: set[str] = set()
+            unique: list[Any] = []
+            trust_rank = {"verified": 3, "human_confirmed": 2, "auto_classified": 1}
+            for m in candidates:
+                if m.id in seen:
+                    continue
+                seen.add(m.id)
+                unique.append(m)
+            unique.sort(
+                key=lambda m: (
+                    trust_rank.get(m.trust_level or "", 0),
+                    m.created_at or 0,
+                ),
+                reverse=True,
+            )
+            top = unique[:1]
+
+            audit = [{
+                "memory_id": m.id,
+                "failure_class": m.failure_class,
+                "task_family": m.task_family,
+                "trust_level": m.trust_level,
+                "score": float(trust_rank.get(m.trust_level or "", 0)),
+            } for m in top]
+
+            # Concrete patterns from evidence_refs when available — the
+            # whole point of codegen-side injection is to surface SPECIFIC
+            # symbols the previous diff omitted. Fall back to the lesson
+            # text when missing_patterns isn't populated.
+            m = top[0]
+            concrete: list[str] = []
+            evidence = m.evidence_refs if isinstance(m.evidence_refs, dict) else {}
+            for entry in evidence.get("missing_patterns") or []:
+                if isinstance(entry, dict) and entry.get("pattern"):
+                    concrete.append(str(entry["pattern"]))
+                elif isinstance(entry, str):
+                    concrete.append(entry)
+            for f in evidence.get("missing_files") or []:
+                if isinstance(f, str):
+                    concrete.append(f)
+
+            directive_lines = [
+                "PRIOR FAILURE WARNING (auto-retrieved from agent_memory):",
+                (
+                    f"On a previous task in this family ({m.task_family}) "
+                    f"the diff failed at {m.scope}: {m.failure_class}."
+                ),
+            ]
+            if concrete:
+                directive_lines.append("Concretely missing from the previous diff:")
+                for c in concrete[:6]:
+                    directive_lines.append(f"  - {c}")
+                directive_lines.append(
+                    "Your diff MUST introduce these as ADDED LINES "
+                    "(not just imports / comments). Match the structural "
+                    "patterns above as literal code in the added hunks."
+                )
+            else:
+                directive_lines.append("Lesson: " + (m.resolution or "")[:300])
+            directive_lines.append(
+                "Treat this as a hard risk warning, not a verified fix recipe — "
+                "the previous run was a different task."
+            )
+            return "\n".join(directive_lines), audit
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "codegen failure-memory retrieval failed (non-fatal): %s", exc
+            )
+            return "", []
+
     def _build_codegen_task_description(
         self,
         *,
@@ -9813,6 +9985,14 @@ class PrimaryOrchestrator:
                     "spec-conformance gate for these reasons — " + joined +
                     ". Address each reason in this attempt."
                 )
+
+        # T-LEARNING-LOOP-V1 Phase 3: codegen failure-memory warning.
+        # Computed once at the main-thread boundary (in the codegen
+        # stage entry) and stashed in pipeline_state so every parallel
+        # worker reads the same directive without re-querying memory.
+        codegen_warning = pipeline_state.get("codegen_failure_warnings")
+        if isinstance(codegen_warning, str) and codegen_warning.strip():
+            directives.append(codegen_warning)
 
         if not directives:
             return original
