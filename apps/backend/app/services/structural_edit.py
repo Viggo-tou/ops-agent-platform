@@ -286,6 +286,19 @@ def apply_kotlin_diagnostic_fast_fixes(
         elif content != before:
             applied.append("qualify_marker_receiver_in_mapview_apply")
 
+    if _should_repair_mapview_receiver_in_mapview_apply(error_text, content):
+        before = content
+        content, err = _repair_mapview_receiver_in_mapview_apply(content)
+        if err:
+            errors.append(
+                StructuralEditError(
+                    err,
+                    operation="qualify_mapview_receiver_in_mapview_apply",
+                )
+            )
+        elif content != before:
+            applied.append("qualify_mapview_receiver_in_mapview_apply")
+
     if _should_repair_firebase_snapshot_children(error_text, content):
         before = content
         content, err, firebase_ops = _repair_firebase_task_shapes(content, line=line)
@@ -559,6 +572,17 @@ def _should_repair_marker_receiver_in_mapview_apply(error_text: str, content: st
     )
 
 
+def _should_repair_mapview_receiver_in_mapview_apply(error_text: str, content: str) -> bool:
+    lower = (error_text or "").lower()
+    if "unresolved reference" not in lower or "mapview" not in lower:
+        return False
+    return (
+        "MapView(" in content
+        and ".apply {" in content
+        and re.search(r"\bmapView\s*\.", content) is not None
+    )
+
+
 def _repair_nullable_geocoder_addresses(content: str) -> tuple[str, str]:
     pattern = re.compile(
         r"(?P<indent>^[ \t]*)if\s*\(\s*(?P<list>[A-Za-z_][A-Za-z0-9_]*)"
@@ -628,6 +652,26 @@ def _repair_marker_receiver_in_mapview_apply(content: str) -> tuple[str, str]:
     if count <= 0:
         return content, "no Marker(this) call found inside MapView apply"
     return new_content, ""
+
+
+def _repair_mapview_receiver_in_mapview_apply(content: str) -> tuple[str, str]:
+    lines = content.splitlines()
+    apply_re = re.compile(r"\bMapView\s*\([^)]*\)\s*\.apply\s*\{")
+    replacements = 0
+    for start_idx, raw in enumerate(lines):
+        if not apply_re.search(raw):
+            continue
+        end_line = _matching_brace_end(lines, start_idx + 1)
+        if end_line <= start_idx + 1:
+            continue
+        for idx in range(start_idx + 1, end_line):
+            new_line, count = re.subn(r"\bmapView\s*\.", "this@apply.", lines[idx])
+            if count:
+                lines[idx] = new_line
+                replacements += count
+    if replacements <= 0:
+        return content, "no mapView receiver reference found inside MapView apply"
+    return _join_like(content, lines), ""
 
 
 def _repair_missing_try_for_kotlin_catch(content: str, *, line: int = 0) -> tuple[str, str]:

@@ -525,6 +525,39 @@ fun make(context: Context) {
     assert "Marker(this)" not in result.content
 
 
+def test_kotlin_fast_fix_qualifies_mapview_receiver_inside_mapview_apply():
+    source = """\
+package com.example
+
+import org.osmdroid.views.MapView
+
+fun make(context: Context) {
+    MapView(context).apply {
+        overlays.add(MapEventsOverlay(object : MapEventsReceiver {
+            override fun singleTapConfirmedHelper(p: GeoPoint?): Boolean {
+                mapView.invalidate()
+                return true
+            }
+        }))
+    }
+}
+"""
+
+    result = apply_kotlin_diagnostic_fast_fixes(
+        file_path="Map.kt",
+        original_content=source,
+        error_text="Unresolved reference 'mapView'.",
+        line=9,
+        protected_symbols=["MapView", "invalidate"],
+    )
+
+    assert result is not None
+    assert result.ok, result.errors
+    assert "qualify_mapview_receiver_in_mapview_apply" in result.applied_operations
+    assert "this@apply.invalidate()" in result.content
+    assert "mapView.invalidate()" not in result.content
+
+
 def test_structural_plan_supports_firebase_snapshot_children_operation():
     source = """\
 package com.example
