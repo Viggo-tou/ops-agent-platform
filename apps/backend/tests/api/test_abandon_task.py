@@ -20,6 +20,7 @@ from app.main import app  # noqa: E402
 from app.models.base import Base  # noqa: E402
 from app.models.event import Event  # noqa: E402
 from app.models.task import Task  # noqa: E402
+from app.services import task_cancel  # noqa: E402
 
 
 @pytest.fixture()
@@ -36,6 +37,8 @@ def db_session() -> Session:
     try:
         yield session
     finally:
+        task_cancel.clear_cancel("task-executing")
+        task_cancel.clear_cancel("task-completed")
         session.close()
         Base.metadata.drop_all(bind=engine)
         engine.dispose()
@@ -95,6 +98,7 @@ def test_abandon_executing_task_marks_failed(client: TestClient, db_session: Ses
     ).all()
     assert len(events) == 1
     assert events[0].payload_json == {"reason": "abandoned_by_admin"}
+    assert task_cancel.is_cancelled(task.id)
 
 
 def test_abandon_completed_task_returns_400(client: TestClient, db_session: Session) -> None:
@@ -104,3 +108,4 @@ def test_abandon_completed_task_returns_400(client: TestClient, db_session: Sess
 
     assert response.status_code == 400
     assert "cannot abandon" in response.json()["detail"]
+    assert not task_cancel.is_cancelled(task.id)

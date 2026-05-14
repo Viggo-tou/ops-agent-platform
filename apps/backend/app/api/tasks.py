@@ -30,6 +30,7 @@ from app.schemas.event import EventRead
 from app.schemas.task import TaskCreateRequest, TaskDetail, TaskRollbackRequest, TaskSummary
 from app.schemas.tool import ToolExecutionRead
 from app.services.events import record_event, set_task_status
+from app.services import task_cancel
 from app.services.tasks import TaskService
 from app.services.task_workspace import TaskWorkspace
 
@@ -516,6 +517,7 @@ def abandon_task(
         payload={"reason": "abandoned_by_admin"},
     )
     db.commit()
+    task_cancel.request_cancel(task_id)
     return service.get_task(task_id, raise_if_missing=True)
 
 
