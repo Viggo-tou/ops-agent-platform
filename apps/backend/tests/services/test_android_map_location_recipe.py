@@ -271,3 +271,43 @@ def test_codegen_uses_recipe_before_agent_loop_or_provider_paths():
     assert result.files_changed == ["CustomerSignup.kt"]
     assert "+        AndroidView(" in result.diff
     assert result.contract_coverage is not None
+
+
+def test_codegen_recipe_handles_single_file_batch_with_global_must_touch_plan():
+    settings = SimpleNamespace(
+        codegen_agent_mode="static",
+        codegen_provider="deepseek",
+        primary_agent_provider="deepseek",
+        codegen_output_format="auto",
+        codegen_structural_kotlin_enabled=True,
+        deepseek_api_key="test",
+        deepseek_model="deepseek-test",
+        openai_api_key=None,
+        openai_base_url="https://api.openai.com/v1",
+    )
+    generator = CodeGenerator(settings)
+    generator._try_provider = lambda **_: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("provider path should not run for recipe batch")
+    )
+
+    result = generator.generate_patch(
+        task_id="task-p69-19-batch",
+        plan_json={
+            **PLAN,
+            "must_touch_files": [
+                "CustomerSignup.kt",
+                "HandymanSignup.kt",
+                "HandymanKYCAddressForm.kt",
+            ],
+            "allowed_paths": [
+                "CustomerSignup.kt",
+                "HandymanSignup.kt",
+                "HandymanKYCAddressForm.kt",
+            ],
+        },
+        context_files={"CustomerSignup.kt": SIGNUP_SOURCE},
+    )
+
+    assert result.provider_name == "harness:android_map_location_recipe"
+    assert result.files_changed == ["CustomerSignup.kt"]
+    assert "+        AndroidView(" in result.diff

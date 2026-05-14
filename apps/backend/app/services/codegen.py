@@ -1106,17 +1106,17 @@ class CodeGenerator:
             try_generate_android_map_location_recipe,
         )
 
-        context_by_norm = {
-            path.replace("\\", "/"): (path, content)
-            for path, content in context_files.items()
+        must_touch_norm = {
+            path.replace("\\", "/")
+            for path in (must_touch_files or [])
+            if str(path).strip()
         }
-        target_paths = must_touch_files or list(context_files.keys())
         targets: list[tuple[str, str]] = []
-        for path in target_paths:
-            item = context_by_norm.get(path.replace("\\", "/"))
-            if item is None:
-                return None
-            targets.append(item)
+        for path, content in context_files.items():
+            normalized = path.replace("\\", "/")
+            if must_touch_norm and normalized not in must_touch_norm:
+                continue
+            targets.append((path, content))
         if not targets:
             return None
 
