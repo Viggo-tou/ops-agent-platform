@@ -1770,14 +1770,24 @@ def _persist_task_intent_task_once(
     db: Session = SessionLocal()
     try:
         service = TaskService(db)
+        effective_request = message
+        if scenario != "process_question":
+            clean_summary = (summary or "").strip()
+            if clean_summary and clean_summary not in (message or ""):
+                effective_request = (
+                    f"{clean_summary}\n\nUser follow-up: {message}"
+                    if message
+                    else clean_summary
+                )
         payload = TaskCreateRequest(
             title=_truncate(summary or message, 200) or None,
-            request=message,
+            request=effective_request,
             actor_name=actor_name,
             actor_role=actor_role,
             session_id=session_id,
             previous_task_id=previous_task_id,
             source_name=source_name,
+            scenario_override=scenario,
         )
         task = service.create_task(payload)
         return task.id
