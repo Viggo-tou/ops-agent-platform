@@ -782,6 +782,25 @@ class CodeGenerator:
         must_touch_files, expected_new_files, allowed_paths = self._extract_plan_target_paths(plan_json)
         enforce = bool(allowed_paths)
 
+        recipe_result = self._try_android_map_location_recipe_codegen(
+            plan_json=plan_json,
+            context_files=context_files,
+            task_description=task_description,
+            source_repo_path=source_repo_path,
+            must_touch_files=must_touch_files,
+            expected_new_files=expected_new_files,
+        )
+        if recipe_result is not None:
+            if enforce:
+                self._validate_diff_paths_within_allowed(
+                    recipe_result.diff,
+                    recipe_result.files_changed,
+                    allowed_paths=allowed_paths,
+                    must_touch_files=must_touch_files,
+                    expected_new_files=expected_new_files,
+                )
+            return recipe_result
+
         # Tier 4 main course: when agent mode = loop, run the multi-turn
         # agent loop instead of the static 1-shot pipeline. Decision
         # 2026-05-10: static stays default until loop validates ≥ static
@@ -1065,6 +1084,137 @@ class CodeGenerator:
                 raise
 
         raise CodegenError("No codegen provider available.")
+
+    def _try_android_map_location_recipe_codegen(
+        self,
+        *,
+        plan_json: dict[str, Any],
+        context_files: dict[str, str],
+        task_description: str,
+        source_repo_path: str | None,
+        must_touch_files: list[str],
+        expected_new_files: list[str],
+    ) -> CodegenResult | None:
+        if expected_new_files:
+            return None
+        if not context_files:
+            return None
+        if self._is_repair_codegen_call(plan_json, task_description):
+            return None
+
+        from app.services.android_map_location_recipe import (
+            try_generate_android_map_location_recipe,
+        )
+
+        context_by_norm = {
+            path.replace("\\", "/"): (path, content)
+            for path, content in context_files.items()
+        }
+        target_paths = must_touch_files or list(context_files.keys())
+        targets: list[tuple[str, str]] = []
+        for path in target_paths:
+            item = context_by_norm.get(path.replace("\\", "/"))
+            if item is None:
+                return None
+            targets.append(item)
+        if not targets:
+            return None
+
+        started = time.perf_counter()
+        recipe_results = []
+        for target_path, prompt_content in targets:
+            original_content = self._load_structural_codegen_source(
+                relative_path=target_path,
+                fallback_content=prompt_content,
+                source_repo_path=source_repo_path,
+            )
+            recipe_result = try_generate_android_map_location_recipe(
+                file_path=target_path,
+                original_content=original_content,
+                plan_json=plan_json,
+                task_description=task_description,
+            )
+            if recipe_result is None:
+                return None
+            recipe_results.append(recipe_result)
+
+        diffs = [result.diff.rstrip() for result in recipe_results if result.diff.strip()]
+        if not diffs:
+            return None
+
+        files_changed = [
+            file_path
+            for result in recipe_results
+            for file_path in result.files_changed
+        ]
+        operations = [
+            operation
+            for result in recipe_results
+            for operation in result.applied_operations
+        ]
+        latency_s = round(time.perf_counter() - started, 3)
+        logger.info(
+            "android_map_location_recipe_applied files=%s latency_s=%.3f operations=%s",
+            files_changed,
+            latency_s,
+            operations[:12],
+        )
+
+        return CodegenResult(
+            diff="\n".join(diffs).strip() + "\n",
+            summary=(
+                "Generated Android map/location patch via deterministic "
+                "harness recipe"
+            ),
+            files_changed=files_changed,
+            file_summaries=[
+                {
+                    "path": file_path,
+                    "summary": "Applied Android map/location harness recipe",
+                }
+                for file_path in files_changed
+            ],
+            attempt_history=[
+                {
+                    "provider": "harness:android_map_location_recipe",
+                    "status": "succeeded",
+                    "duration_s": latency_s,
+                }
+            ],
+            provider_name="harness:android_map_location_recipe",
+            model_name="deterministic-v1",
+            input_tokens=0,
+            output_tokens=0,
+            contract_coverage=self._merge_codegen_contract_coverage(
+                [
+                    result.contract_coverage
+                    for result in recipe_results
+                    if isinstance(result.contract_coverage, dict)
+                ]
+            ),
+        )
+
+    @staticmethod
+    def _merge_codegen_contract_coverage(
+        coverages: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        if not coverages:
+            return None
+        merged: dict[str, Any] = {
+            "implemented_contracts": [],
+            "verified_no_change_contracts": [],
+            "unimplemented_contracts": [],
+        }
+        for coverage in coverages:
+            for key in (
+                "implemented_contracts",
+                "verified_no_change_contracts",
+                "unimplemented_contracts",
+            ):
+                rows = coverage.get(key)
+                if isinstance(rows, list):
+                    merged[key].extend(rows)
+        return merged
 
     def _should_try_structural_kotlin_codegen(
         self,
