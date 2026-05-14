@@ -138,6 +138,12 @@ def apply_structural_edit_plan(
             content, err = _op_add_import(content, raw_edit)
         elif op in {"replace_block", "replace_call_expression"}:
             content, err = _op_replace_block(content, raw_edit)
+        elif op in {"insert_after_anchor", "insert_before_anchor"}:
+            content, err = _op_insert_near_anchor(
+                content,
+                raw_edit,
+                before=op == "insert_before_anchor",
+            )
         elif op == "insert_into_function":
             content, err = _op_insert_into_function(content, raw_edit)
         elif op == "wrap_firebase_snapshot_children":
@@ -399,6 +405,9 @@ def _op_replace_block(content: str, edit: dict[str, Any]) -> tuple[str, str]:
     replacement = str(edit.get("content") or "")
     if not anchor:
         return content, "replace_block missing anchor_substring"
+    weak_reason = _weak_anchor_reason(anchor)
+    if weak_reason:
+        return content, weak_reason
     if replacement == "":
         return content, "replace_block missing content"
     lines = content.splitlines()
@@ -415,6 +424,43 @@ def _op_replace_block(content: str, edit: dict[str, Any]) -> tuple[str, str]:
     indent = _leading_ws(lines[start - 1])
     replacement_lines = _indent_block(replacement_lines, indent)
     new_lines = lines[: start - 1] + replacement_lines + lines[end:]
+    return _join_like(content, new_lines), ""
+
+
+def _op_insert_near_anchor(
+    content: str,
+    edit: dict[str, Any],
+    *,
+    before: bool,
+) -> tuple[str, str]:
+    anchor = str(edit.get("anchor_substring") or "").strip()
+    insertion = str(edit.get("content") or "")
+    if not anchor:
+        return content, "insert_anchor missing anchor_substring"
+    weak_reason = _weak_anchor_reason(anchor)
+    if weak_reason:
+        return content, weak_reason
+    if not insertion.strip():
+        return content, "insert_anchor missing content"
+
+    lines = content.splitlines()
+    anchor_line = _find_unique_line_for_anchor(
+        lines,
+        anchor,
+        int(edit.get("anchor_line") or 0),
+    )
+    if anchor_line <= 0:
+        return content, "anchor not found or ambiguous"
+
+    anchor_text = lines[anchor_line - 1]
+    indent = str(edit.get("indent") or "")
+    if not indent:
+        indent = _leading_ws(anchor_text)
+        if not before and anchor_text.rstrip().endswith("{"):
+            indent += "    "
+    insertion_lines = _indent_block(insertion.splitlines(), indent)
+    insert_at = anchor_line - 1 if before else anchor_line
+    new_lines = lines[:insert_at] + insertion_lines + lines[insert_at:]
     return _join_like(content, new_lines), ""
 
 
@@ -981,6 +1027,15 @@ def _first_anchor_line(lines: list[str], anchor: str) -> int:
         return 0
     hits = [idx for idx, line in enumerate(lines, start=1) if anchor in line]
     return hits[0] if len(hits) == 1 else 0
+
+
+def _weak_anchor_reason(anchor: str) -> str:
+    stripped = anchor.strip()
+    if len(stripped) < 4:
+        return "anchor too short"
+    if not re.search(r"[A-Za-z0-9_]", stripped):
+        return "anchor must include an identifier or literal"
+    return ""
 
 
 def _clamp_line(line: int, total: int) -> int:

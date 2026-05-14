@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     # → aider_blocks (15-25 pp gain on mid-tier per Aider data); others
     # → unified_diff. Force a specific value for A/B measurement.
     codegen_output_format: Literal["auto", "unified_diff", "aider_blocks"] = "auto"
+    # V1 structural Kotlin path: for one existing .kt/.kts file, ask the
+    # LLM for JSON edit intent and let the harness apply + diff it. Falls
+    # back to codegen_output_format when JSON/apply validation fails.
+    codegen_structural_kotlin_enabled: bool = True
     # Agent mode (Tier 4 main course). "static" = the existing 1-shot
     # codegen + retry + structural-gate pipeline. "loop" = multi-turn
     # agent that issues read_file/search_symbol/list_directory tool

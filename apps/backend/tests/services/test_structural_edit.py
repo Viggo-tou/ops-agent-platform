@@ -115,6 +115,75 @@ def test_apply_structural_edit_rejects_ambiguous_anchor_without_line_pin():
     assert any("anchor not found or ambiguous" in e.reason for e in result.errors)
 
 
+def test_apply_structural_edit_inserts_after_anchor_with_block_indent():
+    source = """\
+fun Screen() {
+    val name = "Ada"
+}
+"""
+    plan = {
+        "file": "Screen.kt",
+        "edits": [
+            {
+                "operation": "insert_after_anchor",
+                "anchor_line": 1,
+                "anchor_substring": "fun Screen() {",
+                "content": 'Text("Hello")',
+            }
+        ],
+    }
+    result = apply_structural_edit_plan(
+        file_path="Screen.kt",
+        original_content=source,
+        plan=plan,
+    )
+    assert result.ok, result.errors
+    assert '    Text("Hello")' in result.content
+    assert "+    Text(\"Hello\")" in result.diff
+
+
+def test_apply_structural_edit_inserts_before_anchor_and_rejects_weak_anchor():
+    source = """\
+fun Screen() {
+    Button(onClick = {}) {
+        Text("Save")
+    }
+}
+"""
+    valid_plan = {
+        "file": "Screen.kt",
+        "edits": [
+            {
+                "operation": "insert_before_anchor",
+                "anchor_line": 2,
+                "anchor_substring": "Button(onClick = {})",
+                "content": 'Text("Address selected")',
+            }
+        ],
+    }
+    result = apply_structural_edit_plan(
+        file_path="Screen.kt",
+        original_content=source,
+        plan=valid_plan,
+    )
+    assert result.ok, result.errors
+    assert '    Text("Address selected")\n    Button(onClick = {})' in result.content
+
+    weak_plan = {
+        "file": "Screen.kt",
+        "edits": [
+            {"operation": "insert_after_anchor", "anchor_substring": "}", "content": "x()"}
+        ],
+    }
+    weak = apply_structural_edit_plan(
+        file_path="Screen.kt",
+        original_content=source,
+        plan=weak_plan,
+    )
+    assert not weak.ok
+    assert any("anchor too short" in e.reason for e in weak.errors)
+
+
 def test_apply_structural_edit_rejects_missing_protected_symbol():
     plan = {
         "file": "CustomerSignup.kt",

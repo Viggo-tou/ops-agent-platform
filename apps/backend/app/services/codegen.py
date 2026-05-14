@@ -196,6 +196,36 @@ Rules:
 """
 
 
+CODEGEN_STRUCTURAL_CODEGEN_SYSTEM_PROMPT = """You are a structural Kotlin code generation agent.
+
+Output ONLY one valid JSON object. No markdown fences, no prose.
+
+Schema:
+{
+  "status": "edit_plan" | "no_patch",
+  "file": "relative/path.kt",
+  "edits": [
+    {
+      "operation": "add_import" | "replace_call_expression" | "replace_block" | "insert_into_function" | "insert_after_anchor" | "insert_before_anchor",
+      "anchor_line": 123,
+      "anchor_substring": "exact text copied from the file",
+      "content": "replacement or inserted Kotlin code"
+    }
+  ],
+  "preserves_intents": ["short intent ids or symbol names"]
+}
+
+Rules:
+1. Do not output a unified diff.
+2. Do not output Aider SEARCH/REPLACE blocks.
+3. The harness will locate anchors, apply edits, validate structure, and generate the final diff.
+4. Use add_import for imports; do not place import statements inside functions.
+5. Use exact anchors from the current file. Do not invent line context.
+6. Prefer small semantic edits: add imports, add state declarations, insert a UI block, replace a broken call/block.
+7. If the requested change cannot be made within the single allowed Kotlin file, output {"status":"no_patch","file":"...","edits":[]}.
+"""
+
+
 # --- Aider search/replace block format (Tier 1.5) ----------------------------
 # Mid-tier models (DeepSeek, GPT-4o-mini) consistently miscount unified-diff
 # hunk headers and paraphrase context lines. Aider's published benchmark data
@@ -1036,6 +1066,313 @@ class CodeGenerator:
 
         raise CodegenError("No codegen provider available.")
 
+    def _should_try_structural_kotlin_codegen(
+        self,
+        *,
+        provider: str,
+        plan_json: dict[str, Any],
+        context_files: dict[str, str],
+        task_description: str,
+        source_repo_path: str | None,
+        override_prompt: str | None,
+    ) -> bool:
+        if not bool(getattr(self.settings, "codegen_structural_kotlin_enabled", True)):
+            return False
+        if override_prompt is not None:
+            return False
+        if provider not in {"deepseek", "openai"}:
+            return False
+        if not context_files or len(context_files) != 1:
+            return False
+        if self._is_repair_codegen_call(plan_json, task_description):
+            return False
+
+        path, content = next(iter(context_files.items()))
+        if not content.strip():
+            return False
+        if Path(path).suffix.lower() not in {".kt", ".kts"}:
+            return False
+
+        _must_touch, expected_new_files, _allowed_paths = self._extract_plan_target_paths(
+            plan_json
+        )
+        if expected_new_files:
+            return False
+
+        # If a real repo root is provided and the file is absent there, this
+        # is effectively a create-file task. V1 keeps create-file JSON on the
+        # existing full-file/Aider path.
+        if source_repo_path:
+            try:
+                disk_file = Path(source_repo_path) / path
+                if not disk_file.is_file():
+                    return False
+            except OSError:
+                return False
+        return True
+
+    @staticmethod
+    def _is_repair_codegen_call(
+        plan_json: dict[str, Any],
+        task_description: str,
+    ) -> bool:
+        markers = (
+            "Fix syntax errors in",
+            "Fix compile errors in",
+            "Repair patch for",
+            "Compile repair",
+        )
+        objective = ""
+        if isinstance(plan_json, dict):
+            objective = str(plan_json.get("objective") or "")
+        description = task_description if isinstance(task_description, str) else ""
+        return any(
+            objective.startswith(marker) or description.startswith(marker)
+            for marker in markers
+        )
+
+    def _try_structural_kotlin_codegen(
+        self,
+        *,
+        provider: str,
+        prompt: str,
+        context_files: dict[str, str],
+        source_repo_path: str | None,
+    ) -> CodegenResult:
+        from app.services.structural_edit import (
+            apply_structural_edit_plan,
+            parse_structural_edit_response,
+        )
+
+        target_path, prompt_content = next(iter(context_files.items()))
+        if provider == "deepseek":
+            model_name = self.settings.deepseek_model
+            raw, input_tokens, output_tokens = self._call_deepseek_text(
+                prompt,
+                model_name,
+                system_prompt=CODEGEN_STRUCTURAL_CODEGEN_SYSTEM_PROMPT,
+                purpose="codegen.structural_kotlin",
+            )
+        elif provider == "openai":
+            model_name = self._resolve_model_name("openai")
+            raw, input_tokens, output_tokens = self._call_openai_text(
+                prompt,
+                model_name,
+                system_prompt=CODEGEN_STRUCTURAL_CODEGEN_SYSTEM_PROMPT,
+                purpose="codegen.structural_kotlin",
+            )
+        else:
+            raise CodegenError(f"structural Kotlin codegen unsupported provider: {provider}")
+
+        try:
+            edit_plan = parse_structural_edit_response(raw)
+        except Exception as exc:  # noqa: BLE001
+            raise CodegenError(f"structural Kotlin JSON parse failed: {exc}") from exc
+
+        status = str(edit_plan.get("status") or "").strip().lower()
+        if status in {"no_patch", "no_change", "noop"}:
+            raise CodegenError("structural Kotlin response returned no_patch")
+        edits = edit_plan.get("edits") or []
+        if not isinstance(edits, list) or not edits:
+            raise CodegenError("structural Kotlin response had no edits")
+
+        plan_file = str(edit_plan.get("file") or target_path).strip()
+        if not self._paths_match(plan_file.replace("\\", "/"), target_path.replace("\\", "/")):
+            raise CodegenError(
+                f"structural Kotlin plan targets {plan_file!r}, expected {target_path!r}"
+            )
+        normalized_plan = dict(edit_plan)
+        normalized_plan["file"] = target_path
+
+        original_content = self._load_structural_codegen_source(
+            relative_path=target_path,
+            fallback_content=prompt_content,
+            source_repo_path=source_repo_path,
+        )
+        applied = apply_structural_edit_plan(
+            file_path=target_path,
+            original_content=original_content,
+            plan=normalized_plan,
+        )
+        if not applied.ok:
+            reasons = "; ".join(
+                f"{err.operation}:{err.reason}" if err.operation else err.reason
+                for err in applied.errors
+            )
+            raise CodegenError(f"structural Kotlin apply failed: {reasons}")
+
+        coverage_payload = None
+        raw_coverage = edit_plan.get("contract_coverage")
+        if isinstance(raw_coverage, dict):
+            coverage_payload = raw_coverage
+
+        operations = ", ".join(applied.applied_operations[:8]) or "structured edits"
+        return CodegenResult(
+            diff=applied.diff,
+            summary=(
+                "Generated structural Kotlin patch via harness-applied JSON "
+                f"({operations})"
+            ),
+            files_changed=[target_path],
+            file_summaries=[
+                {
+                    "path": target_path,
+                    "summary": (
+                        "Applied structural Kotlin edit plan and generated diff "
+                        "inside the harness"
+                    ),
+                }
+            ],
+            provider_name=f"{provider}:structural_kotlin",
+            model_name=model_name,
+            input_tokens=int(input_tokens or 0),
+            output_tokens=int(output_tokens or 0),
+            contract_coverage=coverage_payload,
+        )
+
+    def _load_structural_codegen_source(
+        self,
+        *,
+        relative_path: str,
+        fallback_content: str,
+        source_repo_path: str | None,
+    ) -> str:
+        if source_repo_path:
+            try:
+                disk_file = Path(source_repo_path) / relative_path
+                if disk_file.is_file():
+                    return disk_file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+        return fallback_content
+
+    def _build_structural_codegen_prompt(
+        self,
+        *,
+        plan_json: dict[str, Any],
+        context_files: dict[str, str],
+        task_description: str,
+    ) -> str:
+        target_path, target_content = next(iter(context_files.items()))
+        objective = str(plan_json.get("objective") or "").strip()
+        change_summary = str(plan_json.get("change_summary") or "").strip()
+        change_explanation = str(plan_json.get("change_explanation") or "").strip()
+
+        parts = [
+            "<task>",
+            "Generate a structural JSON edit plan for the single Kotlin file.",
+            "The model decides WHAT code should change. The harness decides WHERE edits apply and generates the diff.",
+            "</task>",
+            "",
+            "<output_contract>",
+            "Return only JSON with status, file, edits, and preserves_intents.",
+            "Do not return unified diff, Aider blocks, markdown, or prose.",
+            "Allowed operations: add_import, replace_call_expression, replace_block, insert_into_function, insert_after_anchor, insert_before_anchor.",
+            "Every anchor_substring must be copied exactly from the file context and must be unique or line-pinned.",
+            "</output_contract>",
+            "",
+            "<allowed_file>",
+            target_path,
+            "</allowed_file>",
+        ]
+
+        if objective or change_summary or change_explanation:
+            parts.extend(["", "<objective>"])
+            if objective:
+                parts.append(objective)
+            if change_summary:
+                parts.append(f"Summary: {change_summary}")
+            if change_explanation:
+                parts.append(f"Details: {change_explanation}")
+            parts.append("</objective>")
+
+        if task_description.strip():
+            parts.extend(["", "<task_description>", task_description.strip(), "</task_description>"])
+
+        constraints = plan_json.get("constraints") or []
+        if isinstance(constraints, list) and constraints:
+            parts.extend(["", "<constraints>"])
+            for item in constraints[:10]:
+                if isinstance(item, str) and item.strip():
+                    parts.append(f"- {item.strip()}")
+            parts.append("</constraints>")
+
+        steps = plan_json.get("steps") or []
+        if isinstance(steps, list) and steps:
+            parts.extend(["", "<plan_steps>"])
+            for step in steps[:12]:
+                if not isinstance(step, dict):
+                    continue
+                title = str(step.get("title") or "").strip()
+                expected = str(step.get("expected_output") or "").strip()
+                if title or expected:
+                    parts.append(f"- {title}: {expected}".strip())
+            parts.append("</plan_steps>")
+
+        memory_context = str(plan_json.get("memory_context") or "").strip()
+        if memory_context:
+            max_lines = max(1, int(getattr(self.settings, "memory_max_lines_in_prompt", 30) or 30))
+            parts.extend(
+                [
+                    "",
+                    "<prior_failure_memory>",
+                    MEMORY_PROMPT_INSTRUCTION,
+                    *memory_context.splitlines()[:max_lines],
+                    "</prior_failure_memory>",
+                ]
+            )
+
+        acceptance_tests = plan_json.get("acceptance_tests") or []
+        if isinstance(acceptance_tests, list):
+            scoped_tests: list[dict[str, Any]] = []
+            for test in acceptance_tests:
+                if not isinstance(test, dict):
+                    continue
+                test_file = str(test.get("file") or test.get("target") or "").strip()
+                if not test_file or self._paths_match(test_file, target_path):
+                    scoped_tests.append(test)
+            if scoped_tests:
+                parts.extend(["", "<hard_acceptance_requirements>"])
+                for idx, test in enumerate(scoped_tests[:10], start=1):
+                    kind = str(test.get("kind") or "").strip()
+                    pattern = str(test.get("pattern") or "").strip()
+                    rationale = str(test.get("rationale") or "").strip()
+                    line = f"{idx}. "
+                    if kind:
+                        line += f"[{kind}] "
+                    if pattern:
+                        line += f"required pattern: {pattern}"
+                    if rationale:
+                        line += f" | why: {rationale[:220]}"
+                    parts.append(line.rstrip())
+                parts.append("</hard_acceptance_requirements>")
+
+        required_contracts = plan_json.get("required_contracts") or []
+        if isinstance(required_contracts, list) and required_contracts:
+            parts.extend(["", "<required_contract_signals>"])
+            for contract in required_contracts[:8]:
+                if not isinstance(contract, dict):
+                    continue
+                cid = str(contract.get("contract_id") or contract.get("id") or "").strip()
+                signal = str(contract.get("signal") or "").strip().replace("\n", " ")
+                if cid or signal:
+                    parts.append(f"- {cid}: {signal[:260]}".strip())
+                for pattern in self._iter_contract_patterns(contract)[:4]:
+                    parts.append(f"  pattern: {pattern}")
+            parts.append("</required_contract_signals>")
+
+        parts.extend(
+            [
+                "",
+                "<file_context>",
+                f"--- BEGIN FILE {target_path} ---",
+                target_content,
+                f"--- END FILE {target_path} ---",
+                "</file_context>",
+            ]
+        )
+        return "\n".join(parts)
+
     def generate_structural_edit(
         self,
         *,
@@ -1288,6 +1625,58 @@ class CodeGenerator:
         # Downstream prompt builders, system-prompt selection, and parsing
         # all read this attribute. JSON-mode providers ignore it.
         self._active_codegen_output_format = self._resolve_codegen_output_format(provider)
+
+        if self._should_try_structural_kotlin_codegen(
+            provider=provider,
+            plan_json=plan_json,
+            context_files=context_files,
+            task_description=task_description,
+            source_repo_path=source_repo_path,
+            override_prompt=override_prompt,
+        ):
+            structural_prompt = self._build_structural_codegen_prompt(
+                plan_json=plan_json,
+                context_files=context_files,
+                task_description=task_description,
+            )
+            structural_fingerprint = hashlib.sha256(
+                structural_prompt.encode("utf-8")
+            ).hexdigest()[:10]
+            structural_started = time.perf_counter()
+            try:
+                result = self._try_structural_kotlin_codegen(
+                    provider=provider,
+                    prompt=structural_prompt,
+                    context_files=context_files,
+                    source_repo_path=source_repo_path,
+                )
+                self._record_codegen_call(
+                    task_id=task_id,
+                    actor_name=actor_name,
+                    result=result,
+                    latency_ms=int((time.perf_counter() - structural_started) * 1000),
+                    success=True,
+                    retry_count=0,
+                    fallback_step=fallback_step,
+                    prompt_fingerprint=structural_fingerprint,
+                )
+                return result
+            except CodegenError as exc:
+                logger.warning(
+                    "structural_kotlin_codegen_fallback provider=%s error=%s",
+                    provider,
+                    str(exc)[:240],
+                )
+                self._record_codegen_failure(
+                    task_id=task_id,
+                    actor_name=actor_name,
+                    provider=f"{provider}:structural_kotlin",
+                    latency_ms=int((time.perf_counter() - structural_started) * 1000),
+                    retry_count=0,
+                    fallback_step=fallback_step,
+                    prompt_fingerprint=structural_fingerprint,
+                    error_type=type(exc).__name__,
+                )
 
         if override_prompt is not None:
             prompt = override_prompt

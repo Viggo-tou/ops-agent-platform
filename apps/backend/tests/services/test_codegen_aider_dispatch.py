@@ -7,6 +7,7 @@ mocks.
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,18 +20,25 @@ import pytest  # noqa: E402
 
 from app.services.codegen import (  # noqa: E402
     CODEGEN_SYSTEM_PROMPT,
+    CODEGEN_STRUCTURAL_CODEGEN_SYSTEM_PROMPT,
     CODEGEN_SYSTEM_PROMPT_AIDER,
     CodeGenerator,
     CodegenError,
 )
+from app.agents.schemas import CodegenResult  # noqa: E402
 
 
 def _settings(output_format: str = "auto") -> SimpleNamespace:
     return SimpleNamespace(
         codegen_provider=None,
         codegen_output_format=output_format,
+        codegen_structural_kotlin_enabled=True,
         primary_agent_provider="mock",
         primary_agent_model="mock",
+        deepseek_api_key="deepseek-test",
+        deepseek_model="deepseek-test",
+        openai_api_key=None,
+        openai_base_url="https://api.openai.com/v1",
     )
 
 
@@ -118,6 +126,109 @@ def test_parse_response_aider_simple_replace():
     assert "+    return 2" in result.diff
     assert result.files_changed == ["m.py"]
     assert "Aider blocks" in result.summary
+
+
+def test_generate_patch_uses_structural_kotlin_json_before_aider():
+    source = """\
+package demo
+
+fun Screen() {
+    val name = "Ada"
+}
+"""
+    settings = _settings("auto")
+    settings.primary_agent_provider = "deepseek"
+    settings.codegen_provider = "deepseek"
+    cg = CodeGenerator(settings)
+
+    def fake_structural_call(prompt, model_name, *, system_prompt, purpose):
+        assert model_name == "deepseek-test"
+        assert system_prompt is CODEGEN_STRUCTURAL_CODEGEN_SYSTEM_PROMPT
+        assert purpose == "codegen.structural_kotlin"
+        assert "<allowed_file>" in prompt
+        return (
+            json.dumps(
+                {
+                    "status": "edit_plan",
+                    "file": "Screen.kt",
+                    "edits": [
+                        {
+                            "operation": "insert_after_anchor",
+                            "anchor_line": 3,
+                            "anchor_substring": "fun Screen() {",
+                            "content": 'Text("Hello")',
+                        }
+                    ],
+                }
+            ),
+            11,
+            7,
+        )
+
+    def fail_raw_call(prompt):
+        raise AssertionError("raw Aider/deepseek path should not run")
+
+    cg._call_deepseek_text = fake_structural_call  # type: ignore[method-assign]
+    cg._call_deepseek = fail_raw_call  # type: ignore[method-assign]
+
+    result = cg.generate_patch(
+        task_id="task-structural",
+        plan_json={
+            "objective": "Add greeting UI.",
+            "must_touch_files": ["Screen.kt"],
+        },
+        context_files={"Screen.kt": source},
+    )
+
+    assert result.provider_name == "deepseek:structural_kotlin"
+    assert result.input_tokens == 11
+    assert result.output_tokens == 7
+    assert result.files_changed == ["Screen.kt"]
+    assert "+    Text(\"Hello\")" in result.diff
+
+
+def test_generate_patch_falls_back_when_structural_kotlin_json_fails():
+    source = "fun Screen() {\n    val name = \"Ada\"\n}\n"
+    settings = _settings("auto")
+    settings.primary_agent_provider = "deepseek"
+    settings.codegen_provider = "deepseek"
+    cg = CodeGenerator(settings)
+
+    def bad_structural_call(prompt, model_name, *, system_prompt, purpose):
+        return ("not json", 3, 2)
+
+    def raw_fallback(prompt):
+        return CodegenResult(
+            diff=(
+                "diff --git a/Screen.kt b/Screen.kt\n"
+                "--- a/Screen.kt\n"
+                "+++ b/Screen.kt\n"
+                "@@ -1,3 +1,4 @@\n"
+                " fun Screen() {\n"
+                "+    Text(\"Hello\")\n"
+                "     val name = \"Ada\"\n"
+                " }\n"
+            ),
+            summary="fallback patch",
+            files_changed=["Screen.kt"],
+            provider_name="deepseek",
+            model_name="deepseek-test",
+        )
+
+    cg._call_deepseek_text = bad_structural_call  # type: ignore[method-assign]
+    cg._call_deepseek = raw_fallback  # type: ignore[method-assign]
+
+    result = cg.generate_patch(
+        task_id="task-fallback",
+        plan_json={
+            "objective": "Add greeting UI.",
+            "must_touch_files": ["Screen.kt"],
+        },
+        context_files={"Screen.kt": source},
+    )
+
+    assert result.provider_name == "deepseek"
+    assert "+    Text(\"Hello\")" in result.diff
 
 
 def test_parse_response_aider_strips_code_fence():
