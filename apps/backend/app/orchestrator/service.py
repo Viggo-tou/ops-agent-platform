@@ -10747,6 +10747,7 @@ class PrimaryOrchestrator:
         "gate:acceptance_check",
         "gate:must_touch",
         "gate:contract_coverage",
+        "review:reservations",
     )
 
     def _build_codegen_failure_warnings(
@@ -10810,7 +10811,7 @@ class PrimaryOrchestrator:
                 ),
                 reverse=True,
             )
-            top = unique[:1]
+            top = unique[:2]
 
             audit = [{
                 "memory_id": m.id,
@@ -10841,14 +10842,23 @@ class PrimaryOrchestrator:
                     concrete.append(f)
             for row in audit:
                 row["missing_patterns"] = list(concrete_patterns)
+            for idx, extra in enumerate(top):
+                if extra.scope == "review:reservations":
+                    audit[idx]["missing_patterns"] = []
 
             directive_lines = [
                 "PRIOR FAILURE WARNING (auto-retrieved from agent_memory):",
-                (
+            ]
+            if m.scope != "review:reservations":
+                directive_lines.append(
                     f"On a previous task in this family ({m.task_family}) "
                     f"the diff failed at {m.scope}: {m.failure_class}."
-                ),
-            ]
+                )
+            if m.scope == "review:reservations":
+                directive_lines.extend(
+                    self._render_codegen_reservation_memory_warning(m, evidence)
+                )
+                concrete = []
             if concrete:
                 directive_lines.append("Concretely missing from the previous diff:")
                 for c in concrete[:6]:
@@ -10860,6 +10870,19 @@ class PrimaryOrchestrator:
                 )
             else:
                 directive_lines.append("Lesson: " + (m.resolution or "")[:300])
+            for extra in top[1:]:
+                if extra.scope == "review:reservations":
+                    extra_evidence = (
+                        extra.evidence_refs
+                        if isinstance(extra.evidence_refs, dict)
+                        else {}
+                    )
+                    directive_lines.extend(
+                        self._render_codegen_reservation_memory_warning(
+                            extra,
+                            extra_evidence,
+                        )
+                    )
             directive_lines.append(
                 "Treat this as a hard risk warning, not a verified fix recipe — "
                 "the previous run was a different task."
@@ -10870,6 +10893,122 @@ class PrimaryOrchestrator:
                 "codegen failure-memory retrieval failed (non-fatal): %s", exc
             )
             return "", []
+
+    def _render_codegen_reservation_memory_warning(
+        self,
+        memory: Any,
+        evidence: dict[str, Any],
+    ) -> list[str]:
+        reservations = evidence.get("reservations") if isinstance(evidence, dict) else []
+        lines = [
+            (
+                f"QUALITY RESERVATION WARNING: A previous task in this family "
+                f"({memory.task_family}) reached approval but reviewer "
+                "reservations flagged quality risks."
+            )
+        ]
+        concrete: list[str] = []
+        if isinstance(reservations, list):
+            for item in reservations:
+                if isinstance(item, dict):
+                    text = str(item.get("text") or "").strip()
+                    severity = str(item.get("severity") or "bug").strip()
+                    if text:
+                        concrete.append(f"[{severity}] {text}")
+                elif isinstance(item, str) and item.strip():
+                    concrete.append(item.strip())
+        if concrete:
+            lines.append("Before returning a diff, check these quality constraints:")
+            for text in concrete[:6]:
+                lines.append(f"  - {text}")
+        else:
+            lines.append("Lesson: " + str(memory.resolution or "")[:300])
+        lines.append(
+            "Use these as a same-family quality checklist. Do not add "
+            "unrelated scope; satisfy the current spec with the least "
+            "duplicated, most consistent implementation."
+        )
+        return lines
+
+    def _record_reservation_quality_memory(
+        self,
+        *,
+        task: Task,
+        reservations_detailed: list[dict],
+        files_changed: list[str],
+        issue_key: str,
+        provenance_event_id: str | None = None,
+    ) -> Any | None:
+        """Persist post-review reservations as same-family quality memory.
+
+        A run can reach approval and still expose repeatable quality risks.
+        Store those risks in the warning pool so future codegen sees them as
+        a quality checklist, not as a success fact or an unconditional recipe.
+        """
+        usable = [
+            dict(item)
+            for item in reservations_detailed
+            if isinstance(item, dict) and str(item.get("text") or "").strip()
+        ]
+        if not usable:
+            return None
+        try:
+            from app.services.failure_classifier import detect_task_family
+            from app.services.memory import MemoryService
+
+            plan_dict = task.plan_json if isinstance(task.plan_json, dict) else {}
+            task_family = detect_task_family(
+                request_text=task.request_text or "",
+                plan_json=plan_dict,
+            )
+            if not task_family:
+                return None
+            blocking = [r for r in usable if bool(r.get("blocking"))]
+            auto_fixable = [r for r in usable if bool(r.get("auto_fixable"))]
+            observation = (
+                f"task={task.id} family={task_family} reached approval "
+                f"for {issue_key} but reservations reviewer flagged "
+                f"{len(usable)} quality item(s), including "
+                f"{len(blocking)} blocking and {len(auto_fixable)} auto-fixable."
+            )
+            lesson_lines = [
+                "A same-family patch can pass compile/acceptance yet still be "
+                "too low-quality for approval. Future codegen should resolve "
+                "reviewer reservations before returning the diff:"
+            ]
+            for item in usable[:6]:
+                text = str(item.get("text") or "").strip()
+                severity = str(item.get("severity") or "bug").strip()
+                lesson_lines.append(f"- [{severity}] {text}")
+            return MemoryService(
+                self.db,
+                self.tool_gateway.settings,
+            ).write_failure_observation(
+                failure_class="approval_reservation_quality",
+                scope="review:reservations",
+                observation_text=observation,
+                lesson="\n".join(lesson_lines),
+                task_family=task_family,
+                provenance_task_id=task.id,
+                provenance_event_id=provenance_event_id,
+                trust_level="auto_classified",
+                prompt_eligible=["planner_warning", "codegen_warning"],
+                evidence_refs={
+                    "task_id": task.id,
+                    "issue_key": issue_key,
+                    "files_changed": list(files_changed),
+                    "reservations": usable[:10],
+                    "blocking_count": len(blocking),
+                    "auto_fixable_count": len(auto_fixable),
+                },
+                confidence=0.85,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "reservation quality memory write failed (non-fatal): %s",
+                exc,
+            )
+            return None
 
     def _build_codegen_task_description(
         self,
@@ -11658,7 +11797,7 @@ class PrimaryOrchestrator:
             reservations_detailed = _reservations_report.to_dicts()  # type: ignore[assignment]
             auto_count = len(_reservations_report.auto_fixable)
             block_count = len(_reservations_report.blocking)
-            record_event(
+            _reservation_event = record_event(
                 self.db,
                 task_id=task.id,
                 event_type=EventType.TOOL_SUCCEEDED,
@@ -11680,6 +11819,13 @@ class PrimaryOrchestrator:
                     "provider": _reservations_report.provider,
                     "model": _reservations_report.model,
                 },
+            )
+            self._record_reservation_quality_memory(
+                task=task,
+                reservations_detailed=reservations_detailed,
+                files_changed=list(files_changed),
+                issue_key=issue_key,
+                provenance_event_id=_reservation_event.id,
             )
             commit_checkpoint(self.db, label="reservations_reviewer_done")
         except Exception as exc:  # noqa: BLE001
