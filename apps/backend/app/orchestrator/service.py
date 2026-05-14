@@ -188,6 +188,19 @@ def _semantic_review_high_count(sr_report: object | None) -> int:
     return int(high_count or 0)
 
 
+def _semantic_review_should_attempt_repair(
+    sr_report: object | None,
+    *,
+    sr_round: int,
+    max_repair_rounds: int,
+) -> bool:
+    if sr_report is None or bool(getattr(sr_report, "passed", False)):
+        return False
+    if sr_round >= max_repair_rounds:
+        return False
+    return bool(getattr(sr_report, "findings", None) or ())
+
+
 def _semantic_review_should_block_on_exhausted(
     sr_report: object | None,
     settings: object,
@@ -6791,7 +6804,31 @@ class PrimaryOrchestrator:
                             )
                     if sr_report.passed:
                         break
-                    if sr_round >= _SR_MAX_REPAIR:
+                    if not _semantic_review_should_attempt_repair(
+                        sr_report,
+                        sr_round=sr_round,
+                        max_repair_rounds=_SR_MAX_REPAIR,
+                    ):
+                        if not (getattr(sr_report, "findings", None) or ()):
+                            record_event(
+                                self.db, task_id=task.id,
+                                event_type=EventType.TOOL_SUCCEEDED,
+                                source=EventSource.ORCHESTRATOR,
+                                stage=WorkflowStage.REVIEW,
+                                role=RoleName.REVIEWER,
+                                tool_name="semantic_review.no_actionable_repair",
+                                message=(
+                                    "Semantic review did not pass, but it "
+                                    "reported no grounded finding(s); "
+                                    "skipping repair re-prompt."
+                                ),
+                                payload={
+                                    "completeness_pct": sr_report.completeness_pct,
+                                    "high": sr_report.high_severity_count(),
+                                    "findings": len(sr_report.findings),
+                                    "sr_repair_round": sr_round,
+                                },
+                            )
                         break
 
                     # Build repair prompt from grounded findings + previous diff

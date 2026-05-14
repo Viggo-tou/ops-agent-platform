@@ -175,6 +175,31 @@ fun Screen() {
     assert ".launch {" in result.content
 
 
+def test_kotlin_fast_fix_adds_remember_coroutine_scope_import():
+    source = """\
+package com.example
+
+import androidx.compose.runtime.Composable
+
+@Composable
+fun Screen() {
+    val coroutineScope = rememberCoroutineScope()
+    Button(onClick = { coroutineScope.launch { save() } }) {}
+}
+"""
+
+    result = apply_kotlin_diagnostic_fast_fixes(
+        file_path="Screen.kt",
+        original_content=source,
+        error_text="Unresolved reference 'rememberCoroutineScope'.",
+        line=7,
+    )
+
+    assert result is not None
+    assert result.ok, result.errors
+    assert "import androidx.compose.runtime.rememberCoroutineScope" in result.content
+
+
 def test_kotlin_fast_fix_wraps_broken_firebase_snapshot_children_loop():
     source = """\
 package com.example

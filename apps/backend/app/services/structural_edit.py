@@ -208,6 +208,21 @@ def apply_kotlin_diagnostic_fast_fixes(
         elif content != before:
             applied.append("add_import:kotlinx.coroutines.launch")
 
+    if _should_add_compose_runtime_import(
+        error_text,
+        content,
+        symbol="rememberCoroutineScope",
+    ):
+        before = content
+        content, err = _op_add_import(
+            content,
+            {"content": "import androidx.compose.runtime.rememberCoroutineScope"},
+        )
+        if err:
+            errors.append(StructuralEditError(err, operation="add_import"))
+        elif content != before:
+            applied.append("add_import:androidx.compose.runtime.rememberCoroutineScope")
+
     if _should_repair_missing_try_for_kotlin_catch(error_text, content):
         before = content
         content, err = _repair_missing_try_for_kotlin_catch(content, line=line)
@@ -386,6 +401,21 @@ def _should_add_coroutines_launch_import(error_text: str, content: str) -> bool:
     ):
         return False
     return "kotlinx.coroutines.CoroutineScope" in content or "rememberCoroutineScope" in content
+
+
+def _should_add_compose_runtime_import(error_text: str, content: str, *, symbol: str) -> bool:
+    lower = (error_text or "").lower()
+    if "unresolved reference" not in lower or symbol.lower() not in lower:
+        return False
+    if symbol not in content:
+        return False
+    if re.search(
+        rf"^\s*import\s+androidx\.compose\.runtime\.(?:{re.escape(symbol)}|\*)\s*$",
+        content,
+        re.MULTILINE,
+    ):
+        return False
+    return True
 
 
 def _should_repair_firebase_snapshot_children(error_text: str, content: str) -> bool:
