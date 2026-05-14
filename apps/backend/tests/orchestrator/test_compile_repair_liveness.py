@@ -142,6 +142,7 @@ def _make_orchestrator(root: Path) -> PrimaryOrchestrator:
     orch.db.add = Mock()
     settings = orch.tool_gateway.settings
     settings.sandbox_base_dir = str(root / "sandbox")
+    settings.sandbox_external_root = ""
     settings.agent_workspace_root = str(root / "workspace")
     settings.codegen_repair_files_per_round = 5
     settings.codegen_repair_round_timeout_seconds = 600.0
@@ -224,8 +225,12 @@ class AttemptCompileRepairLivenessTests(unittest.TestCase):
         self.root = _writable_mkdtemp()
         self.orch = _make_orchestrator(self.root)
         self.task = _task()
-        self.sandbox = _make_sandbox_with_broken(
-            self.root, ["app/Foo.kt"]
+        self.sandbox = self.orch._build_develop_sandbox(self.task).work_dir
+        self.sandbox.mkdir(parents=True, exist_ok=True)
+        (self.sandbox / "app").mkdir(parents=True, exist_ok=True)
+        (self.sandbox / "app/Foo.kt").write_text(
+            "fun broken() { invalid }\n",
+            encoding="utf-8",
         )
         # Disable post-codegen knowledge source read by stubbing the helper
         # to return an empty string so the function takes the no-original path.
@@ -310,6 +315,45 @@ class AttemptCompileRepairLivenessTests(unittest.TestCase):
             f"call timeout {call_timeout} not bounded by remaining round budget",
         )
         self.assertGreaterEqual(call_timeout, 1.0)
+
+    def test_c10_structural_error_uses_structured_edit_before_legacy_repair(self) -> None:
+        records: list = []
+
+        def _fake_execute(**kwargs):
+            payload = kwargs["payload"]
+            self.assertEqual(payload.get("output_format"), "structural_edit_json")
+            return {
+                "provider_name": "mock",
+                "model_name": "mock",
+                "edit_plan": {
+                    "status": "repair_patch",
+                    "file": "app/Foo.kt",
+                    "edits": [
+                        {
+                            "operation": "replace_block",
+                            "anchor_line": 1,
+                            "anchor_substring": "invalid",
+                            "content": "fun broken() {}",
+                        }
+                    ],
+                },
+            }
+
+        result, captured = self._run_repair(
+            compile_errors=[
+                {
+                    "file": "app/Foo.kt",
+                    "line": 1,
+                    "error": "Unresolved reference 'catch'; Expecting ')'",
+                }
+            ],
+            round_timeout=30.0,
+            mock_execute_side_effect=_fake_execute,
+            records_out=records,
+        )
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(result, (True, ["app/Foo.kt"]))
 
     # ----- Test 3 — timeout failures do NOT consume retry path ------------
 

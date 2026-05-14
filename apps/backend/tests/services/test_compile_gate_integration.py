@@ -140,6 +140,7 @@ def _make_orchestrator(tmp_path: Path) -> PrimaryOrchestrator:
     orchestrator = PrimaryOrchestrator(db=Mock())
     settings = orchestrator.tool_gateway.settings
     settings.sandbox_base_dir = str(tmp_path / "sandboxes")
+    settings.sandbox_external_root = ""
     settings.agent_workspace_root = str(tmp_path / "workspace")
     settings.knowledge_source_path = ""
     settings.verification_profile_enabled = True

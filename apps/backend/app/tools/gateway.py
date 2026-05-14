@@ -530,6 +530,12 @@ class ToolGateway:
             and all(isinstance(path, str) and isinstance(content, str) for path, content in context_files_value.items())
             else None
         )
+        # P0-4 (2026-05-11): caller can opt into strict git apply (no
+        # fuzz fallback) so the sandbox's verdict matches what SWE-bench
+        # evaluator's git apply would do. Default stays lenient for
+        # production paths where the patch is already trusted.
+        strict_value = payload.get("strict_only", False)
+        strict_only = bool(strict_value) if isinstance(strict_value, bool) else False
 
         try:
             sandbox = ExecutionSandbox(
@@ -542,6 +548,7 @@ class ToolGateway:
                 commit=commit,
                 commit_message=commit_message,
                 timeout_seconds=definition.timeout_seconds,
+                strict_only=strict_only,
             )
         except SandboxError as exc:
             raise ToolInvocationError(str(exc), retryable=False) from exc
@@ -682,7 +689,17 @@ class ToolGateway:
 
         try:
             actor_name_value = actor_context.get("actor_name")
-            result = CodeGenerator(self.settings, db=self.db).generate_patch(
+            generator = CodeGenerator(self.settings, db=self.db)
+            if str(payload.get("output_format") or "").strip() == "structural_edit_json":
+                return generator.generate_structural_edit(
+                    task_id=task_id,
+                    plan_json=dict(plan_json_value),
+                    context_files={str(path): str(content) for path, content in context_files_value.items()},
+                    task_description=task_description,
+                    source_repo_path=source_repo_path,
+                    actor_name=str(actor_name_value) if actor_name_value else None,
+                )
+            result = generator.generate_patch(
                 task_id=task_id,
                 plan_json=dict(plan_json_value),
                 context_files={str(path): str(content) for path, content in context_files_value.items()},

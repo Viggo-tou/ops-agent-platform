@@ -182,6 +182,13 @@ class Settings(BaseSettings):
     # exceed this get a tool_timed_out event and the coverage gate runs
     # on the partial result.
     codegen_batch_deadline_seconds: float = 720.0
+    # If a parallel codegen batch hits the Python-level deadline while
+    # sibling batches produced usable diffs, retry only the missing batch
+    # once with a shorter, sequential call. This recovers transient provider
+    # stalls without weakening batch_coverage.
+    codegen_timeout_salvage_enabled: bool = True
+    codegen_timeout_salvage_seconds: float = 240.0
+    codegen_timeout_late_result_grace_seconds: float = 360.0
     codegen_repair_files_per_round: int = 5
     # Bumped from 180s. Empirically a single codegen.generate_patch call
     # via Claude Code CLI takes 3-4 min (~180-240s). The 180s deadline

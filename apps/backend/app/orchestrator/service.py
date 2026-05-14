@@ -15,7 +15,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.agents.schemas import GeneratedPlan, GeneratedSemanticTranslation
-from app.agents.service import ActionAgent, PrimaryAgentPlanner, ReviewerAgent
+from app.agents.service import (
+    ActionAgent,
+    PrimaryAgentPlanner,
+    ReviewerAgent,
+    _source_bind_expected_new_files,
+)
 from app.agents.translation import SemanticTranslator
 from app.core.config import get_settings
 from app.core.enums import ActorRole, ApprovalStatus, EventSource, EventType, RoleName, TaskStatus, WorkflowStage
@@ -355,6 +360,7 @@ def _extract_protected_symbols(
     first_attempt_diff: str,
     rel_path: str,
     acceptance_patterns: list[str] | None = None,
+    memory_patterns: list[str] | None = None,
 ) -> list[str]:
     """Return identifiers from the first-attempt diff that are
     feature-critical (per the rule above). Used by both the repair
@@ -380,22 +386,62 @@ def _extract_protected_symbols(
 
     protected: set[str] = set()
 
+    def _pattern_matches_line(pattern: str, line: str) -> bool:
+        if pattern in line:
+            return True
+        try:
+            return bool(_ps_re.search(pattern, line))
+        except _ps_re.error:
+            return False
+
+    def _tokens_from_pattern(pattern: str) -> list[str]:
+        raw_tokens = _ps_re.findall(r"[A-Za-z_][A-Za-z0-9_]*", pattern or "")
+        stop = {
+            "org",
+            "com",
+            "android",
+            "androidx",
+            "java",
+            "javax",
+            "kotlin",
+            "kotlinx",
+            "osmdroid",
+            "views",
+            "events",
+            "util",
+            "overlay",
+        }
+        out: list[str] = []
+        for tok in raw_tokens:
+            if tok in stop:
+                continue
+            if len(tok) == 1 and tok.islower():
+                continue
+            if tok not in out:
+                out.append(tok)
+        return out
+
     # 1) Acceptance pattern matches — extract literal alternation tokens.
-    for pat in acceptance_patterns or []:
+    for pat in list(acceptance_patterns or []) + list(memory_patterns or []):
         if not pat or not isinstance(pat, str):
             continue
         for alt in pat.split("|"):
             alt = alt.strip()
             if not alt:
                 continue
-            # Use it as a literal substring search across added lines.
+            tokens = _tokens_from_pattern(alt)
             for line in added_lines:
-                if alt in line:
+                if _pattern_matches_line(alt, line):
                     # Pull the actual identifier-shaped token from the line.
                     # E.g. line `+var showMap by remember {…}` → `showMap`.
                     # The alt itself is often the token we want.
                     if _ps_re.match(r"[A-Za-z_][A-Za-z0-9_]*$", alt):
                         protected.add(alt)
+                        break
+                    for token in tokens:
+                        if _ps_re.search(r"\b" + _ps_re.escape(token) + r"\b", line):
+                            protected.add(token)
+                    if tokens:
                         break
                     # Else fall back to a token-shape extraction near alt.
                     m = _ps_re.search(
@@ -441,6 +487,39 @@ def _extract_protected_symbols(
                 protected.add(decl_name)
 
     return sorted(protected)
+
+
+def _dedupe_compile_errors_by_file(compile_errors: list[dict]) -> list[dict]:
+    """Collapse duplicate compiler errors for one file into one repair job."""
+    by_file: dict[str, dict[str, Any]] = {}
+    ordered: list[dict[str, Any]] = []
+    for err in compile_errors or []:
+        if not isinstance(err, dict):
+            continue
+        rel_path = str(err.get("file") or "").strip().replace("\\", "/")
+        if not rel_path:
+            ordered.append(dict(err))
+            continue
+        if rel_path not in by_file:
+            merged = dict(err)
+            merged["file"] = rel_path
+            merged["related_errors"] = [dict(err)]
+            by_file[rel_path] = merged
+            ordered.append(merged)
+            continue
+        by_file[rel_path].setdefault("related_errors", []).append(dict(err))
+
+    for merged in by_file.values():
+        related = merged.get("related_errors") or []
+        messages: list[str] = []
+        for entry in related:
+            if isinstance(entry, dict):
+                msg = str(entry.get("error") or "").strip()
+                if msg and msg not in messages:
+                    messages.append(msg)
+        if len(messages) > 1:
+            merged["error"] = "; ".join(messages[:8])
+    return ordered
 
 
 def _repair_dropped_protected_symbols(
@@ -1427,7 +1506,31 @@ class PrimaryOrchestrator:
                 candidate_files=candidate_files,
             )
         plan_document = planning_result.plan
+        plan_document, _demoted_new_files = _source_bind_expected_new_files(
+            plan_document,
+            request_text=task.request_text or "",
+            issue_context=issue_context if isinstance(issue_context, dict) else None,
+        )
         task.plan_json = plan_document.model_dump(mode="json")
+        if _demoted_new_files:
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_SUCCEEDED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.PLANNING,
+                role=RoleName.PLANNER,
+                tool_name="planner.scope_guard",
+                message=(
+                    "Planner new-file requirement(s) were demoted because "
+                    "they were not named by the user/Jira source text."
+                ),
+                payload={
+                    "demoted_expected_new_files": _demoted_new_files,
+                    "expected_new_files": list(plan_document.expected_new_files or []),
+                    "likely_touch_files": list(plan_document.likely_touch_files or []),
+                },
+            )
 
         # v16.2: inject required_contracts (from the matched playbook,
         # NOT planner-decided) into the plan dict. Codegen reads
@@ -1440,6 +1543,8 @@ class PrimaryOrchestrator:
             task.plan_json["required_contracts"] = [
                 c.to_dict() for c in _required_contracts
             ]
+        if _matched_playbook is not None and isinstance(task.plan_json, dict):
+            task.plan_json["domain_playbook_id"] = _matched_playbook.get("id")
 
         record_event(
             self.db,
@@ -3678,6 +3783,12 @@ class PrimaryOrchestrator:
             pipeline_state["evidence_bundle_done"] = True
             self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
 
+        from app.services.batch_coverage import (
+            BatchOutcome,
+            check_coverage,
+            classify_batch_outcome,
+        )
+
         codegen_result = pipeline_state.get("codegen_result")
         if not isinstance(codegen_result, dict):
             # --- Fast path: deterministic rename if applicable ---
@@ -3874,6 +3985,13 @@ class PrimaryOrchestrator:
             )
             if _codegen_warning and _codegen_warning_audit:
                 pipeline_state["codegen_failure_warnings"] = _codegen_warning
+                _memory_patterns: list[str] = []
+                for _row in _codegen_warning_audit:
+                    for _pat in _row.get("missing_patterns") or []:
+                        if isinstance(_pat, str) and _pat not in _memory_patterns:
+                            _memory_patterns.append(_pat)
+                if _memory_patterns:
+                    pipeline_state["codegen_failure_missing_patterns"] = _memory_patterns
                 try:
                     record_event(
                         self.db,
@@ -3937,6 +4055,48 @@ class PrimaryOrchestrator:
             # record them from main thread post-join). Single-batch path keeps
             # self.tool_gateway so test mocks still apply.
             _use_direct_codegen = len(batches) > 1
+
+            def _scope_lock_single_file_batch_result(
+                dump: dict[str, Any],
+                b_files: dict[str, str],
+            ) -> dict[str, Any]:
+                # Defensive scope-lock: single-file batches must only modify
+                # their target existing file. New-file creation hunks are kept
+                # across all batches; merge de-duplicates them later.
+                if len(b_files) != 1:
+                    return dump
+                target = next(iter(b_files.keys()))
+                diff_text = str(dump.get("diff") or "")
+                kept_sections: list[str] = []
+                kept_file_paths: list[str] = []
+                for section in re.split(
+                    r"(?=^diff --git )", diff_text, flags=re.MULTILINE
+                ):
+                    section = section.strip()
+                    if not section:
+                        continue
+                    m = re.match(r"diff --git a/(.+?) b/", section)
+                    if m is None:
+                        continue
+                    hunk_file = m.group(1).strip()
+                    is_target = hunk_file == target or hunk_file.endswith("/" + target)
+                    is_new_file = (
+                        "new file mode " in section
+                        or bool(re.search(r"^index 0{7,}\.\.", section, re.MULTILINE))
+                    )
+                    if is_target or is_new_file:
+                        kept_sections.append(section)
+                        kept_file_paths.append(hunk_file)
+                dump["diff"] = "\n".join(kept_sections)
+                fc = dump.get("files_changed") or []
+                dump["files_changed"] = [
+                    f for f in fc
+                    if f == target
+                    or f.endswith("/" + target)
+                    or f in kept_file_paths
+                    or any(k.endswith("/" + f) for k in kept_file_paths)
+                ]
+                return dump
 
             def _worker_codegen(
                 b_idx: int, b_files: dict[str, str]
@@ -4066,9 +4226,13 @@ class PrimaryOrchestrator:
             _BATCH_DEADLINE_S = float(
                 getattr(get_settings(), "codegen_batch_deadline_seconds", 720.0)
             )
-            with ThreadPoolExecutor(
+            pool = ThreadPoolExecutor(
                 max_workers=parallel_max, thread_name_prefix="codegen"
-            ) as pool:
+            )
+            _deadline_expired = False
+            timed_out_batches: dict[int, list[str]] = {}
+            timed_out_futures: dict[int, Any] = {}
+            try:
                 futures = [
                     pool.submit(_worker_codegen, i, batches[i])
                     for i in range(len(batches))
@@ -4083,11 +4247,16 @@ class PrimaryOrchestrator:
                         # Deadline blew; synthesize timeout errors for all
                         # still-running batches so the coverage gate can rule
                         # on partial results instead of waiting forever.
+                        _deadline_expired = True
                         for stale_fut in list(pending):
-                            stale_fut.cancel()
                             stale_idx = future_to_batch[stale_fut]
                             stale_label = f"batch {stale_idx + 1}/{len(batches)}"
                             stale_files = list(batches[stale_idx].keys())
+                            timed_out_batches[stale_idx] = stale_files
+                            if stale_fut.running():
+                                timed_out_futures[stale_idx] = stale_fut
+                            else:
+                                stale_fut.cancel()
                             logger.warning(
                                 "codegen %s exceeded per-batch deadline %.0fs — marking failed",
                                 stale_label, _BATCH_DEADLINE_S,
@@ -4177,6 +4346,401 @@ class PrimaryOrchestrator:
                             )
                         commit_checkpoint(
                             self.db, label=f"codegen_batch_{batch_idx}_done"
+                        )
+            finally:
+                # Do not let ThreadPoolExecutor.__exit__ undo the liveness
+                # guarantee by waiting for provider calls that already
+                # exceeded the orchestrator deadline. Running threads may
+                # finish in the background, but the pipeline can now record
+                # batch_coverage failure and move to a terminal state.
+                pool.shutdown(
+                    wait=not _deadline_expired,
+                    cancel_futures=True,
+                )
+
+            if (
+                timed_out_batches
+                and bool(getattr(self.tool_gateway.settings, "codegen_timeout_salvage_enabled", True))
+            ):
+                salvage_timeout = float(
+                    getattr(
+                        self.tool_gateway.settings,
+                        "codegen_timeout_salvage_seconds",
+                        240.0,
+                    )
+                    or 240.0
+                )
+                for stale_idx, stale_files in sorted(timed_out_batches.items()):
+                    if stale_idx in results_by_idx:
+                        continue
+                    stale_label = f"batch {stale_idx + 1}/{len(batches)}"
+                    stale_batch = batches[stale_idx]
+                    target_paths = _targets_in_batch(stale_files)
+                    late_future = timed_out_futures.get(stale_idx)
+                    if late_future is not None and not late_future.cancelled():
+                        late_grace = float(
+                            getattr(
+                                self.tool_gateway.settings,
+                                "codegen_timeout_late_result_grace_seconds",
+                                360.0,
+                            )
+                            or 360.0
+                        )
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_CALL_REQUESTED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.ACTION,
+                            role=RoleName.ACTION,
+                            tool_name="codegen.timeout_late_wait",
+                            message=(
+                                f"Waiting up to {late_grace:.0f}s for late result from "
+                                f"timed-out {stale_label} before starting a duplicate call."
+                            ),
+                            payload={
+                                "batch": stale_idx,
+                                "files": stale_files,
+                                "timeout_seconds": late_grace,
+                            },
+                        )
+                        try:
+                            late_idx, late_result, late_err = late_future.result(
+                                timeout=late_grace
+                            )
+                        except TimeoutError as exc:
+                            late_timeout = TimeoutError(
+                                f"codegen late result exceeded {late_grace:.0f}s"
+                            )
+                            for target_path in target_paths:
+                                outcome = classify_batch_outcome(
+                                    file_path=target_path,
+                                    plan=plan,
+                                    batch_result=None,
+                                    error=late_timeout,
+                                    batch_id=f"{stale_label} late-result",
+                                )
+                                batch_outcomes_by_file[outcome.file_path] = outcome
+                            record_event(
+                                self.db,
+                                task_id=task.id,
+                                event_type=EventType.TOOL_TIMED_OUT,
+                                source=EventSource.ORCHESTRATOR,
+                                stage=WorkflowStage.ACTION,
+                                role=RoleName.ACTION,
+                                tool_name="codegen.timeout_late_wait",
+                                message=(
+                                    f"Late result for {stale_label} did not arrive "
+                                    f"within {late_grace:.0f}s: {exc}"
+                                ),
+                                payload={
+                                    "batch": stale_idx,
+                                    "files": stale_files,
+                                    "timeout_seconds": late_grace,
+                                },
+                            )
+                            continue
+                        except Exception as exc:  # noqa: BLE001
+                            for target_path in target_paths:
+                                outcome = classify_batch_outcome(
+                                    file_path=target_path,
+                                    plan=plan,
+                                    batch_result=None,
+                                    error=exc,
+                                    batch_id=f"{stale_label} late-result",
+                                )
+                                batch_outcomes_by_file[outcome.file_path] = outcome
+                            record_event(
+                                self.db,
+                                task_id=task.id,
+                                event_type=EventType.TOOL_FAILED,
+                                source=EventSource.ORCHESTRATOR,
+                                stage=WorkflowStage.ACTION,
+                                role=RoleName.ACTION,
+                                tool_name="codegen.timeout_late_wait",
+                                message=f"Late result for {stale_label} failed: {exc}",
+                                payload={
+                                    "batch": stale_idx,
+                                    "files": stale_files,
+                                    "error": str(exc)[:500],
+                                },
+                            )
+                            continue
+
+                        if late_idx != stale_idx:
+                            logger.warning(
+                                "late codegen result index mismatch: expected %s got %s",
+                                stale_idx,
+                                late_idx,
+                            )
+                        if late_err is not None:
+                            for target_path in target_paths:
+                                outcome = classify_batch_outcome(
+                                    file_path=target_path,
+                                    plan=plan,
+                                    batch_result=None,
+                                    error=late_err,
+                                    batch_id=f"{stale_label} late-result",
+                                )
+                                batch_outcomes_by_file[outcome.file_path] = outcome
+                            record_event(
+                                self.db,
+                                task_id=task.id,
+                                event_type=EventType.TOOL_FAILED,
+                                source=EventSource.ORCHESTRATOR,
+                                stage=WorkflowStage.ACTION,
+                                role=RoleName.ACTION,
+                                tool_name="codegen.timeout_late_wait",
+                                message=f"Late result for {stale_label} returned error: {late_err}",
+                                payload={
+                                    "batch": stale_idx,
+                                    "files": stale_files,
+                                    "error": str(late_err)[:500],
+                                },
+                            )
+                            continue
+                        if late_result and str(late_result.get("diff") or "").strip():
+                            late_result = _scope_lock_single_file_batch_result(
+                                late_result,
+                                stale_batch,
+                            )
+                            results_by_idx[stale_idx] = late_result
+                            for target_path in target_paths:
+                                outcome = classify_batch_outcome(
+                                    file_path=target_path,
+                                    plan=plan,
+                                    batch_result=late_result,
+                                    error=None,
+                                    batch_id=f"{stale_label} late-result",
+                                )
+                                batch_outcomes_by_file[outcome.file_path] = outcome
+                            record_event(
+                                self.db,
+                                task_id=task.id,
+                                event_type=EventType.TOOL_SUCCEEDED,
+                                source=EventSource.ORCHESTRATOR,
+                                stage=WorkflowStage.ACTION,
+                                role=RoleName.ACTION,
+                                tool_name="codegen.timeout_late_wait",
+                                message=(
+                                    f"Late result for {stale_label} arrived and "
+                                    f"produced {len(late_result.get('files_changed') or [])} file(s)."
+                                ),
+                                payload=late_result,
+                            )
+                            continue
+
+                        no_late_output = RuntimeError("late codegen result produced no diff")
+                        for target_path in target_paths:
+                            outcome = classify_batch_outcome(
+                                file_path=target_path,
+                                plan=plan,
+                                batch_result=None,
+                                error=no_late_output,
+                                batch_id=f"{stale_label} late-result",
+                            )
+                            batch_outcomes_by_file[outcome.file_path] = outcome
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_FAILED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.ACTION,
+                            role=RoleName.ACTION,
+                            tool_name="codegen.timeout_late_wait",
+                            message=f"Late result for {stale_label} produced no diff.",
+                            payload={"batch": stale_idx, "files": stale_files},
+                        )
+                        continue
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_CALL_REQUESTED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.ACTION,
+                        role=RoleName.ACTION,
+                        tool_name="codegen.timeout_salvage",
+                        message=(
+                            f"Retrying timed-out {stale_label} once with a "
+                            f"{salvage_timeout:.0f}s bounded single-batch call."
+                        ),
+                        payload={
+                            "batch": stale_idx,
+                            "files": stale_files,
+                            "timeout_seconds": salvage_timeout,
+                        },
+                    )
+
+                    def _salvage_call() -> dict[str, Any]:
+                        from app.services.codegen import CodeGenerator
+
+                        salvage_plan = dict(_plan_json_for_codegen)
+                        if target_paths:
+                            salvage_plan["must_touch_files"] = list(target_paths)
+                            salvage_plan["expected_new_files"] = [
+                                p for p in list(salvage_plan.get("expected_new_files") or [])
+                                if p in target_paths
+                            ]
+                            salvage_plan["likely_touch_files"] = [
+                                p for p in list(salvage_plan.get("likely_touch_files") or [])
+                                if p in target_paths
+                            ]
+                        base_settings = self.tool_gateway.settings
+                        current_deepseek_timeout = float(
+                            getattr(base_settings, "deepseek_timeout_seconds", 120.0)
+                            or 120.0
+                        )
+                        salvage_updates = {
+                            "deepseek_timeout_seconds": min(
+                                current_deepseek_timeout,
+                                max(30.0, salvage_timeout),
+                            ),
+                            "codegen_self_validation_max_retries": 0,
+                        }
+                        if hasattr(base_settings, "model_copy"):
+                            salvage_settings = base_settings.model_copy(update=salvage_updates)
+                        else:
+                            salvage_settings = base_settings
+                        salvage_description = (
+                            self._build_codegen_task_description(
+                                task=task,
+                                plan=plan,
+                                pipeline_state=pipeline_state,
+                                batch_files=stale_batch,
+                            )
+                            + "\n\nTIMEOUT SALVAGE RETRY:\n"
+                            + "The first codegen call for this same batch timed out. "
+                            + "Other sibling batches already handled their own files. "
+                            + "Return the smallest valid patch for ONLY this batch's "
+                            + f"target file(s): {', '.join(stale_files)}. "
+                            + "Do not broaden scope or rewrite unrelated code."
+                        )
+                        result = CodeGenerator(salvage_settings).generate_patch(
+                            task_id=task.id,
+                            plan_json=salvage_plan,
+                            context_files=stale_batch,
+                            task_description=salvage_description,
+                            source_repo_path=str(_source_path) if _source_path else None,
+                        )
+                        return _scope_lock_single_file_batch_result(
+                            result.model_dump(mode="json"),
+                            stale_batch,
+                        )
+
+                    salvage_pool = ThreadPoolExecutor(
+                        max_workers=1,
+                        thread_name_prefix="codegen-salvage",
+                    )
+                    salvage_future = salvage_pool.submit(_salvage_call)
+                    try:
+                        salvage_result = salvage_future.result(timeout=salvage_timeout)
+                    except TimeoutError as exc:
+                        salvage_future.cancel()
+                        salvage_pool.shutdown(wait=False, cancel_futures=True)
+                        timeout_err = TimeoutError(
+                            f"codegen timeout salvage exceeded {salvage_timeout:.0f}s"
+                        )
+                        for target_path in target_paths:
+                            outcome = classify_batch_outcome(
+                                file_path=target_path,
+                                plan=plan,
+                                batch_result=None,
+                                error=timeout_err,
+                                batch_id=f"{stale_label} salvage",
+                            )
+                            batch_outcomes_by_file[outcome.file_path] = outcome
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_TIMED_OUT,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.ACTION,
+                            role=RoleName.ACTION,
+                            tool_name="codegen.timeout_salvage",
+                            message=f"Timeout salvage for {stale_label} timed out: {exc}",
+                            payload={
+                                "batch": stale_idx,
+                                "files": stale_files,
+                                "timeout_seconds": salvage_timeout,
+                            },
+                        )
+                        continue
+                    except Exception as exc:  # noqa: BLE001
+                        salvage_pool.shutdown(wait=True, cancel_futures=True)
+                        for target_path in target_paths:
+                            outcome = classify_batch_outcome(
+                                file_path=target_path,
+                                plan=plan,
+                                batch_result=None,
+                                error=exc,
+                                batch_id=f"{stale_label} salvage",
+                            )
+                            batch_outcomes_by_file[outcome.file_path] = outcome
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_FAILED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.ACTION,
+                            role=RoleName.ACTION,
+                            tool_name="codegen.timeout_salvage",
+                            message=f"Timeout salvage for {stale_label} failed: {exc}",
+                            payload={
+                                "batch": stale_idx,
+                                "files": stale_files,
+                                "error": str(exc)[:500],
+                            },
+                        )
+                        continue
+                    else:
+                        salvage_pool.shutdown(wait=True, cancel_futures=True)
+
+                    if salvage_result and str(salvage_result.get("diff") or "").strip():
+                        results_by_idx[stale_idx] = salvage_result
+                        for target_path in target_paths:
+                            outcome = classify_batch_outcome(
+                                file_path=target_path,
+                                plan=plan,
+                                batch_result=salvage_result,
+                                error=None,
+                                batch_id=f"{stale_label} salvage",
+                            )
+                            batch_outcomes_by_file[outcome.file_path] = outcome
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_SUCCEEDED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.ACTION,
+                            role=RoleName.ACTION,
+                            tool_name="codegen.timeout_salvage",
+                            message=(
+                                f"Timeout salvage for {stale_label} produced "
+                                f"{len(salvage_result.get('files_changed') or [])} file(s)."
+                            ),
+                            payload=salvage_result,
+                        )
+                    else:
+                        no_output_err = RuntimeError("timeout salvage produced no diff")
+                        for target_path in target_paths:
+                            outcome = classify_batch_outcome(
+                                file_path=target_path,
+                                plan=plan,
+                                batch_result=None,
+                                error=no_output_err,
+                                batch_id=f"{stale_label} salvage",
+                            )
+                            batch_outcomes_by_file[outcome.file_path] = outcome
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_FAILED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.ACTION,
+                            role=RoleName.ACTION,
+                            tool_name="codegen.timeout_salvage",
+                            message=f"Timeout salvage for {stale_label} produced no diff.",
+                            payload={"batch": stale_idx, "files": stale_files},
                         )
             # Persist outcomes for the coverage gate (and for UI / debug).
             pipeline_state["batch_outcomes"] = {
@@ -4335,6 +4899,25 @@ class PrimaryOrchestrator:
                     }))
                 except Exception:  # noqa: BLE001
                     continue
+        if not outcomes_list and isinstance(codegen_result, dict):
+            replay_targets: list[str] = []
+            for path in (
+                list(getattr(plan, "must_touch_files", []) or [])
+                + list(getattr(plan, "expected_new_files", []) or [])
+                + list(codegen_result.get("files_changed") or [])
+            ):
+                if isinstance(path, str) and path and path not in replay_targets:
+                    replay_targets.append(path)
+            outcomes_list = [
+                classify_batch_outcome(
+                    file_path=path,
+                    plan=plan,
+                    batch_result=codegen_result,
+                    error=None,
+                    batch_id="resume_codegen_result",
+                )
+                for path in replay_targets
+            ]
         coverage_verdict = check_coverage(outcomes_list, plan)
         pipeline_state["coverage_verdict"] = coverage_verdict.to_payload()
         record_event(
@@ -4680,11 +5263,43 @@ class PrimaryOrchestrator:
         try:
             from app.services.patch_budget import (
                 PatchBudget,
+                PatchScopeReview,
+                evaluate_domain_patch_scope,
                 evaluate_patch_budget,
             )
 
             patch_budget = PatchBudget()
             budget_report = evaluate_patch_budget(diff, patch_budget)
+            _budget_plan = task.plan_json if isinstance(task.plan_json, dict) else {}
+            _domain_id = str(_budget_plan.get("domain_playbook_id") or "").strip()
+            if not _domain_id:
+                _contract_ids = {
+                    str(c.get("contract_id") or c.get("id") or "")
+                    for c in (_budget_plan.get("required_contracts") or [])
+                    if isinstance(c, dict)
+                }
+                if {"map_ui_present", "user_can_select_location"} & _contract_ids:
+                    _domain_id = "android_map_location"
+            scope_review = evaluate_domain_patch_scope(
+                diff,
+                domain_id=_domain_id or None,
+                budget_report=budget_report,
+            )
+            if scope_review.needs_review and budget_report.passed:
+                _coverage_ok = bool(getattr(coverage_verdict, "ok", False))
+                _contract_ok = _cc_verdict is None or bool(getattr(_cc_verdict, "ok", False))
+                if _coverage_ok and _contract_ok:
+                    scope_review = PatchScopeReview(
+                        needs_review=False,
+                        recommendation="continue",
+                        findings=[
+                            "scope review advisory suppressed because "
+                            "batch_coverage and contract_coverage already "
+                            "passed for this patch"
+                        ]
+                        + list(scope_review.findings),
+                        metrics=scope_review.metrics,
+                    )
             record_event(
                 self.db,
                 task_id=task.id,
@@ -4713,6 +5328,7 @@ class PrimaryOrchestrator:
                     "metrics": {
                         k: v for k, v in budget_report.metrics.items() if k != "per_file"
                     },
+                    "scope_review": scope_review.to_payload(),
                 },
             )
             if not budget_report.passed:
@@ -4738,6 +5354,49 @@ class PrimaryOrchestrator:
                     },
                 )
                 return
+            if scope_review.needs_review:
+                retry_done = bool(pipeline_state.get("patch_scope_retry_done"))
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=(
+                        EventType.TOOL_SKIPPED
+                        if not retry_done
+                        else EventType.TOOL_SUCCEEDED
+                    ),
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="patch_budget.scope_review",
+                    message=(
+                        "Patch scope review requested a smaller codegen attempt."
+                        if not retry_done
+                        else "Patch scope review still broad after retry; continuing."
+                    ),
+                    payload=scope_review.to_payload(),
+                )
+                if not retry_done:
+                    pipeline_state["patch_scope_retry_done"] = True
+                    feedback = [
+                        "Patch scope review: "
+                        + "; ".join(scope_review.findings)
+                        + " Generate a smaller corrective patch. Preserve "
+                        "existing map/location anchors and change only the "
+                        "missing wiring; avoid broad file rewrites or large "
+                        "import bursts."
+                    ]
+                    self._reset_for_conformance_retry(
+                        task=task,
+                        pipeline_state=pipeline_state,
+                        feedback=feedback,
+                    )
+                    time.sleep(15)
+                    return self._execute_develop_pipeline(
+                        task=task,
+                        actor_name=actor_name,
+                        plan=plan,
+                        approval_id=approval_id,
+                    )
         except Exception as exc:  # noqa: BLE001
             self._workspace_append_audit(
                 task,
@@ -5320,6 +5979,42 @@ class PrimaryOrchestrator:
         # accepted that diff because it has a `_arithmetic_mask`-shape
         # pattern hit. Without acceptance_tests, feature_presence still
         # runs as the only structural anchor.
+        if not pipeline_state.get("feature_presence_done"):
+            _compile_only_text = " ".join(
+                str(part or "")
+                for part in (
+                    task.request_text,
+                    getattr(plan, "objective", ""),
+                    getattr(plan, "request_summary", ""),
+                )
+            ).casefold()
+            _is_compile_only_fix = bool(
+                isinstance(test_result, dict)
+                and str(test_result.get("verified_by") or "").casefold() == "compile"
+                and re.search(
+                    r"\b(compile|compilation|compiler|build error|unresolved reference)\b",
+                    _compile_only_text,
+                )
+            )
+            if _is_compile_only_fix:
+                pipeline_state["feature_presence_done"] = True
+                pipeline_state["feature_presence_skipped"] = "compile_only_fix"
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_SUCCEEDED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="feature_presence_check.skipped",
+                    message=(
+                        "Compile-only fix detected; skipping feature_presence "
+                        "because compile_gate is the relevant validator."
+                    ),
+                    payload={"reason": "compile_only_fix"},
+                )
+                self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+
         _plan_acceptance_tests = (
             (task.plan_json or {}).get("acceptance_tests")
             if isinstance(task.plan_json, dict)
@@ -5671,7 +6366,21 @@ class PrimaryOrchestrator:
                             )
                         )
                     diff_text = pipeline_state.get("diff") or ""
-                    report = evaluate_acceptance(diff_text, parsed_tests)
+                    patched_files_for_acceptance: dict[str, str] = {}
+                    for rel in sorted(set(re.findall(r"^diff --git a/(.+?) b/", diff_text, flags=re.MULTILINE))):
+                        try:
+                            full_path = sandbox_dir / Path(*rel.split("/"))
+                            if full_path.exists():
+                                patched_files_for_acceptance[rel] = full_path.read_text(
+                                    encoding="utf-8", errors="replace"
+                                )
+                        except Exception:  # noqa: BLE001
+                            continue
+                    report = evaluate_acceptance(
+                        diff_text,
+                        parsed_tests,
+                        patched_files=patched_files_for_acceptance,
+                    )
                     record_event(
                         self.db,
                         task_id=task.id,
@@ -8018,9 +8727,11 @@ class PrimaryOrchestrator:
         return {"status": "cloned", **result}
 
     def _build_develop_sandbox(self, task: Task) -> ExecutionSandbox:
+        settings_obj = self.tool_gateway.settings
         return ExecutionSandbox(
             task_id=task.id,
-            base_dir=str(getattr(self.tool_gateway.settings, "sandbox_base_dir", "data/sandboxes")),
+            base_dir=str(getattr(settings_obj, "sandbox_base_dir", "data/sandboxes")),
+            sandbox_external_root=str(getattr(settings_obj, "sandbox_external_root", "") or ""),
         )
 
     def _develop_sandbox_dir(self, task: Task) -> Path:
@@ -8319,9 +9030,10 @@ class PrimaryOrchestrator:
                 )
                 break
 
+            repair_compile_errors = _dedupe_compile_errors_by_file(compile_errors)
             files_queued = [
                 str(e.get("file") or "")
-                for e in compile_errors[:files_per_round]
+                for e in repair_compile_errors[:files_per_round]
                 if e.get("file")
             ]
             round_label = round_index + 1
@@ -8357,7 +9069,7 @@ class PrimaryOrchestrator:
                     task=task,
                     actor_name=actor_name,
                     plan=plan,
-                    compile_errors=compile_errors,
+                    compile_errors=repair_compile_errors,
                     sandbox_dir=sandbox_dir,
                     pipeline_state=pipeline_state,
                     approval_id=approval_id,
@@ -8944,10 +9656,16 @@ class PrimaryOrchestrator:
                             acceptance_patterns.append(p)
                 except Exception:  # noqa: BLE001
                     pass
+                memory_patterns = [
+                    str(p)
+                    for p in (pipeline_state.get("codegen_failure_missing_patterns") or [])
+                    if isinstance(p, str) and p.strip()
+                ]
                 protected_symbols = _extract_protected_symbols(
                     first_attempt_diff,
                     rel_path,
                     acceptance_patterns=acceptance_patterns,
+                    memory_patterns=memory_patterns,
                 )
                 if protected_symbols:
                     protected_symbols_section = (
@@ -8962,6 +9680,18 @@ class PrimaryOrchestrator:
                         + "\n".join(f"  - {s}" for s in protected_symbols)
                         + "\n\n"
                     )
+                if memory_patterns:
+                    protected_symbols_section += (
+                        "MEMORY-DERIVED PROTECTED PATTERNS "
+                        "(T-LEARN-LOOP-V2):\n"
+                        "A prior same-family failure reached acceptance_check "
+                        "with these structural patterns missing. If this "
+                        "first-attempt diff introduced code matching any of "
+                        "them, the repair MUST preserve that code instead of "
+                        "deleting it:\n"
+                        + "\n".join(f"  - {p}" for p in memory_patterns[:8])
+                        + "\n\n"
+                    )
 
             objective_section = (
                 "ORIGINAL TASK OBJECTIVE:\n"
@@ -8969,6 +9699,17 @@ class PrimaryOrchestrator:
                 f"- Request summary: {_truncate_text(getattr(plan, 'request_summary', ''), limit=1000)}\n"
                 f"- Change summary: {_truncate_text(getattr(plan, 'change_summary', ''), limit=1000)}\n\n"
             )
+
+            library_contract_section = ""
+            project_constraint = self._project_library_constraint(
+                getattr(task, "source_name", None)
+            )
+            if project_constraint:
+                library_contract_section = (
+                    "PROJECT/LIBRARY CONTRACTS (must obey during repair):\n"
+                    + project_constraint[:5000]
+                    + "\n\n"
+                )
 
             scope_section = ""
             if allowed_paths:
@@ -8993,6 +9734,8 @@ class PrimaryOrchestrator:
             # saw raw compiler text and "fixed" the wrong layer (e.g.
             # ripping out the import).
             classified_hint_section = ""
+            classified_kind = ""
+            diagnostic_line_int = 0
             try:
                 from app.services.compile_error_classifier import classify
 
@@ -9001,11 +9744,13 @@ class PrimaryOrchestrator:
                     _line_int = int(_line)
                 except (TypeError, ValueError):
                     _line_int = 0
+                diagnostic_line_int = _line_int
                 classified = classify(
                     str(error_msg),
                     file=rel_path,
                     line=_line_int,
                 )
+                classified_kind = str(classified.kind)
                 if classified.kind != "unknown" and classified.repair_hint:
                     classified_hint_section = (
                         "STRUCTURED COMPILE ERROR ANALYSIS (T-TYPE-AWARE-V1):\n"
@@ -9070,10 +9815,11 @@ class PrimaryOrchestrator:
                     )
                     symbol_verifier_section = "\n".join(_hit_lines) + "\n\n"
 
-            repair_prompt = (
+            repair_prompt_base = (
                 f"STRUCTURAL REPAIR TASK - fix ONE broken file: {rel_path}\n\n"
                 + objective_section
                 + protected_symbols_section
+                + library_contract_section
                 + classified_hint_section
                 + symbol_verifier_section
                 + "These compile errors must be fixed without changing task scope.\n"
@@ -9099,6 +9845,9 @@ class PrimaryOrchestrator:
                 + f"ERROR:\n  {rel_path}: {str(error_msg)[:1000]}\n\n"
                 + orig_section
                 + first_attempt_section
+            )
+            repair_prompt = (
+                repair_prompt_base
                 + f"Output ONLY valid unified diff hunks that fix {rel_path}.\n"
                 f"Start with 'diff --git a/{rel_path} b/{rel_path}'.\n"
                 "If no fix is needed, output nothing.\n"
@@ -9131,7 +9880,215 @@ class PrimaryOrchestrator:
             }
             repair_result = None
             file_call_timed_out = False
-            for _repair_attempt in range(2):  # 1 retry on non-timeout failure
+
+            try:
+                from app.services.structural_edit import apply_kotlin_diagnostic_fast_fixes
+
+                _fast_fix = apply_kotlin_diagnostic_fast_fixes(
+                    file_path=rel_path,
+                    original_content=broken_content,
+                    error_text=str(error_msg),
+                    line=diagnostic_line_int,
+                    protected_symbols=protected_symbols,
+                )
+                if _fast_fix is not None and _fast_fix.ok and _fast_fix.diff.strip():
+                    repair_result = {
+                        "diff": _fast_fix.diff,
+                        "summary": "deterministic Kotlin diagnostic repair",
+                        "files_changed": [rel_path],
+                        "provider_name": "harness",
+                        "model_name": "deterministic",
+                    }
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_SUCCEEDED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="compile_repair.deterministic_completed",
+                        message=(
+                            "Deterministic Kotlin diagnostic repair produced "
+                            f"a scoped diff for {rel_path}."
+                        ),
+                        payload={
+                            "file": rel_path,
+                            "operations": list(_fast_fix.applied_operations),
+                        },
+                    )
+                elif _fast_fix is not None:
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_FAILED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="compile_repair.deterministic_failed",
+                        message=(
+                            "Deterministic Kotlin diagnostic repair could not "
+                            f"produce a valid scoped diff for {rel_path}."
+                        ),
+                        payload={
+                            "file": rel_path,
+                            "errors": [
+                                {"operation": e.operation, "reason": e.reason}
+                                for e in _fast_fix.errors[:8]
+                            ],
+                        },
+                    )
+            except Exception as exc:  # noqa: BLE001
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_FAILED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.REVIEW,
+                    role=RoleName.REVIEWER,
+                    tool_name="compile_repair.deterministic_failed",
+                    message=f"Deterministic Kotlin diagnostic repair errored for {rel_path}: {exc}",
+                    payload={"file": rel_path, "error": str(exc)[:500]},
+                )
+
+            # C10: Kotlin parser/scope explosions are not normal
+            # unresolved-reference repairs. First try diagnostic-scoped JSON
+            # edits, then let the harness locate/apply/generate diff. If the
+            # structured path fails validation, fall back to the legacy repair
+            # path for this round.
+            if repair_result is None and classified_kind == "kotlin_structural_breakage":
+                structural_prompt = (
+                    repair_prompt_base
+                    + "\nSTRUCTURED EDIT JSON MODE (C10):\n"
+                    "Return ONLY JSON. Do not return a diff. Use operations "
+                    "`add_import`, `replace_call_expression`, `replace_block`, "
+                    "`insert_into_function`, or `wrap_firebase_snapshot_children`. "
+                    "Keep edits local to the nearest "
+                    "broken Kotlin block/function. Preserve all protected "
+                    "symbols listed above.\n"
+                )
+                structural_payload = {
+                    "plan_json": {
+                        "objective": f"Structural repair for {rel_path}",
+                        "steps": [],
+                    },
+                    "context_files": {rel_path: broken_content},
+                    "task_description": structural_prompt,
+                    "output_format": "structural_edit_json",
+                }
+                try:
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_CALL_REQUESTED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="compile_repair.structural_started",
+                        message=f"C10 structural repair starting for {rel_path}.",
+                        payload={"file": rel_path, "error_kind": classified_kind},
+                    )
+                    _structural_result = self._execute_develop_tool(
+                        task=task,
+                        actor_name=actor_name,
+                        tool_name="codegen.generate_patch",
+                        payload=structural_payload,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        approval_id=approval_id,
+                        pipeline_state=pipeline_state,
+                        timeout_seconds=_compute_call_timeout(),
+                    )
+                    from app.services.structural_edit import apply_structural_edit_plan
+
+                    _edit_plan = (
+                        _structural_result.get("edit_plan")
+                        if isinstance(_structural_result, dict)
+                        else None
+                    )
+                    if isinstance(_edit_plan, dict):
+                        _applied = apply_structural_edit_plan(
+                            file_path=rel_path,
+                            original_content=broken_content,
+                            plan=_edit_plan,
+                            protected_symbols=protected_symbols,
+                        )
+                        if _applied.ok and _applied.diff.strip():
+                            repair_result = {
+                                "diff": _applied.diff,
+                                "summary": "C10 structural repair",
+                                "files_changed": [rel_path],
+                                "provider_name": _structural_result.get("provider_name"),
+                                "model_name": _structural_result.get("model_name"),
+                            }
+                            record_event(
+                                self.db,
+                                task_id=task.id,
+                                event_type=EventType.TOOL_SUCCEEDED,
+                                source=EventSource.ORCHESTRATOR,
+                                stage=WorkflowStage.REVIEW,
+                                role=RoleName.REVIEWER,
+                                tool_name="compile_repair.structural_completed",
+                                message=f"C10 structural repair produced a scoped diff for {rel_path}.",
+                                payload={
+                                    "file": rel_path,
+                                    "operations": list(_applied.applied_operations),
+                                },
+                            )
+                        else:
+                            record_event(
+                                self.db,
+                                task_id=task.id,
+                                event_type=EventType.TOOL_FAILED,
+                                source=EventSource.ORCHESTRATOR,
+                                stage=WorkflowStage.REVIEW,
+                                role=RoleName.REVIEWER,
+                                tool_name="compile_repair.structural_failed",
+                                message=(
+                                    f"C10 structural repair did not produce a valid scoped diff for {rel_path}."
+                                ),
+                                payload={
+                                    "file": rel_path,
+                                    "errors": [
+                                        {"operation": e.operation, "reason": e.reason}
+                                        for e in _applied.errors[:8]
+                                    ],
+                                },
+                            )
+                except DevelopToolTimeout as exc:
+                    file_call_timed_out = True
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_TIMED_OUT,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="compile_repair.structural_timeout",
+                        message=(
+                            f"C10 structural repair for {rel_path} exceeded "
+                            f"{exc.timeout_seconds:.1f}s."
+                        ),
+                        payload={"file": rel_path, "timeout_seconds": exc.timeout_seconds},
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_FAILED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.REVIEW,
+                        role=RoleName.REVIEWER,
+                        tool_name="compile_repair.structural_failed",
+                        message=f"C10 structural repair failed for {rel_path}: {exc}",
+                        payload={"file": rel_path, "error": str(exc)[:500]},
+                    )
+
+            repair_attempts = (
+                ()
+                if file_call_timed_out or repair_result is not None
+                else range(2)
+            )
+            for _repair_attempt in repair_attempts:  # 1 retry on non-timeout failure
                 # Round deadline check before EVERY attempt (C7 acceptance #4).
                 if deadline is not None and time.monotonic() >= deadline:
                     raise RepairRoundTimeout(
@@ -9462,6 +10419,7 @@ class PrimaryOrchestrator:
                                 role=RoleName.REVIEWER,
                                 approval_id=approval_id,
                                 pipeline_state=pipeline_state,
+                                timeout_seconds=_compute_call_timeout(),
                             )
                             retry_diff = str((retry_result or {}).get("diff") or "").strip()
                             # Filter to target file only.
@@ -9482,7 +10440,24 @@ class PrimaryOrchestrator:
                                     baseline_content=orig_content,
                                     threshold=intent_threshold,
                                 )
-                                if not _retry_dropped:
+                                _retry_protected_dropped: list[str] = []
+                                if protected_symbols:
+                                    _retry_removed = _changed_lines_from_diff(
+                                        retry_diff, rel_path, "-"
+                                    )
+                                    _retry_added = _changed_lines_from_diff(
+                                        retry_diff, rel_path, "+"
+                                    )
+                                    _retry_post = broken_content
+                                    for _rl in _retry_removed:
+                                        if _rl:
+                                            _retry_post = _retry_post.replace(_rl, "")
+                                    _retry_post = _retry_post + "\n" + "\n".join(_retry_added)
+                                    _retry_protected_dropped = _repair_dropped_protected_symbols(
+                                        protected=protected_symbols,
+                                        repaired_file_content=_retry_post,
+                                    )
+                                if not _retry_dropped and not _retry_protected_dropped:
                                     record_event(
                                         self.db,
                                         task_id=task.id,
@@ -9499,6 +10474,12 @@ class PrimaryOrchestrator:
                                     repair_diff = retry_diff
                                     # Fall through to apply.
                                 else:
+                                    _retry_extra = ""
+                                    if _retry_protected_dropped:
+                                        _retry_extra = (
+                                            " Protected symbols still dropped: "
+                                            + ", ".join(_retry_protected_dropped[:5])
+                                        )
                                     record_event(
                                         self.db,
                                         task_id=task.id,
@@ -9510,6 +10491,7 @@ class PrimaryOrchestrator:
                                         message=(
                                             f"Intent-drop retry still dropping intent for "
                                             f"{rel_path} ({_retry_ratio:.0%}); giving up this round."
+                                            + _retry_extra
                                         ),
                                     )
                                     self._preserve_develop_pipeline_state(
@@ -9844,15 +10826,21 @@ class PrimaryOrchestrator:
             # text when missing_patterns isn't populated.
             m = top[0]
             concrete: list[str] = []
+            concrete_patterns: list[str] = []
             evidence = m.evidence_refs if isinstance(m.evidence_refs, dict) else {}
             for entry in evidence.get("missing_patterns") or []:
                 if isinstance(entry, dict) and entry.get("pattern"):
-                    concrete.append(str(entry["pattern"]))
+                    pattern = str(entry["pattern"])
+                    concrete.append(pattern)
+                    concrete_patterns.append(pattern)
                 elif isinstance(entry, str):
                     concrete.append(entry)
+                    concrete_patterns.append(entry)
             for f in evidence.get("missing_files") or []:
                 if isinstance(f, str):
                     concrete.append(f)
+            for row in audit:
+                row["missing_patterns"] = list(concrete_patterns)
 
             directive_lines = [
                 "PRIOR FAILURE WARNING (auto-retrieved from agent_memory):",

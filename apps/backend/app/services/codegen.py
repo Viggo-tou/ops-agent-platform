@@ -167,6 +167,35 @@ Given a task plan and source file contents, output ONLY the requested JSON symbo
 Do not produce a diff, markdown fence, explanation, or any prose."""
 
 
+CODEGEN_STRUCTURAL_EDIT_SYSTEM_PROMPT = """You are a structural compile-repair agent.
+
+Output ONLY one valid JSON object. No markdown fences, no prose.
+
+Schema:
+{
+  "status": "repair_patch" | "no_patch",
+  "file": "relative/path.kt",
+  "edits": [
+    {
+      "operation": "add_import" | "replace_call_expression" | "replace_block" | "insert_into_function",
+      "anchor_line": 123,
+      "anchor_substring": "exact text near the diagnostic",
+      "content": "replacement or inserted code"
+    }
+  ],
+  "preserves_intents": ["short intent ids or symbol names"]
+}
+
+Rules:
+1. Do not output a unified diff.
+2. Do not output Aider SEARCH/REPLACE blocks.
+3. Keep edits local to the broken file and diagnostic area.
+4. Use add_import for imports; do not place import statements inside functions.
+5. For Kotlin parser/scope failures, repair the nearest block or call expression. Do not rewrite the whole file.
+6. Preserve every protected symbol listed by the harness.
+"""
+
+
 # --- Aider search/replace block format (Tier 1.5) ----------------------------
 # Mid-tier models (DeepSeek, GPT-4o-mini) consistently miscount unified-diff
 # hunk headers and paraphrase context lines. Aider's published benchmark data
@@ -618,6 +647,86 @@ class CodeGenerator:
                 f"expected_new_files={sorted(expected_new_files)}"
             )
 
+    @staticmethod
+    def _validate_diff_paths_within_allowed(
+        diff: str,
+        files_changed: list[str],
+        *,
+        allowed_paths: set[str],
+        must_touch_files: list[str],
+        expected_new_files: list[str],
+    ) -> None:
+        """Validate the executable diff, not only reported metadata."""
+        CodeGenerator._validate_changed_files_within_allowed(
+            files_changed,
+            allowed_paths=allowed_paths,
+            must_touch_files=must_touch_files,
+            expected_new_files=expected_new_files,
+        )
+        if not str(diff or "").strip():
+            return
+        try:
+            from app.services.spec_conformance import _classify_files_in_diff
+
+            file_shapes = _classify_files_in_diff(diff)
+        except Exception:  # noqa: BLE001
+            file_shapes = {}
+        if not file_shapes:
+            return
+
+        diff_paths = {
+            path.strip()
+            for path in file_shapes
+            if isinstance(path, str) and path.strip()
+        }
+        extra = sorted(
+            path
+            for path in diff_paths
+            if not any(
+                CodeGenerator._paths_match(path, allowed)
+                for allowed in allowed_paths
+            )
+        )
+        if extra:
+            raise CodegenError(
+                "file_outside_allowed_set: diff contains files not in plan: "
+                f"{extra}. Allowed must_touch_files={sorted(must_touch_files)}, "
+                f"expected_new_files={sorted(expected_new_files)}"
+            )
+
+        created_files = [
+            path for path, shape in file_shapes.items()
+            if shape == "create"
+        ]
+        unplanned_created = sorted(
+            path
+            for path in created_files
+            if not any(
+                CodeGenerator._paths_match(path, expected)
+                for expected in expected_new_files
+            )
+        )
+        if unplanned_created:
+            raise CodegenError(
+                "unplanned_new_file: diff creates file(s) not declared in "
+                f"expected_new_files: {unplanned_created}. New files must be "
+                "source-bound by the planner before codegen may create them."
+            )
+
+        must_touch_created = sorted(
+            path
+            for path in created_files
+            if any(
+                CodeGenerator._paths_match(path, must_touch)
+                for must_touch in must_touch_files
+            )
+        )
+        if must_touch_created:
+            raise CodegenError(
+                "must_touch_recreated_as_new_file: existing must_touch file(s) "
+                f"were emitted as new files: {must_touch_created}."
+            )
+
     def generate_patch(
         self,
         *,
@@ -640,12 +749,15 @@ class CodeGenerator:
         # across calls).
         self._tool_loop_count = 0
 
+        must_touch_files, expected_new_files, allowed_paths = self._extract_plan_target_paths(plan_json)
+        enforce = bool(allowed_paths)
+
         # Tier 4 main course: when agent mode = loop, run the multi-turn
         # agent loop instead of the static 1-shot pipeline. Decision
         # 2026-05-10: static stays default until loop validates ≥ static
         # quality on the 4-task regression baseline.
         if getattr(self.settings, "codegen_agent_mode", "static") == "loop":
-            return self._run_agent_loop(
+            result = self._run_agent_loop(
                 task_id=task_id,
                 plan_json=plan_json,
                 context_files=context_files,
@@ -653,10 +765,17 @@ class CodeGenerator:
                 source_repo_path=source_repo_path,
                 actor_name=actor_name,
             )
+            if enforce:
+                self._validate_diff_paths_within_allowed(
+                    result.diff,
+                    result.files_changed,
+                    allowed_paths=allowed_paths,
+                    must_touch_files=must_touch_files,
+                    expected_new_files=expected_new_files,
+                )
+            return result
 
         providers = self._resolve_provider_chain()
-        must_touch_files, expected_new_files, allowed_paths = self._extract_plan_target_paths(plan_json)
-        enforce = bool(allowed_paths)
 
         import logging as _log
         _logger = _log.getLogger("codegen.provider_chain")
@@ -682,7 +801,8 @@ class CodeGenerator:
                     provider, time.monotonic() - _provider_t0,
                 )
                 if enforce:
-                    self._validate_changed_files_within_allowed(
+                    self._validate_diff_paths_within_allowed(
+                        result.diff,
                         result.files_changed,
                         allowed_paths=allowed_paths,
                         must_touch_files=must_touch_files,
@@ -861,7 +981,8 @@ class CodeGenerator:
                                 provider, kind, sv_attempt + 1, max_retries,
                             )
                             if enforce:
-                                self._validate_changed_files_within_allowed(
+                                self._validate_diff_paths_within_allowed(
+                                    result.diff,
                                     result.files_changed,
                                     allowed_paths=allowed_paths,
                                     must_touch_files=must_touch_files,
@@ -914,6 +1035,233 @@ class CodeGenerator:
                 raise
 
         raise CodegenError("No codegen provider available.")
+
+    def generate_structural_edit(
+        self,
+        *,
+        task_id: str,
+        plan_json: dict[str, Any],
+        context_files: dict[str, str],
+        task_description: str,
+        source_repo_path: str | None = None,
+        actor_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Generate diagnostic-scoped structural edit JSON.
+
+        Normal codegen returns a diff.  This path is reserved for compile
+        repair, where the harness needs the model to propose constrained edit
+        operations and the harness applies them to the broken sandbox file.
+        """
+        from app.services.structural_edit import parse_structural_edit_response
+
+        self._current_context_files = dict(context_files or {})
+        self._current_source_repo_path = source_repo_path
+        prompt = self._build_structural_edit_prompt(
+            plan_json=plan_json,
+            context_files=context_files,
+            task_description=task_description,
+        )
+        providers = [
+            provider
+            for provider in self._resolve_provider_chain()
+            if provider in {"deepseek", "openai", "anthropic", "mock"}
+        ] or ["mock"]
+        prompt_fingerprint = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:10]
+        errors: list[str] = []
+
+        for fallback_step, provider in enumerate(providers):
+            started = time.perf_counter()
+            try:
+                if provider == "mock":
+                    first_file = next(iter(context_files.keys()), "")
+                    raw = json.dumps({"status": "no_patch", "file": first_file, "edits": []})
+                    model_name = "mock"
+                    input_tokens = output_tokens = 0
+                elif provider == "deepseek":
+                    model_name = self.settings.deepseek_model
+                    raw, input_tokens, output_tokens = self._call_deepseek_text(
+                        prompt,
+                        model_name,
+                        system_prompt=CODEGEN_STRUCTURAL_EDIT_SYSTEM_PROMPT,
+                        purpose="codegen.structural_repair",
+                    )
+                elif provider == "openai":
+                    model_name = self._resolve_model_name("openai")
+                    raw, input_tokens, output_tokens = self._call_openai_text(
+                        prompt,
+                        model_name,
+                        system_prompt=CODEGEN_STRUCTURAL_EDIT_SYSTEM_PROMPT,
+                        purpose="codegen.structural_repair",
+                    )
+                elif provider == "anthropic":
+                    model_name = self.settings.anthropic_model
+                    raw, input_tokens, output_tokens = self._call_anthropic_text(
+                        prompt,
+                        model_name,
+                        system_prompt=CODEGEN_STRUCTURAL_EDIT_SYSTEM_PROMPT,
+                    )
+                else:
+                    continue
+                parsed = parse_structural_edit_response(raw)
+                if self.db is not None:
+                    record_llm_call(
+                        self.db,
+                        LlmCall(
+                            purpose="codegen.structural_repair",
+                            provider=provider,
+                            model=model_name,
+                            input_tokens=int(input_tokens or 0),
+                            output_tokens=int(output_tokens or 0),
+                            latency_ms=int((time.perf_counter() - started) * 1000),
+                            success=True,
+                            retry_count=0,
+                            fallback_step=fallback_step,
+                            prompt_fingerprint=prompt_fingerprint,
+                            task_id=task_id,
+                            actor_name=actor_name,
+                        ),
+                    )
+                return {
+                    "status": "completed",
+                    "provider_name": provider,
+                    "model_name": model_name,
+                    "edit_plan": parsed,
+                    "raw_response": raw[:4000],
+                }
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{provider}: {exc}")
+                if self.db is not None:
+                    self._record_codegen_failure(
+                        task_id=task_id,
+                        actor_name=actor_name,
+                        provider=provider,
+                        latency_ms=int((time.perf_counter() - started) * 1000),
+                        retry_count=0,
+                        fallback_step=fallback_step,
+                        prompt_fingerprint=prompt_fingerprint,
+                        error_type=type(exc).__name__,
+                    )
+                continue
+
+        raise CodegenError("structural edit generation failed: " + "; ".join(errors))
+
+    def _build_structural_edit_prompt(
+        self,
+        *,
+        plan_json: dict[str, Any],
+        context_files: dict[str, str],
+        task_description: str,
+    ) -> str:
+        parts = [
+            "Generate a diagnostic-scoped structural edit JSON plan.",
+            "Do not generate a diff. The harness validates and applies the JSON.",
+            "",
+            "=== PLAN JSON ===",
+            json.dumps(plan_json, ensure_ascii=False, default=str)[:4000],
+        ]
+        if task_description.strip():
+            parts.extend(["", "=== REPAIR TASK ===", task_description.strip()])
+        parts.extend(["", "=== CURRENT FILE CONTEXT ==="])
+        for path, content in (context_files or {}).items():
+            parts.extend([
+                f"--- BEGIN FILE {path} ---",
+                content,
+                f"--- END FILE {path} ---",
+            ])
+        return "\n".join(parts)
+
+    @staticmethod
+    def _iter_contract_patterns(contract: dict[str, Any]) -> list[str]:
+        patterns: list[str] = []
+        for pattern in contract.get("verification_patterns") or []:
+            if isinstance(pattern, str) and pattern.strip():
+                patterns.append(pattern.strip())
+
+        def _walk_rules(rules: object) -> None:
+            if not isinstance(rules, list):
+                return
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    continue
+                pattern = rule.get("pattern")
+                if isinstance(pattern, str) and pattern.strip():
+                    patterns.append(pattern.strip())
+                _walk_rules(rule.get("rules"))
+
+        _walk_rules(contract.get("verifications"))
+        out: list[str] = []
+        seen: set[str] = set()
+        for pattern in patterns:
+            if pattern not in seen:
+                seen.add(pattern)
+                out.append(pattern)
+        return out
+
+    @staticmethod
+    def _find_pattern_quote(pattern: str, content: str) -> str:
+        try:
+            regex = re.compile(pattern)
+        except re.error:
+            regex = re.compile(re.escape(pattern))
+        for line in content.splitlines():
+            if regex.search(line):
+                return line.strip()[:180]
+        return ""
+
+    @classmethod
+    def _existing_contract_evidence_block(
+        cls,
+        plan_json: dict[str, Any],
+        context_files: dict[str, str],
+    ) -> str:
+        """Render a prompt hint when required contract signals already exist."""
+        required_contracts = plan_json.get("required_contracts") or []
+        if not isinstance(required_contracts, list) or not required_contracts:
+            return ""
+        if not context_files:
+            return ""
+
+        hits: list[str] = []
+        seen_contracts: set[tuple[str, str]] = set()
+        for contract in required_contracts:
+            if not isinstance(contract, dict):
+                continue
+            cid = str(contract.get("contract_id") or contract.get("id") or "").strip()
+            if not cid:
+                continue
+            for pattern in cls._iter_contract_patterns(contract):
+                for path, content in context_files.items():
+                    if not isinstance(content, str) or not content.strip():
+                        continue
+                    quote = cls._find_pattern_quote(pattern, content)
+                    if not quote:
+                        continue
+                    key = (cid, path)
+                    if key in seen_contracts:
+                        continue
+                    seen_contracts.add(key)
+                    hits.append(
+                        f"  - {cid} in {path}: pattern `{pattern}` matched `{quote}`"
+                    )
+                    break
+                if len(hits) >= 8:
+                    break
+            if len(hits) >= 8:
+                break
+
+        if not hits:
+            return ""
+        return "\n".join(
+            [
+                "=== EXISTING CONTRACT EVIDENCE (minimal-patch mode) ===",
+                "These required contract signals already appear in this "
+                "batch's file context. Treat them as existing implementation "
+                "anchors: preserve them and make minimal corrective edits "
+                "around missing wiring. Do not rebuild or rewrite a file just "
+                "to re-add signals that are already present.",
+                *hits,
+            ]
+        )
 
     def _try_provider(
         self,
@@ -1525,10 +1873,30 @@ class CodeGenerator:
 
     def _call_anthropic(self, prompt: str) -> CodegenResult:
         """Call Anthropic Messages API for code generation."""
+        content, input_tokens, output_tokens = self._call_anthropic_text(
+            prompt,
+            self.settings.anthropic_model,
+            system_prompt=CODEGEN_SYSTEM_PROMPT,
+        )
+        return self._parse_response(
+            content,
+            provider_name="anthropic",
+            model_name=self.settings.anthropic_model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+
+    def _call_anthropic_text(
+        self,
+        prompt: str,
+        model_name: str,
+        *,
+        system_prompt: str,
+    ) -> tuple[str, int, int]:
+        """Call Anthropic Messages API once and return raw text."""
         if not self.settings.anthropic_api_key:
             raise CodegenError("OPS_AGENT_ANTHROPIC_API_KEY is not configured.")
 
-        model_name = self.settings.anthropic_model
         url = f"{self.settings.anthropic_base_url.rstrip('/')}/v1/messages"
         headers = {
             "x-api-key": self.settings.anthropic_api_key,
@@ -1538,7 +1906,7 @@ class CodeGenerator:
         body = {
             "model": model_name,
             "max_tokens": 8192,
-            "system": self._build_system_prompt(CODEGEN_SYSTEM_PROMPT, getattr(self, "_current_context_files", None)),
+            "system": self._build_system_prompt(system_prompt, getattr(self, "_current_context_files", None)),
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
         }
@@ -1556,12 +1924,10 @@ class CodeGenerator:
                 if block.get("type") == "text":
                     content += block.get("text", "")
             usage = data.get("usage", {})
-            return self._parse_response(
+            return (
                 content,
-                provider_name="anthropic",
-                model_name=model_name,
-                input_tokens=usage.get("input_tokens", 0),
-                output_tokens=usage.get("output_tokens", 0),
+                int(usage.get("input_tokens", 0) or 0),
+                int(usage.get("output_tokens", 0) or 0),
             )
         except httpx.HTTPError as exc:
             raise CodegenError(f"Anthropic API error: {exc}") from exc
@@ -2744,6 +3110,12 @@ class CodeGenerator:
                 "user's selection."
             )
 
+        existing_contract_evidence = self._existing_contract_evidence_block(
+            plan_json, context_files
+        )
+        if existing_contract_evidence:
+            parts.extend(["", existing_contract_evidence])
+
         # Separate existing files from new files (empty content = to be created)
         existing_files = {f: c for f, c in context_files.items() if c.strip()}
         new_files = [f for f, c in context_files.items() if not c.strip()]
@@ -2973,6 +3345,23 @@ class CodeGenerator:
 
     def _call_deepseek_once_text(self, prompt: str, model_name: str) -> str:
         """Call DeepSeek once and return raw content without parsing."""
+        content, _, _ = self._call_deepseek_text(
+            prompt,
+            model_name,
+            system_prompt=CODEGEN_REACT_PLAN_SYSTEM_PROMPT,
+            purpose="codegen.react_plan",
+        )
+        return content
+
+    def _call_deepseek_text(
+        self,
+        prompt: str,
+        model_name: str,
+        *,
+        system_prompt: str,
+        purpose: str,
+    ) -> tuple[str, int, int]:
+        """Call DeepSeek once and return raw content plus token counts."""
         url = "https://api.deepseek.com/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.settings.deepseek_api_key}",
@@ -2981,7 +3370,7 @@ class CodeGenerator:
         body = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": self._build_system_prompt(CODEGEN_REACT_PLAN_SYSTEM_PROMPT, getattr(self, "_current_context_files", None)),},
+                {"role": "system", "content": self._build_system_prompt(system_prompt, getattr(self, "_current_context_files", None)),},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.0,
@@ -2993,7 +3382,7 @@ class CodeGenerator:
                 json=body,
                 headers=headers,
                 timeout=external_http_timeout(self.settings.deepseek_timeout_seconds),
-                provider_hint="codegen.deepseek.react_plan",
+                provider_hint=f"deepseek.{purpose}",
             )
             response.raise_for_status()
             data = response.json()
@@ -3002,10 +3391,14 @@ class CodeGenerator:
             log_llm_cache_hit(
                 provider="deepseek",
                 model=model_name,
-                purpose="codegen.react_plan",
+                purpose=purpose,
                 usage=usage,
             )
-            return content
+            return (
+                content,
+                int(usage.get("prompt_tokens", 0) or 0),
+                int(usage.get("completion_tokens", 0) or 0),
+            )
         except httpx.HTTPError as exc:
             raise CodegenError(f"DeepSeek API error: {exc}") from exc
 
@@ -3088,6 +3481,29 @@ class CodeGenerator:
 
     def _call_openai_once(self, prompt: str, model_name: str) -> CodegenResult:
         """Call OpenAI once and parse the raw response."""
+        content, input_tokens, output_tokens = self._call_openai_text(
+            prompt,
+            model_name,
+            system_prompt=CODEGEN_SYSTEM_PROMPT,
+            purpose="codegen",
+        )
+        return self._parse_response(
+            content,
+            provider_name="openai",
+            model_name=model_name,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+
+    def _call_openai_text(
+        self,
+        prompt: str,
+        model_name: str,
+        *,
+        system_prompt: str,
+        purpose: str,
+    ) -> tuple[str, int, int]:
+        """Call OpenAI-compatible API once and return raw text."""
         url = f"{self.settings.openai_base_url.rstrip('/')}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.settings.openai_api_key}",
@@ -3096,7 +3512,7 @@ class CodeGenerator:
         body = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": self._build_system_prompt(CODEGEN_SYSTEM_PROMPT, getattr(self, "_current_context_files", None)),},
+                {"role": "system", "content": self._build_system_prompt(system_prompt, getattr(self, "_current_context_files", None)),},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.0,
@@ -3117,15 +3533,13 @@ class CodeGenerator:
             log_llm_cache_hit(
                 provider="openai",
                 model=model_name,
-                purpose="codegen",
+                purpose=purpose,
                 usage=usage,
             )
-            return self._parse_response(
+            return (
                 content,
-                provider_name="openai",
-                model_name=model_name,
-                input_tokens=usage.get("prompt_tokens", 0),
-                output_tokens=usage.get("completion_tokens", 0),
+                int(usage.get("prompt_tokens", 0) or 0),
+                int(usage.get("completion_tokens", 0) or 0),
             )
         except httpx.HTTPError as exc:
             raise CodegenError(f"OpenAI API error: {exc}") from exc
@@ -4332,6 +4746,8 @@ def _is_minimal_edit_retryable_error_message(message: str) -> bool:
 
 def _is_retryable_codegen_error(exc: CodegenError) -> bool:
     message = str(exc).lower()
+    if "codegen_terminal" in message:
+        return False
     # v15 Ticket 2A: PHANTOM_NO_CHANGE is a quote-verification failure —
     # the model claimed the file already implements the feature but the
     # quotes don't exist. This is a fixable mistake (the model can either
@@ -4342,8 +4758,6 @@ def _is_retryable_codegen_error(exc: CodegenError) -> bool:
     # signals; retrying changes nothing. Hard-no retry. Includes
     # NO_CHANGE_NEEDED_VERIFIED (model gave honest evidence; the patch
     # would be wrong) and the legacy un-classified NO_CHANGE_NEEDED.
-    if "codegen_terminal" in message:
-        return False
     return any(
         key in message
         for key in (
