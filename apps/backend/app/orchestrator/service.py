@@ -39,6 +39,7 @@ from app.services.evidence_chain import EvidenceChainReport, check_evidence_chai
 from app.services.failure_diagnosis import FailureKind, run_diagnosis
 from app.services.checkpointing import CheckpointStage, TaskCheckpoint, read_task_checkpoint, write_task_checkpoint
 from app.services.memory import MemoryService
+from app.services.planner_context import render_planner_context_packet
 from app.services.sandbox import ExecutionSandbox, SandboxError
 from app.services.spec_conformance import (
     ConformanceReport,
@@ -1311,6 +1312,23 @@ class PrimaryOrchestrator:
                 issue_context=issue_context,
                 write_checkpoint=False,
             )
+            planning_request_text = self._augment_request_with_context(
+                original_request=task.request_text,
+                translation_document=task.translation_json,
+                issue_context=issue_context,
+                planning_knowledge_context=None,
+            )
+            self._write_task_checkpoint(
+                task,
+                stage="retrieve",
+                output_payload=self._task_checkpoint_payload(
+                    task,
+                    semantic_translation=task.translation_json,
+                    issue_context=issue_context,
+                    planning_knowledge_context=None,
+                    planning_request_text=planning_request_text,
+                ),
+            )
         elif skip_jira_prefetch and task.scenario in {"jira_issue_plan", "jira_issue_develop"}:
             # Synthesize a minimal issue_context from request_text so the
             # rest of the planning code path doesn't need to special-case
@@ -1439,12 +1457,8 @@ class PrimaryOrchestrator:
 
         # v16.1: domain playbook injection happens here, in the common
         # path after every if/elif branch has had its chance to populate
-        # `planning_request_text`. The Jira-fetched develop branch (line
-        # ~1059) doesn't call `_augment_request_with_context` at all
-        # (issue_context flows separately into generate_plan), so
-        # instrumenting only the augmentation call sites missed that
-        # path entirely. Single call here = exactly one classify+emit
-        # per task, regardless of branch.
+        # `planning_request_text`. Single call here = exactly one
+        # classify+emit per task, regardless of branch.
         planning_request_text, _matched_playbook = self._augment_with_domain_playbook(
             task=task, planning_request_text=planning_request_text,
         )
@@ -3138,49 +3152,12 @@ class PrimaryOrchestrator:
         issue_context: dict[str, object] | None,
         planning_knowledge_context: dict[str, object] | None,
     ) -> str:
-        lines = [original_request.strip()]
-
-        if translation_document:
-            lines.extend(
-                [
-                    "",
-                    "Semantic Translation:",
-                    json.dumps(
-                        PrimaryOrchestrator._summarize_translation_document(translation_document),
-                        indent=2,
-                        ensure_ascii=False,
-                    ),
-                ]
-            )
-
-        if issue_context:
-            lines.extend(
-                [
-                    "",
-                    "Jira Issue Context:",
-                    f"Issue Key: {issue_context.get('issue_key', '')}",
-                    f"Summary: {_truncate_text(issue_context.get('summary', ''), limit=240)}",
-                    f"Status: {issue_context.get('issue_status', '')}",
-                    f"Issue Type: {issue_context.get('issue_type', '')}",
-                    f"Priority: {issue_context.get('priority', '')}",
-                    f"Description: {_truncate_text(issue_context.get('description', ''), limit=1200)}",
-                ]
-            )
-
-        if planning_knowledge_context:
-            lines.extend(
-                [
-                    "",
-                    "Planning Repository Context:",
-                    json.dumps(
-                        PrimaryOrchestrator._summarize_planning_knowledge_context(planning_knowledge_context),
-                        indent=2,
-                        ensure_ascii=False,
-                    ),
-                ]
-            )
-
-        return "\n".join(lines).strip()
+        return render_planner_context_packet(
+            original_request=original_request,
+            translation_document=translation_document,
+            issue_context=issue_context,
+            planning_knowledge_context=planning_knowledge_context,
+        )
 
     def _execute_plan(
         self,
