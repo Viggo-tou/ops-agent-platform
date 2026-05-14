@@ -458,6 +458,42 @@ fun reverseGeocode() {
     assert "addresses[0]" not in result.content
 
 
+def test_kotlin_fast_fix_repairs_android_address_property_aliases():
+    source = """\
+package com.example
+
+import android.location.Geocoder
+
+fun fill() {
+    val addresses = geocoder.getFromLocation(point.latitude, point.longitude, 1)
+    addresses?.firstOrNull()?.let { addr ->
+        addr.streetNumber?.let { houseNumber = it }
+        addr.street?.let { street = it }
+        addr.subLocality?.let { area = it }
+    }
+}
+"""
+
+    result = apply_kotlin_diagnostic_fast_fixes(
+        file_path="Geo.kt",
+        original_content=source,
+        error_text=(
+            "Unresolved reference 'streetNumber'. "
+            "Unresolved reference 'street'."
+        ),
+        line=8,
+        protected_symbols=["getFromLocation"],
+    )
+
+    assert result is not None
+    assert result.ok, result.errors
+    assert "repair_android_address_property_aliases" in result.applied_operations
+    assert "addr.subThoroughfare?.let { houseNumber = it }" in result.content
+    assert "addr.thoroughfare?.let { street = it }" in result.content
+    assert "addr.streetNumber" not in result.content
+    assert "addr.street?.let" not in result.content
+
+
 def test_kotlin_fast_fix_does_not_treat_valid_catch_as_missing_try_for_other_syntax_errors():
     source = """\
 package com.example

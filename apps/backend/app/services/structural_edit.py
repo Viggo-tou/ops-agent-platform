@@ -266,6 +266,19 @@ def apply_kotlin_diagnostic_fast_fixes(
         elif content != before:
             applied.append("make_geocoder_addresses_nullable_safe")
 
+    if _should_repair_android_address_property_aliases(error_text, content):
+        before = content
+        content, err = _repair_android_address_property_aliases(content)
+        if err:
+            errors.append(
+                StructuralEditError(
+                    err,
+                    operation="repair_android_address_property_aliases",
+                )
+            )
+        elif content != before:
+            applied.append("repair_android_address_property_aliases")
+
     if _should_repair_lifecycle_owner_in_disposable_effect(error_text, content):
         before = content
         content, err = _repair_lifecycle_owner_in_disposable_effect(content)
@@ -597,6 +610,17 @@ def _should_repair_nullable_geocoder_addresses(error_text: str, content: str) ->
     )
 
 
+def _should_repair_android_address_property_aliases(error_text: str, content: str) -> bool:
+    lower = (error_text or "").lower()
+    if "unresolved reference" not in lower:
+        return False
+    if "streetnumber" not in lower and "street" not in lower:
+        return False
+    if "getFromLocation" not in content and "Geocoder(" not in content:
+        return False
+    return ".streetNumber" in content or re.search(r"\.[ \t]*street\b", content) is not None
+
+
 def _should_repair_lifecycle_owner_in_disposable_effect(error_text: str, content: str) -> bool:
     lower = (error_text or "").lower()
     if "@composable invocations can only happen" not in lower:
@@ -650,6 +674,25 @@ def _repair_nullable_geocoder_addresses(content: str) -> tuple[str, str]:
     new_content, count = pattern.subn(replace, content, count=8)
     if count <= 0:
         return content, "no nullable geocoder address list shape found"
+    return new_content, ""
+
+
+def _repair_android_address_property_aliases(content: str) -> tuple[str, str]:
+    replacements = 0
+    new_content, count = re.subn(
+        r"\b(?P<receiver>[A-Za-z_][A-Za-z0-9_]*)\.streetNumber\b",
+        r"\g<receiver>.subThoroughfare",
+        content,
+    )
+    replacements += count
+    new_content, count = re.subn(
+        r"\b(?P<receiver>[A-Za-z_][A-Za-z0-9_]*)\.street\b",
+        r"\g<receiver>.thoroughfare",
+        new_content,
+    )
+    replacements += count
+    if replacements <= 0:
+        return content, "no Android Address alias properties found"
     return new_content, ""
 
 
