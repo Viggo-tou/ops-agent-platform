@@ -141,7 +141,7 @@ def apply_structural_edit_plan(
         elif op == "insert_into_function":
             content, err = _op_insert_into_function(content, raw_edit)
         elif op == "wrap_firebase_snapshot_children":
-            content, err = _repair_firebase_snapshot_children_loop(
+            content, err, _firebase_ops = _repair_firebase_task_shapes(
                 content,
                 line=int(raw_edit.get("anchor_line") or 0),
             )
@@ -288,7 +288,7 @@ def apply_kotlin_diagnostic_fast_fixes(
 
     if _should_repair_firebase_snapshot_children(error_text, content):
         before = content
-        content, err = _repair_firebase_snapshot_children_loop(content, line=line)
+        content, err, firebase_ops = _repair_firebase_task_shapes(content, line=line)
         if err:
             errors.append(
                 StructuralEditError(
@@ -297,7 +297,7 @@ def apply_kotlin_diagnostic_fast_fixes(
                 )
             )
         elif content != before:
-            applied.append("wrap_firebase_snapshot_children")
+            applied.extend(firebase_ops or ["wrap_firebase_snapshot_children"])
 
     if not applied and not errors:
         return None
@@ -671,6 +671,84 @@ def _is_try_insertion_lambda_opener(line: str) -> bool:
     )
 
 
+def _repair_firebase_task_shapes(content: str, *, line: int = 0) -> tuple[str, str, list[str]]:
+    """Repair common Firebase Task listener structures after text patch drift."""
+    working = content
+    applied: list[str] = []
+    reasons: list[str] = []
+
+    updated, err = _repair_firebase_success_listener_close_before_failure(
+        working,
+        line=line,
+    )
+    if err:
+        reasons.append(err)
+    elif updated != working:
+        working = updated
+        applied.append("close_firebase_success_listener_before_failure")
+
+    updated, err = _repair_firebase_snapshot_children_loop(working, line=line)
+    if err:
+        reasons.append(err)
+    elif updated != working:
+        working = updated
+        applied.append("wrap_firebase_snapshot_children")
+
+    if applied:
+        return working, "", applied
+    return content, "; ".join(reasons) or "no Firebase task repair shape found", []
+
+
+def _repair_firebase_success_listener_close_before_failure(
+    content: str,
+    *,
+    line: int = 0,
+) -> tuple[str, str]:
+    lines = content.splitlines()
+    failure_re = re.compile(r"^(?P<indent>\s*)\.addOnFailureListener\s*\{")
+    success_re = re.compile(r"^(?P<indent>\s*)\.addOnSuccessListener\s*\{")
+    update_re = re.compile(r"(?:\.ref\.)?updateChildren\s*\(")
+    candidates = [idx for idx, raw in enumerate(lines) if failure_re.search(raw)]
+    if line > 0 and candidates:
+        near = [idx for idx in candidates if abs((idx + 1) - line) <= 120]
+        if near:
+            candidates = near
+
+    inserts: list[tuple[int, str]] = []
+    for failure_idx in candidates:
+        previous = _previous_nonblank_line(lines, failure_idx)
+        if previous and previous.strip() in {"}", "})"}:
+            continue
+        failure_indent = _leading_ws(lines[failure_idx])
+        success_idx = -1
+        search_start = max(0, failure_idx - 80)
+        for idx in range(failure_idx - 1, search_start - 1, -1):
+            success_match = success_re.search(lines[idx])
+            if not success_match:
+                continue
+            if _leading_ws(lines[idx]) != failure_indent:
+                continue
+            has_update_call = any(
+                update_re.search(lines[probe])
+                for probe in range(max(0, idx - 4), idx + 1)
+            )
+            if has_update_call:
+                success_idx = idx
+                break
+        if success_idx < 0:
+            continue
+        if _brace_balance(lines[success_idx:failure_idx]) <= 0:
+            continue
+        inserts.append((failure_idx, f"{failure_indent}}}"))
+
+    if not inserts:
+        return content, "no Firebase success listener chain missing close found"
+
+    for idx, inserted_line in reversed(inserts):
+        lines.insert(idx, inserted_line)
+    return _join_like(content, lines), ""
+
+
 def _repair_firebase_snapshot_children_loop(content: str, *, line: int = 0) -> tuple[str, str]:
     lines = content.splitlines()
     success_re = re.compile(r"\.addOnSuccessListener\s*\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*->")
@@ -869,6 +947,24 @@ def _clamp_line(line: int, total: int) -> int:
 
 def _leading_ws(line: str) -> str:
     return line[: len(line) - len(line.lstrip())]
+
+
+def _previous_nonblank_line(lines: list[str], before_idx: int) -> str:
+    for idx in range(before_idx - 1, -1, -1):
+        if lines[idx].strip():
+            return lines[idx]
+    return ""
+
+
+def _brace_balance(lines: list[str]) -> int:
+    balance = 0
+    for raw in lines:
+        for ch in _strip_line_comments_and_strings(raw):
+            if ch == "{":
+                balance += 1
+            elif ch == "}":
+                balance -= 1
+    return balance
 
 
 def _indent_block(lines: list[str], indent: str) -> list[str]:

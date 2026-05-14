@@ -267,6 +267,47 @@ fun save() {
     assert "updateChildren(addressData)" in result.content
 
 
+def test_kotlin_fast_fix_closes_firebase_success_listener_before_failure_listener():
+    source = """\
+package com.example
+
+import com.google.firebase.database.FirebaseDatabase
+
+fun save() {
+    val query = FirebaseDatabase.getInstance().getReference("Handyman")
+    query.get().addOnSuccessListener { snapshot ->
+        for (child in snapshot.children) {
+            child.ref.updateChildren(addressData)
+                .addOnSuccessListener {
+                    done()
+                .addOnFailureListener { e ->
+                    log(e.message)
+                }
+        }
+        if (!snapshot.exists()) {
+            log("missing")
+        }
+    }.addOnFailureListener { e ->
+        log(e.message)
+    }
+}
+"""
+
+    result = apply_kotlin_diagnostic_fast_fixes(
+        file_path="Save.kt",
+        original_content=source,
+        error_text="No value passed for parameter 'content'. Unresolved reference 'addOnFailureListener'.",
+        line=10,
+        protected_symbols=["updateChildren", "addOnSuccessListener", "addOnFailureListener"],
+    )
+
+    assert result is not None
+    assert result.ok, result.errors
+    assert "close_firebase_success_listener_before_failure" in result.applied_operations
+    assert "done()\n                }\n                .addOnFailureListener" in result.content
+    assert "for (child in snapshot.children)" in result.content
+
+
 def test_kotlin_fast_fix_inserts_missing_try_for_isolated_catch_in_launch():
     source = """\
 package com.example
