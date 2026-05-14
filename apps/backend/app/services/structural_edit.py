@@ -249,6 +249,19 @@ def apply_kotlin_diagnostic_fast_fixes(
         elif content != before:
             applied.append("make_geocoder_addresses_nullable_safe")
 
+    if _should_repair_lifecycle_owner_in_disposable_effect(error_text, content):
+        before = content
+        content, err = _repair_lifecycle_owner_in_disposable_effect(content)
+        if err:
+            errors.append(
+                StructuralEditError(
+                    err,
+                    operation="hoist_lifecycle_owner_from_disposable_effect",
+                )
+            )
+        elif content != before:
+            applied.append("hoist_lifecycle_owner_from_disposable_effect")
+
     if _should_repair_firebase_snapshot_children(error_text, content):
         before = content
         content, err = _repair_firebase_snapshot_children_loop(content, line=line)
@@ -488,6 +501,16 @@ def _should_repair_nullable_geocoder_addresses(error_text: str, content: str) ->
     )
 
 
+def _should_repair_lifecycle_owner_in_disposable_effect(error_text: str, content: str) -> bool:
+    lower = (error_text or "").lower()
+    if "@composable invocations can only happen" not in lower:
+        return False
+    return (
+        "DisposableEffect" in content
+        and "LocalLifecycleOwner.current.lifecycle" in content
+    )
+
+
 def _repair_nullable_geocoder_addresses(content: str) -> tuple[str, str]:
     pattern = re.compile(
         r"(?P<indent>^[ \t]*)if\s*\(\s*(?P<list>[A-Za-z_][A-Za-z0-9_]*)"
@@ -510,6 +533,45 @@ def _repair_nullable_geocoder_addresses(content: str) -> tuple[str, str]:
     if count <= 0:
         return content, "no nullable geocoder address list shape found"
     return new_content, ""
+
+
+def _repair_lifecycle_owner_in_disposable_effect(content: str) -> tuple[str, str]:
+    lines = content.splitlines()
+    effect_re = re.compile(r"^(?P<indent>\s*)DisposableEffect\s*\((?P<keys>[^)]*)\)\s*\{")
+    lifecycle_re = re.compile(
+        r"^\s*val\s+lifecycle\s*=\s*LocalLifecycleOwner\.current\.lifecycle\s*$"
+    )
+    for effect_idx, raw in enumerate(lines):
+        m_effect = effect_re.match(raw)
+        if not m_effect:
+            continue
+        end_line = _matching_brace_end(lines, effect_idx + 1)
+        if end_line <= effect_idx + 1:
+            continue
+        lifecycle_idx = -1
+        for idx in range(effect_idx + 1, end_line - 1):
+            if lifecycle_re.match(lines[idx]):
+                lifecycle_idx = idx
+                break
+        if lifecycle_idx < 0:
+            continue
+        previous = lines[effect_idx - 1].strip() if effect_idx > 0 else ""
+        if previous == "val lifecycle = LocalLifecycleOwner.current.lifecycle":
+            continue
+        indent = m_effect.group("indent")
+        keys = [part.strip() for part in m_effect.group("keys").split(",") if part.strip()]
+        if "lifecycle" not in keys:
+            keys.append("lifecycle")
+            lines[effect_idx] = f"{indent}DisposableEffect({', '.join(keys)}) {{"
+        lifecycle_line = f"{indent}val lifecycle = LocalLifecycleOwner.current.lifecycle"
+        new_lines = (
+            lines[:effect_idx]
+            + [lifecycle_line]
+            + lines[effect_idx:lifecycle_idx]
+            + lines[lifecycle_idx + 1 :]
+        )
+        return _join_like(content, new_lines), ""
+    return content, "no LocalLifecycleOwner.current inside DisposableEffect block found"
 
 
 def _repair_missing_try_for_kotlin_catch(content: str, *, line: int = 0) -> tuple[str, str]:

@@ -383,6 +383,44 @@ fun save() {
     assert "for (child in snapshot.children)" in result.content
 
 
+def test_kotlin_fast_fix_hoists_lifecycle_owner_from_disposable_effect():
+    source = """\
+package com.example
+
+import androidx.compose.runtime.DisposableEffect
+import androidx.lifecycle.compose.LocalLifecycleOwner
+
+fun Screen() {
+    DisposableEffect(mapView) {
+        val observer = object : DefaultLifecycleObserver {
+            override fun onResume(owner: LifecycleOwner) {
+                mapView?.onResume()
+            }
+        }
+        val lifecycle = LocalLifecycleOwner.current.lifecycle
+        lifecycle.addObserver(observer)
+        onDispose {
+            lifecycle.removeObserver(observer)
+        }
+    }
+}
+"""
+
+    result = apply_kotlin_diagnostic_fast_fixes(
+        file_path="Screen.kt",
+        original_content=source,
+        error_text="@Composable invocations can only happen from the context of a @Composable function",
+        line=13,
+        protected_symbols=["LocalLifecycleOwner", "DisposableEffect"],
+    )
+
+    assert result is not None
+    assert result.ok, result.errors
+    assert "val lifecycle = LocalLifecycleOwner.current.lifecycle\n    DisposableEffect(mapView, lifecycle)" in result.content
+    assert result.content.count("LocalLifecycleOwner.current.lifecycle") == 1
+    assert "lifecycle.addObserver(observer)" in result.content
+
+
 def test_structural_plan_supports_firebase_snapshot_children_operation():
     source = """\
 package com.example
