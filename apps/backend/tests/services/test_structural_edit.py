@@ -257,6 +257,107 @@ fun reverseGeocode(geocoder: Geocoder, lat: Double, lng: Double) {
     assert "getFromLocation(lat, lng, 1)" in result.content
 
 
+def test_kotlin_fast_fix_makes_geocoder_addresses_nullable_safe():
+    source = """\
+package com.example
+
+import android.location.Geocoder
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+
+fun reverseGeocode() {
+    coroutineScope.launch(Dispatchers.IO) {
+        try {
+            val addresses = geocoder.getFromLocation(point.latitude, point.longitude, 1)
+            if (addresses.isNotEmpty()) {
+                val addr = addresses[0]
+                street = addr.thoroughfare ?: ""
+            }
+        } catch (e: Exception) {
+            log(e.message)
+        }
+    }
+}
+"""
+
+    result = apply_kotlin_diagnostic_fast_fixes(
+        file_path="Geo.kt",
+        original_content=source,
+        error_text=(
+            "Only safe (?.) or non-null asserted (!!.) calls are allowed on a "
+            "nullable receiver of type 'kotlin.collections.(Mutable)List<android.location.Address!>?'."
+        ),
+        line=11,
+        protected_symbols=["getFromLocation"],
+    )
+
+    assert result is not None
+    assert result.ok, result.errors
+    assert "val addr = addresses?.firstOrNull()" in result.content
+    assert "if (addr != null) {" in result.content
+    assert "addresses.isNotEmpty()" not in result.content
+    assert "addresses[0]" not in result.content
+
+
+def test_kotlin_fast_fix_does_not_treat_valid_catch_as_missing_try_for_other_syntax_errors():
+    source = """\
+package com.example
+
+import android.location.Geocoder
+import com.google.firebase.database.FirebaseDatabase
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+
+fun save() {
+    coroutineScope.launch(Dispatchers.IO) {
+        try {
+            val addresses = geocoder.getFromLocation(point.latitude, point.longitude, 1)
+            if (addresses.isNotEmpty()) {
+                val addr = addresses[0]
+                street = addr.thoroughfare ?: ""
+            }
+        } catch (e: Exception) {
+            log(e.message)
+        }
+    }
+    val query = FirebaseDatabase.getInstance().getReference("Handyman")
+    query.get().addOnSuccessListener { snapshot ->
+            child.ref.updateChildren(addressData)
+                .addOnFailureListener { e ->
+                    log(e.message)
+                }
+        }
+        if (!snapshot.exists()) {
+            log("missing")
+        }
+    }.addOnFailureListener { e ->
+        log(e.message)
+    }
+}
+"""
+
+    result = apply_kotlin_diagnostic_fast_fixes(
+        file_path="Save.kt",
+        original_content=source,
+        error_text=(
+            "No value passed for parameter 'content'. "
+            "Syntax error: Expecting ')'. "
+            "Only safe calls are allowed on a nullable receiver of type "
+            "'kotlin.collections.(Mutable)List<android.location.Address!>?'."
+        ),
+        line=21,
+        protected_symbols=["getFromLocation", "updateChildren", "addOnFailureListener"],
+    )
+
+    assert result is not None
+    assert result.ok, result.errors
+    assert "insert_missing_try_for_catch" not in result.applied_operations
+    assert "make_geocoder_addresses_nullable_safe" in result.applied_operations
+    assert "wrap_firebase_snapshot_children" in result.applied_operations
+    assert "val addr = addresses?.firstOrNull()" in result.content
+    assert "for (child in snapshot.children)" in result.content
+
+
 def test_structural_plan_supports_firebase_snapshot_children_operation():
     source = """\
 package com.example

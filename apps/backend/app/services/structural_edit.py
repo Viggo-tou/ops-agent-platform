@@ -221,6 +221,19 @@ def apply_kotlin_diagnostic_fast_fixes(
         elif content != before:
             applied.append("insert_missing_try_for_catch")
 
+    if _should_repair_nullable_geocoder_addresses(error_text, content):
+        before = content
+        content, err = _repair_nullable_geocoder_addresses(content)
+        if err:
+            errors.append(
+                StructuralEditError(
+                    err,
+                    operation="make_geocoder_addresses_nullable_safe",
+                )
+            )
+        elif content != before:
+            applied.append("make_geocoder_addresses_nullable_safe")
+
     if _should_repair_firebase_snapshot_children(error_text, content):
         before = content
         content, err = _repair_firebase_snapshot_children_loop(content, line=line)
@@ -403,20 +416,70 @@ def _should_repair_firebase_snapshot_children(error_text: str, content: str) -> 
 
 def _should_repair_missing_try_for_kotlin_catch(error_text: str, content: str) -> bool:
     lower = (error_text or "").lower()
-    diagnostic_signal = any(
+    catch_reference_signal = any(
         token in lower
         for token in (
             "unresolved reference 'catch'",
             "unresolved reference: catch",
-            "syntax error: expecting ')'",
-            "unexpected tokens",
         )
     )
-    if not diagnostic_signal:
+    if not catch_reference_signal and not _diagnostic_line_is_catch(content, lower):
         return False
     if not re.search(r"^\s*}\s*catch\s*\(", content, re.MULTILINE):
         return False
     return ".launch" in content or "launch(" in content
+
+
+def _diagnostic_line_is_catch(content: str, lower_error_text: str) -> bool:
+    if not any(token in lower_error_text for token in ("syntax error", "unexpected tokens")):
+        return False
+    m = re.search(r"\bline\s*[:=]\s*(\d+)\b", lower_error_text)
+    if not m:
+        return False
+    line_no = int(m.group(1))
+    lines = content.splitlines()
+    for idx in range(max(1, line_no - 2), min(len(lines), line_no + 2) + 1):
+        if re.search(r"^\s*}\s*catch\s*\(", lines[idx - 1]):
+            return True
+    return False
+
+
+def _should_repair_nullable_geocoder_addresses(error_text: str, content: str) -> bool:
+    lower = (error_text or "").lower()
+    if "nullable receiver" not in lower and "only safe" not in lower:
+        return False
+    if "address" not in lower and "getfromlocation" not in lower:
+        return False
+    return (
+        "getFromLocation" in content
+        and ".isNotEmpty()" in content
+        and re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\[\s*0\s*\]", content)
+        is not None
+    )
+
+
+def _repair_nullable_geocoder_addresses(content: str) -> tuple[str, str]:
+    pattern = re.compile(
+        r"(?P<indent>^[ \t]*)if\s*\(\s*(?P<list>[A-Za-z_][A-Za-z0-9_]*)"
+        r"\.isNotEmpty\(\)\s*\)\s*\{\s*\n"
+        r"(?P<value_indent>[ \t]*)val\s+(?P<addr>[A-Za-z_][A-Za-z0-9_]*)"
+        r"\s*=\s*(?P=list)\s*\[\s*0\s*\]",
+        re.MULTILINE,
+    )
+
+    def replace(match: re.Match[str]) -> str:
+        indent = match.group("indent")
+        list_name = match.group("list")
+        addr_name = match.group("addr")
+        return (
+            f"{indent}val {addr_name} = {list_name}?.firstOrNull()\n"
+            f"{indent}if ({addr_name} != null) {{"
+        )
+
+    new_content, count = pattern.subn(replace, content, count=8)
+    if count <= 0:
+        return content, "no nullable geocoder address list shape found"
+    return new_content, ""
 
 
 def _repair_missing_try_for_kotlin_catch(content: str, *, line: int = 0) -> tuple[str, str]:

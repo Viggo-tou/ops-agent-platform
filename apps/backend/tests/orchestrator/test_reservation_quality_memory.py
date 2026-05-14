@@ -198,3 +198,47 @@ def test_codegen_warning_combines_failure_patterns_and_quality_reservations(db: 
     assert "singleTapConfirmedHelper" in directive
     assert "QUALITY RESERVATION WARNING" in directive
     assert "shared map picker helper" in directive
+
+
+def test_codegen_warning_keeps_quality_reservation_when_two_pattern_rows_exist(db: Session) -> None:
+    _seed_acceptance_failure(db)
+    MemoryService(db).write_failure_observation(
+        failure_class="must_touch_incomplete_diff",
+        scope="gate:must_touch",
+        observation_text="task=round-8 family=android_map_location missed files",
+        lesson="Touch both signup and KYC files and include the map picker symbols.",
+        task_family="android_map_location",
+        trust_level="human_confirmed",
+        prompt_eligible=["planner_warning", "codegen_warning"],
+        evidence_refs={
+            "missing_patterns": [
+                "singleTapConfirmedHelper|setOnMarkerDragListener",
+                "getFromLocation\\s*\\(",
+            ]
+        },
+    )
+    orch = PrimaryOrchestrator(db=db)
+    quality_row = orch._record_reservation_quality_memory(
+        task=_task(),
+        reservations_detailed=[
+            {
+                "text": "Customer and handyman signup persist different address schemas.",
+                "severity": "policy",
+                "auto_fixable": False,
+                "blocking": True,
+            }
+        ],
+        files_changed=["app/src/main/java/com/example/handyman/handyman_pages/HandymanSignup.kt"],
+        issue_key="P69-19",
+    )
+    assert quality_row is not None
+    db.commit()
+
+    directive, audit = orch._build_codegen_failure_warnings(task=_task(), plan=_plan())
+
+    classes = {item["failure_class"] for item in audit}
+    assert "approval_reservation_quality" in classes
+    assert len(audit) == 2
+    assert quality_row.id in {item["memory_id"] for item in audit}
+    assert "singleTapConfirmedHelper" in directive
+    assert "different address schemas" in directive

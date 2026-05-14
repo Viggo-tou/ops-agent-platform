@@ -10811,7 +10811,22 @@ class PrimaryOrchestrator:
                 ),
                 reverse=True,
             )
-            top = unique[:2]
+            non_reservation = [
+                m for m in unique if getattr(m, "scope", "") != "review:reservations"
+            ]
+            reservation = [
+                m for m in unique if getattr(m, "scope", "") == "review:reservations"
+            ]
+            top: list[Any] = []
+            if non_reservation:
+                top.append(non_reservation[0])
+            if reservation:
+                top.append(reservation[0])
+            for m in unique:
+                if len(top) >= 2:
+                    break
+                if m not in top:
+                    top.append(m)
 
             audit = [{
                 "memory_id": m.id,
