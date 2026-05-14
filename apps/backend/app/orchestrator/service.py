@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import shutil
+import subprocess
 import time
 import traceback
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
@@ -1041,6 +1042,123 @@ class PrimaryOrchestrator:
             )
 
         self._workspace_call(task, _write)
+
+    @staticmethod
+    def _git_snapshot_sha(snapshot_id: object) -> str | None:
+        value = str(snapshot_id or "").strip()
+        if not value.startswith("git:"):
+            return None
+        sha = value[len("git:") :].strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{7,40}", sha):
+            return None
+        return sha
+
+    @classmethod
+    def _safe_codegen_paths(cls, values: list[object]) -> list[str]:
+        paths: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            normalized = cls._normalize_codegen_path(str(value or ""))
+            if normalized and normalized not in seen:
+                paths.append(normalized)
+                seen.add(normalized)
+        return paths
+
+    def _sandbox_diff_since_pre_codegen(
+        self,
+        *,
+        task: Task,
+        pipeline_state: dict[str, object],
+        plan: GeneratedPlan,
+        codegen_result: dict[str, object],
+    ) -> str:
+        """Return the final sandbox diff, including uncommitted repair edits."""
+        sha = self._git_snapshot_sha(pipeline_state.get("pre_codegen_snapshot_id"))
+        if not sha:
+            return ""
+        sandbox_dir = self._develop_sandbox_dir(task)
+        if not (sandbox_dir / ".git").is_dir():
+            return ""
+
+        path_candidates: list[object] = []
+        for key in ("files_changed", "verification_allowed_paths"):
+            value = pipeline_state.get(key)
+            if isinstance(value, (list, tuple, set)):
+                path_candidates.extend(value)
+        result_files = codegen_result.get("files_changed")
+        if isinstance(result_files, (list, tuple, set)):
+            path_candidates.extend(result_files)
+        path_candidates.extend(list(getattr(plan, "must_touch_files", []) or []))
+        path_candidates.extend(list(getattr(plan, "expected_new_files", []) or []))
+        path_candidates.extend(_diff_sections_by_file(str(pipeline_state.get("diff") or "")).keys())
+        paths = self._safe_codegen_paths(path_candidates)
+
+        cmd = ["git", "diff", "--binary", sha, "--", *paths]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(sandbox_dir),
+            timeout=60,
+        )
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout or "git diff failed")[:500])
+        return result.stdout.strip()
+
+    def _refresh_codegen_diff_from_sandbox(
+        self,
+        *,
+        task: Task,
+        pipeline_state: dict[str, object],
+        plan: GeneratedPlan,
+        codegen_result: dict[str, object],
+        reason: str,
+    ) -> bool:
+        """Make approval/review artifacts reflect the sandbox tree that gates saw."""
+        final_diff = self._sandbox_diff_since_pre_codegen(
+            task=task,
+            pipeline_state=pipeline_state,
+            plan=plan,
+            codegen_result=codegen_result,
+        )
+        if not final_diff:
+            return False
+
+        files_changed = list(_diff_sections_by_file(final_diff).keys())
+        if not files_changed:
+            return False
+
+        codegen_result["diff"] = final_diff
+        codegen_result["files_changed"] = files_changed
+        pipeline_state["diff"] = final_diff
+        pipeline_state["files_changed"] = files_changed
+        pipeline_state["codegen_result"] = codegen_result
+        pipeline_state["final_tree_diff_refreshed"] = True
+        pipeline_state["final_tree_diff_refresh_reason"] = reason
+        pipeline_state["final_tree_diff_chars"] = len(final_diff)
+        self._workspace_write_attempt_diff(task, pipeline_state, diff=final_diff)
+        self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.TOOL_SUCCEEDED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            tool_name="sandbox.final_tree_diff",
+            message=(
+                "Refreshed final diff from sandbox working tree "
+                f"after {reason} ({len(files_changed)} file(s))."
+            ),
+            payload={
+                "reason": reason,
+                "files_changed": files_changed,
+                "diff_chars": len(final_diff),
+            },
+        )
+        return True
 
     def _workspace_write_attempt_compile(
         self,
@@ -5964,6 +6082,14 @@ class PrimaryOrchestrator:
             )
             if outcome in {"approval_requested", "failed"}:
                 return
+            if outcome == "passed":
+                self._refresh_codegen_diff_from_sandbox(
+                    task=task,
+                    pipeline_state=pipeline_state,
+                    plan=plan,
+                    codegen_result=codegen_result,
+                    reason="compile_repair_passed",
+                )
             self._write_task_checkpoint(
                 task,
                 stage="compile",
@@ -9172,6 +9298,15 @@ class PrimaryOrchestrator:
 
             if repaired:
                 changed = list({*changed, *files_touched})
+                existing_changed = pipeline_state.get("files_changed")
+                if not isinstance(existing_changed, (list, tuple, set)):
+                    existing_changed = []
+                pipeline_state["files_changed"] = sorted(
+                    {
+                        *[str(path) for path in existing_changed if path],
+                        *[str(path) for path in files_touched if path],
+                    }
+                )
                 # Clear stuck history on actual progress.
                 _failure_signature_history = []
             else:

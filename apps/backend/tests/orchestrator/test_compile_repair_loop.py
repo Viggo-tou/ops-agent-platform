@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -256,7 +257,100 @@ class CompileRepairLoopTests(unittest.TestCase):
             sorted(rounds[0]["files_repaired"]),
             ["src/a.js", "src/b.js", "src/c.js"],
         )
+        self.assertEqual(
+            sorted(pipeline_state["files_changed"]),
+            ["src/a.js", "src/b.js", "src/c.js"],
+        )
         self.assertFalse(rounds[0]["timed_out"])
+
+    def test_refresh_final_tree_diff_captures_uncommitted_repair(self) -> None:
+        orchestrator = _make_orchestrator(self.root)
+        task = _task("task-final-diff")
+        plan = _plan()
+        sandbox_dir = orchestrator._develop_sandbox_dir(task)
+        (sandbox_dir / "src").mkdir(parents=True, exist_ok=True)
+        target = sandbox_dir / "src" / "a.js"
+        target.write_text("const value = 0;\n", encoding="utf-8")
+        subprocess.run(["git", "init"], cwd=sandbox_dir, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "add", "-A"], cwd=sandbox_dir, check=True, capture_output=True, text=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.email=sandbox@example.local",
+                "-c",
+                "user.name=Sandbox",
+                "commit",
+                "-m",
+                "baseline",
+            ],
+            cwd=sandbox_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        baseline = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=sandbox_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        target.write_text("const value = 1;\n", encoding="utf-8")
+        stale_diff = subprocess.run(
+            ["git", "diff", baseline, "--", "src/a.js"],
+            cwd=sandbox_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        subprocess.run(["git", "add", "-A"], cwd=sandbox_dir, check=True, capture_output=True, text=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.email=sandbox@example.local",
+                "-c",
+                "user.name=Sandbox",
+                "commit",
+                "-m",
+                "generated",
+            ],
+            cwd=sandbox_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        # Compile repair applies after codegen and leaves the sandbox dirty.
+        target.write_text("const value = 2;\n", encoding="utf-8")
+
+        pipeline_state: dict = {
+            "pre_codegen_snapshot_id": f"git:{baseline}",
+            "files_changed": ["src/a.js"],
+            "diff": stale_diff,
+        }
+        codegen_result: dict[str, object] = {
+            "diff": stale_diff,
+            "files_changed": ["src/a.js"],
+        }
+
+        with patch("app.orchestrator.service.record_event"):
+            refreshed = orchestrator._refresh_codegen_diff_from_sandbox(
+                task=task,
+                pipeline_state=pipeline_state,
+                plan=plan,
+                codegen_result=codegen_result,
+                reason="test",
+            )
+
+        self.assertTrue(refreshed)
+        self.assertIn("+const value = 2;", codegen_result["diff"])
+        self.assertNotIn("+const value = 1;", codegen_result["diff"])
+        workspace_diff = (
+            self.root / "workspace" / task.id / "attempts" / "001" / "diff.patch"
+        ).read_text(encoding="utf-8")
+        self.assertIn("+const value = 2;", workspace_diff)
 
     # --- 3. 7 errors → 2 rounds → pass (multi-round, fits in budget) ----- #
 
