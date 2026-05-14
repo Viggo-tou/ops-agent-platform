@@ -1701,6 +1701,83 @@ class PrimaryOrchestrator:
                 },
             )
 
+        if _matched_playbook is not None and isinstance(task.plan_json, dict):
+            try:
+                from app.services.domain_classifier import (
+                    synthesize_acceptance_tests_from_playbook,
+                    synthesize_must_touch_files_from_candidates,
+                )
+
+                _plan_data = dict(task.plan_json)
+                _existing_acceptance = list(
+                    _plan_data.get("acceptance_tests") or []
+                )
+                _acceptance = synthesize_acceptance_tests_from_playbook(
+                    playbook=_matched_playbook,
+                    acceptance_tests=_existing_acceptance,
+                )
+
+                _issue_text_parts = [task.request_text or ""]
+                if isinstance(issue_context, dict):
+                    for _key in ("summary", "description", "acceptance_criteria"):
+                        _value = str(issue_context.get(_key) or "").strip()
+                        if _value:
+                            _issue_text_parts.append(_value)
+                _existing_must_touch = list(
+                    _plan_data.get("must_touch_files") or []
+                )
+                _must_touch = synthesize_must_touch_files_from_candidates(
+                    playbook=_matched_playbook,
+                    candidate_files=candidate_files,
+                    issue_text="\n".join(_issue_text_parts),
+                    existing_must_touch=_existing_must_touch,
+                    expected_new_files=list(_plan_data.get("expected_new_files") or []),
+                )
+
+                _changed = False
+                _payload: dict[str, Any] = {
+                    "domain_id": _matched_playbook.get("id"),
+                }
+                if _acceptance != _existing_acceptance:
+                    _plan_data["acceptance_tests"] = _acceptance
+                    _payload["acceptance_tests_before"] = len(_existing_acceptance)
+                    _payload["acceptance_tests_after"] = len(_acceptance)
+                    _payload["backfilled_contract_ids"] = [
+                        str(item.get("contract_id") or "")
+                        for item in _acceptance
+                        if isinstance(item, dict) and item.get("contract_id")
+                    ]
+                    _changed = True
+                if _must_touch and _must_touch != _existing_must_touch:
+                    _plan_data["must_touch_files"] = _must_touch
+                    _payload["must_touch_before"] = list(_existing_must_touch)
+                    _payload["must_touch_after"] = list(_must_touch)
+                    _payload["candidate_files"] = len(candidate_files)
+                    _changed = True
+
+                if _changed:
+                    plan_document = GeneratedPlan.model_validate(_plan_data)
+                    task.plan_json = plan_document.model_dump(mode="json")
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_SUCCEEDED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.PLANNING,
+                        role=RoleName.PLANNER,
+                        tool_name="planner.domain_backfill",
+                        message=(
+                            "Planner plan fields were deterministically "
+                            "backfilled from the matched domain playbook "
+                            "and preplan evidence."
+                        ),
+                        payload=_payload,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "planner domain backfill failed (non-fatal): %s", exc,
+                )
+
         # v16.2: inject required_contracts (from the matched playbook,
         # NOT planner-decided) into the plan dict. Codegen reads
         # `plan_json["required_contracts"]` and mandates a structured

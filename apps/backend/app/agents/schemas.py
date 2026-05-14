@@ -58,6 +58,7 @@ class PlanAcceptanceTest(BaseModel):
         "forbids_pattern_in_diff",
         "test_must_reference_existing_symbol",
     ]
+    contract_id: str | None = Field(default=None, max_length=100)
     pattern: str = Field(default="", max_length=240)
     file: str | None = Field(default=None, max_length=400)
     function: str | None = Field(default=None, max_length=200)
@@ -77,6 +78,30 @@ class GeneratedPlanPayload(BaseModel):
     requires_approval: bool
     approval_reasons: list[str] = Field(default_factory=list, max_length=6)
     affected_code_locations: list[PlanCodeLocation] = Field(default_factory=list, max_length=8)
+    must_inspect_files: list[str] = Field(
+        default_factory=list,
+        max_length=12,
+        description=(
+            "Read-only context files the planner must inspect to ground the "
+            "patch but does NOT modify. Examples: build.gradle for SDK "
+            "dependency lookup, AndroidManifest.xml for permission/feature "
+            "tags, nav_graph.xml for route registration. These flow into "
+            "codegen prompt as context but are NOT included in the "
+            "must-touch enforcement set. Phase 2 of pre-plan scope "
+            "discovery (2026-05-11)."
+        ),
+    )
+    likely_touch_files: list[str] = Field(
+        default_factory=list,
+        max_length=12,
+        description=(
+            "Files that probably need modification but evidence is not yet "
+            "conclusive (filename matches keywords; content not yet read). "
+            "Promote to must_touch_files only after direct edit is "
+            "confirmed by deeper inspection. Phase 2 of pre-plan scope "
+            "discovery (2026-05-11)."
+        ),
+    )
     must_touch_files: list[str] = Field(
         default_factory=list,
         max_length=12,
@@ -220,3 +245,8 @@ class CodegenResult(BaseModel):
     output_tokens: int = 0
     used_fallback: bool = False
     fallback_reason: str | None = None
+    # v16.2: structured contract coverage block parsed from the model's
+    # response (when the plan carries `required_contracts`). Dict form
+    # matches `CoverageDeclaration.to_dict()`; orchestrator merges this
+    # across batches and feeds to `contract_coverage.verify_coverage`.
+    contract_coverage: dict[str, Any] | None = None
