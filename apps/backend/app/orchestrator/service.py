@@ -1638,6 +1638,28 @@ class PrimaryOrchestrator:
                     "preplan_discover failed (non-fatal): %s", exc,
                 )
 
+        context_packet_rendered = planning_request_text.lstrip().startswith(
+            "<planner_context"
+        )
+        if context_packet_rendered:
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_SUCCEEDED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.PLANNING,
+                role=RoleName.PLANNER,
+                tool_name="planner.context_packet",
+                message="Planner context packet prepared for structured plan generation.",
+                payload={
+                    "chars": len(planning_request_text),
+                    "has_issue_context": isinstance(issue_context, dict),
+                    "has_repository_context": isinstance(planning_knowledge_context, dict),
+                    "candidate_files": len(candidate_files),
+                    "provider_duplicate_context_suppressed": True,
+                },
+            )
+
         with get_tracer().start_as_current_span("task.plan") as span:
             _set_task_span_attributes(span, task=task, actor_name=actor_name)
             planning_result = self.primary_agent.generate_plan(
@@ -1646,8 +1668,10 @@ class PrimaryOrchestrator:
                 scenario=task.scenario,
                 actor_name=actor_name,
                 semantic_translation=semantic_translation,
-                planning_knowledge=planning_knowledge_context,
-                issue_context=issue_context,
+                planning_knowledge=(
+                    None if context_packet_rendered else planning_knowledge_context
+                ),
+                issue_context=None if context_packet_rendered else issue_context,
                 candidate_files=candidate_files,
             )
         plan_document = planning_result.plan
