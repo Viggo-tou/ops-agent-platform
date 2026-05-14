@@ -223,6 +223,17 @@ def apply_kotlin_diagnostic_fast_fixes(
         elif content != before:
             applied.append("add_import:androidx.compose.runtime.rememberCoroutineScope")
 
+    if _should_add_android_view_import(error_text, content):
+        before = content
+        content, err = _op_add_import(
+            content,
+            {"content": "import androidx.compose.ui.viewinterop.AndroidView"},
+        )
+        if err:
+            errors.append(StructuralEditError(err, operation="add_import"))
+        elif content != before:
+            applied.append("add_import:androidx.compose.ui.viewinterop.AndroidView")
+
     if _should_repair_missing_try_for_kotlin_catch(error_text, content):
         before = content
         content, err = _repair_missing_try_for_kotlin_catch(content, line=line)
@@ -261,6 +272,19 @@ def apply_kotlin_diagnostic_fast_fixes(
             )
         elif content != before:
             applied.append("hoist_lifecycle_owner_from_disposable_effect")
+
+    if _should_repair_marker_receiver_in_mapview_apply(error_text, content):
+        before = content
+        content, err = _repair_marker_receiver_in_mapview_apply(content)
+        if err:
+            errors.append(
+                StructuralEditError(
+                    err,
+                    operation="qualify_marker_receiver_in_mapview_apply",
+                )
+            )
+        elif content != before:
+            applied.append("qualify_marker_receiver_in_mapview_apply")
 
     if _should_repair_firebase_snapshot_children(error_text, content):
         before = content
@@ -431,6 +455,19 @@ def _should_add_compose_runtime_import(error_text: str, content: str, *, symbol:
     return True
 
 
+def _should_add_android_view_import(error_text: str, content: str) -> bool:
+    lower = (error_text or "").lower()
+    if "unresolved reference" not in lower or "androidview" not in lower:
+        return False
+    if "AndroidView" not in content:
+        return False
+    return not re.search(
+        r"^\s*import\s+androidx\.compose\.ui\.viewinterop\.(?:AndroidView|\*)\s*$",
+        content,
+        re.MULTILINE,
+    )
+
+
 def _should_repair_firebase_snapshot_children(error_text: str, content: str) -> bool:
     lower = (error_text or "").lower()
     diagnostic_signal = any(
@@ -511,6 +548,17 @@ def _should_repair_lifecycle_owner_in_disposable_effect(error_text: str, content
     )
 
 
+def _should_repair_marker_receiver_in_mapview_apply(error_text: str, content: str) -> bool:
+    lower = (error_text or "").lower()
+    if "argument type mismatch" not in lower or "mapview" not in lower:
+        return False
+    return (
+        "MapView(" in content
+        and ".apply {" in content
+        and "Marker(this)" in content
+    )
+
+
 def _repair_nullable_geocoder_addresses(content: str) -> tuple[str, str]:
     pattern = re.compile(
         r"(?P<indent>^[ \t]*)if\s*\(\s*(?P<list>[A-Za-z_][A-Za-z0-9_]*)"
@@ -572,6 +620,14 @@ def _repair_lifecycle_owner_in_disposable_effect(content: str) -> tuple[str, str
         )
         return _join_like(content, new_lines), ""
     return content, "no LocalLifecycleOwner.current inside DisposableEffect block found"
+
+
+def _repair_marker_receiver_in_mapview_apply(content: str) -> tuple[str, str]:
+    pattern = re.compile(r"\bMarker\s*\(\s*this\s*\)")
+    new_content, count = pattern.subn("Marker(this@apply)", content, count=16)
+    if count <= 0:
+        return content, "no Marker(this) call found inside MapView apply"
+    return new_content, ""
 
 
 def _repair_missing_try_for_kotlin_catch(content: str, *, line: int = 0) -> tuple[str, str]:

@@ -200,6 +200,30 @@ fun Screen() {
     assert "import androidx.compose.runtime.rememberCoroutineScope" in result.content
 
 
+def test_kotlin_fast_fix_adds_android_view_import():
+    source = """\
+package com.example
+
+import androidx.compose.runtime.Composable
+
+@Composable
+fun Screen() {
+    AndroidView(factory = { context -> View(context) })
+}
+"""
+
+    result = apply_kotlin_diagnostic_fast_fixes(
+        file_path="Screen.kt",
+        original_content=source,
+        error_text="Unresolved reference 'AndroidView'.",
+        line=7,
+    )
+
+    assert result is not None
+    assert result.ok, result.errors
+    assert "import androidx.compose.ui.viewinterop.AndroidView" in result.content
+
+
 def test_kotlin_fast_fix_wraps_broken_firebase_snapshot_children_loop():
     source = """\
 package com.example
@@ -419,6 +443,45 @@ fun Screen() {
     assert "val lifecycle = LocalLifecycleOwner.current.lifecycle\n    DisposableEffect(mapView, lifecycle)" in result.content
     assert result.content.count("LocalLifecycleOwner.current.lifecycle") == 1
     assert "lifecycle.addObserver(observer)" in result.content
+
+
+def test_kotlin_fast_fix_qualifies_marker_receiver_inside_mapview_apply():
+    source = """\
+package com.example
+
+import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.Marker
+
+fun make(context: Context) {
+    val mv = MapView(context).apply {
+        overlays.add(MapEventsOverlay(object : MapEventsReceiver {
+            override fun singleTapConfirmedHelper(p: GeoPoint?): Boolean {
+                val marker = Marker(this).apply {
+                    position = GeoPoint(1.0, 2.0)
+                }
+                overlays.add(marker)
+                return true
+            }
+        }))
+    }
+}
+"""
+
+    result = apply_kotlin_diagnostic_fast_fixes(
+        file_path="Map.kt",
+        original_content=source,
+        error_text=(
+            "Argument type mismatch: actual type is '<anonymous>', "
+            "but 'org.osmdroid.views.MapView!' was expected."
+        ),
+        line=10,
+        protected_symbols=["Marker", "MapView"],
+    )
+
+    assert result is not None
+    assert result.ok, result.errors
+    assert "Marker(this@apply)" in result.content
+    assert "Marker(this)" not in result.content
 
 
 def test_structural_plan_supports_firebase_snapshot_children_operation():
