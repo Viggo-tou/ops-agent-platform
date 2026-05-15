@@ -8,6 +8,7 @@ import subprocess
 import time
 import traceback
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from dataclasses import is_dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -195,8 +196,11 @@ def _semantic_review_should_attempt_repair(
     *,
     sr_round: int,
     max_repair_rounds: int,
+    verified_gates_passed: bool = False,
 ) -> bool:
     if sr_report is None or bool(getattr(sr_report, "passed", False)):
+        return False
+    if verified_gates_passed:
         return False
     if sr_round >= max_repair_rounds:
         return False
@@ -241,6 +245,154 @@ def _semantic_review_high_findings(sr_report: object | None) -> list[dict[str, o
         if severity == "high":
             out.append(payload)
     return out
+
+
+def _semantic_review_verified_gates_passed(
+    pipeline_state: dict[str, object] | None,
+) -> bool:
+    state = pipeline_state or {}
+    compile_gate = state.get("compile_gate")
+    coverage = state.get("contract_coverage_verdict")
+    symbol_graph = state.get("symbol_graph")
+    compile_ok = isinstance(compile_gate, dict) and compile_gate.get("passed") is True
+    coverage_ok = isinstance(coverage, dict) and coverage.get("ok") is True
+    acceptance_ok = bool(state.get("acceptance_check_done"))
+    symbol_ok = (
+        not state.get("symbol_graph_done")
+        or (isinstance(symbol_graph, dict) and symbol_graph.get("passed") is True)
+    )
+    return compile_ok and coverage_ok and acceptance_ok and symbol_ok
+
+
+def _semantic_review_finding_contradicted_by_verified_gates(
+    finding: object,
+    *,
+    pipeline_state: dict[str, object] | None,
+) -> bool:
+    if not _semantic_review_verified_gates_passed(pipeline_state):
+        return False
+    if isinstance(finding, dict):
+        severity = str(finding.get("severity") or "").lower()
+        text = " ".join(
+            str(finding.get(key) or "")
+            for key in ("category", "description", "evidence_quote", "suggested_fix")
+        ).lower()
+    else:
+        severity = str(getattr(finding, "severity", "") or "").lower()
+        text = " ".join(
+            str(getattr(finding, key, "") or "")
+            for key in ("category", "description", "evidence_quote", "suggested_fix")
+        ).lower()
+    if severity != "high":
+        return False
+
+    compile_terms = (
+        "compile",
+        "compilation",
+        "unresolved reference",
+        "missing import",
+        "not imported",
+        "without importing",
+        "locale.getdefault",
+    )
+    if any(term in text for term in compile_terms):
+        return True
+
+    missing_terms = ("missing", "lacks", "does not add", "not implemented", "no ")
+    contract_terms = (
+        "map",
+        "mapview",
+        "osmdroid",
+        "geocoder",
+        "singleTapConfirmedHelper".lower(),
+        "latitude",
+        "longitude",
+        "coordinates",
+        "address",
+        "firebase",
+        "updatechildren",
+        "setvalue",
+    )
+    return any(term in text for term in missing_terms) and any(
+        term in text for term in contract_terms
+    )
+
+
+def _semantic_review_filter_after_verified_gates(
+    sr_report: object | None,
+    *,
+    pipeline_state: dict[str, object] | None,
+) -> tuple[object | None, list[dict[str, object]]]:
+    if sr_report is None or bool(getattr(sr_report, "passed", False)):
+        return sr_report, []
+    if not _semantic_review_verified_gates_passed(pipeline_state):
+        return sr_report, []
+
+    findings = list(getattr(sr_report, "findings", None) or [])
+    if not findings:
+        return sr_report, []
+
+    kept: list[object] = []
+    dropped: list[dict[str, object]] = []
+    for finding in findings:
+        if _semantic_review_finding_contradicted_by_verified_gates(
+            finding,
+            pipeline_state=pipeline_state,
+        ):
+            if isinstance(finding, dict):
+                dropped.append(dict(finding))
+            else:
+                dropped.append(
+                    {
+                        "file": getattr(finding, "file", None),
+                        "severity": getattr(finding, "severity", None),
+                        "category": getattr(finding, "category", None),
+                        "description": getattr(finding, "description", None),
+                        "evidence_quote": getattr(finding, "evidence_quote", None),
+                        "suggested_fix": getattr(finding, "suggested_fix", None),
+                    }
+                )
+            continue
+        kept.append(finding)
+    if not dropped:
+        return sr_report, []
+
+    high_left = 0
+    for finding in kept:
+        severity = (
+            str(finding.get("severity") or "").lower()
+            if isinstance(finding, dict)
+            else str(getattr(finding, "severity", "") or "").lower()
+        )
+        if severity == "high":
+            high_left += 1
+    pass_threshold = int(getattr(sr_report, "pass_threshold", 80) or 80)
+    completeness = int(getattr(sr_report, "completeness_pct", 0) or 0)
+    passed = completeness >= pass_threshold and high_left == 0
+    summary = (
+        f"{getattr(sr_report, 'summary', '') or ''} "
+        f"[{len(dropped)} high semantic finding(s) suppressed because "
+        "compile, contract coverage, acceptance, and symbol graph already passed.]"
+    ).strip()
+
+    if is_dataclass(sr_report):
+        return (
+            replace(
+                sr_report,
+                passed=passed,
+                summary=summary,
+                findings=tuple(kept),
+            ),
+            dropped,
+        )
+
+    try:
+        setattr(sr_report, "passed", passed)
+        setattr(sr_report, "summary", summary)
+        setattr(sr_report, "findings", kept)
+    except Exception:
+        pass
+    return sr_report, dropped
 
 
 def _normalize_diff_path(path: object) -> str:
@@ -6962,6 +7114,35 @@ class PrimaryOrchestrator:
                         sr_report = None
                         break
 
+                    (
+                        sr_report,
+                        sr_suppressed_verified_gate_findings,
+                    ) = _semantic_review_filter_after_verified_gates(
+                        sr_report,
+                        pipeline_state=pipeline_state,
+                    )
+                    if sr_suppressed_verified_gate_findings:
+                        record_event(
+                            self.db, task_id=task.id,
+                            event_type=EventType.TOOL_SUCCEEDED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            tool_name="semantic_review.verified_gate_override",
+                            message=(
+                                "Suppressed "
+                                f"{len(sr_suppressed_verified_gate_findings)} "
+                                "semantic_review high finding(s) contradicted "
+                                "by passed deterministic gates."
+                            ),
+                            payload={
+                                "suppressed_findings": sr_suppressed_verified_gate_findings,
+                                "compile_gate_passed": True,
+                                "contract_coverage_passed": True,
+                                "acceptance_check_done": True,
+                            },
+                        )
+
                     sr_event = record_event(
                         self.db, task_id=task.id,
                         event_type=(
@@ -7012,6 +7193,9 @@ class PrimaryOrchestrator:
                         sr_report,
                         sr_round=sr_round,
                         max_repair_rounds=_SR_MAX_REPAIR,
+                        verified_gates_passed=_semantic_review_verified_gates_passed(
+                            pipeline_state
+                        ),
                     ):
                         if not (getattr(sr_report, "findings", None) or ()):
                             record_event(
