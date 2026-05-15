@@ -10,8 +10,10 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.orchestrator.service import (  # noqa: E402
+    _semantic_review_actionable_quality_findings,
     _semantic_review_filter_after_verified_gates,
     _semantic_review_high_count,
+    _semantic_review_should_attempt_quality_refine,
     _semantic_review_should_attempt_repair,
     _semantic_review_should_block_on_exhausted,
 )
@@ -263,3 +265,138 @@ def test_semantic_review_keeps_unbound_state_finding_when_only_some_fields_are_s
 
     assert dropped == []
     assert _semantic_review_high_count(filtered) == 1
+
+
+def test_semantic_quality_refine_requires_grounded_medium_finding():
+    sr_report = SimpleNamespace(
+        passed=True,
+        completeness_pct=90,
+        findings=[],
+    )
+
+    assert _semantic_review_actionable_quality_findings(sr_report) == []
+    assert (
+        _semantic_review_should_attempt_quality_refine(
+            sr_report,
+            refine_attempts=0,
+            max_refine_attempts=1,
+            quality_threshold=95,
+            verified_gates_passed=True,
+        )
+        is False
+    )
+
+
+def test_semantic_quality_refine_runs_for_passed_grounded_medium_finding():
+    finding = SimpleNamespace(
+        severity="medium",
+        description="Persisted payload omits the validated address field.",
+        evidence_quote='"address" to addressText',
+    )
+    sr_report = SimpleNamespace(
+        passed=True,
+        completeness_pct=90,
+        high_severity_count=0,
+        findings=[finding],
+    )
+
+    assert _semantic_review_actionable_quality_findings(sr_report) == [finding]
+    assert (
+        _semantic_review_should_attempt_quality_refine(
+            sr_report,
+            refine_attempts=0,
+            max_refine_attempts=1,
+            quality_threshold=95,
+            verified_gates_passed=True,
+        )
+        is True
+    )
+
+
+def test_semantic_quality_refine_ignores_low_or_ungrounded_findings():
+    sr_report = SimpleNamespace(
+        passed=True,
+        completeness_pct=90,
+        findings=[
+            {
+                "severity": "low",
+                "description": "Naming could be clearer.",
+                "evidence_quote": "val name",
+            },
+            {
+                "severity": "medium",
+                "description": "Could improve edge handling.",
+                "evidence_quote": "",
+            },
+        ],
+    )
+
+    assert _semantic_review_actionable_quality_findings(sr_report) == []
+    assert (
+        _semantic_review_should_attempt_quality_refine(
+            sr_report,
+            refine_attempts=0,
+            max_refine_attempts=1,
+            quality_threshold=95,
+            verified_gates_passed=True,
+        )
+        is False
+    )
+
+
+def test_semantic_quality_refine_respects_disable_threshold_attempts_and_gates():
+    sr_report = SimpleNamespace(
+        passed=True,
+        completeness_pct=95,
+        high_severity_count=0,
+        findings=[
+            {
+                "severity": "medium",
+                "description": "Persisted payload omits the validated address field.",
+                "evidence_quote": '"address" to addressText',
+            }
+        ],
+    )
+
+    assert (
+        _semantic_review_should_attempt_quality_refine(
+            sr_report,
+            refine_attempts=0,
+            max_refine_attempts=1,
+            quality_threshold=95,
+            enabled=False,
+            verified_gates_passed=True,
+        )
+        is False
+    )
+    assert (
+        _semantic_review_should_attempt_quality_refine(
+            sr_report,
+            refine_attempts=0,
+            max_refine_attempts=1,
+            quality_threshold=95,
+            verified_gates_passed=True,
+        )
+        is False
+    )
+    sr_report.completeness_pct = 90
+    assert (
+        _semantic_review_should_attempt_quality_refine(
+            sr_report,
+            refine_attempts=1,
+            max_refine_attempts=1,
+            quality_threshold=95,
+            verified_gates_passed=True,
+        )
+        is False
+    )
+    assert (
+        _semantic_review_should_attempt_quality_refine(
+            sr_report,
+            refine_attempts=0,
+            max_refine_attempts=1,
+            quality_threshold=95,
+            verified_gates_passed=False,
+        )
+        is False
+    )

@@ -218,6 +218,54 @@ def _semantic_review_should_attempt_repair(
     return bool(getattr(sr_report, "findings", None) or ())
 
 
+def _semantic_review_actionable_quality_findings(
+    sr_report: object | None,
+) -> list[object]:
+    if sr_report is None:
+        return []
+    out: list[object] = []
+    for finding in getattr(sr_report, "findings", None) or []:
+        if isinstance(finding, dict):
+            severity = str(finding.get("severity") or "").lower()
+            description = str(finding.get("description") or "").strip()
+            evidence_quote = str(finding.get("evidence_quote") or "").strip()
+        else:
+            severity = str(getattr(finding, "severity", "") or "").lower()
+            description = str(getattr(finding, "description", "") or "").strip()
+            evidence_quote = str(getattr(finding, "evidence_quote", "") or "").strip()
+        if severity != "medium":
+            continue
+        if not description or len(evidence_quote) < 5:
+            continue
+        out.append(finding)
+    return out
+
+
+def _semantic_review_should_attempt_quality_refine(
+    sr_report: object | None,
+    *,
+    refine_attempts: int,
+    max_refine_attempts: int,
+    quality_threshold: int,
+    enabled: bool = True,
+    verified_gates_passed: bool = False,
+) -> bool:
+    if not enabled or sr_report is None:
+        return False
+    if not bool(getattr(sr_report, "passed", False)):
+        return False
+    if not verified_gates_passed:
+        return False
+    if refine_attempts >= max(0, int(max_refine_attempts)):
+        return False
+    if _semantic_review_high_count(sr_report) > 0:
+        return False
+    completeness = int(getattr(sr_report, "completeness_pct", 0) or 0)
+    if completeness >= int(quality_threshold):
+        return False
+    return bool(_semantic_review_actionable_quality_findings(sr_report))
+
+
 def _semantic_review_should_block_on_exhausted(
     sr_report: object | None,
     settings: object,
@@ -7330,6 +7378,59 @@ class PrimaryOrchestrator:
                                 "R3a memory persist failed: %s", exc,
                             )
                     if sr_report.passed:
+                        _quality_refine_enabled = bool(
+                            getattr(
+                                self.tool_gateway.settings,
+                                "semantic_review_quality_refine_enabled",
+                                True,
+                            )
+                        )
+                        _quality_refine_threshold = int(
+                            getattr(
+                                self.tool_gateway.settings,
+                                "semantic_review_quality_refine_threshold",
+                                95,
+                            )
+                            or 95
+                        )
+                        _quality_refine_max = int(
+                            getattr(
+                                self.tool_gateway.settings,
+                                "semantic_review_quality_refine_max_attempts",
+                                1,
+                            )
+                            or 1
+                        )
+                        _quality_refine_attempts = int(
+                            pipeline_state.get("semantic_review_quality_refine_attempts")
+                            or 0
+                        )
+                        if _semantic_review_should_attempt_quality_refine(
+                            sr_report,
+                            refine_attempts=_quality_refine_attempts,
+                            max_refine_attempts=_quality_refine_max,
+                            quality_threshold=_quality_refine_threshold,
+                            enabled=_quality_refine_enabled,
+                            verified_gates_passed=_semantic_review_verified_gates_passed(
+                                pipeline_state
+                            ),
+                        ):
+                            refined = self._attempt_semantic_quality_refine(
+                                task=task,
+                                actor_name=actor_name,
+                                plan=plan,
+                                pipeline_state=pipeline_state,
+                                sr_report=sr_report,
+                                approval_id=approval_id,
+                                sandbox_dir=_sr_sandbox_dir,
+                            )
+                            if refined:
+                                return self._execute_develop_pipeline(
+                                    task=task,
+                                    actor_name=actor_name,
+                                    plan=plan,
+                                    approval_id=approval_id,
+                                )
                         break
                     if not _semantic_review_should_attempt_repair(
                         sr_report,
@@ -11660,6 +11761,315 @@ class PrimaryOrchestrator:
                 exc,
             )
             return None
+
+    @staticmethod
+    def _semantic_review_finding_files(sr_report: object | None) -> list[str]:
+        files: list[str] = []
+        for finding in _semantic_review_actionable_quality_findings(sr_report):
+            file_value = (
+                finding.get("file")
+                if isinstance(finding, dict)
+                else getattr(finding, "file", None)
+            )
+            normalized = PrimaryOrchestrator._normalize_codegen_path(
+                str(file_value or "").strip().replace("\\", "/")
+            )
+            if normalized and normalized not in files:
+                files.append(normalized)
+        return files
+
+    @staticmethod
+    def _reset_after_semantic_quality_refine(
+        pipeline_state: dict[str, object],
+    ) -> None:
+        for key in (
+            "compile_gate_done",
+            "compile_gate",
+            "compile_gate_failed",
+            "acceptance_check_done",
+            "acceptance_check",
+            "acceptance_check_failed",
+            "symbol_graph_done",
+            "symbol_graph",
+            "symbol_graph_skipped",
+            "semantic_review_done",
+            "semantic_review",
+            "semantic_review_unavailable",
+            "runtime_validation_done",
+            "runtime_validation",
+            "review_result",
+            "review_verdict",
+            "conformance_report",
+            "evidence_chain_validated",
+            "evidence_chain",
+            "evidence_chain_gaps",
+            "goal_attestation",
+            "reservations",
+            "reservations_detailed",
+        ):
+            pipeline_state.pop(key, None)
+
+    def _attempt_semantic_quality_refine(
+        self,
+        *,
+        task: Task,
+        actor_name: str,
+        plan: GeneratedPlan,
+        pipeline_state: dict[str, object],
+        sr_report: object,
+        approval_id: str | None,
+        sandbox_dir: Path,
+    ) -> bool:
+        """Run one evidence-gated quality refinement pass.
+
+        This is intentionally narrower than compile/semantic repair. It only
+        runs for already-passing reviews with grounded medium findings and it
+        refuses patches that touch files outside the current diff/finding set.
+        """
+        if not pipeline_state.get("pre_codegen_snapshot_id"):
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_SKIPPED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="semantic_review.quality_refine",
+                message="Quality refine skipped: no pre-codegen sandbox snapshot.",
+            )
+            return False
+
+        finding_files = self._semantic_review_finding_files(sr_report)
+        changed_files = [
+            p for p in self._safe_codegen_paths(
+                list(pipeline_state.get("files_changed") or [])
+            )
+            if p
+        ]
+        allowed_files = sorted({*finding_files, *changed_files})
+        if not allowed_files:
+            return False
+
+        context_files: dict[str, str] = {}
+        for rel in allowed_files:
+            full = sandbox_dir / rel
+            try:
+                if full.is_file():
+                    body = full.read_text(encoding="utf-8", errors="replace")
+                    context_files[rel] = body[:30_000]
+            except Exception:
+                continue
+        if not context_files:
+            return False
+
+        findings_lines: list[str] = []
+        for finding in _semantic_review_actionable_quality_findings(sr_report):
+            if isinstance(finding, dict):
+                file_value = str(finding.get("file") or "").strip()
+                line_start = int(finding.get("line_start") or 0)
+                line_end = int(finding.get("line_end") or 0)
+                category = str(finding.get("category") or "general").strip()
+                description = str(finding.get("description") or "").strip()
+                evidence_quote = str(finding.get("evidence_quote") or "").strip()
+                suggested_fix = str(finding.get("suggested_fix") or "").strip()
+            else:
+                file_value = str(getattr(finding, "file", "") or "").strip()
+                line_start = int(getattr(finding, "line_start", 0) or 0)
+                line_end = int(getattr(finding, "line_end", 0) or 0)
+                category = str(getattr(finding, "category", "general") or "general").strip()
+                description = str(getattr(finding, "description", "") or "").strip()
+                evidence_quote = str(getattr(finding, "evidence_quote", "") or "").strip()
+                suggested_fix = str(getattr(finding, "suggested_fix", "") or "").strip()
+            line_part = (
+                f"{file_value}:{line_start}-{line_end}"
+                if line_start and line_end
+                else file_value
+            )
+            findings_lines.append(
+                f"  - [MEDIUM|{category}] {line_part}: {description} "
+                f"-- Evidence: {evidence_quote}"
+                + (f" -- Suggested: {suggested_fix}" if suggested_fix else "")
+            )
+        if not findings_lines:
+            return False
+        previous_diff = str(pipeline_state.get("diff") or "")
+        if len(previous_diff) > 12_000:
+            previous_diff = previous_diff[:12_000] + "\n[truncated]"
+        prompt = (
+            "SEMANTIC QUALITY REFINE (bounded, one pass):\n"
+            "The current patch already passed compile, acceptance, contract "
+            "coverage, SymbolGraph, and the semantic hard threshold. Improve "
+            "ONLY the grounded medium-quality findings below. Do not broaden "
+            "scope. Do not rewrite files. Do not change unrelated behavior. "
+            "If the finding cannot be fixed safely inside the allowed files, "
+            "return no diff.\n\n"
+            "ALLOWED FILES:\n"
+            + "\n".join(f"- {path}" for path in allowed_files)
+            + "\n\nFINDINGS TO FIX:\n"
+            + "\n".join(findings_lines)
+            + "\n\nPREVIOUS DIFF (do not undo):\n"
+            f"```diff\n{previous_diff}\n```\n\n"
+            "Output a small unified diff against the current sandbox files."
+        )
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.TOOL_CALL_REQUESTED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            tool_name="semantic_review.quality_refine",
+            message=(
+                "Attempting bounded semantic quality refine with "
+                f"{len(findings_lines)} grounded finding(s)."
+            ),
+            payload={
+                "allowed_files": allowed_files,
+                "completeness_pct": getattr(sr_report, "completeness_pct", None),
+            },
+        )
+        try:
+            refine_result = self._execute_develop_tool(
+                task=task,
+                actor_name=actor_name,
+                tool_name="codegen.generate_patch",
+                payload={
+                    "plan_json": {
+                        "objective": "Bounded semantic quality refinement",
+                        "must_touch_files": allowed_files,
+                        "steps": [],
+                    },
+                    "context_files": context_files,
+                    "task_description": prompt,
+                    "source_repo_path": str(sandbox_dir),
+                },
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                approval_id=approval_id,
+                pipeline_state=pipeline_state,
+                timeout_seconds=float(
+                    getattr(
+                        self.tool_gateway.settings,
+                        "semantic_review_quality_refine_timeout_seconds",
+                        180.0,
+                    )
+                    or 180.0
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_FAILED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="semantic_review.quality_refine",
+                message=f"Quality refine codegen failed: {exc}",
+            )
+            return False
+
+        refine_diff = str((refine_result or {}).get("diff") or "").strip()
+        if not refine_diff:
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_SKIPPED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="semantic_review.quality_refine",
+                message="Quality refine produced no diff.",
+            )
+            return False
+
+        touched = set(_diff_sections_by_file(refine_diff))
+        disallowed = sorted(touched - set(allowed_files))
+        if disallowed:
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_FAILED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="semantic_review.quality_refine",
+                message="Quality refine rejected: patch touched disallowed files.",
+                payload={
+                    "allowed_files": allowed_files,
+                    "disallowed_files": disallowed,
+                },
+            )
+            return False
+
+        try:
+            apply_result = self._execute_develop_tool(
+                task=task,
+                actor_name=actor_name,
+                tool_name="sandbox.apply_patch",
+                payload={
+                    "task_id": task.id,
+                    "patch": refine_diff,
+                    "context_files": context_files,
+                    "commit": True,
+                    "commit_message": f"Apply semantic quality refine for {task.id}",
+                },
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                approval_id=approval_id,
+                pipeline_state=pipeline_state,
+            )
+        except Exception as exc:  # noqa: BLE001
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_FAILED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="semantic_review.quality_refine",
+                message=f"Quality refine patch failed to apply: {exc}",
+            )
+            return False
+        if apply_result is None:
+            return False
+
+        attempts = int(pipeline_state.get("semantic_review_quality_refine_attempts") or 0) + 1
+        pipeline_state["semantic_review_quality_refine_attempts"] = attempts
+        pipeline_state["semantic_review_quality_refine_applied"] = True
+        pipeline_state["semantic_review_quality_refine_patch_chars"] = len(refine_diff)
+        pipeline_state["semantic_review_quality_refine_files"] = sorted(touched)
+        pipeline_state["semantic_review_quality_refine_apply_result"] = apply_result
+
+        codegen_result = dict(pipeline_state.get("codegen_result") or {})
+        self._refresh_codegen_diff_from_sandbox(
+            task=task,
+            pipeline_state=pipeline_state,
+            plan=plan,
+            codegen_result=codegen_result,
+            reason="semantic_quality_refine",
+        )
+        self._reset_after_semantic_quality_refine(pipeline_state)
+        self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.TOOL_SUCCEEDED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            tool_name="semantic_review.quality_refine",
+            message=(
+                "Quality refine applied; downstream verification gates will "
+                "rerun before approval."
+            ),
+            payload={
+                "attempts": attempts,
+                "files": sorted(touched),
+                "patch_chars": len(refine_diff),
+            },
+        )
+        return True
 
     def _build_codegen_task_description(
         self,

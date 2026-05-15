@@ -235,6 +235,15 @@ class Settings(BaseSettings):
     semantic_translator_model: str = "MiniMax-M2.7"
     semantic_translator_timeout_seconds: float = 30.0
     semantic_review_high_blocks_on_exhausted: bool = True
+    # Bounded quality refinement: if semantic_review already passes the
+    # hard merge threshold but returns grounded medium findings below this
+    # quality target, allow one narrow refinement pass before approval. The
+    # pass is deliberately evidence-gated; summary-only concerns do not
+    # trigger codegen.
+    semantic_review_quality_refine_enabled: bool = True
+    semantic_review_quality_refine_threshold: int = 95
+    semantic_review_quality_refine_max_attempts: int = 1
+    semantic_review_quality_refine_timeout_seconds: float = 180.0
     minimax_api_key: str | None = None
     minimax_base_url: str = "https://api.minimaxi.com"
     knowledge_source_name: str = "handymanapp"
