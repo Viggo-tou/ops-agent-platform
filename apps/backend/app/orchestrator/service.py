@@ -466,6 +466,23 @@ def _phone_otp_reservation_contradicts_verified_contract(
         or "error handling is removed" in text
     ):
         return True
+    if (
+        "only saved" in text
+        and ("after successful otp verification" in text or "after firebase accepts" in text)
+        and ("abandon" in text or "re-enter" in text or "reenter" in text)
+    ):
+        return True
+    if (
+        "verificationid" in text
+        and "phonenumber" in text
+        and (
+            "path parameter" in text
+            or "route" in text
+            or "backstack" in text
+            or "server log" in text
+        )
+    ):
+        return True
     return any(
         marker in text
         for marker in (

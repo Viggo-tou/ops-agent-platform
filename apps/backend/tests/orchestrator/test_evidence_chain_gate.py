@@ -483,6 +483,25 @@ def test_verified_phone_otp_contract_filters_contradictory_reservations() -> Non
         "auto_fixable": False,
         "blocking": True,
     }
+    verified_after_otp_policy_item = {
+        "text": (
+            "Phone number is only saved to DB after successful OTP verification. "
+            "If user abandons flow after receiving code, the number is lost and "
+            "they must re-enter it."
+        ),
+        "severity": "policy",
+        "auto_fixable": False,
+        "blocking": True,
+    }
+    preexisting_route_security_item = {
+        "text": (
+            "VerificationId and phoneNumber are passed as URL path parameters "
+            "to the OTP screen - visible in app backstack and server logs."
+        ),
+        "severity": "security",
+        "auto_fixable": False,
+        "blocking": True,
+    }
     missing_test_item = {
         "text": "No tests were added for the OTP flow.",
         "severity": "missing_test",
@@ -502,6 +521,8 @@ def test_verified_phone_otp_contract_filters_contradictory_reservations() -> Non
             policy_item,
             speculative_policy_item,
             speculative_security_item,
+            verified_after_otp_policy_item,
+            preexisting_route_security_item,
             missing_test_item,
             style_item,
         ],
@@ -514,6 +535,8 @@ def test_verified_phone_otp_contract_filters_contradictory_reservations() -> Non
         policy_item["text"],
         speculative_policy_item["text"],
         speculative_security_item["text"],
+        verified_after_otp_policy_item["text"],
+        preexisting_route_security_item["text"],
     ]
     assert {item["suppressed_reason"] for item in suppressed} == {
         "contradicts_verified_phone_otp_contract"
