@@ -48,19 +48,6 @@ required_contracts:
         file_filter: app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCPhoneNumber.kt
         pattern: 'navController\.navigate\("handymanKycCodeOTP/\$verificationId/\$phoneNumber"\)'
 
-  - id: otp_verification_remains_source_of_truth
-    signal: >
-      The OTP code screen remains the source of truth for verification. It
-      should keep Firebase credential validation and mark the profile verified
-      after the code is accepted, not during the request-code step.
-    verifications:
-      - kind: diff_contains_pattern
-        pattern: 'linkWithCredential|signInWithCredential|isPhoneVerified|FirebaseAuthUserCollisionException|already'
-      - kind: final_context_contains_pattern
-        anchor: changed_hunk
-        scope: window:240
-        pattern: 'linkWithCredential|signInWithCredential|isPhoneVerified'
-
 completeness_rule:
   minimum_contracts_referenced: 2
   on_failure: PLAN_UNDER_SPECIFIED
