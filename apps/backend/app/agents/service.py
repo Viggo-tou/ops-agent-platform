@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -181,6 +182,56 @@ def _demote_unsourced_android_map_new_files(
 
 
 _CODE_CHANGE_SCENARIOS = frozenset({"jira_issue_develop", "bug_fix"})
+_FALLBACK_PLAN_SOURCE_EXTENSIONS = frozenset(
+    {".kt", ".kts", ".java", ".py", ".ts", ".tsx", ".js", ".jsx"}
+)
+
+
+def _fallback_plan_candidate_source_paths(
+    candidate_files: list[dict[str, Any]] | None,
+    *,
+    limit: int = 6,
+) -> list[str]:
+    """Promote preplan candidates into fallback plan targets.
+
+    The fallback plan is used when the LLM planner times out or all providers
+    fail. For develop tasks, an empty target list is correctly rejected by the
+    reviewer, so use deterministic preplan discovery as the fallback target
+    source. Keep this conservative: production source files only, no tests,
+    build files, resources, or IDE metadata.
+    """
+    paths: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidate_files or []:
+        if not isinstance(candidate, dict):
+            continue
+        path = str(candidate.get("path") or "").strip().replace("\\", "/")
+        if not path or path in seen:
+            continue
+        lowered = path.lower()
+        suffix = Path(lowered).suffix
+        if suffix not in _FALLBACK_PLAN_SOURCE_EXTENSIONS:
+            continue
+        if any(
+            marker in lowered
+            for marker in (
+                "/src/test/",
+                "/test/",
+                "/tests/",
+                "/androidtest/",
+                "/build/",
+                "/generated/",
+                "/.idea/",
+            )
+        ):
+            continue
+        if "/src/main/" not in lowered and lowered.startswith("app/"):
+            continue
+        paths.append(path)
+        seen.add(path)
+        if len(paths) >= limit:
+            break
+    return paths
 
 
 def _collect_external_text(value: Any) -> list[str]:
@@ -436,6 +487,7 @@ def build_fallback_plan_payload(
     semantic_translation: GeneratedSemanticTranslation | None = None,
     planning_knowledge: dict[str, Any] | None = None,
     issue_context: dict[str, Any] | None = None,
+    candidate_files: list[dict[str, Any]] | None = None,
 ) -> GeneratedPlanPayload:
     request_summary = _short_request_summary(request_text)
     registry = ToolRegistry()
@@ -476,6 +528,8 @@ def build_fallback_plan_payload(
                     must_touch_paths.append(rel)
                 if len(must_touch_paths) >= 6:
                     break
+    if scenario == "jira_issue_develop" and not must_touch_paths:
+        must_touch_paths = _fallback_plan_candidate_source_paths(candidate_files)
 
     if scenario == "jira_issue_develop":
         codegen_tool = "codegen.generate_patch"
@@ -1458,6 +1512,7 @@ class PrimaryAgentPlanner:
             semantic_translation=semantic_translation,
             planning_knowledge=planning_knowledge,
             issue_context=issue_context,
+            candidate_files=candidate_files,
         )
 
         # T-LEARNING-LOOP-V1 Phase 2 — retrieve failure_observation rows

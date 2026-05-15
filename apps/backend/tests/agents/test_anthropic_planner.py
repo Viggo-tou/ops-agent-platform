@@ -39,6 +39,42 @@ def _settings(provider: str = "auto") -> SimpleNamespace:
 
 
 class AnthropicPlannerTests(unittest.TestCase):
+    def test_develop_fallback_plan_uses_preplan_source_candidates(self) -> None:
+        payload = build_fallback_plan_payload(
+            "develop P69-21",
+            scenario="jira_issue_develop",
+            candidate_files=[
+                {
+                    "path": (
+                        "app/src/main/java/com/example/handyman/customer_pages/"
+                        "CustomerKYCPhoneNumber.kt"
+                    )
+                },
+                {"path": "app/src/main/res/xml/backup_rules.xml"},
+                {"path": "app/src/test/java/com/example/handyman/ExampleUnitTest.kt"},
+                {
+                    "path": (
+                        "app/src/main/java/com/example/handyman/handyman_pages/"
+                        "HandymanKYCPhoneNumber.kt"
+                    )
+                },
+            ],
+        )
+
+        self.assertEqual(
+            payload.must_touch_files,
+            [
+                (
+                    "app/src/main/java/com/example/handyman/customer_pages/"
+                    "CustomerKYCPhoneNumber.kt"
+                ),
+                (
+                    "app/src/main/java/com/example/handyman/handyman_pages/"
+                    "HandymanKYCPhoneNumber.kt"
+                ),
+            ],
+        )
+
     def test_generate_plan_anthropic_auto(self) -> None:
         plan_payload = build_fallback_plan_payload(
             "Where is the Firebase config?",
