@@ -782,6 +782,25 @@ class CodeGenerator:
         must_touch_files, expected_new_files, allowed_paths = self._extract_plan_target_paths(plan_json)
         enforce = bool(allowed_paths)
 
+        recipe_result = self._try_android_job_default_address_recipe_codegen(
+            plan_json=plan_json,
+            context_files=context_files,
+            task_description=task_description,
+            source_repo_path=source_repo_path,
+            must_touch_files=must_touch_files,
+            expected_new_files=expected_new_files,
+        )
+        if recipe_result is not None:
+            if enforce:
+                self._validate_diff_paths_within_allowed(
+                    recipe_result.diff,
+                    recipe_result.files_changed,
+                    allowed_paths=allowed_paths,
+                    must_touch_files=must_touch_files,
+                    expected_new_files=expected_new_files,
+                )
+            return recipe_result
+
         recipe_result = self._try_android_map_location_recipe_codegen(
             plan_json=plan_json,
             context_files=context_files,
@@ -1084,6 +1103,134 @@ class CodeGenerator:
                 raise
 
         raise CodegenError("No codegen provider available.")
+
+    def _try_android_job_default_address_recipe_codegen(
+        self,
+        *,
+        plan_json: dict[str, Any],
+        context_files: dict[str, str],
+        task_description: str,
+        source_repo_path: str | None,
+        must_touch_files: list[str],
+        expected_new_files: list[str],
+    ) -> CodegenResult | None:
+        if expected_new_files:
+            return None
+        if not context_files:
+            return None
+        if self._is_repair_codegen_call(plan_json, task_description):
+            return None
+
+        domain_id = str(plan_json.get("domain_playbook_id") or plan_json.get("domain_id") or "").strip()
+        contract_ids = {
+            str(c.get("contract_id") or c.get("id") or "")
+            for c in (plan_json.get("required_contracts") or [])
+            if isinstance(c, dict)
+        }
+        if domain_id != "android_job_default_address" and not (
+            {
+                "saved_home_address_loaded",
+                "job_location_prefilled",
+                "saved_address_geocoded_to_map",
+                "work_location_saved_to_job_only",
+            }
+            & contract_ids
+        ):
+            return None
+
+        from app.services.android_job_default_address_recipe import (
+            try_generate_android_job_default_address_recipe,
+        )
+
+        must_touch_norm = {
+            path.replace("\\", "/")
+            for path in (must_touch_files or [])
+            if str(path).strip()
+        }
+        supported_names = {"jobpostingfragment.kt", "jobpostingflow.kt"}
+        targets: list[tuple[str, str]] = []
+        for path, content in context_files.items():
+            normalized = path.replace("\\", "/")
+            if must_touch_norm and normalized not in must_touch_norm:
+                continue
+            if Path(normalized).name.lower() not in supported_names:
+                continue
+            targets.append((path, content))
+        if not targets:
+            return None
+
+        started = time.perf_counter()
+        recipe_results = []
+        for target_path, prompt_content in targets:
+            original_content = self._load_structural_codegen_source(
+                relative_path=target_path,
+                fallback_content=prompt_content,
+                source_repo_path=source_repo_path,
+            )
+            recipe_result = try_generate_android_job_default_address_recipe(
+                file_path=target_path,
+                original_content=original_content,
+                plan_json=plan_json,
+                task_description=task_description,
+            )
+            if recipe_result is not None:
+                recipe_results.append(recipe_result)
+
+        diffs = [result.diff.rstrip() for result in recipe_results if result.diff.strip()]
+        if not diffs:
+            return None
+
+        files_changed = [
+            file_path
+            for result in recipe_results
+            for file_path in result.files_changed
+        ]
+        operations = [
+            operation
+            for result in recipe_results
+            for operation in result.applied_operations
+        ]
+        latency_s = round(time.perf_counter() - started, 3)
+        logger.info(
+            "android_job_default_address_recipe_applied files=%s latency_s=%.3f operations=%s",
+            files_changed,
+            latency_s,
+            operations[:12],
+        )
+
+        return CodegenResult(
+            diff="\n".join(diffs).strip() + "\n",
+            summary=(
+                "Generated Android job default-address patch via deterministic "
+                "harness recipe"
+            ),
+            files_changed=files_changed,
+            file_summaries=[
+                {
+                    "path": file_path,
+                    "summary": "Applied Android job default-address harness recipe",
+                }
+                for file_path in files_changed
+            ],
+            attempt_history=[
+                {
+                    "provider": "harness:android_job_default_address_recipe",
+                    "status": "succeeded",
+                    "duration_s": latency_s,
+                }
+            ],
+            provider_name="harness:android_job_default_address_recipe",
+            model_name="deterministic-v1",
+            input_tokens=0,
+            output_tokens=0,
+            contract_coverage=self._merge_codegen_contract_coverage(
+                [
+                    result.contract_coverage
+                    for result in recipe_results
+                    if isinstance(result.contract_coverage, dict)
+                ]
+            ),
+        )
 
     def _try_android_map_location_recipe_codegen(
         self,

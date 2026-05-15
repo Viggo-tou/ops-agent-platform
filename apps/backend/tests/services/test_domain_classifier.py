@@ -253,6 +253,40 @@ def test_synthesize_acceptance_tests_from_playbook_fills_minimum():
     }
 
 
+def test_job_default_synthetic_acceptance_uses_touched_file_final_context():
+    pb = classify_domain(
+        request_text=(
+            "Load default address when creating jobs; pre-fill job location "
+            "from saved home address"
+        ),
+        project_tag="handymanapp",
+    )
+
+    tests = synthesize_acceptance_tests_from_playbook(
+        playbook=pb,
+        acceptance_tests=[],
+    )
+
+    assert tests
+    assert {
+        t["contract_id"]: (t["kind"], t.get("file"))
+        for t in tests
+    } == {
+        "saved_home_address_loaded": (
+            "diff_contains_pattern_in_file",
+            "app/src/main/java/com/example/handyman/JobPostingFragment.kt",
+        ),
+        "job_location_prefilled": (
+            "diff_contains_pattern_in_file",
+            "app/src/main/java/com/example/handyman/JobPostingFragment.kt",
+        ),
+        "saved_address_geocoded_to_map": (
+            "diff_contains_pattern_in_file",
+            "app/src/main/java/com/example/handyman/JobPostingFragment.kt",
+        ),
+    }
+
+
 def test_synthesize_acceptance_tests_preserves_existing_and_fills_missing():
     pb = classify_domain(
         request_text="map picker", project_tag="handymanapp"
@@ -375,7 +409,6 @@ def test_synthesize_must_touch_uses_job_default_address_candidates():
     assert must_touch == [
         "app/src/main/java/com/example/handyman/JobPostingFragment.kt",
         "app/src/main/java/com/example/handyman/JobPostingFlow.kt",
-        "app/src/main/java/com/example/handyman/JobPostingViewModel.kt",
     ]
 
 

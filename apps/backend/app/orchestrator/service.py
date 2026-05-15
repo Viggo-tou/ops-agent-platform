@@ -186,9 +186,19 @@ def _truncated_traceback(exc: BaseException, *, limit: int = 2000) -> str:
 def _semantic_review_high_count(sr_report: object | None) -> int:
     if sr_report is None:
         return 0
-    high_count = getattr(sr_report, "high_severity_count", 0)
+    high_count = getattr(sr_report, "high_severity_count", None)
     if callable(high_count):
         high_count = high_count()
+    if high_count is None:
+        high_count = 0
+        for finding in getattr(sr_report, "findings", None) or []:
+            severity = (
+                str(finding.get("severity") or "").lower()
+                if isinstance(finding, dict)
+                else str(getattr(finding, "severity", "") or "").lower()
+            )
+            if severity == "high":
+                high_count += 1
     return int(high_count or 0)
 
 
@@ -265,10 +275,86 @@ def _semantic_review_verified_gates_passed(
     return compile_ok and coverage_ok and acceptance_ok and symbol_ok
 
 
+def _semantic_review_related_context_paths(files_changed: object) -> list[str]:
+    """Return small sibling context files useful for semantic review fact checks."""
+    if not isinstance(files_changed, list):
+        return []
+    related: list[str] = []
+    seen: set[str] = set()
+    suffixes = ("Fragment", "Flow", "Screen", "Activity")
+    for item in files_changed:
+        rel = str(item or "").strip().replace("\\", "/")
+        if not rel.endswith(".kt") or "/" not in rel:
+            continue
+        directory, filename = rel.rsplit("/", 1)
+        stem = filename[:-3]
+        for suffix in suffixes:
+            if not stem.endswith(suffix):
+                continue
+            base = stem[: -len(suffix)]
+            if not base:
+                continue
+            candidate = f"{directory}/{base}ViewModel.kt"
+            if candidate != rel and candidate not in seen:
+                seen.add(candidate)
+                related.append(candidate)
+    return related
+
+
+def _semantic_review_compose_state_fields(
+    file_contents: dict[str, str] | None,
+) -> set[str]:
+    fields: set[str] = set()
+    for path, content in (file_contents or {}).items():
+        if not str(path).replace("\\", "/").endswith("ViewModel.kt"):
+            continue
+        for match in re.finditer(
+            r"\bvar\s+([A-Za-z_][A-Za-z0-9_]*)\s+by\s+mutableStateOf\s*\(",
+            content or "",
+        ):
+            fields.add(match.group(1))
+    return fields
+
+
+def _semantic_review_unbound_state_contradicted(
+    finding: object,
+    *,
+    file_contents: dict[str, str] | None,
+) -> bool:
+    if isinstance(finding, dict):
+        text = " ".join(
+            str(finding.get(key) or "")
+            for key in ("category", "description", "evidence_quote", "suggested_fix")
+        )
+    else:
+        text = " ".join(
+            str(getattr(finding, key, "") or "")
+            for key in ("category", "description", "evidence_quote", "suggested_fix")
+        )
+    lowered = text.lower()
+    if not (
+        "unbound" in lowered
+        or "not backed by compose state" in lowered
+        or "never recomposes" in lowered
+        or "ui never recomposes" in lowered
+    ):
+        return False
+
+    state_fields = _semantic_review_compose_state_fields(file_contents)
+    if not state_fields:
+        return False
+    suspect_fields = set(re.findall(r"\bviewModel\.([A-Za-z_][A-Za-z0-9_]*)\b", text))
+    for domain_field in ("locationAddress", "latitude", "longitude", "citySuburb"):
+        if re.search(rf"\b{re.escape(domain_field)}\b", text):
+            suspect_fields.add(domain_field)
+    return bool(suspect_fields) and suspect_fields.issubset(state_fields)
+
+
 def _semantic_review_finding_contradicted_by_verified_gates(
     finding: object,
     *,
     pipeline_state: dict[str, object] | None,
+    file_contents: dict[str, str] | None = None,
 ) -> bool:
     if not _semantic_review_verified_gates_passed(pipeline_state):
         return False
@@ -299,6 +385,12 @@ def _semantic_review_finding_contradicted_by_verified_gates(
     if any(term in text for term in compile_terms):
         return True
 
+    if _semantic_review_unbound_state_contradicted(
+        finding,
+        file_contents=file_contents,
+    ):
+        return True
+
     missing_terms = ("missing", "lacks", "does not add", "not implemented", "no ")
     contract_terms = (
         "map",
@@ -323,6 +415,7 @@ def _semantic_review_filter_after_verified_gates(
     sr_report: object | None,
     *,
     pipeline_state: dict[str, object] | None,
+    file_contents: dict[str, str] | None = None,
 ) -> tuple[object | None, list[dict[str, object]]]:
     if sr_report is None or bool(getattr(sr_report, "passed", False)):
         return sr_report, []
@@ -339,6 +432,7 @@ def _semantic_review_filter_after_verified_gates(
         if _semantic_review_finding_contradicted_by_verified_gates(
             finding,
             pipeline_state=pipeline_state,
+            file_contents=file_contents,
         ):
             if isinstance(finding, dict):
                 dropped.append(dict(finding))
@@ -7079,7 +7173,14 @@ class PrimaryOrchestrator:
                     diff_for_review = pipeline_state.get("diff") or ""
                     _sr_file_contents: dict[str, str] = {}
                     if _sr_sandbox_dir.exists():
-                        for rel in (pipeline_state.get("files_changed") or []):
+                        _sr_review_paths = list(pipeline_state.get("files_changed") or [])
+                        _sr_review_paths.extend(
+                            path for path in _semantic_review_related_context_paths(
+                                pipeline_state.get("files_changed") or []
+                            )
+                            if path not in _sr_review_paths
+                        )
+                        for rel in _sr_review_paths:
                             try:
                                 full = _sr_sandbox_dir / rel
                                 if full.is_file():
@@ -7160,6 +7261,7 @@ class PrimaryOrchestrator:
                     ) = _semantic_review_filter_after_verified_gates(
                         sr_report,
                         pipeline_state=pipeline_state,
+                        file_contents=_sr_file_contents,
                     )
                     if sr_suppressed_verified_gate_findings:
                         record_event(
@@ -12301,6 +12403,75 @@ class PrimaryOrchestrator:
             ),
         }
 
+    def _record_playbook_promotion_candidate(
+        self,
+        *,
+        task: Task,
+        plan: GeneratedPlan,
+        pipeline_state: dict[str, object],
+        approval_action: str,
+        approval_id: str | None,
+    ) -> None:
+        try:
+            from app.services.playbook_promotion import (
+                build_playbook_promotion_candidate,
+                write_playbook_promotion_candidate,
+            )
+
+            plan_json = (
+                task.plan_json
+                if isinstance(task.plan_json, dict)
+                else plan.model_dump(mode="json")
+            )
+            candidate = build_playbook_promotion_candidate(
+                task=task,
+                plan_json=plan_json,
+                pipeline_state=pipeline_state,
+                approval_action=approval_action,
+                approval_id=approval_id,
+            )
+            artifact_path = write_playbook_promotion_candidate(
+                task=task,
+                candidate=candidate,
+                settings=self.tool_gateway.settings,
+            )
+            self._workspace_append_audit(
+                task,
+                "learning.playbook_promotion_candidate",
+                {
+                    "artifact_path": artifact_path,
+                    "status": candidate.get("status"),
+                    "promotion_eligible": candidate.get("promotion_eligible"),
+                    "approval_action": approval_action,
+                },
+            )
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_SUCCEEDED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="learning.playbook_promotion_candidate",
+                message=(
+                    "Learning loop wrote a draft playbook promotion candidate "
+                    f"({candidate.get('status')})."
+                ),
+                payload={
+                    "artifact_path": artifact_path,
+                    "status": candidate.get("status"),
+                    "promotion_eligible": candidate.get("promotion_eligible"),
+                    "domain_playbook_id": candidate.get("domain_playbook_id"),
+                    "promotion_blockers": candidate.get("promotion_blockers") or [],
+                    "approval_action": approval_action,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "playbook promotion candidate write failed",
+                extra={"task_id": task.id, "error": str(exc)[:300]},
+            )
+
     def _request_jira_transition_approval(
         self,
         *,
@@ -12389,6 +12560,9 @@ class PrimaryOrchestrator:
                 message=f"Reservations reviewer failed (non-blocking): {exc}",
                 payload={"error": str(exc)[:5000]},
             )
+
+        pipeline_state["reservations"] = reservations
+        pipeline_state["reservations_detailed"] = reservations_detailed
 
         # v15 Ticket 6 (2026-05-11): warnings + hard_gates summary for
         # the approval payload. ``warnings`` is a structured list the
@@ -12544,6 +12718,13 @@ class PrimaryOrchestrator:
                 "reservations_detailed": reservations_detailed,
                 "evidence_chain": evidence_chain_payload,
             },
+        )
+        self._record_playbook_promotion_candidate(
+            task=task,
+            plan=plan,
+            pipeline_state=pipeline_state,
+            approval_action=approval.action_name,
+            approval_id=approval.id,
         )
         attempt_index = pipeline_state.get("workspace_attempt_index")
         stage_completed = (
@@ -12951,6 +13132,13 @@ class PrimaryOrchestrator:
                 "completeness_pct": sr_completeness,
                 "threshold": sr_threshold,
             },
+        )
+        self._record_playbook_promotion_candidate(
+            task=task,
+            plan=plan,
+            pipeline_state=pipeline_state,
+            approval_action=approval.action_name,
+            approval_id=approval.id,
         )
         self._workspace_append_audit(
             task,

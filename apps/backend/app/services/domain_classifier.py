@@ -400,7 +400,14 @@ def synthesize_acceptance_tests_from_playbook(
         file_filter = str(
             verification.get("file") or verification.get("file_filter") or ""
         ).strip()
-        if kind == "diff_contains_pattern_in_file" and file_filter:
+        if file_filter and kind == "diff_contains_pattern":
+            # The contract verifier can use file_filter while still treating
+            # this as a diff rule. The later acceptance_check has a stronger
+            # final-context path for in-file tests, which is what we want for
+            # contracts whose evidence may already exist in a touched file.
+            test["kind"] = "diff_contains_pattern_in_file"
+            test["file"] = file_filter
+        elif kind == "diff_contains_pattern_in_file" and file_filter:
             test["file"] = file_filter
         out.append(test)
         matched.add(contract_id)
@@ -634,8 +641,6 @@ def _is_job_default_address_path(path: str) -> bool:
     return name in {
         "jobpostingfragment.kt",
         "jobpostingflow.kt",
-        "jobpostingviewmodel.kt",
-        "job.kt",
     }
 
 
@@ -644,8 +649,6 @@ def _job_default_address_path_rank(path: str) -> int:
     ordered = (
         "jobpostingfragment.kt",
         "jobpostingflow.kt",
-        "jobpostingviewmodel.kt",
-        "job.kt",
     )
     for index, marker in enumerate(ordered):
         if lower.endswith(marker):

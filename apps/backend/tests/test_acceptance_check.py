@@ -48,6 +48,25 @@ def test_diff_contains_pattern_passes_when_in_added_lines():
     assert report.results[0].reason
 
 
+def test_diff_contains_pattern_supports_regex_patterns():
+    diff = """\
+diff --git a/app/src/main/java/com/example/CustomerSignup.kt b/app/src/main/java/com/example/CustomerSignup.kt
+--- a/app/src/main/java/com/example/CustomerSignup.kt
++++ b/app/src/main/java/com/example/CustomerSignup.kt
+@@ -1,2 +1,3 @@
+ package com.example
++import org.osmdroid.views.MapView
+"""
+    tests = [
+        AcceptanceTest(
+            kind="diff_contains_pattern",
+            pattern=r"org\.osmdroid\.views\.MapView",
+        )
+    ]
+    report = evaluate_acceptance(diff, tests)
+    assert report.passed
+
+
 def test_diff_contains_pattern_fails_when_pattern_only_in_context():
     # `mask = self.mask` is a context line (no leading +), so it
     # should NOT count as "added".
@@ -66,6 +85,145 @@ def test_diff_contains_pattern_in_file_scoped():
         )
     ]
     report = evaluate_acceptance(_DIFF_ASTROPY, tests)
+    assert report.passed
+
+
+def test_diff_contains_pattern_accepts_existing_sink_when_payload_changed():
+    """Round-10 regression guard: Firebase setValue can be an unchanged
+    sink. The implementation is still real when the diff changes the
+    payload fields that flow into that existing sink."""
+    diff = """\
+diff --git a/app/src/main/java/com/example/handyman/customer_pages/CustomerSignup.kt b/app/src/main/java/com/example/handyman/customer_pages/CustomerSignup.kt
+--- a/app/src/main/java/com/example/handyman/customer_pages/CustomerSignup.kt
++++ b/app/src/main/java/com/example/handyman/customer_pages/CustomerSignup.kt
+@@ -20,8 +20,8 @@ fun CustomerSignup() {
+     val userData = mapOf(
+-        "latitude" to 0.0,
+-        "longitude" to 0.0,
++        "latitude" to mapLatitude,
++        "longitude" to mapLongitude,
+     )
+     userRef.setValue(userData)
+ }
+"""
+    patched = {
+        "app/src/main/java/com/example/handyman/customer_pages/CustomerSignup.kt": """
+fun CustomerSignup() {
+    val userData = mapOf(
+        "latitude" to mapLatitude,
+        "longitude" to mapLongitude,
+    )
+    userRef.setValue(userData)
+}
+"""
+    }
+    tests = [
+        AcceptanceTest(
+            kind="diff_contains_pattern",
+            pattern="updateChildren|setValue",
+            rationale="selected address must reach Firebase persistence",
+        )
+    ]
+    report = evaluate_acceptance(diff, tests, patched_files=patched)
+    assert report.passed
+    assert "existing sink" in report.results[0].reason
+
+
+def test_diff_contains_pattern_in_file_accepts_existing_final_context_when_file_touched():
+    """Round-11 regression guard: when the target file already contains
+    the map intent, a small corrective patch in that same file should not
+    fail merely because the old map lines are context/no-change lines."""
+    diff = """\
+diff --git a/app/src/main/java/com/example/handyman/customer_pages/CustomerKYCAddressForm.kt b/app/src/main/java/com/example/handyman/customer_pages/CustomerKYCAddressForm.kt
+--- a/app/src/main/java/com/example/handyman/customer_pages/CustomerKYCAddressForm.kt
++++ b/app/src/main/java/com/example/handyman/customer_pages/CustomerKYCAddressForm.kt
+@@ -1,5 +1,6 @@
+ package com.example.handyman.customer_pages
++import java.util.Locale
+ import android.location.Geocoder
+@@ -20,7 +21,7 @@ fun CustomerKYCAddressForm() {
+-    val geocoder = remember { Geocoder(context) }
++    val geocoder = remember { Geocoder(context, Locale.getDefault()) }
+ }
+"""
+    file_path = "app/src/main/java/com/example/handyman/customer_pages/CustomerKYCAddressForm.kt"
+    patched = {
+        file_path: """
+import org.osmdroid.views.MapView
+
+fun CustomerKYCAddressForm() {
+    var mapViewRef by remember { mutableStateOf<MapView?>(null) }
+    val geocoder = remember { Geocoder(context, Locale.getDefault()) }
+    coroutineScope.launch(Dispatchers.IO) {
+        geocoder.getFromLocation(lat, lng, 1)
+    }
+    override fun singleTapConfirmedHelper(p: GeoPoint): Boolean {
+        reverseGeocode(p.latitude, p.longitude)
+        return true
+    }
+}
+"""
+    }
+    tests = [
+        AcceptanceTest(
+            kind="diff_contains_pattern_in_file",
+            pattern=r"org\.osmdroid\.views\.MapView",
+            file=file_path,
+        ),
+        AcceptanceTest(
+            kind="diff_contains_pattern_in_file",
+            pattern="singleTapConfirmedHelper|setOnMapClickListener",
+            file=file_path,
+        ),
+        AcceptanceTest(
+            kind="diff_contains_pattern_in_file",
+            pattern=r"withContext\(Dispatchers\.IO\)",
+            file=file_path,
+        ),
+        AcceptanceTest(
+            kind="diff_contains_pattern_in_file",
+            pattern=r"getFromLocation\(|reverseGeocode",
+            file=file_path,
+        ),
+    ]
+    report = evaluate_acceptance(diff, tests, patched_files=patched)
+    assert report.passed
+    assert all("patched final file" in r.reason for r in report.results)
+
+
+def test_job_default_backfilled_tests_accept_existing_profile_read_in_touched_file():
+    file_path = "app/src/main/java/com/example/handyman/JobPostingFragment.kt"
+    diff = f"""\
+diff --git a/{file_path} b/{file_path}
+--- a/{file_path}
++++ b/{file_path}
+@@ -1,3 +1,4 @@
+ import java.util.UUID
++import java.util.Locale
+"""
+    patched = {
+        file_path: """\
+FirebaseDatabase.getInstance()
+    .getReference("User").child(userId).get()
+viewModel.locationAddress = homeAddress
+Geocoder(ctx, Locale.getDefault()).getFromLocationName(homeAddress, 1)
+"""
+    }
+    tests = [
+        AcceptanceTest(
+            kind="diff_contains_pattern_in_file",
+            file=file_path,
+            pattern='SessionManager|getLoggedInUserId|getReference\\("User"\\)|child\\(userId\\)\\.get\\(',
+        ),
+        AcceptanceTest(
+            kind="diff_contains_pattern_in_file",
+            file=file_path,
+            pattern=r"locationAddress\s*=\s*homeAddress|viewModel\.locationAddress\s*=\s*homeAddress|homeAddress",
+        ),
+    ]
+
+    report = evaluate_acceptance(diff, tests, patched_files=patched)
+
     assert report.passed
 
 

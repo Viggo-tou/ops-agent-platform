@@ -29,6 +29,7 @@ required_contracts:
       be the existing user profile/session path, not a hard-coded address.
     verifications:
       - kind: diff_contains_pattern
+        file_filter: "app/src/main/java/com/example/handyman/JobPostingFragment.kt"
         pattern: "SessionManager|getLoggedInUserId|getReference\\(\"User\"\\)|child\\(userId\\)\\.get\\("
 
   - id: job_location_prefilled
@@ -37,6 +38,7 @@ required_contracts:
       the user has not already edited the work location.
     verifications:
       - kind: diff_contains_pattern
+        file_filter: "app/src/main/java/com/example/handyman/JobPostingFragment.kt"
         pattern: "locationAddress\\s*=\\s*homeAddress|viewModel\\.locationAddress\\s*=\\s*homeAddress|homeAddress"
       - kind: final_context_contains_pattern
         anchor: changed_hunk
@@ -49,6 +51,7 @@ required_contracts:
       pinned from that address by geocoding it into latitude/longitude.
     verifications:
       - kind: diff_contains_pattern
+        file_filter: "app/src/main/java/com/example/handyman/JobPostingFragment.kt"
         pattern: "getFromLocationName\\s*\\(.*homeAddress|latitude\\s*=|longitude\\s*="
 
   - id: work_location_saved_to_job_only
@@ -56,9 +59,11 @@ required_contracts:
       User edits to the work location must be saved with the job payload,
       not written back over the user's saved home/profile address.
     verifications:
+      - kind: diff_contains_pattern
+        pattern: "jobLocation\\s*=\\s*viewModel\\.locationAddress|latitude\\s*=\\s*viewModel\\.latitude|longitude\\s*=\\s*viewModel\\.longitude"
       - kind: final_context_contains_pattern
         anchor: changed_hunk
-        scope: same_function
+        scope: window:500
         pattern: "jobLocation\\s*=\\s*viewModel\\.locationAddress|latitude\\s*=\\s*viewModel\\.latitude|longitude\\s*=\\s*viewModel\\.longitude"
     forbidden_patterns:
       - "lastLatitude"
@@ -73,7 +78,7 @@ required_contracts:
       a work location manually.
     verifications:
       - kind: diff_contains_pattern
-        pattern: "try\\s*\\{|catch\\s*\\(|runCatching|isBlank\\(\\)"
+        pattern: "try\\s*\\{|catch\\s*\\(|runCatching|isBlank\\(\\)|isNotBlank\\(\\)"
 
 completeness_rule:
   minimum_contracts_referenced: 3

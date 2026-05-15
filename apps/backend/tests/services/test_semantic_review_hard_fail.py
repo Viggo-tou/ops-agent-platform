@@ -135,3 +135,131 @@ def test_semantic_review_drops_compile_finding_contradicted_by_gates():
     assert len(dropped) == 1
     assert _semantic_review_high_count(filtered) == 0
     assert len(filtered.findings) == 1
+
+
+def test_semantic_review_drops_unbound_state_finding_when_viewmodel_is_compose_state():
+    pipeline_state = {
+        "compile_gate": {"passed": True},
+        "contract_coverage_verdict": {"ok": True, "verdict_kind": "complete"},
+        "acceptance_check_done": True,
+        "symbol_graph_done": True,
+        "symbol_graph": {"passed": True},
+    }
+    sr_report = SimpleNamespace(
+        passed=False,
+        pass_threshold=80,
+        completeness_pct=30,
+        summary="Reviewer says the UI cannot recompose.",
+        findings=[
+            {
+                "severity": "high",
+                "category": "unbound_field",
+                "description": (
+                    "ViewModel properties (locationAddress, latitude, longitude) "
+                    "are assigned directly but are not backed by Compose state, "
+                    "so the UI never recomposes."
+                ),
+                "evidence_quote": "viewModel.locationAddress = homeAddress",
+                "suggested_fix": "Wrap the properties in mutableStateOf.",
+            }
+        ],
+    )
+    file_contents = {
+        "app/src/main/java/com/example/handyman/JobPostingViewModel.kt": """
+            import androidx.compose.runtime.mutableStateOf
+            class JobPostingViewModel {
+                var locationAddress by mutableStateOf("")
+                var latitude by mutableStateOf(0.0)
+                var longitude by mutableStateOf(0.0)
+            }
+        """,
+    }
+
+    filtered, dropped = _semantic_review_filter_after_verified_gates(
+        sr_report,
+        pipeline_state=pipeline_state,
+        file_contents=file_contents,
+    )
+
+    assert len(dropped) == 1
+    assert _semantic_review_high_count(filtered) == 0
+    assert filtered.passed is False  # completeness is still below threshold
+
+
+def test_semantic_review_keeps_unbound_state_finding_without_viewmodel_fact():
+    pipeline_state = {
+        "compile_gate": {"passed": True},
+        "contract_coverage_verdict": {"ok": True, "verdict_kind": "complete"},
+        "acceptance_check_done": True,
+        "symbol_graph_done": True,
+        "symbol_graph": {"passed": True},
+    }
+    sr_report = SimpleNamespace(
+        passed=False,
+        pass_threshold=80,
+        completeness_pct=30,
+        summary="Reviewer says the UI cannot recompose.",
+        findings=[
+            {
+                "severity": "high",
+                "category": "unbound_field",
+                "description": "viewModel.locationAddress is not backed by Compose state.",
+                "evidence_quote": "viewModel.locationAddress = homeAddress",
+                "suggested_fix": "Wrap the property in mutableStateOf.",
+            }
+        ],
+    )
+
+    filtered, dropped = _semantic_review_filter_after_verified_gates(
+        sr_report,
+        pipeline_state=pipeline_state,
+        file_contents={},
+    )
+
+    assert dropped == []
+    assert _semantic_review_high_count(filtered) == 1
+
+
+def test_semantic_review_keeps_unbound_state_finding_when_only_some_fields_are_state():
+    pipeline_state = {
+        "compile_gate": {"passed": True},
+        "contract_coverage_verdict": {"ok": True, "verdict_kind": "complete"},
+        "acceptance_check_done": True,
+        "symbol_graph_done": True,
+        "symbol_graph": {"passed": True},
+    }
+    sr_report = SimpleNamespace(
+        passed=False,
+        pass_threshold=80,
+        completeness_pct=30,
+        summary="Reviewer says the UI cannot recompose.",
+        findings=[
+            {
+                "severity": "high",
+                "category": "unbound_field",
+                "description": (
+                    "ViewModel properties (locationAddress, latitude, longitude) "
+                    "are not backed by Compose state."
+                ),
+                "evidence_quote": "viewModel.locationAddress = homeAddress",
+                "suggested_fix": "Wrap the properties in mutableStateOf.",
+            }
+        ],
+    )
+    file_contents = {
+        "app/src/main/java/com/example/handyman/JobPostingViewModel.kt": """
+            import androidx.compose.runtime.mutableStateOf
+            class JobPostingViewModel {
+                var locationAddress by mutableStateOf("")
+            }
+        """,
+    }
+
+    filtered, dropped = _semantic_review_filter_after_verified_gates(
+        sr_report,
+        pipeline_state=pipeline_state,
+        file_contents=file_contents,
+    )
+
+    assert dropped == []
+    assert _semantic_review_high_count(filtered) == 1

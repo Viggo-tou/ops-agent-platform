@@ -293,6 +293,12 @@ class TaskWorkspace:
             },
         )
 
+    def write_memory_artifact(self, name: str, payload: dict[str, Any]) -> None:
+        """Write a named learning-loop artifact inside this task workspace."""
+        self._ensure_task_layout()
+        safe_name = _safe_identifier(name, field_name="memory artifact name")
+        self._atomic_write_json(self.root / "memory" / safe_name, payload)
+
     def write_checkpoint(
         self,
         *,

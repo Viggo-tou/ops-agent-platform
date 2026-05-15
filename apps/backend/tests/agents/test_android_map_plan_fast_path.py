@@ -143,7 +143,6 @@ def test_job_default_address_fast_path_uses_job_posting_targets() -> None:
     assert result.plan.must_touch_files == [
         "app/src/main/java/com/example/handyman/JobPostingFragment.kt",
         "app/src/main/java/com/example/handyman/JobPostingFlow.kt",
-        "app/src/main/java/com/example/handyman/JobPostingViewModel.kt",
     ]
     assert "job creation location" in result.plan.objective.lower()
     assert "signup" not in result.plan.objective.lower()
