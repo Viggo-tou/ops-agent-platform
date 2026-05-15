@@ -76,6 +76,52 @@ fun HandymanKYCPhoneNumber() {
 """
 
 
+CUSTOMER_CODE_SOURCE = """package com.example.handyman.customer_pages
+
+fun CustomerKYCCodeOTP() {
+    query.get().addOnSuccessListener { snapshot ->
+        if (snapshot.exists()) {
+            for (child in snapshot.children) {
+                child.ref.child("isPhoneVerified").setValue(true)
+                child.ref.child("status").setValue("Verified")
+            }
+        }
+    }
+    query.get().addOnSuccessListener { snapshot ->
+        if (snapshot.exists()) {
+            for (child in snapshot.children) {
+                child.ref.child("isPhoneVerified").setValue(true)
+                child.ref.child("status").setValue("Verified")
+            }
+        }
+    }
+}
+"""
+
+
+HANDYMAN_CODE_SOURCE = """package com.example.handyman.handyman_pages
+
+fun HandymanKYCCodeOTP() {
+    query.get().addOnSuccessListener { snapshot ->
+        if (snapshot.exists()) {
+            for (child in snapshot.children) {
+                child.ref.child("isPhoneVerified").setValue(true)
+                child.ref.child("verificationStatus").setValue("Verified")
+            }
+        }
+    }
+    query.get().addOnSuccessListener { snapshot ->
+        if (snapshot.exists()) {
+            for (child in snapshot.children) {
+                child.ref.child("isPhoneVerified").setValue(true)
+                child.ref.child("verificationStatus").setValue("Verified")
+            }
+        }
+    }
+}
+"""
+
+
 def test_recipe_removes_customer_preverification_db_block():
     result = try_generate_android_phone_otp_reverification_recipe(
         file_path=(
@@ -123,6 +169,49 @@ def test_recipe_removes_handyman_preverification_db_block():
     assert result.contract_coverage is not None
     assert result.contract_coverage["implemented_contracts"][0]["contract_id"] == (
         "handyman_no_preverification_phone_write"
+    )
+
+
+def test_recipe_adds_customer_postverification_phone_write():
+    result = try_generate_android_phone_otp_reverification_recipe(
+        file_path=(
+            "app/src/main/java/com/example/handyman/customer_pages/"
+            "CustomerKYCCodeOTP.kt"
+        ),
+        original_content=CUSTOMER_CODE_SOURCE,
+        plan_json=PLAN,
+    )
+
+    assert result is not None
+    assert validate_kotlin_structure(result.content) == []
+    assert result.content.count('child.ref.child("phoneNumber").setValue(phoneNumber)') == 2
+    assert (
+        'child.ref.child("phoneNumber").setValue(phoneNumber)\n'
+        '                child.ref.child("isPhoneVerified").setValue(true)'
+        in result.content
+    )
+    assert result.contract_coverage is not None
+    assert result.contract_coverage["implemented_contracts"][0]["contract_id"] == (
+        "customer_postverification_phone_write"
+    )
+
+
+def test_recipe_adds_handyman_postverification_phone_write():
+    result = try_generate_android_phone_otp_reverification_recipe(
+        file_path=(
+            "app/src/main/java/com/example/handyman/handyman_pages/"
+            "HandymanKYCCodeOTP.kt"
+        ),
+        original_content=HANDYMAN_CODE_SOURCE,
+        plan_json=PLAN,
+    )
+
+    assert result is not None
+    assert validate_kotlin_structure(result.content) == []
+    assert result.content.count('child.ref.child("phoneNumber").setValue(phoneNumber)') == 2
+    assert result.contract_coverage is not None
+    assert result.contract_coverage["implemented_contracts"][0]["contract_id"] == (
+        "handyman_postverification_phone_write"
     )
 
 

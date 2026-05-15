@@ -18,7 +18,9 @@ from app.services.structural_edit import validate_kotlin_structure
 
 ANDROID_PHONE_OTP_REVERIFICATION_CONTRACTS = [
     "customer_no_preverification_phone_write",
+    "customer_postverification_phone_write",
     "handyman_no_preverification_phone_write",
+    "handyman_postverification_phone_write",
 ]
 
 
@@ -47,21 +49,31 @@ def try_generate_android_phone_otp_reverification_recipe(
     if not _is_phone_otp_task(plan_json or {}, task_description):
         return None
 
-    route = _otp_route_for_file(file_path)
     contract_id = _contract_for_file(file_path)
-    if not route or not contract_id:
+    if not contract_id:
         return None
-    if "onCodeSent" not in original_content or "navController.navigate" not in original_content:
-        return None
-
-    content, changed = _replace_on_code_sent_body(
-        original_content,
-        route=route,
-    )
-    if not changed or content == original_content:
-        return None
-    if _has_preverification_phone_write(content):
-        return None
+    route = _otp_route_for_file(file_path)
+    if route:
+        if "onCodeSent" not in original_content or "navController.navigate" not in original_content:
+            return None
+        content, changed = _replace_on_code_sent_body(
+            original_content,
+            route=route,
+        )
+        if not changed or content == original_content:
+            return None
+        if _has_preverification_phone_write(content):
+            return None
+        operation = "replace_on_code_sent_body"
+        evidence_quote = f'navController.navigate("{route}/$verificationId/$phoneNumber")'
+    else:
+        content, changed = _ensure_postverification_phone_write(original_content)
+        if not changed or content == original_content:
+            return None
+        if not _has_postverification_phone_write(content):
+            return None
+        operation = "ensure_postverification_phone_write"
+        evidence_quote = 'child.ref.child("phoneNumber").setValue(phoneNumber)'
 
     structure_errors = validate_kotlin_structure(content)
     if structure_errors:
@@ -76,11 +88,11 @@ def try_generate_android_phone_otp_reverification_recipe(
         diff=diff,
         files_changed=[file_path],
         summary="Generated Android phone OTP re-verification patch via harness recipe",
-        applied_operations=["replace_on_code_sent_body"],
+        applied_operations=[operation],
         contract_coverage=_coverage_payload(
             file_path=file_path,
             contract_id=contract_id,
-            route=route,
+            evidence_quote=evidence_quote,
         ),
     )
 
@@ -123,11 +135,16 @@ def _otp_route_for_file(file_path: str) -> str:
 
 
 def _contract_for_file(file_path: str) -> str:
-    route = _otp_route_for_file(file_path)
-    if route == "customerKycCodeOTP":
+    normalized = file_path.replace("\\", "/").lower()
+    name = Path(normalized).name
+    if name == "customerkycphonenumber.kt":
         return "customer_no_preverification_phone_write"
-    if route == "handymanKycCodeOTP":
+    if name == "customerkyccodeotp.kt":
+        return "customer_postverification_phone_write"
+    if name == "handymankycphonenumber.kt":
         return "handyman_no_preverification_phone_write"
+    if name == "handymankyccodeotp.kt":
+        return "handyman_postverification_phone_write"
     return ""
 
 
@@ -187,13 +204,39 @@ def _has_preverification_phone_write(content: str) -> bool:
     )
 
 
-def _coverage_payload(*, file_path: str, contract_id: str, route: str) -> dict[str, Any]:
+def _ensure_postverification_phone_write(content: str) -> tuple[str, bool]:
+    lines = content.splitlines()
+    out: list[str] = []
+    changed = False
+    needle = 'child.ref.child("isPhoneVerified").setValue(true)'
+    write_line = 'child.ref.child("phoneNumber").setValue(phoneNumber)'
+    for idx, line in enumerate(lines):
+        if needle in line:
+            window = "\n".join(out[-4:] + lines[idx : idx + 1])
+            if write_line not in window:
+                indent = re.match(r"\s*", line).group(0)  # type: ignore[union-attr]
+                out.append(f"{indent}{write_line}")
+                changed = True
+        out.append(line)
+    return _join_like(content, out), changed
+
+
+def _has_postverification_phone_write(content: str) -> bool:
+    return 'child.ref.child("phoneNumber").setValue(phoneNumber)' in content
+
+
+def _coverage_payload(
+    *,
+    file_path: str,
+    contract_id: str,
+    evidence_quote: str,
+) -> dict[str, Any]:
     return {
         "implemented_contracts": [
             {
                 "contract_id": contract_id,
                 "file_path": file_path,
-                "evidence_quote": f'navController.navigate("{route}/$verificationId/$phoneNumber")',
+                "evidence_quote": evidence_quote,
                 "evidence_mode": "recipe_diff",
             }
         ],

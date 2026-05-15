@@ -337,9 +337,17 @@ def test_phone_otp_synthetic_acceptance_uses_final_file_forbids():
             "final_file_forbids_pattern_in_file",
             "app/src/main/java/com/example/handyman/customer_pages/CustomerKYCPhoneNumber.kt",
         ),
+        "customer_postverification_phone_write": (
+            "diff_contains_pattern_in_file",
+            "app/src/main/java/com/example/handyman/customer_pages/CustomerKYCCodeOTP.kt",
+        ),
         "handyman_no_preverification_phone_write": (
             "final_file_forbids_pattern_in_file",
             "app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCPhoneNumber.kt",
+        ),
+        "handyman_postverification_phone_write": (
+            "diff_contains_pattern_in_file",
+            "app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCCodeOTP.kt",
         ),
     }
 
@@ -514,7 +522,9 @@ def test_synthesize_must_touch_uses_phone_otp_request_pages():
 
     assert must_touch == [
         "app/src/main/java/com/example/handyman/customer_pages/CustomerKYCPhoneNumber.kt",
+        "app/src/main/java/com/example/handyman/customer_pages/CustomerKYCCodeOTP.kt",
         "app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCPhoneNumber.kt",
+        "app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCCodeOTP.kt",
     ]
 
 

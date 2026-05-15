@@ -709,16 +709,20 @@ def _signup_address_path_rank(path: str) -> int:
 def _is_phone_otp_request_path(path: str) -> bool:
     name = Path(path).name.lower()
     return name in {
+        "customerkyccodeotp.kt",
         "customerkycphonenumber.kt",
+        "handymankyccodeotp.kt",
         "handymankycphonenumber.kt",
-    } or bool(re.search(r"(customer|handyman).*kycphonenumber\.kt$", name))
+    } or bool(re.search(r"(customer|handyman).*kyc(?:codeotp|phonenumber)\.kt$", name))
 
 
 def _phone_otp_request_path_rank(path: str) -> int:
     lower = path.lower()
     ordered = (
         "customer_pages/customerkycphonenumber.kt",
+        "customer_pages/customerkyccodeotp.kt",
         "handyman_pages/handymankycphonenumber.kt",
+        "handyman_pages/handymankyccodeotp.kt",
     )
     for index, marker in enumerate(ordered):
         if marker in lower:

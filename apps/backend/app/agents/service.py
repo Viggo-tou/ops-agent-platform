@@ -1186,11 +1186,12 @@ def build_domain_fast_path_plan(
             "In the customer and handyman phone-number request-code screens, "
             "do not query the profile row or write phoneNumber when Firebase "
             "only sends the OTP code. Navigate to the OTP entry screen with "
-            "the verification id and phone number, and leave credential "
-            "validation plus verified profile updates in the OTP code screens."
+            "the verification id and phone number. In the OTP code screens, "
+            "persist phoneNumber together with the verified profile status "
+            "only after Firebase accepts the OTP credential."
         )
         assumptions = [
-            "The request-code screens are the edit targets, not the OTP credential screens.",
+            "The request-code screens and OTP credential screens are the edit targets.",
             "Persisting phone verification state belongs after Firebase accepts the OTP credential.",
             "Repeated SMS requests for the same phone number should not be blocked by a pre-verification database write.",
         ]

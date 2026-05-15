@@ -203,14 +203,18 @@ def test_phone_otp_fast_path_uses_request_code_targets() -> None:
     assert result.provider_name == "harness:android_phone_otp_plan"
     assert result.plan.must_touch_files == [
         "app/src/main/java/com/example/handyman/customer_pages/CustomerKYCPhoneNumber.kt",
+        "app/src/main/java/com/example/handyman/customer_pages/CustomerKYCCodeOTP.kt",
         "app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCPhoneNumber.kt",
+        "app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCCodeOTP.kt",
     ]
-    assert "request-code screens" in result.plan.change_explanation
+    assert "OTP code screens" in result.plan.change_explanation
 
     contract_ids = {
         test.contract_id for test in result.plan.acceptance_tests if test.contract_id
     }
     assert {
         "customer_no_preverification_phone_write",
+        "customer_postverification_phone_write",
         "handyman_no_preverification_phone_write",
+        "handyman_postverification_phone_write",
     }.issubset(contract_ids)

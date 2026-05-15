@@ -34,6 +34,15 @@ required_contracts:
         file_filter: app/src/main/java/com/example/handyman/customer_pages/CustomerKYCPhoneNumber.kt
         pattern: 'navController\.navigate\("customerKycCodeOTP/\$verificationId/\$phoneNumber"\)'
 
+  - id: customer_postverification_phone_write
+    signal: >
+      The customer OTP code screen must persist phoneNumber only after Firebase
+      accepts the OTP credential, together with the verified profile status.
+    verifications:
+      - kind: diff_contains_pattern_in_file
+        file_filter: app/src/main/java/com/example/handyman/customer_pages/CustomerKYCCodeOTP.kt
+        pattern: 'child\.ref\.child\("phoneNumber"\)\.setValue\(phoneNumber\)'
+
   - id: handyman_no_preverification_phone_write
     signal: >
       The handyman phone request screen must not query the profile row and
@@ -48,7 +57,16 @@ required_contracts:
         file_filter: app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCPhoneNumber.kt
         pattern: 'navController\.navigate\("handymanKycCodeOTP/\$verificationId/\$phoneNumber"\)'
 
+  - id: handyman_postverification_phone_write
+    signal: >
+      The handyman OTP code screen must persist phoneNumber only after Firebase
+      accepts the OTP credential, together with the verified profile status.
+    verifications:
+      - kind: diff_contains_pattern_in_file
+        file_filter: app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCCodeOTP.kt
+        pattern: 'child\.ref\.child\("phoneNumber"\)\.setValue\(phoneNumber\)'
+
 completeness_rule:
-  minimum_contracts_referenced: 2
+  minimum_contracts_referenced: 4
   on_failure: PLAN_UNDER_SPECIFIED
   retry_planner_once: true

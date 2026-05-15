@@ -1173,7 +1173,9 @@ class CodeGenerator:
             if str(path).strip()
         }
         supported_names = {
+            "customerkyccodeotp.kt",
             "customerkycphonenumber.kt",
+            "handymankyccodeotp.kt",
             "handymankycphonenumber.kt",
         }
         targets: list[tuple[str, str]] = []
