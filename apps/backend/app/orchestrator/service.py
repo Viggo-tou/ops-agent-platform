@@ -266,6 +266,49 @@ def _semantic_review_should_attempt_quality_refine(
     return bool(_semantic_review_actionable_quality_findings(sr_report))
 
 
+def _reservation_blocking_items(
+    reservations_detailed: list[dict] | tuple[dict, ...] | None,
+) -> list[dict]:
+    return [
+        item
+        for item in reservations_detailed or []
+        if isinstance(item, dict) and bool(item.get("blocking"))
+    ]
+
+
+def _reservation_repairable_items(
+    reservations_detailed: list[dict] | tuple[dict, ...] | None,
+) -> list[dict]:
+    # Style-only reservations are useful warnings, but they should not trigger
+    # codegen or block a clean task. Bug and missing_test findings are concrete
+    # enough to feed into a bounded amend round.
+    return [
+        item
+        for item in reservations_detailed or []
+        if isinstance(item, dict)
+        and bool(item.get("auto_fixable"))
+        and str(item.get("severity") or "").strip().lower()
+        in {"bug", "missing_test"}
+        and str(item.get("text") or "").strip()
+    ]
+
+
+def _reservation_should_attempt_repair(
+    reservations_detailed: list[dict] | tuple[dict, ...] | None,
+    *,
+    repair_attempts: int,
+    max_repair_attempts: int,
+    enabled: bool = True,
+) -> bool:
+    if not enabled:
+        return False
+    if repair_attempts >= max(0, int(max_repair_attempts)):
+        return False
+    if _reservation_blocking_items(reservations_detailed):
+        return False
+    return bool(_reservation_repairable_items(reservations_detailed))
+
+
 def _semantic_review_should_block_on_exhausted(
     sr_report: object | None,
     settings: object,
@@ -347,6 +390,88 @@ def _semantic_review_related_context_paths(files_changed: object) -> list[str]:
                 seen.add(candidate)
                 related.append(candidate)
     return related
+
+
+_PLAN_BACKFILL_SOURCE_SUFFIXES = (
+    ".kt",
+    ".kts",
+    ".java",
+    ".py",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+)
+
+
+def _backfill_plan_targets_from_candidate_mentions(
+    plan: GeneratedPlan,
+    candidate_files: list[dict[str, object]] | None,
+    *,
+    max_files: int = 4,
+) -> list[str]:
+    """Promote empty planner targets from evidence-backed file mentions.
+
+    The planner sometimes names concrete files in prose/acceptance tests
+    while leaving ``must_touch_files`` empty. This function never invents a
+    path: it can only promote files that came from preplan discovery.
+    """
+    if list(getattr(plan, "must_touch_files", []) or []):
+        return []
+    if list(getattr(plan, "expected_new_files", []) or []):
+        return []
+
+    candidates: list[str] = []
+    for item in candidate_files or []:
+        if not isinstance(item, dict):
+            continue
+        raw = str(item.get("path") or item.get("file") or "").strip()
+        path = raw.replace("\\", "/")
+        lower = path.lower()
+        if not path or not lower.endswith(_PLAN_BACKFILL_SOURCE_SUFFIXES):
+            continue
+        if any(
+            marker in lower
+            for marker in ("/test/", "/tests/", "/androidtest/", "/build/")
+        ):
+            continue
+        if path not in candidates:
+            candidates.append(path)
+
+    if not candidates:
+        return []
+
+    text_parts: list[str] = [
+        str(getattr(plan, "objective", "") or ""),
+        str(getattr(plan, "request_summary", "") or ""),
+        str(getattr(plan, "change_summary", "") or ""),
+        str(getattr(plan, "change_explanation", "") or ""),
+    ]
+    for step in getattr(plan, "steps", []) or []:
+        for attr in ("title", "expected_output", "success_criteria"):
+            text_parts.append(str(getattr(step, attr, "") or ""))
+    for test in getattr(plan, "acceptance_tests", []) or []:
+        if isinstance(test, dict):
+            text_parts.extend(
+                str(test.get(key) or "")
+                for key in ("file", "pattern", "rationale", "scope")
+            )
+        else:
+            text_parts.extend(
+                str(getattr(test, key, "") or "")
+                for key in ("file", "pattern", "rationale", "scope")
+            )
+
+    blob = "\n".join(text_parts)
+    blob_lower = blob.lower()
+    selected: list[str] = []
+    for path in candidates:
+        basename = path.rsplit("/", 1)[-1]
+        if path.lower() in blob_lower or basename.lower() in blob_lower:
+            selected.append(path)
+        if len(selected) >= max_files:
+            break
+    return selected
 
 
 def _semantic_review_compose_state_fields(
@@ -2110,6 +2235,40 @@ class PrimaryOrchestrator:
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "planner domain backfill failed (non-fatal): %s", exc,
+                )
+
+        if isinstance(task.plan_json, dict):
+            try:
+                _backfilled_targets = _backfill_plan_targets_from_candidate_mentions(
+                    plan_document,
+                    candidate_files,
+                )
+                if _backfilled_targets:
+                    _plan_data = dict(task.plan_json)
+                    _plan_data["must_touch_files"] = _backfilled_targets
+                    plan_document = GeneratedPlan.model_validate(_plan_data)
+                    task.plan_json = plan_document.model_dump(mode="json")
+                    record_event(
+                        self.db,
+                        task_id=task.id,
+                        event_type=EventType.TOOL_SUCCEEDED,
+                        source=EventSource.ORCHESTRATOR,
+                        stage=WorkflowStage.PLANNING,
+                        role=RoleName.PLANNER,
+                        tool_name="planner.scope_backfill",
+                        message=(
+                            "Planner emitted empty edit targets; "
+                            "deterministically backfilled must_touch_files "
+                            "from evidence-backed file mentions."
+                        ),
+                        payload={
+                            "must_touch_files": list(_backfilled_targets),
+                            "candidate_files": len(candidate_files),
+                        },
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "planner scope backfill failed (non-fatal): %s", exc,
                 )
 
         # v16.2: inject required_contracts (from the matched playbook,
@@ -5339,7 +5498,7 @@ class PrimaryOrchestrator:
                     _early_outcomes = []
                 if _early_outcomes:
                     _early_verdict = check_coverage(_early_outcomes, plan)
-                    if _early_verdict.kind == "plan_codegen_conflict":
+                    if not _early_verdict.ok:
                         pipeline_state["coverage_verdict"] = _early_verdict.to_payload()
                         record_event(
                             self.db,
@@ -5352,11 +5511,37 @@ class PrimaryOrchestrator:
                             message=_early_verdict.summary[:400],
                             payload=_early_verdict.to_payload(),
                         )
-                        self._request_plan_codegen_conflict_approval(
+                        if self._prepare_batch_coverage_repair_retry(
                             task=task,
-                            plan=plan,
                             pipeline_state=pipeline_state,
                             verdict=_early_verdict,
+                        ):
+                            cooldown = float(
+                                getattr(
+                                    self.tool_gateway.settings,
+                                    "batch_coverage_repair_cooldown_seconds",
+                                    5.0,
+                                )
+                                or 0.0
+                            )
+                            if cooldown > 0:
+                                time.sleep(cooldown)
+                            return self._execute_develop_pipeline(
+                                task=task,
+                                actor_name=actor_name,
+                                plan=plan,
+                                approval_id=approval_id,
+                            )
+                        self._fail_develop_pipeline(
+                            task=task,
+                            message=(
+                                "Batch coverage unresolved after "
+                                f"bounded repair: {_early_verdict.summary}"
+                            ),
+                            payload={
+                                "coverage_verdict": _early_verdict.to_payload(),
+                                "plan_id": plan.plan_id,
+                            },
                         )
                         return
                 self._fail_develop_pipeline(
@@ -5633,14 +5818,38 @@ class PrimaryOrchestrator:
                 _cc_verdict = None
 
         if not coverage_verdict.ok:
-            if coverage_verdict.kind == "plan_codegen_conflict":
-                # Soft landing: human reviewer decides whether the planner
-                # over-scoped or codegen under-implemented.
-                self._request_plan_codegen_conflict_approval(
+            if self._prepare_batch_coverage_repair_retry(
+                task=task,
+                pipeline_state=pipeline_state,
+                verdict=coverage_verdict,
+            ):
+                cooldown = float(
+                    getattr(
+                        self.tool_gateway.settings,
+                        "batch_coverage_repair_cooldown_seconds",
+                        5.0,
+                    )
+                    or 0.0
+                )
+                if cooldown > 0:
+                    time.sleep(cooldown)
+                return self._execute_develop_pipeline(
                     task=task,
+                    actor_name=actor_name,
                     plan=plan,
-                    pipeline_state=pipeline_state,
-                    verdict=coverage_verdict,
+                    approval_id=approval_id,
+                )
+            if coverage_verdict.kind == "plan_codegen_conflict":
+                self._fail_develop_pipeline(
+                    task=task,
+                    message=(
+                        "Plan/codegen conflict unresolved after bounded "
+                        f"repair: {coverage_verdict.summary}"
+                    ),
+                    payload={
+                        "coverage_verdict": coverage_verdict.to_payload(),
+                        "plan_id": plan.plan_id,
+                    },
                 )
                 return
             # Hard blockers (phantom / missing) \u2014 fail the pipeline.
@@ -7168,10 +7377,6 @@ class PrimaryOrchestrator:
                     SemanticReviewError,
                     evaluate_semantic_review,
                 )
-                from app.services.feature_presence_check import (
-                    merge_diffs_by_file as _merge_diffs_by_file,
-                )
-
                 _SR_PASS_THRESHOLD = 80
                 _SR_MAX_REPAIR = 2
                 _sr_translation = (
@@ -7461,6 +7666,28 @@ class PrimaryOrchestrator:
                                 },
                             )
                         break
+                    sr_attempts_used = int(
+                        pipeline_state.get("semantic_review_repair_attempts") or 0
+                    )
+                    if sr_attempts_used >= max(0, _SR_MAX_REPAIR):
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_SKIPPED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            tool_name="semantic_review.repair_budget",
+                            message=(
+                                "Semantic review repair budget exhausted; "
+                                "not issuing another codegen call."
+                            ),
+                            payload={
+                                "attempts": sr_attempts_used,
+                                "max_attempts": _SR_MAX_REPAIR,
+                            },
+                        )
+                        break
 
                     # Build repair prompt from grounded findings + previous diff
                     findings_lines = sr_report.repair_prompt_lines()
@@ -7497,7 +7724,16 @@ class PrimaryOrchestrator:
                             f"{len(sr_report.findings)} grounded finding(s)"
                         ),
                     )
-                    time.sleep(10)  # Rate-limit cooldown
+                    cooldown = float(
+                        getattr(
+                            self.tool_gateway.settings,
+                            "semantic_review_repair_cooldown_seconds",
+                            5.0,
+                        )
+                        or 0.0
+                    )
+                    if cooldown > 0:
+                        time.sleep(cooldown)
                     # R3b: context expansion — for every file mentioned by
                     # a grounded finding, ensure the codegen sees the
                     # POST-EDIT full content (not just the diff). This
@@ -7545,6 +7781,41 @@ class PrimaryOrchestrator:
                                 "files_added": sorted(sr_finding_files),
                             },
                         )
+                    sr_allowed_files = self._safe_codegen_paths(
+                        list(pipeline_state.get("files_changed") or [])
+                    )
+                    if not sr_allowed_files:
+                        sr_allowed_files = sorted(
+                            _diff_sections_by_file(previous_diff_text)
+                        )
+                    if not sr_allowed_files:
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_FAILED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            tool_name="semantic_review.repair",
+                            message=(
+                                "Semantic review repair skipped: no changed "
+                                "files are available as an edit scope."
+                            ),
+                        )
+                        break
+                    for fp in sr_allowed_files:
+                        try:
+                            full = _sr_sandbox_dir / fp
+                            if full.is_file():
+                                content = full.read_text(
+                                    encoding="utf-8",
+                                    errors="replace",
+                                )
+                                if len(content) > 30_000:
+                                    content = content[:30_000] + "\n[truncated]"
+                                sr_expanded_context[fp] = content
+                        except Exception:
+                            pass
                     try:
                         sr_repair_result = self._execute_develop_tool(
                             task=task,
@@ -7553,15 +7824,25 @@ class PrimaryOrchestrator:
                             payload={
                                 "plan_json": {
                                     "objective": "Address semantic_review findings",
+                                    "must_touch_files": sr_allowed_files,
                                     "steps": [],
                                 },
                                 "context_files": sr_expanded_context,
                                 "task_description": sr_repair_prompt,
+                                "source_repo_path": str(_sr_sandbox_dir),
                             },
                             stage=WorkflowStage.REVIEW,
                             role=RoleName.REVIEWER,
                             approval_id=approval_id,
                             pipeline_state=pipeline_state,
+                            timeout_seconds=float(
+                                getattr(
+                                    self.tool_gateway.settings,
+                                    "semantic_review_repair_timeout_seconds",
+                                    180.0,
+                                )
+                                or 180.0
+                            ),
                         )
                     except Exception as exc:
                         record_event(
@@ -7588,10 +7869,88 @@ class PrimaryOrchestrator:
                             message="Repair codegen produced no diff",
                         )
                         break
-                    sr_merged = _merge_diffs_by_file(
-                        previous_diff_text, sr_repair_diff,
+                    sr_touched = set(_diff_sections_by_file(sr_repair_diff))
+                    sr_disallowed = sorted(sr_touched - set(sr_allowed_files))
+                    if sr_disallowed:
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_FAILED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            tool_name="semantic_review.repair",
+                            message=(
+                                "Semantic review repair rejected: patch "
+                                "touched disallowed files."
+                            ),
+                            payload={
+                                "allowed_files": sr_allowed_files,
+                                "disallowed_files": sr_disallowed,
+                            },
+                        )
+                        break
+                    try:
+                        sr_apply_result = self._execute_develop_tool(
+                            task=task,
+                            actor_name=actor_name,
+                            tool_name="sandbox.apply_patch",
+                            payload={
+                                "task_id": task.id,
+                                "patch": sr_repair_diff,
+                                "context_files": sr_expanded_context,
+                                "commit": True,
+                                "commit_message": (
+                                    "Apply semantic review repair "
+                                    f"for {task.id}"
+                                ),
+                            },
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            approval_id=approval_id,
+                            pipeline_state=pipeline_state,
+                        )
+                    except Exception as exc:
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_FAILED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            tool_name="semantic_review.repair",
+                            message=f"Repair patch failed to apply: {exc}",
+                        )
+                        break
+                    if sr_apply_result is None:
+                        return
+                    sr_attempts = int(
+                        pipeline_state.get("semantic_review_repair_attempts") or 0
+                    ) + 1
+                    pipeline_state["semantic_review_repair_attempts"] = sr_attempts
+                    pipeline_state["semantic_review_repair_applied"] = True
+                    pipeline_state["semantic_review_repair_patch_chars"] = len(
+                        sr_repair_diff
                     )
-                    pipeline_state["diff"] = sr_merged
+                    pipeline_state["semantic_review_repair_files"] = sorted(
+                        sr_touched
+                    )
+                    pipeline_state["semantic_review_repair_apply_result"] = (
+                        sr_apply_result
+                    )
+                    codegen_result = dict(pipeline_state.get("codegen_result") or {})
+                    self._refresh_codegen_diff_from_sandbox(
+                        task=task,
+                        pipeline_state=pipeline_state,
+                        plan=plan,
+                        codegen_result=codegen_result,
+                        reason="semantic_review_repair",
+                    )
+                    self._reset_after_semantic_quality_refine(pipeline_state)
+                    self._preserve_develop_pipeline_state(
+                        task=task,
+                        pipeline_state=pipeline_state,
+                    )
                     record_event(
                         self.db, task_id=task.id,
                         event_type=EventType.TOOL_SUCCEEDED,
@@ -7600,10 +7959,20 @@ class PrimaryOrchestrator:
                         role=RoleName.REVIEWER,
                         tool_name="semantic_review.repair",
                         message=(
-                            f"Repair produced {len(sr_repair_diff)} chars; "
-                            f"merged with prior {len(previous_diff_text)} -> "
-                            f"{len(sr_merged)} total; re-evaluating"
+                            "Semantic review repair applied; downstream "
+                            "verification gates will rerun before approval."
                         ),
+                        payload={
+                            "attempts": sr_attempts,
+                            "files": sorted(sr_touched),
+                            "patch_chars": len(sr_repair_diff),
+                        },
+                    )
+                    return self._execute_develop_pipeline(
+                        task=task,
+                        actor_name=actor_name,
+                        plan=plan,
+                        approval_id=approval_id,
                     )
 
                 # End of repair loop. Unresolved high findings can now
@@ -7712,10 +8081,76 @@ class PrimaryOrchestrator:
                 if rv_report.passed:
                     break  # Gate passed
 
-                # --- Attempt semantic repair (first pass only) ---
-                if rv_pass == 0:
+                # --- Attempt executable semantic repair (first pass only) ---
+                rv_repair_attempts = int(
+                    pipeline_state.get("runtime_validation_repair_attempts") or 0
+                )
+                rv_repair_max = int(
+                    getattr(
+                        self.tool_gateway.settings,
+                        "runtime_validation_repair_max_attempts",
+                        1,
+                    )
+                    or 1
+                )
+                rv_repair_enabled = bool(
+                    getattr(
+                        self.tool_gateway.settings,
+                        "runtime_validation_repair_enabled",
+                        True,
+                    )
+                )
+                if (
+                    rv_pass == 0
+                    and rv_repair_enabled
+                    and rv_repair_attempts < max(0, rv_repair_max)
+                ):
                     repair_prompt = build_repair_prompt(rv_report.findings)
                     if repair_prompt:
+                        allowed_files = self._safe_codegen_paths(
+                            list(pipeline_state.get("files_changed") or [])
+                        )
+                        if not allowed_files:
+                            allowed_files = sorted(
+                                _diff_sections_by_file(
+                                    str(pipeline_state.get("diff") or diff or "")
+                                )
+                            )
+                        if not allowed_files:
+                            record_event(
+                                self.db,
+                                task_id=task.id,
+                                event_type=EventType.TOOL_FAILED,
+                                source=EventSource.ORCHESTRATOR,
+                                stage=WorkflowStage.REVIEW,
+                                role=RoleName.REVIEWER,
+                                tool_name="runtime_validation.repair",
+                                message=(
+                                    "Runtime validation repair skipped: no "
+                                    "changed files are available as an edit scope."
+                                ),
+                            )
+                            break
+
+                        sandbox_dir = self._develop_sandbox_dir(task)
+                        repair_context_files: dict[str, str] = {}
+                        for rel_path in allowed_files:
+                            full_path = sandbox_dir / rel_path
+                            try:
+                                if full_path.is_file():
+                                    repair_context_files[rel_path] = (
+                                        full_path.read_text(
+                                            encoding="utf-8",
+                                            errors="replace",
+                                        )[:30_000]
+                                    )
+                            except Exception:
+                                continue
+                        if not repair_context_files:
+                            repair_context_files = dict(
+                                pipeline_state.get("context_files") or {}
+                            )
+
                         record_event(
                             self.db,
                             task_id=task.id,
@@ -7724,15 +8159,37 @@ class PrimaryOrchestrator:
                             stage=WorkflowStage.REVIEW,
                             role=RoleName.REVIEWER,
                             tool_name="runtime_validation.repair",
-                            message="Attempting semantic repair based on runtime validation findings",
+                            message=(
+                                "Attempting executable semantic repair based "
+                                "on runtime validation findings"
+                            ),
+                            payload={
+                                "attempt": rv_repair_attempts + 1,
+                                "max_attempts": rv_repair_max,
+                                "allowed_files": allowed_files,
+                            },
                         )
 
-                        time.sleep(15)  # Rate-limit cooldown
+                        cooldown = float(
+                            getattr(
+                                self.tool_gateway.settings,
+                                "runtime_validation_repair_cooldown_seconds",
+                                5.0,
+                            )
+                            or 0.0
+                        )
+                        if cooldown > 0:
+                            time.sleep(cooldown)
 
                         repair_payload = {
-                            "plan_json": {"objective": "Fix runtime validation issues", "steps": []},
-                            "context_files": pipeline_state.get("context_files", {}),
+                            "plan_json": {
+                                "objective": "Fix runtime validation issues",
+                                "must_touch_files": allowed_files,
+                                "steps": [],
+                            },
+                            "context_files": repair_context_files,
                             "task_description": repair_prompt,
+                            "source_repo_path": str(sandbox_dir),
                         }
                         try:
                             repair_result = self._execute_develop_tool(
@@ -7744,12 +8201,91 @@ class PrimaryOrchestrator:
                                 role=RoleName.REVIEWER,
                                 approval_id=approval_id,
                                 pipeline_state=pipeline_state,
+                                timeout_seconds=float(
+                                    getattr(
+                                        self.tool_gateway.settings,
+                                        "runtime_validation_repair_timeout_seconds",
+                                        180.0,
+                                    )
+                                    or 180.0
+                                ),
                             )
                             repair_diff = str((repair_result or {}).get("diff", "")).strip()
                             if repair_diff:
-                                # Apply repair diff to sandbox and re-run validation
-                                diff = repair_diff
-                                pipeline_state["diff"] = diff
+                                touched = set(_diff_sections_by_file(repair_diff))
+                                disallowed = sorted(touched - set(allowed_files))
+                                if disallowed:
+                                    record_event(
+                                        self.db,
+                                        task_id=task.id,
+                                        event_type=EventType.TOOL_FAILED,
+                                        source=EventSource.ORCHESTRATOR,
+                                        stage=WorkflowStage.REVIEW,
+                                        role=RoleName.REVIEWER,
+                                        tool_name="runtime_validation.repair",
+                                        message=(
+                                            "Runtime validation repair rejected: "
+                                            "patch touched disallowed files."
+                                        ),
+                                        payload={
+                                            "allowed_files": allowed_files,
+                                            "disallowed_files": disallowed,
+                                        },
+                                    )
+                                    break
+                                apply_result = self._execute_develop_tool(
+                                    task=task,
+                                    actor_name=actor_name,
+                                    tool_name="sandbox.apply_patch",
+                                    payload={
+                                        "task_id": task.id,
+                                        "patch": repair_diff,
+                                        "context_files": repair_context_files,
+                                        "commit": True,
+                                        "commit_message": (
+                                            "Apply runtime validation repair "
+                                            f"for {task.id}"
+                                        ),
+                                    },
+                                    stage=WorkflowStage.REVIEW,
+                                    role=RoleName.REVIEWER,
+                                    approval_id=approval_id,
+                                    pipeline_state=pipeline_state,
+                                )
+                                if apply_result is None:
+                                    return
+                                pipeline_state[
+                                    "runtime_validation_repair_attempts"
+                                ] = rv_repair_attempts + 1
+                                pipeline_state[
+                                    "runtime_validation_repair_applied"
+                                ] = True
+                                pipeline_state[
+                                    "runtime_validation_repair_patch_chars"
+                                ] = len(repair_diff)
+                                pipeline_state[
+                                    "runtime_validation_repair_files"
+                                ] = sorted(touched)
+                                pipeline_state[
+                                    "runtime_validation_repair_apply_result"
+                                ] = apply_result
+                                codegen_result = dict(
+                                    pipeline_state.get("codegen_result") or {}
+                                )
+                                self._refresh_codegen_diff_from_sandbox(
+                                    task=task,
+                                    pipeline_state=pipeline_state,
+                                    plan=plan,
+                                    codegen_result=codegen_result,
+                                    reason="runtime_validation_repair",
+                                )
+                                self._reset_after_semantic_quality_refine(
+                                    pipeline_state
+                                )
+                                self._preserve_develop_pipeline_state(
+                                    task=task,
+                                    pipeline_state=pipeline_state,
+                                )
                                 record_event(
                                     self.db,
                                     task_id=task.id,
@@ -7758,9 +8294,23 @@ class PrimaryOrchestrator:
                                     stage=WorkflowStage.REVIEW,
                                     role=RoleName.REVIEWER,
                                     tool_name="runtime_validation.repair",
-                                    message="Semantic repair produced a patch; re-validating",
+                                    message=(
+                                        "Runtime validation repair applied; "
+                                        "downstream verification gates will "
+                                        "rerun before approval."
+                                    ),
+                                    payload={
+                                        "attempt": rv_repair_attempts + 1,
+                                        "files": sorted(touched),
+                                        "patch_chars": len(repair_diff),
+                                    },
                                 )
-                                continue  # Re-run validation with repaired diff
+                                return self._execute_develop_pipeline(
+                                    task=task,
+                                    actor_name=actor_name,
+                                    plan=plan,
+                                    approval_id=approval_id,
+                                )
                             else:
                                 record_event(
                                     self.db,
@@ -11786,6 +12336,8 @@ class PrimaryOrchestrator:
             "compile_gate_done",
             "compile_gate",
             "compile_gate_failed",
+            "test_result",
+            "test_skipped",
             "acceptance_check_done",
             "acceptance_check",
             "acceptance_check_failed",
@@ -11808,6 +12360,98 @@ class PrimaryOrchestrator:
             "reservations_detailed",
         ):
             pipeline_state.pop(key, None)
+
+    def _prepare_batch_coverage_repair_retry(
+        self,
+        *,
+        task: Task,
+        pipeline_state: dict[str, object],
+        verdict: object,
+    ) -> bool:
+        """Convert an uncovered batch outcome into one bounded codegen retry.
+
+        This keeps "must_touch was not actually implemented" out of human
+        approval. The model gets concrete feedback and another executable
+        patch attempt; if that still cannot cover the target, the pipeline
+        fails and the learning loop can record the miss.
+        """
+        settings = self.tool_gateway.settings
+        if not bool(getattr(settings, "batch_coverage_repair_enabled", True)):
+            return False
+
+        payload = verdict.to_payload() if hasattr(verdict, "to_payload") else {}
+        kind = str(payload.get("kind") or "")
+        if kind not in {
+            "plan_codegen_conflict",
+            "missing_must_touch",
+            "missing_expected_new",
+        }:
+            return False
+
+        attempts = int(pipeline_state.get("batch_coverage_repair_attempts") or 0)
+        max_attempts = int(
+            getattr(settings, "batch_coverage_repair_max_attempts", 1) or 1
+        )
+        if attempts >= max(0, max_attempts):
+            return False
+
+        items: list[dict[str, object]] = []
+        for key in ("conflicts", "failures"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                items.extend(item for item in value if isinstance(item, dict))
+
+        file_bits: list[str] = []
+        for item in items:
+            path = str(item.get("file_path") or "").strip()
+            status = str(item.get("status") or "").strip()
+            reason = str(item.get("reason") or "").strip()
+            if path:
+                file_bits.append(f"{path} [{status or 'uncovered'}]: {reason}")
+        if not file_bits:
+            file_bits.append(str(payload.get("summary") or kind))
+
+        feedback = [
+            "Batch coverage rejected the previous codegen result: "
+            + str(payload.get("summary") or kind),
+            "Generate executable code changes for every must_touch or expected_new target. "
+            "Comment-only and whitespace-only diffs are invalid and count as no implementation.",
+            "Do not return NO_CHANGE_NEEDED for a planner-declared must_touch file unless the "
+            "requested task is already satisfied by exact, quoted code in that same file.",
+        ]
+        feedback.extend(file_bits[:8])
+
+        pipeline_state["batch_coverage_repair_attempts"] = attempts + 1
+        pipeline_state["batch_coverage_repair_last_kind"] = kind
+        pipeline_state["batch_coverage_repair_last_summary"] = str(
+            payload.get("summary") or ""
+        )
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.TOOL_SKIPPED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.ACTION,
+            role=RoleName.ACTION,
+            tool_name="batch_coverage.repair_retry",
+            message=(
+                "Batch coverage blocked the patch; resetting sandbox and "
+                f"retrying codegen with executable-change feedback "
+                f"({attempts + 1}/{max_attempts})."
+            ),
+            payload={
+                "kind": kind,
+                "attempt": attempts + 1,
+                "max_attempts": max_attempts,
+                "feedback": feedback,
+            },
+        )
+        self._reset_for_conformance_retry(
+            task=task,
+            pipeline_state=pipeline_state,
+            feedback=feedback,
+        )
+        return True
 
     def _attempt_semantic_quality_refine(
         self,
@@ -12071,6 +12715,234 @@ class PrimaryOrchestrator:
         )
         return True
 
+    def _attempt_reservation_quality_repair(
+        self,
+        *,
+        task: Task,
+        actor_name: str,
+        plan: GeneratedPlan,
+        pipeline_state: dict[str, object],
+        reservations_detailed: list[dict],
+        approval_id: str | None,
+        sandbox_dir: Path,
+    ) -> bool:
+        """Run one bounded repair pass for concrete post-review reservations."""
+        if not pipeline_state.get("pre_codegen_snapshot_id"):
+            return False
+
+        repairable = _reservation_repairable_items(reservations_detailed)
+        if not repairable:
+            return False
+
+        allowed_files = [
+            p for p in self._safe_codegen_paths(
+                list(pipeline_state.get("files_changed") or [])
+            )
+            if p
+        ]
+        if not allowed_files:
+            return False
+
+        context_files: dict[str, str] = {}
+        for rel in allowed_files:
+            full = sandbox_dir / rel
+            try:
+                if full.is_file():
+                    context_files[rel] = full.read_text(
+                        encoding="utf-8",
+                        errors="replace",
+                    )[:30_000]
+            except Exception:
+                continue
+        if not context_files:
+            return False
+
+        previous_diff = str(pipeline_state.get("diff") or "")
+        if len(previous_diff) > 12_000:
+            previous_diff = previous_diff[:12_000] + "\n[truncated]"
+        findings_lines = [
+            (
+                f"  - [{str(item.get('severity') or 'bug').upper()}] "
+                f"{str(item.get('text') or '').strip()}"
+            )
+            for item in repairable
+        ]
+        prompt = (
+            "RESERVATION QUALITY REPAIR (bounded, one pass):\n"
+            "The patch passed compile and structural gates, but the final "
+            "reservations reviewer found concrete quality bugs or missing "
+            "tests. Fix ONLY the findings below. Do not broaden scope. Do "
+            "not rewrite files. Do not add unrelated behavior. If a finding "
+            "cannot be fixed safely inside the allowed files, return no diff.\n\n"
+            "ALLOWED FILES:\n"
+            + "\n".join(f"- {path}" for path in allowed_files)
+            + "\n\nRESERVATIONS TO FIX:\n"
+            + "\n".join(findings_lines)
+            + "\n\nPREVIOUS DIFF (do not undo unrelated correct changes):\n"
+            f"```diff\n{previous_diff}\n```\n\n"
+            "Output a small unified diff against the current sandbox files."
+        )
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.TOOL_CALL_REQUESTED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            tool_name="reservations.repair",
+            message=(
+                "Attempting bounded reservation repair with "
+                f"{len(repairable)} repairable item(s)."
+            ),
+            payload={
+                "allowed_files": allowed_files,
+                "repairable_count": len(repairable),
+            },
+        )
+
+        try:
+            repair_result = self._execute_develop_tool(
+                task=task,
+                actor_name=actor_name,
+                tool_name="codegen.generate_patch",
+                payload={
+                    "plan_json": {
+                        "objective": "Bounded reservation quality repair",
+                        "must_touch_files": allowed_files,
+                        "steps": [],
+                    },
+                    "context_files": context_files,
+                    "task_description": prompt,
+                    "source_repo_path": str(sandbox_dir),
+                },
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                approval_id=approval_id,
+                pipeline_state=pipeline_state,
+                timeout_seconds=float(
+                    getattr(
+                        self.tool_gateway.settings,
+                        "reservation_repair_timeout_seconds",
+                        180.0,
+                    )
+                    or 180.0
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_FAILED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="reservations.repair",
+                message=f"Reservation repair codegen failed: {exc}",
+            )
+            return False
+
+        repair_diff = str((repair_result or {}).get("diff") or "").strip()
+        if not repair_diff:
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_SKIPPED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="reservations.repair",
+                message="Reservation repair produced no diff.",
+            )
+            return False
+
+        touched = set(_diff_sections_by_file(repair_diff))
+        disallowed = sorted(touched - set(allowed_files))
+        if disallowed:
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_FAILED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="reservations.repair",
+                message="Reservation repair rejected: patch touched disallowed files.",
+                payload={
+                    "allowed_files": allowed_files,
+                    "disallowed_files": disallowed,
+                },
+            )
+            return False
+
+        try:
+            apply_result = self._execute_develop_tool(
+                task=task,
+                actor_name=actor_name,
+                tool_name="sandbox.apply_patch",
+                payload={
+                    "task_id": task.id,
+                    "patch": repair_diff,
+                    "context_files": context_files,
+                    "commit": True,
+                    "commit_message": f"Apply reservation quality repair for {task.id}",
+                },
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                approval_id=approval_id,
+                pipeline_state=pipeline_state,
+            )
+        except Exception as exc:  # noqa: BLE001
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_FAILED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="reservations.repair",
+                message=f"Reservation repair patch failed to apply: {exc}",
+            )
+            return False
+        if apply_result is None:
+            return False
+
+        attempts = int(pipeline_state.get("reservation_repair_attempts") or 0) + 1
+        pipeline_state["reservation_repair_attempts"] = attempts
+        pipeline_state["reservation_repair_applied"] = True
+        pipeline_state["reservation_repair_patch_chars"] = len(repair_diff)
+        pipeline_state["reservation_repair_files"] = sorted(touched)
+        pipeline_state["reservation_repair_apply_result"] = apply_result
+
+        codegen_result = dict(pipeline_state.get("codegen_result") or {})
+        self._refresh_codegen_diff_from_sandbox(
+            task=task,
+            pipeline_state=pipeline_state,
+            plan=plan,
+            codegen_result=codegen_result,
+            reason="reservation_quality_repair",
+        )
+        self._reset_after_semantic_quality_refine(pipeline_state)
+        self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.TOOL_SUCCEEDED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            tool_name="reservations.repair",
+            message=(
+                "Reservation repair applied; downstream verification gates "
+                "will rerun before approval."
+            ),
+            payload={
+                "attempts": attempts,
+                "files": sorted(touched),
+                "patch_chars": len(repair_diff),
+            },
+        )
+        return True
+
     def _build_codegen_task_description(
         self,
         *,
@@ -12250,6 +13122,11 @@ class PrimaryOrchestrator:
             "evidence_chain_gaps",
             "goal_attestation",
             "retry_done",
+            "batch_outcomes",
+            "coverage_verdict",
+            "contract_coverage_verdict",
+            "plan_codegen_conflict",
+            "pending_plan_codegen_conflict_approval_id",
         ):
             pipeline_state.pop(key, None)
         pipeline_state["conformance_feedback"] = list(feedback)
@@ -13017,6 +13894,120 @@ class PrimaryOrchestrator:
 
         pipeline_state["reservations"] = reservations
         pipeline_state["reservations_detailed"] = reservations_detailed
+        hard_gates = self._summarize_hard_gates(pipeline_state)
+        blocking_reservations = _reservation_blocking_items(reservations_detailed)
+        repairable_reservations = _reservation_repairable_items(reservations_detailed)
+        pipeline_state["reservation_gate"] = {
+            "blocking_count": len(blocking_reservations),
+            "repairable_count": len(repairable_reservations),
+            "attempts": int(pipeline_state.get("reservation_repair_attempts") or 0),
+        }
+
+        if blocking_reservations:
+            message = (
+                "Post-review reservations include blocking security/policy "
+                "concerns; Jira transition approval is blocked until the "
+                "implementation is changed or the task is re-scoped."
+            )
+            payload = {
+                "decision": "reservation_blocked",
+                "issue_key": issue_key,
+                "files_changed": list(files_changed),
+                "diff": diff,
+                "reservations": reservations,
+                "reservations_detailed": reservations_detailed,
+                "blocking_reservations": blocking_reservations,
+                "hard_gates": hard_gates,
+                "evidence_chain": evidence_chain_payload,
+                "pipeline_state": pipeline_state,
+            }
+            self._record_playbook_promotion_candidate(
+                task=task,
+                plan=plan,
+                pipeline_state=pipeline_state,
+                approval_action="reservation_blocked",
+                approval_id=None,
+            )
+            self._fail_develop_pipeline(
+                task=task,
+                message=message,
+                event_type=EventType.REVIEW_FAILED,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                payload=payload,
+            )
+            commit_checkpoint(self.db, label="reservation_blocked")
+            return
+
+        reservation_repair_attempts = int(
+            pipeline_state.get("reservation_repair_attempts") or 0
+        )
+        reservation_repair_enabled = bool(
+            getattr(self.tool_gateway.settings, "reservation_repair_enabled", True)
+        )
+        reservation_repair_max = int(
+            getattr(self.tool_gateway.settings, "reservation_repair_max_attempts", 1)
+            or 1
+        )
+        if _reservation_should_attempt_repair(
+            reservations_detailed,
+            repair_attempts=reservation_repair_attempts,
+            max_repair_attempts=reservation_repair_max,
+            enabled=reservation_repair_enabled,
+        ):
+            repaired = self._attempt_reservation_quality_repair(
+                task=task,
+                actor_name=task.actor_name or "system",
+                plan=plan,
+                pipeline_state=pipeline_state,
+                reservations_detailed=reservations_detailed,
+                approval_id=None,
+                sandbox_dir=self._develop_sandbox_dir(task),
+            )
+            if repaired:
+                return self._execute_develop_pipeline(
+                    task=task,
+                    actor_name=task.actor_name or "system",
+                    plan=plan,
+                    approval_id=None,
+                )
+
+        if repairable_reservations:
+            message = (
+                "Post-review reservations include repairable quality defects, "
+                "but the bounded repair budget did not resolve them; Jira "
+                "transition approval is blocked."
+            )
+            payload = {
+                "decision": "reservation_repair_unresolved",
+                "issue_key": issue_key,
+                "files_changed": list(files_changed),
+                "diff": diff,
+                "reservations": reservations,
+                "reservations_detailed": reservations_detailed,
+                "repairable_reservations": repairable_reservations,
+                "reservation_repair_attempts": reservation_repair_attempts,
+                "hard_gates": hard_gates,
+                "evidence_chain": evidence_chain_payload,
+                "pipeline_state": pipeline_state,
+            }
+            self._record_playbook_promotion_candidate(
+                task=task,
+                plan=plan,
+                pipeline_state=pipeline_state,
+                approval_action="reservation_repair_unresolved",
+                approval_id=None,
+            )
+            self._fail_develop_pipeline(
+                task=task,
+                message=message,
+                event_type=EventType.REVIEW_FAILED,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                payload=payload,
+            )
+            commit_checkpoint(self.db, label="reservation_repair_unresolved")
+            return
 
         # v15 Ticket 6 (2026-05-11): warnings + hard_gates summary for
         # the approval payload. ``warnings`` is a structured list the
@@ -13044,8 +14035,6 @@ class PrimaryOrchestrator:
                     ),
                 }
             )
-        hard_gates = self._summarize_hard_gates(pipeline_state)
-
         preview_result = {
             "scenario": "jira_issue_develop",
             "issue_key": issue_key,

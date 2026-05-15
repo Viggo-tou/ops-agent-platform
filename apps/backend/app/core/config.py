@@ -193,6 +193,9 @@ class Settings(BaseSettings):
     codegen_timeout_salvage_enabled: bool = True
     codegen_timeout_salvage_seconds: float = 240.0
     codegen_timeout_late_result_grace_seconds: float = 360.0
+    batch_coverage_repair_enabled: bool = True
+    batch_coverage_repair_max_attempts: int = 1
+    batch_coverage_repair_cooldown_seconds: float = 5.0
     codegen_repair_files_per_round: int = 5
     # Bumped from 180s. Empirically a single codegen.generate_patch call
     # via Claude Code CLI takes 3-4 min (~180-240s). The 180s deadline
@@ -244,6 +247,15 @@ class Settings(BaseSettings):
     semantic_review_quality_refine_threshold: int = 95
     semantic_review_quality_refine_max_attempts: int = 1
     semantic_review_quality_refine_timeout_seconds: float = 180.0
+    semantic_review_repair_timeout_seconds: float = 180.0
+    semantic_review_repair_cooldown_seconds: float = 5.0
+    runtime_validation_repair_enabled: bool = True
+    runtime_validation_repair_max_attempts: int = 1
+    runtime_validation_repair_timeout_seconds: float = 180.0
+    runtime_validation_repair_cooldown_seconds: float = 5.0
+    reservation_repair_enabled: bool = True
+    reservation_repair_max_attempts: int = 1
+    reservation_repair_timeout_seconds: float = 180.0
     minimax_api_key: str | None = None
     minimax_base_url: str = "https://api.minimaxi.com"
     knowledge_source_name: str = "handymanapp"

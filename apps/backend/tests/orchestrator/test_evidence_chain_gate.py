@@ -23,8 +23,12 @@ from app.core.enums import (
     ToolPermissionCategory,
     WorkflowStage,
 )
-from app.orchestrator.service import PrimaryOrchestrator
+from app.orchestrator.service import (
+    PrimaryOrchestrator,
+    _backfill_plan_targets_from_candidate_mentions,
+)
 from app.schemas.evidence import EvidenceItem
+from app.services.semantic_review import SemanticReviewReport
 from app.services.task_workspace import TaskWorkspace
 
 
@@ -96,6 +100,7 @@ def _task(task_id: str = "task-chain", *, request_text: str = "Update src/a.py f
         risk_category=RiskCategory.CHANGE_MANAGEMENT,
         request_text=request_text,
         scenario="jira_issue_develop",
+        source_name="test",
         status=TaskStatus.QUEUED,
         workflow_stage=WorkflowStage.INTAKE,
         translation_json={"issue_key": "TEST-1", "normalized_request": request_text},
@@ -143,6 +148,73 @@ def _test_pass() -> dict[str, object]:
         "passed_count": 1,
         "total_steps": 1,
     }
+
+
+def _semantic_review_pass() -> SemanticReviewReport:
+    return SemanticReviewReport(
+        passed=True,
+        completeness_pct=100,
+        summary="Mock semantic review passed.",
+        findings=(),
+        pass_threshold=80,
+        total_findings_raw=0,
+        findings_dropped_no_evidence=0,
+        provider_name="test",
+    )
+
+
+def _semantic_review_fail() -> SimpleNamespace:
+    finding = SimpleNamespace(
+        severity="high",
+        file="src/a.py",
+        description="The patch does not implement the requested behavior.",
+        evidence_quote="+new",
+        suggested_fix="Add the missing executable behavior.",
+    )
+    return SimpleNamespace(
+        passed=False,
+        completeness_pct=20,
+        pass_threshold=80,
+        findings=[finding],
+        findings_dropped_no_evidence=0,
+        high_severity_count=lambda: 1,
+        repair_prompt_lines=lambda: [
+            "- [HIGH] src/a.py: add the missing executable behavior."
+        ],
+        to_payload=lambda: {
+            "passed": False,
+            "completeness_pct": 20,
+            "high_count": 1,
+            "findings": [
+                {
+                    "severity": "high",
+                    "file": "src/a.py",
+                    "description": finding.description,
+                }
+            ],
+        },
+    )
+
+
+def _runtime_report(*, passed: bool, findings: list[object] | None = None) -> SimpleNamespace:
+    findings = findings or []
+    return SimpleNamespace(
+        passed=passed,
+        findings=findings,
+        summary=lambda: "Runtime validation passed" if passed else "Runtime validation failed",
+        to_payload=lambda: {
+            "passed": passed,
+            "blocking_count": 0 if passed else len(findings),
+            "findings": [
+                {
+                    "severity": getattr(item, "severity", "error"),
+                    "file": getattr(item, "file", ""),
+                    "message": getattr(item, "message", ""),
+                }
+                for item in findings
+            ],
+        },
+    )
 
 
 def _write_workspace(
@@ -204,8 +276,18 @@ def _run_pipeline(
     task: SimpleNamespace,
     plan: GeneratedPlan,
     codegen_result: dict[str, object],
+    reservations_report: object | None = None,
 ) -> list[object]:
     added: list[object] = []
+    if reservations_report is None:
+        reservations_report = SimpleNamespace(
+            reservations=[],
+            to_dicts=lambda: [],
+            auto_fixable=[],
+            blocking=[],
+            provider="test",
+            model="none",
+        )
     orchestrator.db.add = Mock(
         side_effect=lambda obj: (added.append(obj), setattr(obj, "id", f"approval-{len(added)}"))[0]
     )
@@ -221,7 +303,10 @@ def _run_pipeline(
         "app.orchestrator.service.set_task_status"
     ), patch(
         "app.services.reservations.build_reservations",
-        return_value=SimpleNamespace(reservations=[], provider="test", model="none"),
+        return_value=reservations_report,
+    ), patch(
+        "app.services.semantic_review.evaluate_semantic_review",
+        return_value=_semantic_review_pass(),
     ):
         orchestrator._execute_develop_pipeline(task=task, actor_name="tester", plan=plan)
     task._record_event_calls = record_event.call_args_list
@@ -252,6 +337,300 @@ def test_chain_closed_task_proceeds_to_approval() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_plan_target_backfill_promotes_evidence_mentioned_files() -> None:
+    plan = _plan()
+    plan.must_touch_files = []
+    plan.expected_new_files = []
+    plan.steps[0].expected_output = (
+        "Modify CustomerKYCPhoneNumber.kt and HandymanKYCPhoneNumber.kt."
+    )
+    plan.acceptance_tests = [
+        {
+            "kind": "diff_contains_pattern_in_file",
+            "file": (
+                "app/src/main/java/com/example/handyman/customer_pages/"
+                "CustomerKYCPhoneNumber.kt"
+            ),
+            "pattern": "setValue",
+        }
+    ]
+    candidates = [
+        {
+            "path": (
+                "app/src/main/java/com/example/handyman/customer_pages/"
+                "CustomerKYCPhoneNumber.kt"
+            )
+        },
+        {
+            "path": (
+                "app/src/main/java/com/example/handyman/handyman_pages/"
+                "HandymanKYCPhoneNumber.kt"
+            )
+        },
+        {"path": "app/src/test/java/com/example/handyman/PhoneTest.kt"},
+    ]
+
+    assert _backfill_plan_targets_from_candidate_mentions(plan, candidates) == [
+        (
+            "app/src/main/java/com/example/handyman/customer_pages/"
+            "CustomerKYCPhoneNumber.kt"
+        ),
+        (
+            "app/src/main/java/com/example/handyman/handyman_pages/"
+            "HandymanKYCPhoneNumber.kt"
+        ),
+    ]
+
+
+def test_blocking_reservations_fail_before_jira_transition_approval() -> None:
+    root = _writable_mkdtemp()
+    try:
+        orchestrator = _orchestrator(root)
+        task = _task()
+        plan = _plan(task.id)
+        _write_workspace(orchestrator, task, evidence_path="src/a.py")
+        blocking_item = {
+            "text": "No rate limit protects repeated OTP sends.",
+            "severity": "security",
+            "auto_fixable": False,
+            "blocking": True,
+        }
+        report = SimpleNamespace(
+            reservations=[blocking_item["text"]],
+            to_dicts=lambda: [blocking_item],
+            auto_fixable=[],
+            blocking=[blocking_item],
+            provider="test",
+            model="none",
+        )
+
+        added = _run_pipeline(
+            orchestrator,
+            task,
+            plan,
+            _codegen_result("src/a.py"),
+            reservations_report=report,
+        )
+
+        approvals = [obj for obj in added if hasattr(obj, "action_name")]
+        assert approvals == []
+        assert task.pending_approval is False
+        assert task.latest_result_json["status"] == TaskStatus.FAILED.value
+        assert task.latest_result_json["decision"] == "reservation_blocked"
+        assert task.latest_result_json["blocking_reservations"] == [blocking_item]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_repairable_reservations_fail_when_repair_budget_disabled() -> None:
+    root = _writable_mkdtemp()
+    try:
+        orchestrator = _orchestrator(root)
+        orchestrator.tool_gateway.settings.reservation_repair_enabled = False
+        task = _task()
+        plan = _plan(task.id)
+        _write_workspace(orchestrator, task, evidence_path="src/a.py")
+        repairable_item = {
+            "text": "The diff only adds a comment and no behavior change.",
+            "severity": "bug",
+            "auto_fixable": True,
+            "blocking": False,
+        }
+        report = SimpleNamespace(
+            reservations=[repairable_item["text"]],
+            to_dicts=lambda: [repairable_item],
+            auto_fixable=[repairable_item],
+            blocking=[],
+            provider="test",
+            model="none",
+        )
+
+        added = _run_pipeline(
+            orchestrator,
+            task,
+            plan,
+            _codegen_result("src/a.py"),
+            reservations_report=report,
+        )
+
+        approvals = [obj for obj in added if hasattr(obj, "action_name")]
+        assert approvals == []
+        assert task.pending_approval is False
+        assert task.latest_result_json["status"] == TaskStatus.FAILED.value
+        assert task.latest_result_json["decision"] == "reservation_repair_unresolved"
+        assert task.latest_result_json["repairable_reservations"] == [repairable_item]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_runtime_validation_repair_is_applied_before_approval() -> None:
+    root = _writable_mkdtemp()
+    try:
+        orchestrator = _orchestrator(root)
+        orchestrator.tool_gateway.settings.runtime_validation_repair_cooldown_seconds = 0
+        task = _task()
+        plan = _plan(task.id)
+        _write_workspace(orchestrator, task, evidence_path="src/a.py")
+        added: list[object] = []
+        orchestrator.db.add = Mock(
+            side_effect=lambda obj: (
+                added.append(obj),
+                setattr(obj, "id", f"approval-{len(added)}"),
+            )[0]
+        )
+        repair_diff = _diff("src/a.py").replace("+new", "+newer")
+        orchestrator.tool_gateway.execute = Mock(
+            side_effect=[
+                _codegen_result("src/a.py"),
+                {"status": "patched", "method": "git_apply"},
+                _test_pass(),
+                {"diff": repair_diff, "files_changed": ["src/a.py"]},
+                {"status": "patched", "method": "git_apply"},
+                _test_pass(),
+                _review_pass(),
+            ]
+        )
+        finding = SimpleNamespace(
+            severity="error",
+            file="src/a.py",
+            message="Generated patch does not satisfy runtime semantics.",
+        )
+        with patch("app.orchestrator.service.record_event") as record_event, patch(
+            "app.orchestrator.service.set_task_status"
+        ), patch(
+            "app.services.reservations.build_reservations",
+            return_value=SimpleNamespace(
+                reservations=[],
+                to_dicts=lambda: [],
+                auto_fixable=[],
+                blocking=[],
+                provider="test",
+                model="none",
+            ),
+        ), patch(
+            "app.services.semantic_review.evaluate_semantic_review",
+            return_value=_semantic_review_pass(),
+        ), patch(
+            "app.services.runtime_validation.validate_diff_semantics",
+            side_effect=[
+                _runtime_report(passed=False, findings=[finding]),
+                _runtime_report(passed=True),
+            ],
+        ), patch(
+            "app.services.runtime_validation.build_repair_prompt",
+            return_value="Fix runtime validation issue in src/a.py.",
+        ):
+            orchestrator._execute_develop_pipeline(
+                task=task,
+                actor_name="tester",
+                plan=plan,
+            )
+
+        tool_names = [
+            call.kwargs.get("tool_name")
+            for call in record_event.call_args_list
+            if "tool_name" in call.kwargs
+        ]
+        apply_calls = [
+            call
+            for call in orchestrator.tool_gateway.execute.call_args_list
+            if call.kwargs.get("tool_name") == "sandbox.apply_patch"
+        ]
+        approvals = [obj for obj in added if hasattr(obj, "action_name")]
+
+        assert len(apply_calls) == 2
+        assert "runtime_validation.repair" in tool_names
+        assert task.latest_result_json["pipeline_state"][
+            "runtime_validation_repair_applied"
+        ] is True
+        assert task.latest_result_json["pipeline_state"]["runtime_validation"][
+            "passed"
+        ] is True
+        assert approvals
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_semantic_review_repair_is_applied_before_reverification() -> None:
+    root = _writable_mkdtemp()
+    try:
+        orchestrator = _orchestrator(root)
+        orchestrator.tool_gateway.settings.semantic_review_repair_cooldown_seconds = 0
+        task = _task()
+        plan = _plan(task.id)
+        _write_workspace(orchestrator, task, evidence_path="src/a.py")
+        added: list[object] = []
+        orchestrator.db.add = Mock(
+            side_effect=lambda obj: (
+                added.append(obj),
+                setattr(obj, "id", f"approval-{len(added)}"),
+            )[0]
+        )
+        repair_diff = _diff("src/a.py").replace("+new", "+newer")
+        orchestrator.tool_gateway.execute = Mock(
+            side_effect=[
+                _codegen_result("src/a.py"),
+                {"status": "patched", "method": "git_apply"},
+                _test_pass(),
+                {"diff": repair_diff, "files_changed": ["src/a.py"]},
+                {"status": "patched", "method": "git_apply"},
+                _test_pass(),
+                _review_pass(),
+            ]
+        )
+        with patch("app.orchestrator.service.record_event") as record_event, patch(
+            "app.orchestrator.service.set_task_status"
+        ), patch(
+            "app.services.reservations.build_reservations",
+            return_value=SimpleNamespace(
+                reservations=[],
+                to_dicts=lambda: [],
+                auto_fixable=[],
+                blocking=[],
+                provider="test",
+                model="none",
+            ),
+        ), patch(
+            "app.services.semantic_review.evaluate_semantic_review",
+            side_effect=[_semantic_review_fail(), _semantic_review_pass()],
+        ), patch(
+            "app.services.runtime_validation.validate_diff_semantics",
+            return_value=_runtime_report(passed=True),
+        ), patch(
+            "app.orchestrator.service._semantic_review_verified_gates_passed",
+            return_value=False,
+        ):
+            orchestrator._execute_develop_pipeline(
+                task=task,
+                actor_name="tester",
+                plan=plan,
+            )
+
+        tool_names = [
+            call.kwargs.get("tool_name")
+            for call in record_event.call_args_list
+            if "tool_name" in call.kwargs
+        ]
+        apply_calls = [
+            call
+            for call in orchestrator.tool_gateway.execute.call_args_list
+            if call.kwargs.get("tool_name") == "sandbox.apply_patch"
+        ]
+        approvals = [obj for obj in added if hasattr(obj, "action_name")]
+
+        assert len(apply_calls) == 2
+        assert "semantic_review.repair" in tool_names
+        assert task.latest_result_json["pipeline_state"][
+            "semantic_review_repair_applied"
+        ] is True
+        assert task.latest_result_json["pipeline_state"]["semantic_review"][
+            "passed"
+        ] is True
+        assert approvals
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_block_severity_fails_before_approval_or_jira_transition() -> None:
     root = _writable_mkdtemp()
     try:
@@ -263,7 +642,8 @@ def test_block_severity_fails_before_approval_or_jira_transition() -> None:
 
         added = _run_pipeline(orchestrator, task, plan, _codegen_result("src/b.py"))
 
-        assert added == []
+        approvals = [obj for obj in added if hasattr(obj, "action_name")]
+        assert approvals == []
         orchestrator._request_jira_transition_approval.assert_not_called()
         assert task.latest_result_json["status"] == TaskStatus.FAILED.value
         assert task.latest_result_json["evidence_chain"]["closed"] is False
