@@ -663,6 +663,57 @@ def test_repairable_reservations_fail_when_repair_budget_disabled() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_nonblocking_executable_reservation_does_not_auto_repair() -> None:
+    root = _writable_mkdtemp()
+    try:
+        orchestrator = _orchestrator(root)
+        task = _task()
+        plan = _plan(task.id)
+        _write_workspace(orchestrator, task, evidence_path="src/a.py")
+        advisory_item = {
+            "text": (
+                "BUG: The removed DB write may have served a secondary purpose; "
+                "verify downstream logic still handles any dependent state."
+            ),
+            "severity": "bug",
+            "auto_fixable": True,
+            "blocking": False,
+        }
+        report = SimpleNamespace(
+            reservations=[advisory_item["text"]],
+            to_dicts=lambda: [advisory_item],
+            auto_fixable=[advisory_item],
+            blocking=[],
+            provider="test",
+            model="none",
+        )
+
+        added = _run_pipeline(
+            orchestrator,
+            task,
+            plan,
+            _codegen_result("src/a.py"),
+            reservations_report=report,
+        )
+
+        tool_names = [
+            call.kwargs.get("tool_name")
+            for call in task._record_event_calls
+            if "tool_name" in call.kwargs
+        ]
+        approvals = [obj for obj in added if hasattr(obj, "action_name")]
+
+        assert "reservations.repair" not in tool_names
+        assert approvals
+        assert task.latest_result_json["status"] == TaskStatus.AWAITING_APPROVAL.value
+        gate = task.latest_result_json["pipeline_state"]["reservation_gate"]
+        assert gate["repairable_count"] == 1
+        assert gate["required_repair_count"] == 0
+        assert gate["advisory_repairable_count"] == 1
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_runtime_validation_repair_is_applied_before_approval() -> None:
     root = _writable_mkdtemp()
     try:

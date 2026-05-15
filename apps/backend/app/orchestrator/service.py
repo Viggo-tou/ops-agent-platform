@@ -343,6 +343,30 @@ def _reservation_repairable_items(
     ]
 
 
+def _reservation_required_repair_items(
+    reservations_detailed: list[dict] | tuple[dict, ...] | None,
+) -> list[dict]:
+    """Return reservation findings that should block approval unless repaired.
+
+    The reservations reviewer runs after deterministic gates have already
+    passed, so generic non-blocking ``bug`` notes are advisory. Automatically
+    feeding those back into codegen can undo verified contracts. We reserve
+    automatic repair for correctness failures with explicit gate-like signals
+    (goal miss, unsafe workaround, ordering regression) or for items already
+    marked blocking by the reviewer.
+    """
+    required: list[dict] = []
+    for item in _reservation_repairable_items(reservations_detailed):
+        category = _reservation_repair_category(item)
+        if bool(item.get("blocking")) or category in {
+            "goal_miss",
+            "unsafe_workaround",
+            "ordering_regression",
+        }:
+            required.append(item)
+    return required
+
+
 def _reservation_hard_blocking_items(
     reservations_detailed: list[dict] | tuple[dict, ...] | None,
 ) -> list[dict]:
@@ -366,7 +390,7 @@ def _reservation_should_attempt_repair(
         return False
     if _reservation_hard_blocking_items(reservations_detailed):
         return False
-    return bool(_reservation_repairable_items(reservations_detailed))
+    return bool(_reservation_required_repair_items(reservations_detailed))
 
 
 def _structural_acceptance_verified(
@@ -12917,7 +12941,7 @@ class PrimaryOrchestrator:
         if not pipeline_state.get("pre_codegen_snapshot_id"):
             return False
 
-        repairable = _reservation_repairable_items(reservations_detailed)
+        repairable = _reservation_required_repair_items(reservations_detailed)
         if not repairable:
             return False
 
@@ -12979,7 +13003,7 @@ class PrimaryOrchestrator:
         prompt = (
             "RESERVATION QUALITY REPAIR (bounded, one pass):\n"
             "The patch passed compile and structural gates, but the final "
-            "reservations reviewer found concrete executable quality defects. "
+            "reservations reviewer found approval-blocking correctness defects. "
             "Fix ONLY the findings below. Do not broaden scope. Do not rewrite "
             "files. Do not add unrelated behavior. If a finding cannot be fixed "
             "safely inside the allowed files, return no diff.\n\n"
@@ -14134,6 +14158,9 @@ class PrimaryOrchestrator:
         hard_gates = self._summarize_hard_gates(pipeline_state)
         blocking_reservations = _reservation_blocking_items(reservations_detailed)
         repairable_reservations = _reservation_repairable_items(reservations_detailed)
+        required_repair_reservations = _reservation_required_repair_items(
+            reservations_detailed
+        )
         hard_blocking_reservations = _reservation_hard_blocking_items(
             reservations_detailed
         )
@@ -14144,6 +14171,11 @@ class PrimaryOrchestrator:
             "blocking_count": len(blocking_reservations),
             "hard_blocking_count": len(hard_blocking_reservations),
             "repairable_count": len(repairable_reservations),
+            "required_repair_count": len(required_repair_reservations),
+            "advisory_repairable_count": max(
+                0,
+                len(repairable_reservations) - len(required_repair_reservations),
+            ),
             "repairable_blocking_count": len(repairable_blocking_reservations),
             "attempts": int(pipeline_state.get("reservation_repair_attempts") or 0),
         }
@@ -14218,9 +14250,9 @@ class PrimaryOrchestrator:
                     approval_id=None,
                 )
 
-        if repairable_reservations:
+        if required_repair_reservations:
             message = (
-                "Post-review reservations include repairable quality defects, "
+                "Post-review reservations include approval-blocking quality defects, "
                 "but the bounded repair budget did not resolve them; Jira "
                 "transition approval is blocked."
             )
@@ -14232,6 +14264,7 @@ class PrimaryOrchestrator:
                 "reservations": reservations,
                 "reservations_detailed": reservations_detailed,
                 "repairable_reservations": repairable_reservations,
+                "required_repair_reservations": required_repair_reservations,
                 "repairable_blocking_reservations": repairable_blocking_reservations,
                 "reservation_repair_attempts": reservation_repair_attempts,
                 "hard_gates": hard_gates,
