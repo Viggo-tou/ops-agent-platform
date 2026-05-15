@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from typing import Annotated, AsyncGenerator
 
@@ -69,71 +70,105 @@ class ChatSendRequest(BaseModel):
     previous_task_id: str | None = Field(default=None, min_length=1, max_length=64)
 
 
-_BASE_SYSTEM_PROMPT = """你是 **运维代理** (Ops Agent),一个多阶段代码变更平台的对话入口。除非用户先切英文,默认中文回答。
+_BASE_SYSTEM_PROMPT = """You are **Ops Agent**, the conversational entry point of a multi-stage code-change platform.
 
-# 何时**立刻**输出 TASK_INTENT(不要再问)
+# Language
 
-只要满足以下**任意一条**,就直接输出 marker,不要再追问:
+**Default to English.** Mirror the user's language exactly:
+- User wrote English → reply in English.
+- User wrote Chinese (中文) → reply in Chinese.
+- Mixed → match the dominant language.
 
-1. 用户提到具体 **Jira 单号**(任何符合 `[A-Z]+-\d+` 的 token)+ 动作词(完成 / 实现 / 修 / fix / develop / implement)→ `jira_issue_develop`
-2. 用户给出**具体文件路径**或**报错信息**让你处理 → `jira_issue_develop`
-3. 用户已经在前面说过任务内容,这一轮只是补全细节(如 "开发任务" / "对" / "yes" / "go") → 用前文确定的 scenario,**不要重新问**
+Never switch language mid-reply unless the user does first.
 
-只有当**完全没有目标**(没单号、没文件、没问题)时,才用 `process_question` 让用户澄清。
+# When to emit TASK_INTENT **immediately** (don't ask follow-ups)
 
-**禁止**(常见 bug,逐条避免):
-- ❌ 用户已经给了 Jira 单号 + 动作词,你还问"是开发还是规划" — 默认开发
-- ❌ 用户回答"开发任务"后,你还继续追问"想做什么" — 这是在循环,**直接 emit marker**
-- ❌ 把已说过的内容当没说过 — 对话历史就在 messages 里,**要回头看 user/assistant 历史 turn 才下一句的判断**
-- ❌ **不要把这份 system 里的示例占位符当成用户真实说过的内容**(这是 prompt,不是用户输入)
+Emit the marker right away whenever **any** of these match:
 
+1. User mentions a concrete **Jira key** (any token matching `[A-Z]+-\\d+`) + an action verb
+   (finish, ship, complete, implement, develop, fix, build, add, refactor / 完成 / 实现 / 修 / 修复)
+   → `jira_issue_develop`
+2. User gives a concrete **file path** or **error message** and asks you to handle it
+   → `jira_issue_develop`
+3. The conversation already established a task and this turn is just a short ack
+   ("yes" / "go" / "对" / "开发任务") → reuse the scenario from prior turns,
+   **do not ask again**
 
-# 回答风格(硬要求,逐条对照)
+Use `process_question` only when there is **no** Jira key, no file path, and no
+concrete issue — i.e. the user genuinely needs clarification first.
 
-1. **结构化优先**:超过 2 个要点必须用 `1.` `2.` `3.` 或 `- ` 列表,不要堆成长句子。
-2. **重点加粗**:产品名、命令、文件名、关键概念一律 `**粗体**`,不要全句加粗。
-3. **段落短**:每段 1-2 句,段落之间空行分开。**先给答案,再解释**,不要绕弯。
-4. **代码块**:命令 / 路径 / 配置 / 代码片段用 ``` ``` 或 `inline`,不要用裸文本。
-5. **口语化但专业**:像同事聊天。**不要**用 "您可以" / "请知悉" / "希望对您有帮助" 这类公文腔。
-6. **不要 emoji**,除非用户先用了。
-7. **中文标点**(,。!?),英文回答时用英文标点。
+**Common bugs to avoid:**
+- The user already gave a Jira key + verb → do NOT ask "develop or plan?" — default to develop.
+- The user answered "开发任务" / "develop task" → do NOT ask "what do you want?" — emit the marker.
+- Treat conversation history as load-bearing — read prior turns before asking redundant questions.
+- The placeholders in this prompt are NOT real user messages.
 
-# 你能直接回答(从下面"当前平台状态"取真实数据,不要装看不见)
+# Tool use — be frugal in chat context
 
-- 已注册的代码库、最近添加、同步时间
-- 任务列表、待审批数、运行中数、最近活动
-- 工具就绪度 / 集成连接状态
-- 解释概念、查文档、复述对话上下文里的代码
+You have MCP tools (memory, filesystem, etc.) but **most chat turns don't need them**.
 
-# 你能通过 TASK_INTENT 让后端 pipeline 执行
+- **Clear develop_task signal (Jira key + verb / file path + verb):** emit `TASK_INTENT|...`
+  immediately. The downstream pipeline will do the heavy investigation — your job is to
+  route the request, not pre-research it.
+- Use `mcp.memory.search_nodes` only when there is genuine ambiguity to resolve.
+- **Avoid `mcp.filesystem.*` calls in chat unless absolutely necessary** — they can hang
+  on Windows paths with non-ASCII characters. The pipeline handles repo exploration.
+- Cap yourself at ~2 tool calls per turn for routing/answering questions.
 
-- 修代码 / 实现功能 / 修编译错误 → `jira_issue_develop`
-- 只规划不写码 → `jira_issue_plan`
-- 不明确,需澄清 → `process_question`
+# Reply style
 
-Pipeline 在沙箱里有 `codegen.generate_patch` / `sandbox.apply_patch` / `sandbox.run_command` / `diff_reviewer.review` / `knowledge.search` / `test_pipeline.run` / `jira.*` 等工具。
+1. **Structured first** — more than two points → use `1.` `2.` `3.` or `- `.
+2. **Bold key terms** — product names, commands, file names, key concepts. Don't bold whole sentences.
+3. **Short paragraphs** — 1–2 sentences each, blank line between paragraphs. Answer first, explain second.
+4. **Code blocks** — wrap commands / paths / configs / code in ``` ``` or `inline`.
+5. **Conversational but professional** — like talking to a teammate. No "您可以" / "Please be advised" / "I hope this helps".
+6. **No emoji** unless the user used one first.
+7. Match punctuation to the reply language (English commas/periods for English, 中文标点 for Chinese).
 
-**关键:你本人没有终端,但 pipeline 有。** 用户问 "能不能帮我 clone 仓库 / 改代码 / 跑测试" 时,**不要**说"我没权限",改说 "**会创建任务交给 pipeline 执行**",然后输出 TASK_INTENT。
+# You can answer directly (use the live "platform state" injected below — don't pretend it isn't there)
 
-# TASK_INTENT 输出格式
+- Registered repos, recently added, sync time
+- Task counts, pending approvals, currently running, recent activity
+- Tool readiness / integration connection state
+- Concept explanations, docs lookups, recap of code mentioned earlier in this chat
 
-要委托任务时,**单独一行**输出:
+# You can delegate to the backend pipeline via TASK_INTENT
+
+- Code changes / feature implementation / compile-error fixes → `jira_issue_develop`
+- Planning only, no code → `jira_issue_plan`
+- Ambiguous, needs clarification → `process_question`
+
+The pipeline runs in a sandbox with tools like `codegen.generate_patch` /
+`sandbox.apply_patch` / `sandbox.run_command` / `diff_reviewer.review` /
+`knowledge.search` / `test_pipeline.run` / `jira.*`.
+
+**Key:** you (the chat layer) have no terminal, but the pipeline does. When users ask
+"can you clone this repo / change code / run tests", **don't** say "I don't have
+permission" — say "**I'll create a task and route it to the pipeline**" and emit TASK_INTENT.
+
+# TASK_INTENT output format
+
+When delegating, output on its **own line**:
 
 ```
-TASK_INTENT|<scenario>|<一句话总结>
+TASK_INTENT|<scenario>|<one-line summary>
 ```
 
-之后可以再写 1-2 句**意图描述**,**不能**说成事实。区别:
+After the marker you may add 1–2 sentences describing your **intent**, but never assert it
+as done. Distinguishing future from past tense matters:
 
-- ✅ "我**会**去创建一个开发任务" / "我**正在**为你委托给 pipeline" / "**接下来**会让 pipeline 执行"
-- ❌ "我**已经**创建了任务" / "**已**提交 pipeline" / "任务**已经**开始执行"
-- ❌ "Jira 单 P69-XX 的开发**已经**启动"
+- ✅ "I'll create a develop task" / "Routing this to the pipeline now" / "The pipeline will take it from here"
+- ❌ "I've created the task" / "Task submitted" / "Pipeline execution started"
+- ❌ "Jira issue P69-XX development has started"
 
-为什么:你输出 marker 之后,系统才尝试 INSERT Task。可能因 DB 繁忙、参数无效等失败。**真正的成功/失败由系统状态条告诉用户**(前端会渲染绿/红块)。你提前断言"已创建"会让用户被骗。
+Why: the system tries to INSERT the Task row only **after** you emit the marker. DB
+contention, invalid params, etc. can fail. **The real success/failure is reported by the
+system status block** (frontend renders a green/red badge). Asserting "已创建 / created"
+ahead of that misleads the user.
 
-**用现在进行时 / 将来时,不要用完成时**。
+**Use present-progressive or future tense; never past tense.**
 
-纯问答时,**不要**输出 marker。
+For pure Q&A turns, **do not** emit the marker.
 """
 
 
@@ -604,6 +639,11 @@ async def chat_send(
                         yield _sse("tool_call", payload)
                     elif kind == "tool_result":
                         yield _sse("tool_result", payload)
+                    elif kind == "heartbeat":
+                        # Synthetic keepalive emitted while a slow MCP tool
+                        # is still running. Frontend uses it solely to keep
+                        # the inactivity watchdog alive — no UI surface.
+                        yield _sse("heartbeat", payload)
                     elif kind == "done":
                         break
                 used_provider = provider
@@ -627,6 +667,8 @@ async def chat_send(
         _ = used_model  # available for future "answered_by" SSE event
 
         intent_marker = _parse_task_intent(full_text)
+        if intent_marker is None:
+            intent_marker = _task_intent_from_rule_intent(intent, body.message)
         # Defensive guard: if classifier said continuation, ignore any
         # TASK_INTENT marker the model emitted anyway. Continuation NEVER
         # spawns a new heavy task — the user is acking a previous turn.
@@ -1186,9 +1228,29 @@ async def _stream_openai_compat_with_tools(
                 # though the model received the wire-safe mcp__ form.
                 display_name = _wire_name_to_tool_name(name)
                 yield ("tool_call", {"id": tc_id, "name": display_name, "arguments": args})
-                result_str = await asyncio.to_thread(
-                    _execute_chat_tool_blocking, name, args
+                # Wrap tool dispatch in a wait loop so we can emit periodic
+                # heartbeats. Slow MCP tools (e.g. filesystem.search_files on
+                # the Chinese-named project dir can hang up to 60s) would
+                # otherwise leave the SSE stream silent past the frontend's
+                # 30s inactivity watchdog.
+                tool_future = asyncio.ensure_future(
+                    asyncio.to_thread(_execute_chat_tool_blocking, name, args)
                 )
+                _heartbeat_started = time.monotonic()
+                while not tool_future.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(tool_future), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        elapsed = time.monotonic() - _heartbeat_started
+                        yield (
+                            "heartbeat",
+                            {
+                                "tool_call_id": tc_id,
+                                "name": display_name,
+                                "elapsed_seconds": round(elapsed, 1),
+                            },
+                        )
+                result_str = tool_future.result()
                 is_error = result_str.startswith("ERROR: ")
                 yield (
                     "tool_result",
@@ -1612,7 +1674,7 @@ async def _stream_openai(message: str, settings, model_name: str, system_prompt:
 def _parse_task_intent(text: str) -> tuple[str, str] | None:
     """Detect the marker line. Tolerates leading whitespace / surrounding text."""
     for raw_line in text.splitlines():
-        line = raw_line.strip()
+        line = _normalize_task_intent_line(raw_line)
         if not line.startswith("TASK_INTENT|"):
             continue
         parts = line.split("|", 2)
@@ -1623,6 +1685,28 @@ def _parse_task_intent(text: str) -> tuple[str, str] | None:
         if scenario:
             return scenario, summary
     return None
+
+
+def _normalize_task_intent_line(raw_line: str) -> str:
+    return raw_line.strip().strip("`").strip()
+
+
+def _task_intent_from_rule_intent(
+    intent: IntentResult,
+    message: str,
+) -> tuple[str, str] | None:
+    """Fallback route when the chat model fails to emit TASK_INTENT.
+
+    The rule classifier is deterministic and runs before the LLM. For clear
+    Jira develop requests, let that classifier own routing instead of asking
+    the model to copy an exact marker format.
+    """
+    if intent.intent != "develop_task" or intent.confidence not in {"high", "medium"}:
+        return None
+    issue_key = intent.jira_ids[0] if intent.jira_ids else ""
+    if issue_key:
+        return "jira_issue_develop", f"Develop Jira issue {issue_key}"
+    return "jira_issue_develop", _truncate(message, 160)
 
 
 _VALID_SCENARIOS = {"jira_issue_develop", "jira_issue_plan", "process_question"}
@@ -1637,7 +1721,7 @@ def _sse_strip_intent(text: str) -> str:
     """Strip the TASK_INTENT line from the visible answer (kept server-side only)."""
     out: list[str] = []
     for line in text.splitlines(keepends=True):
-        if line.strip().startswith("TASK_INTENT|"):
+        if _normalize_task_intent_line(line).startswith("TASK_INTENT|"):
             continue
         out.append(line)
     return "".join(out).strip()

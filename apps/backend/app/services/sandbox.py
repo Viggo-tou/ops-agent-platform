@@ -382,8 +382,18 @@ class ExecutionSandbox:
         commit: bool = True,
         commit_message: str = "Applied patch via sandbox",
         timeout_seconds: float = 30,
+        strict_only: bool = False,
     ) -> dict[str, object]:
-        """Apply a unified diff to the sandbox repo. Returns before/after SHAs."""
+        """Apply a unified diff to the sandbox repo. Returns before/after SHAs.
+
+        P0-4 (2026-05-11): when ``strict_only=True`` we only run
+        ``git apply`` (no recount, no 3way, no whitespace tolerance, no
+        python-patch, no ``patch -p1`` fuzz fallback). This matches what
+        SWE-bench's evaluator does, so a patch that passes here will
+        pass evaluator's strict apply too. Lenient mode (default) keeps
+        the historical cascade for production paths where the patch is
+        already known good and we just want it to land.
+        """
         if not self.exists():
             raise SandboxError(f"Sandbox does not exist: {self.sandbox_dir}")
 
@@ -398,12 +408,18 @@ class ExecutionSandbox:
 
         repair_result = repair_diff(patch, context_files=context_files)
         sanitized_patch = _sanitize_diff(repair_result.repaired_diff)
-        strategies: list[tuple[str, list[str]]] = [
-            ("git_apply", []),
-            ("git_apply_recount", ["--recount"]),
-            ("git_apply_3way", ["--3way"]),
-            ("git_apply_relaxed", ["--ignore-whitespace", "--whitespace=nowarn", "--recount"]),
-        ]
+        if strict_only:
+            # Mirror SWE-bench evaluator: plain `git apply` only.
+            strategies: list[tuple[str, list[str]]] = [
+                ("git_apply_strict", []),
+            ]
+        else:
+            strategies = [
+                ("git_apply", []),
+                ("git_apply_recount", ["--recount"]),
+                ("git_apply_3way", ["--3way"]),
+                ("git_apply_relaxed", ["--ignore-whitespace", "--whitespace=nowarn", "--recount"]),
+            ]
 
         apply_result: dict[str, object] | None = None
         for method, extra_args in strategies:
@@ -422,24 +438,25 @@ class ExecutionSandbox:
                 break
             apply_result = result
 
-        if apply_result is None or not apply_result["success"]:
-            result = self._try_python_patch(sanitized_patch)
-            result["method"] = "python_patch"
-            logger.info(
-                "sandbox patch strategy attempted",
-                extra={"task_id": self.task_id, "method": "python_patch", "success": result["success"]},
-            )
-            if result["success"]:
-                apply_result = result
+        if not strict_only:
+            if apply_result is None or not apply_result["success"]:
+                result = self._try_python_patch(sanitized_patch)
+                result["method"] = "python_patch"
+                logger.info(
+                    "sandbox patch strategy attempted",
+                    extra={"task_id": self.task_id, "method": "python_patch", "success": result["success"]},
+                )
+                if result["success"]:
+                    apply_result = result
 
-        if apply_result is None or not apply_result["success"]:
-            result = self._try_patch_command(sanitized_patch, timeout_seconds=timeout_seconds)
-            result["method"] = "patch_p1"
-            logger.info(
-                "sandbox patch strategy attempted",
-                extra={"task_id": self.task_id, "method": "patch_p1", "success": result["success"]},
-            )
-            apply_result = result
+            if apply_result is None or not apply_result["success"]:
+                result = self._try_patch_command(sanitized_patch, timeout_seconds=timeout_seconds)
+                result["method"] = "patch_p1"
+                logger.info(
+                    "sandbox patch strategy attempted",
+                    extra={"task_id": self.task_id, "method": "patch_p1", "success": result["success"]},
+                )
+                apply_result = result
 
         if not apply_result["success"]:
             raise SandboxError(f"All patch strategies failed. Last error: {str(apply_result['error'])[:500]}")
@@ -495,7 +512,8 @@ class ExecutionSandbox:
     ) -> dict[str, object]:
         """Try git apply with optional args and return a structured status."""
         patch_file = self.sandbox_dir / ".claude_patch.diff"
-        patch_file.write_text(diff, encoding="utf-8")
+        with patch_file.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(diff)
         try:
             result = subprocess.run(
                 ["git", "apply", "--stat", "--apply", *extra_args, patch_file.name],
@@ -675,7 +693,8 @@ class ExecutionSandbox:
     def _try_patch_command(self, diff: str, *, timeout_seconds: float) -> dict[str, object]:
         """Try POSIX patch as a final fallback for systems that provide it."""
         patch_file = self.sandbox_dir / ".claude_patch.diff"
-        patch_file.write_text(diff, encoding="utf-8")
+        with patch_file.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(diff)
         try:
             result = self.run(
                 "patch -p1 < .claude_patch.diff",

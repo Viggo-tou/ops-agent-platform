@@ -49,7 +49,7 @@ diff --git a/app/two.py b/app/two.py
         self.assertEqual(result.file_count, 2)
         self.assertIn("@@ -1,1 +1,1 @@", result.repaired_diff)
         self.assertIn("@@ -3,1 +3,1 @@", result.repaired_diff)
-        self.assertIn("\n\ndiff --git a/app/two.py b/app/two.py\n", result.repaired_diff)
+        self.assertIn("\ndiff --git a/app/two.py b/app/two.py\n", result.repaired_diff)
 
     def test_repair_trailing_text_stripped(self) -> None:
         diff = """diff --git a/app/example.py b/app/example.py
@@ -83,8 +83,35 @@ diff --git a/app/two.py b/app/two.py
 
         result = repair_diff(diff)
 
-        self.assertIn("\n\ndiff --git a/app/two.py b/app/two.py\n", result.repaired_diff)
-        self.assertIn("added blank separators", " ".join(result.repairs_applied))
+        self.assertIn("\ndiff --git a/app/two.py b/app/two.py\n", result.repaired_diff)
+        self.assertNotIn("added blank separators", " ".join(result.repairs_applied))
+
+    def test_repair_does_not_add_separator_before_post_header_blank(self) -> None:
+        diff = """diff --git a/app/one.py b/app/one.py
+--- a/app/one.py
++++ b/app/one.py
+@@ -1,1 +1,1 @@
+-old
++new
+diff --git a/app/two.py b/app/two.py
+
+--- a/app/two.py
++++ b/app/two.py
+@@ -1,1 +1,1 @@
+-before
++after
+"""
+
+        result = repair_diff(diff)
+
+        self.assertIn(
+            "+new\ndiff --git a/app/two.py b/app/two.py\n\n--- a/app/two.py",
+            result.repaired_diff,
+        )
+        self.assertNotIn(
+            "+new\n\ndiff --git a/app/two.py b/app/two.py\n\n--- a/app/two.py",
+            result.repaired_diff,
+        )
 
     def test_repair_with_context_files_fixes_offset(self) -> None:
         diff = """diff --git a/app/example.py b/app/example.py

@@ -200,6 +200,41 @@ def test_codegen_warning_combines_failure_patterns_and_quality_reservations(db: 
     assert "shared map picker helper" in directive
 
 
+def test_semantic_review_failure_memory_injects_codegen_checklist(db: Session) -> None:
+    MemoryService(db).record_semantic_review_findings(
+        task=_task(),  # type: ignore[arg-type]
+        review_payload={
+            "status": "failed",
+            "provider_name": "deepseek",
+            "completeness_pct": 70,
+            "high_severity_count": 1,
+            "findings": [
+                {
+                    "file": "CustomerSignup.kt",
+                    "line_start": 120,
+                    "line_end": 130,
+                    "severity": "high",
+                    "category": "state_sync",
+                    "description": "Typed address lookup moves the marker but does not sync address fields.",
+                    "evidence_quote": "+                    map.invalidate()",
+                    "suggested_fix": "Call reverseGeocodeAddress(point, marker, map) after moving the marker.",
+                }
+            ],
+        },
+        provenance_event_id="event-semantic",
+    )
+    db.commit()
+
+    orch = PrimaryOrchestrator(db=db)
+    directive, audit = orch._build_codegen_failure_warnings(task=_task(), plan=_plan())
+
+    assert "SEMANTIC REVIEW WARNING" in directive
+    assert "state_sync" in directive
+    assert "reverseGeocodeAddress" in directive
+    assert audit[0]["failure_class"] == "semantic_review_state_sync"
+    assert audit[0]["task_family"] == "android_map_location"
+
+
 def test_codegen_warning_keeps_quality_reservation_when_two_pattern_rows_exist(db: Session) -> None:
     _seed_acceptance_failure(db)
     MemoryService(db).write_failure_observation(

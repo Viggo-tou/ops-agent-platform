@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
@@ -419,3 +420,54 @@ def test_dispatcher_prefers_acceptance_over_must_touch(db: Session) -> None:
         f"Expected dispatcher to defer must_touch on acceptance failures. "
         f"Got: {failure_classes}"
     )
+
+
+def test_semantic_review_findings_write_failure_observation(db: Session) -> None:
+    task = SimpleNamespace(
+        id="task-semantic-memory",
+        request_text="Develop P69-19 map-based address picker with OSMDroid",
+        plan_json={
+            "objective": "Add map-based address picker",
+            "must_touch_files": ["CustomerSignup.kt"],
+        },
+    )
+    review_payload = {
+        "status": "failed",
+        "provider_name": "deepseek",
+        "completeness_pct": 70,
+        "high_severity_count": 1,
+        "findings": [
+            {
+                "file": "CustomerSignup.kt",
+                "line_start": 120,
+                "line_end": 130,
+                "severity": "high",
+                "category": "state_sync",
+                "description": "Typed address lookup moves the marker but does not sync address fields.",
+                "evidence_quote": "+                    map.invalidate()",
+                "suggested_fix": "Call reverseGeocodeAddress(point, marker, map) after moving the marker.",
+            },
+            {
+                "file": "CustomerSignup.kt",
+                "severity": "low",
+                "category": "style",
+                "description": "Button copy could be clearer.",
+            },
+        ],
+    }
+
+    recorded = MemoryService(db).record_semantic_review_findings(
+        task=task,  # type: ignore[arg-type]
+        review_payload=review_payload,
+        provenance_event_id="event-semantic",
+    )
+    db.commit()
+
+    assert recorded == 1
+    row = db.query(AgentMemory).filter(AgentMemory.scope == "review:semantic").one()
+    assert row.memory_kind == "failure_observation"
+    assert row.failure_class == "semantic_review_state_sync"
+    assert row.task_family == "android_map_location"
+    assert row.prompt_eligible == ["planner_warning", "codegen_warning"]
+    assert "reverseGeocodeAddress" in row.evidence_refs["finding"]["suggested_fix"]
+    assert "success_fact" not in row.memory_kind

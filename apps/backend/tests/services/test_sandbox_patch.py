@@ -13,6 +13,7 @@ BACKEND_ROOT = Path(__file__).resolve().parents[2]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
+from app.core.config import get_settings  # noqa: E402
 from app.services.sandbox import ExecutionSandbox, SandboxError  # noqa: E402
 
 
@@ -62,8 +63,12 @@ def _git(repo_dir: Path, *args: str) -> subprocess.CompletedProcess[str]:
 class ExecutionSandboxApplyPatchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.base_dir = _writable_mkdtemp()
+        self.settings = get_settings()
+        self._original_sandbox_external_root = self.settings.sandbox_external_root
+        self.settings.sandbox_external_root = None
 
     def tearDown(self) -> None:
+        self.settings.sandbox_external_root = self._original_sandbox_external_root
         shutil.rmtree(self.base_dir, ignore_errors=True)
 
     def _sandbox_with_repo(self, task_id: str = "task-1") -> ExecutionSandbox:
@@ -119,10 +124,43 @@ class ExecutionSandboxApplyPatchTests(unittest.TestCase):
         self.assertEqual(result["method"], "git_apply")
         self.assertIn("patched without newline", (sandbox.work_dir / "message.txt").read_text(encoding="utf-8"))
 
+    def test_apply_patch_writes_lf_patch_file_for_multifile_diff(self) -> None:
+        sandbox = self._sandbox_with_repo()
+        (sandbox.work_dir / "one.txt").write_text("old\n", encoding="utf-8")
+        (sandbox.work_dir / "two.txt").write_text("alpha\nkeep\nbeta\n", encoding="utf-8")
+        _git(sandbox.work_dir, "add", "one.txt", "two.txt")
+        _git(sandbox.work_dir, "commit", "-m", "Add multi-file fixtures")
+        patch_text = """diff --git a/one.txt b/one.txt
+--- a/one.txt
++++ b/one.txt
+@@ -1,1 +1,1 @@
+-old
++new
+diff --git a/two.txt b/two.txt
+
+--- a/two.txt
++++ b/two.txt
+@@ -1,3 +1,4 @@
+ alpha
+ keep
+ beta
++after
+"""
+
+        result = sandbox.apply_patch(patch_text, commit=False)
+
+        self.assertEqual(result["method"], "git_apply")
+        self.assertEqual((sandbox.work_dir / "one.txt").read_text(encoding="utf-8"), "new\n")
+        self.assertEqual(
+            (sandbox.work_dir / "two.txt").read_text(encoding="utf-8"),
+            "alpha\nkeep\nbeta\nafter\n",
+        )
+
     def test_apply_patch_fallback_to_relaxed(self) -> None:
         sandbox = self._sandbox_with_repo()
         results = [
             {"success": False, "method": "git_apply", "error": "strict failed", "stdout": ""},
+            {"success": False, "method": "git_apply", "error": "recount failed", "stdout": ""},
             {"success": False, "method": "git_apply", "error": "3way failed", "stdout": ""},
             {"success": True, "method": "git_apply", "error": "", "stdout": ""},
         ]
@@ -131,8 +169,11 @@ class ExecutionSandboxApplyPatchTests(unittest.TestCase):
             result = sandbox.apply_patch(self._patch_with_line("relaxed"), commit=False)
 
         self.assertEqual(result["method"], "git_apply_relaxed")
-        self.assertEqual(git_apply.call_count, 3)
-        self.assertEqual(git_apply.call_args_list[2].kwargs["extra_args"], ["--ignore-whitespace", "--whitespace=nowarn"])
+        self.assertEqual(git_apply.call_count, 4)
+        self.assertEqual(
+            git_apply.call_args_list[3].kwargs["extra_args"],
+            ["--ignore-whitespace", "--whitespace=nowarn", "--recount"],
+        )
 
     def test_apply_patch_bad_diff(self) -> None:
         sandbox = self._sandbox_with_repo()

@@ -381,6 +381,7 @@ def _map_helper_block(*, post_code: str) -> str:
                     map.controller.animateTo(point)
                     map.controller.setZoom(16.0)
                     map.invalidate()
+                    reverseGeocodeAddress(point, marker, map)
                 }}
             }} catch (e: Exception) {{
                 Log.e("MapPicker", "Forward geocoding failed", e)

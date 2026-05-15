@@ -10,6 +10,7 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from app.api import chat  # noqa: E402
 from app.core.enums import ActorRole  # noqa: E402
+from app.services.chat_intent import IntentResult  # noqa: E402
 
 
 def test_persist_task_intent_forces_scenario_and_preserves_summary_context(monkeypatch):
@@ -48,3 +49,28 @@ def test_persist_task_intent_forces_scenario_and_preserves_summary_context(monke
     assert "P69-19" in payload.request
     assert "User follow-up: develop" in payload.request
     assert captured["closed"] is True
+
+
+def test_parse_task_intent_accepts_backticked_marker():
+    marker = "`TASK_INTENT|jira_issue_develop|Develop Jira issue P69-19`"
+
+    assert chat._parse_task_intent(marker) == (
+        "jira_issue_develop",
+        "Develop Jira issue P69-19",
+    )
+    assert chat._sse_strip_intent(f"Routing now.\n{marker}\n") == "Routing now."
+
+
+def test_rule_intent_fallback_routes_clear_jira_develop_request():
+    intent = IntentResult(
+        intent="develop_task",
+        confidence="high",
+        signals=["jira_id=P69-19", "develop_verb"],
+        jira_ids=["P69-19"],
+        file_paths=[],
+    )
+
+    assert chat._task_intent_from_rule_intent(intent, "develop P69-19") == (
+        "jira_issue_develop",
+        "Develop Jira issue P69-19",
+    )

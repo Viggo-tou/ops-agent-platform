@@ -198,6 +198,7 @@ def test_recipe_adds_osmdroid_map_picker_and_wires_signup_payload():
     assert "Geocoder(map.context, Locale.getDefault())" in result.content
     assert "getFromLocationName(query, 1)" in result.content
     assert "withContext(Dispatchers.IO)" in result.content
+    assert "map.invalidate()\n                    reverseGeocodeAddress(point, marker, map)" in result.content
     assert "try {" in result.content
     assert "catch (e: Exception)" in result.content
     assert 'Log.e("MapPicker", "Reverse geocoding failed", e)' in result.content
@@ -244,6 +245,7 @@ def test_recipe_adds_coordinates_to_existing_kyc_payload_with_valid_commas():
     assert result.content.count('label = { Text("House number") }') == 1
     assert result.content.count('label = { Text("Street") }') == 1
     assert "Find typed address on map" in result.content
+    assert "map.invalidate()\n                    reverseGeocodeAddress(point, marker, map)" in result.content
 
 
 def test_recipe_preserves_existing_map_and_only_repairs_geocoder_locale():

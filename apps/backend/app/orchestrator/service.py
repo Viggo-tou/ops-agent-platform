@@ -21,6 +21,7 @@ from app.agents.service import (
     ActionAgent,
     PrimaryAgentPlanner,
     ReviewerAgent,
+    build_domain_fast_path_plan,
     _source_bind_expected_new_files,
 )
 from app.agents.translation import SemanticTranslator
@@ -1814,18 +1815,57 @@ class PrimaryOrchestrator:
 
         with get_tracer().start_as_current_span("task.plan") as span:
             _set_task_span_attributes(span, task=task, actor_name=actor_name)
-            planning_result = self.primary_agent.generate_plan(
+            fast_path_result = build_domain_fast_path_plan(
                 task_id=task.id,
-                request_text=planning_request_text,
+                request_text=task.request_text or planning_request_text,
                 scenario=task.scenario,
-                actor_name=actor_name,
+                matched_playbook=_matched_playbook,
                 semantic_translation=semantic_translation,
-                planning_knowledge=(
-                    None if context_packet_rendered else planning_knowledge_context
-                ),
-                issue_context=None if context_packet_rendered else issue_context,
+                issue_context=issue_context if isinstance(issue_context, dict) else None,
                 candidate_files=candidate_files,
             )
+            if fast_path_result is not None:
+                span.set_attribute("planner.fast_path", True)
+                planning_result = fast_path_result
+                record_event(
+                    self.db,
+                    task_id=task.id,
+                    event_type=EventType.TOOL_SUCCEEDED,
+                    source=EventSource.ORCHESTRATOR,
+                    stage=WorkflowStage.PLANNING,
+                    role=RoleName.PLANNER,
+                    tool_name="planner.fast_path",
+                    message=(
+                        "Planner LLM call skipped because a matched domain "
+                        "playbook can produce a deterministic plan."
+                    ),
+                    payload={
+                        "domain_id": (_matched_playbook or {}).get("id"),
+                        "provider_name": planning_result.provider_name,
+                        "model_name": planning_result.model_name,
+                        "candidate_files": len(candidate_files),
+                        "must_touch_files": list(
+                            planning_result.plan.must_touch_files or []
+                        ),
+                        "acceptance_tests": len(
+                            planning_result.plan.acceptance_tests or []
+                        ),
+                    },
+                )
+            else:
+                span.set_attribute("planner.fast_path", False)
+                planning_result = self.primary_agent.generate_plan(
+                    task_id=task.id,
+                    request_text=planning_request_text,
+                    scenario=task.scenario,
+                    actor_name=actor_name,
+                    semantic_translation=semantic_translation,
+                    planning_knowledge=(
+                        None if context_packet_rendered else planning_knowledge_context
+                    ),
+                    issue_context=None if context_packet_rendered else issue_context,
+                    candidate_files=candidate_files,
+                )
         plan_document = planning_result.plan
         plan_document, _demoted_new_files = _source_bind_expected_new_files(
             plan_document,
@@ -11182,6 +11222,7 @@ class PrimaryOrchestrator:
         "gate:must_touch",
         "gate:contract_coverage",
         "review:reservations",
+        "review:semantic",
     )
 
     def _build_codegen_failure_warnings(
@@ -11308,6 +11349,13 @@ class PrimaryOrchestrator:
                     self._render_codegen_reservation_memory_warning(m, evidence)
                 )
                 concrete = []
+            rendered_special_memory = m.scope == "review:reservations"
+            if m.scope == "review:semantic":
+                directive_lines.extend(
+                    self._render_codegen_semantic_memory_warning(m, evidence)
+                )
+                concrete = []
+                rendered_special_memory = True
             if concrete:
                 directive_lines.append("Concretely missing from the previous diff:")
                 for c in concrete[:6]:
@@ -11317,7 +11365,7 @@ class PrimaryOrchestrator:
                     "(not just imports / comments). Match the structural "
                     "patterns above as literal code in the added hunks."
                 )
-            else:
+            elif not rendered_special_memory:
                 directive_lines.append("Lesson: " + (m.resolution or "")[:300])
             for extra in top[1:]:
                 if extra.scope == "review:reservations":
@@ -11328,6 +11376,18 @@ class PrimaryOrchestrator:
                     )
                     directive_lines.extend(
                         self._render_codegen_reservation_memory_warning(
+                            extra,
+                            extra_evidence,
+                        )
+                    )
+                elif extra.scope == "review:semantic":
+                    extra_evidence = (
+                        extra.evidence_refs
+                        if isinstance(extra.evidence_refs, dict)
+                        else {}
+                    )
+                    directive_lines.extend(
+                        self._render_codegen_semantic_memory_warning(
                             extra,
                             extra_evidence,
                         )
@@ -11376,6 +11436,46 @@ class PrimaryOrchestrator:
             "Use these as a same-family quality checklist. Do not add "
             "unrelated scope; satisfy the current spec with the least "
             "duplicated, most consistent implementation."
+        )
+        return lines
+
+    def _render_codegen_semantic_memory_warning(
+        self,
+        memory: Any,
+        evidence: dict[str, Any],
+    ) -> list[str]:
+        finding = evidence.get("finding") if isinstance(evidence, dict) else {}
+        if not isinstance(finding, dict):
+            finding = {}
+        semantic = evidence.get("semantic_review") if isinstance(evidence, dict) else {}
+        if not isinstance(semantic, dict):
+            semantic = {}
+        severity = str(finding.get("severity") or "high").strip()
+        category = str(finding.get("category") or "general").strip()
+        file_path = str(finding.get("file") or "").strip()
+        description = str(finding.get("description") or memory.observation or "").strip()
+        suggested = str(finding.get("suggested_fix") or "").strip()
+        completeness = semantic.get("completeness_pct")
+        header = (
+            f"SEMANTIC REVIEW WARNING: A previous task in this family "
+            f"({memory.task_family}) passed compile/structural gates but "
+            "semantic_review found an implementation-quality gap"
+        )
+        if completeness is not None:
+            header += f" (completeness={completeness}%)."
+        else:
+            header += "."
+        lines = [header]
+        target = f"{file_path}: " if file_path else ""
+        lines.append(
+            f"  - [{severity}/{category}] {target}{description[:500]}"
+        )
+        if suggested:
+            lines.append(f"    Reviewer suggested: {suggested[:500]}")
+        lines.append(
+            "Before returning a diff, explicitly check that this same "
+            "quality gap is not repeated. Treat this as a same-family "
+            "quality checklist, not as authorization to change unrelated scope."
         )
         return lines
 

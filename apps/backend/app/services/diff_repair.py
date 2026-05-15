@@ -40,14 +40,9 @@ def repair_diff(raw_diff: str, context_files: dict[str, str] | None = None) -> D
         repaired_sections.append(section_text.rstrip("\n"))
         repairs.extend(section_repairs)
 
-    repaired_diff = "\n\n".join(section for section in repaired_sections if section)
+    repaired_diff = "\n".join(section for section in repaired_sections if section)
     if repaired_diff:
         repaired_diff += "\n"
-
-    if len(repaired_sections) > 1:
-        raw_joined = "\n".join(line for section in sections for line in section.lines)
-        if "\n\ndiff --git " not in raw_joined and "\ndiff --git " in raw_joined:
-            repairs.append("added blank separators between file diffs")
 
     return DiffRepairResult(
         repaired_diff=repaired_diff,

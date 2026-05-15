@@ -89,6 +89,216 @@ def _trim_text(value: str, *, limit: int) -> str:
     return f"{normalized[: max(limit - 3, 1)]}..."
 
 
+_ANDROID_MAP_PLAN_RE = re.compile(
+    r"android_map_location|org\.osmdroid|osmdroid|mapview|map-based|map based|address picker|location picker|map-based address",
+    re.IGNORECASE,
+)
+
+
+def _plan_mentions_android_map(payload: dict[str, Any]) -> bool:
+    fields = (
+        "objective",
+        "request_summary",
+        "change_summary",
+        "change_explanation",
+    )
+    text = "\n".join(str(payload.get(field) or "") for field in fields)
+    text += "\n" + "\n".join(str(v) for v in payload.get("assumptions") or [])
+    return bool(_ANDROID_MAP_PLAN_RE.search(text))
+
+
+def _normalize_library_acceptance_tests(
+    acceptance: list[dict[str, Any]],
+    *,
+    plan_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not acceptance or not _plan_mentions_android_map(plan_payload):
+        return acceptance
+    normalized: list[dict[str, Any]] = []
+    replacement = "MapEventsOverlay|MapEventsReceiver|singleTapConfirmedHelper"
+    for entry in acceptance:
+        item = dict(entry)
+        pattern = str(item.get("pattern") or "")
+        if "setOnMapClickListener" in pattern:
+            item["pattern"] = re.sub(
+                r"\bsetOnMapClickListener\b",
+                replacement,
+                pattern,
+            )
+            rationale = str(item.get("rationale") or "").strip()
+            note = (
+                "OSMDroid MapView does not expose setOnMapClickListener; "
+                "tap selection must use MapEventsOverlay/MapEventsReceiver."
+            )
+            item["rationale"] = _trim_text(
+                f"{rationale} {note}".strip(),
+                limit=240,
+            )
+        normalized.append(item)
+    return normalized
+
+
+def _demote_unsourced_android_map_new_files(
+    sanitized: dict[str, Any],
+) -> None:
+    """Avoid broad helper-component creation for existing map integrations.
+
+    Android map/location work usually has to land in existing KYC/signup
+    forms. If the planner already selected multiple existing targets and the
+    user/Jira-facing summary did not explicitly name a new file, treating a
+    helper component as required creates an extra codegen batch and a
+    cross-file consistency problem. Keep it as likely_touch context instead.
+    """
+    if sanitized.get("scenario") not in {"jira_issue_develop", "bug_fix"}:
+        return
+    if not _plan_mentions_android_map(sanitized):
+        return
+    expected_new = list(sanitized.get("expected_new_files") or [])
+    must_touch = list(sanitized.get("must_touch_files") or [])
+    if not expected_new or len(must_touch) < 2:
+        return
+    grounding_text = "\n".join(
+        str(sanitized.get(field) or "")
+        for field in ("objective", "request_summary")
+    ).lower()
+    kept: list[str] = []
+    demoted: list[str] = []
+    for path in expected_new:
+        leaf = path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if leaf and leaf in grounding_text:
+            kept.append(path)
+        else:
+            demoted.append(path)
+    if not demoted:
+        return
+    likely = list(sanitized.get("likely_touch_files") or [])
+    for path in demoted:
+        if path not in likely:
+            likely.append(path)
+    sanitized["expected_new_files"] = kept
+    sanitized["likely_touch_files"] = _trim_string_list(likely, limit=12)
+
+
+_CODE_CHANGE_SCENARIOS = frozenset({"jira_issue_develop", "bug_fix"})
+
+
+def _collect_external_text(value: Any) -> list[str]:
+    """Collect user/Jira-provided text for provenance checks.
+
+    Do not feed planner-authored fields into this helper. It is specifically
+    for source text that existed before the model wrote the plan.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for child in value.values():
+            parts.extend(_collect_external_text(child))
+        return parts
+    if isinstance(value, (list, tuple)):
+        parts: list[str] = []
+        for child in value:
+            parts.extend(_collect_external_text(child))
+        return parts
+    return []
+
+
+def _expected_new_file_is_source_bound(path: str, source_text: str) -> bool:
+    """Return True when a planned new path is explicitly grounded.
+
+    Existing-feature tasks often tempt the planner to invent a helper
+    component and then make downstream coverage require it. For mixed
+    existing-file + new-file plans, accept a new file only when the original
+    user/Jira text names the path or basename. Migration files are the one
+    common generated-name exception: the exact timestamped filename is often
+    impossible for the requester to know, but the request must still mention
+    migrations.
+    """
+    norm = str(path or "").strip().replace("\\", "/").strip("/")
+    if not norm:
+        return False
+    text = (source_text or "").casefold()
+    if not text:
+        return False
+    path_lower = norm.casefold()
+    leaf = path_lower.rsplit("/", 1)[-1]
+    if path_lower in text or leaf in text:
+        return True
+    if "/migrations/" in f"/{path_lower}" and "migration" in text:
+        return True
+    return False
+
+
+def _source_bind_expected_new_files(
+    plan_payload: GeneratedPlanPayload,
+    *,
+    request_text: str,
+    issue_context: dict[str, Any] | None = None,
+) -> tuple[GeneratedPlanPayload, list[str]]:
+    """Demote planner-invented new files on existing-code tasks.
+
+    This is the general version of the P69-19 lesson: a planner may not
+    create a new artifact requirement from its own prose. If the task already
+    has existing must-touch files, any expected new file must be named by the
+    requester/Jira source text, otherwise it becomes non-binding
+    likely-touch context.
+    """
+    if plan_payload.scenario not in _CODE_CHANGE_SCENARIOS:
+        return plan_payload, []
+
+    expected_new = list(plan_payload.expected_new_files or [])
+    must_touch = list(plan_payload.must_touch_files or [])
+    if not expected_new or not must_touch:
+        return plan_payload, []
+
+    external_text = "\n".join(
+        [request_text or "", *_collect_external_text(issue_context or {})]
+    )
+    kept: list[str] = []
+    demoted: list[str] = []
+    for path in expected_new:
+        if _expected_new_file_is_source_bound(path, external_text):
+            kept.append(path)
+        else:
+            demoted.append(path)
+
+    if not demoted:
+        return plan_payload, []
+
+    demoted_norm = {p.replace("\\", "/").strip("/") for p in demoted}
+    demoted_stems = {
+        p.rsplit("/", 1)[-1].split(".", 1)[0].casefold()
+        for p in demoted_norm
+        if p.rsplit("/", 1)[-1].split(".", 1)[0]
+    }
+    kept_acceptance = []
+    for test in list(plan_payload.acceptance_tests or []):
+        test_file = str(getattr(test, "file", "") or "").replace("\\", "/").strip("/")
+        pattern = str(getattr(test, "pattern", "") or "").casefold()
+        if test_file in demoted_norm:
+            continue
+        if any(stem and stem in pattern for stem in demoted_stems):
+            continue
+        kept_acceptance.append(test)
+
+    likely = list(plan_payload.likely_touch_files or [])
+    for path in demoted:
+        if path not in likely:
+            likely.append(path)
+
+    updated = plan_payload.model_copy(
+        update={
+            "expected_new_files": kept,
+            "likely_touch_files": _trim_string_list(likely, limit=12),
+            "acceptance_tests": kept_acceptance,
+        }
+    )
+    return updated, demoted
+
+
 def _looks_like_test_path(path: str) -> bool:
     """Return True if ``path`` is a test file by the usual conventions.
 
@@ -831,6 +1041,114 @@ def build_fallback_plan_payload(
     )
 
 
+def build_domain_fast_path_plan(
+    *,
+    task_id: str,
+    request_text: str,
+    scenario: str,
+    matched_playbook: dict[str, Any] | None,
+    semantic_translation: GeneratedSemanticTranslation | None = None,
+    issue_context: dict[str, Any] | None = None,
+    candidate_files: list[dict[str, Any]] | None = None,
+) -> PlanGenerationResult | None:
+    """Build a deterministic plan for domains already covered by a playbook.
+
+    The fast path is intentionally narrow: it removes slow/fragile planner
+    model calls only when the domain playbook already defines the contract and
+    the normal preplan discovery has supplied candidate files. The ordinary
+    orchestrator gates still run after this plan is materialized.
+    """
+    domain_id = str((matched_playbook or {}).get("id") or "").strip()
+    if scenario != "jira_issue_develop" or domain_id != "android_map_location":
+        return None
+
+    issue_text_parts = [request_text or ""]
+    if isinstance(issue_context, dict):
+        for key in ("summary", "description", "acceptance_criteria"):
+            value = str(issue_context.get(key) or "").strip()
+            if value:
+                issue_text_parts.append(value)
+    issue_text = "\n".join(part for part in issue_text_parts if part).strip()
+
+    try:
+        from app.services.domain_classifier import (
+            synthesize_acceptance_tests_from_playbook,
+            synthesize_must_touch_files_from_candidates,
+        )
+
+        acceptance_tests = synthesize_acceptance_tests_from_playbook(
+            playbook=matched_playbook,
+            acceptance_tests=[],
+        )
+        must_touch_files = synthesize_must_touch_files_from_candidates(
+            playbook=matched_playbook,
+            candidate_files=candidate_files or [],
+            issue_text=issue_text,
+            existing_must_touch=[],
+            expected_new_files=[],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("domain fast-path synthesis failed: %s", exc)
+        acceptance_tests = []
+        must_touch_files = []
+
+    base_payload = build_fallback_plan_payload(
+        request_text,
+        scenario=scenario,
+        semantic_translation=semantic_translation,
+        planning_knowledge=None,
+        issue_context=issue_context,
+    )
+    payload_data = base_payload.model_dump(mode="python")
+    payload_data.update(
+        {
+            "objective": (
+                "Implement the Android map-location address picker in the "
+                "existing signup and KYC address flows."
+            ),
+            "change_summary": (
+                "Add OSMDroid map address selection to existing Android forms."
+            ),
+            "change_explanation": (
+                "Use OSMDroid MapView and MapEventsOverlay for tap selection; "
+                "run Geocoder calls on Dispatchers.IO with Locale.getDefault(); "
+                "sync selected coordinates and address fields into existing "
+                "form state and persistence payloads; preserve existing "
+                "Firebase loops and payload fields; avoid duplicate manual "
+                "address inputs and avoid new helper files unless the source "
+                "explicitly names them."
+            ),
+            "assumptions": [
+                "The existing signup and KYC address screens are the edit targets.",
+                "The project already provides OSMDroid dependencies.",
+                "The generated patch should modify existing flows instead of creating a detached component.",
+            ],
+            "missing_information": [],
+            "must_touch_files": must_touch_files,
+            "expected_new_files": [],
+            "acceptance_tests": acceptance_tests,
+        }
+    )
+    payload = GeneratedPlanPayload.model_validate(payload_data)
+    provider = {
+        "name": "harness:android_map_location_plan",
+        "model": "deterministic-v1",
+        "domain_playbook_id": domain_id,
+    }
+    plan = _materialize_plan(
+        payload=payload,
+        task_id=task_id,
+        provider=provider,
+    )
+    return PlanGenerationResult(
+        plan=plan,
+        provider_name="harness:android_map_location_plan",
+        model_name="deterministic-v1",
+        used_fallback=False,
+        fallback_reason=None,
+    )
+
+
 class PlanTargetsDroppedToEmpty(Exception):
     """Phase 1.3 (2026-05-11): the planner emitted must_touch_files but
     every one of them was filtered out by KB validation, and there are
@@ -880,6 +1198,8 @@ class PrimaryAgentPlanner:
         "gate:compile_repair",
         "provider:liveness",
         "provider:codegen",
+        "review:semantic",
+        "review:reservations",
     )
 
     _TRUST_WEIGHT = {
@@ -1424,7 +1744,8 @@ class PrimaryAgentPlanner:
             kept, dropped = _validate_must_touch_against_kb(must_touch, self.db)
             if dropped:
                 logger.warning(
-                    "plan_validate dropped (not in KB): paths=%s kept=%s",
+                    "must_touch_files entries dropped during plan_validate "
+                    "(not in KB): paths=%s kept=%s",
                     dropped, kept,
                 )
             if kept != must_touch:
@@ -2079,6 +2400,7 @@ class PrimaryAgentPlanner:
                 p for p in sanitized.get("must_touch_files", [])
                 if not _looks_like_test_path(p)
             ]
+            _demote_unsourced_android_map_new_files(sanitized)
 
         if sanitized["scenario"] == "process_question":
             sanitized["missing_information"] = []
@@ -2221,6 +2543,10 @@ class PrimaryAgentPlanner:
                 acceptance.append(entry)
                 if len(acceptance) >= 10:
                     break
+        acceptance = _normalize_library_acceptance_tests(
+            acceptance,
+            plan_payload=sanitized,
+        )
         sanitized["acceptance_tests"] = acceptance
 
         raw_contract = sanitized.get("final_output_contract")
@@ -2311,6 +2637,8 @@ class PrimaryAgentPlanner:
             "(h) test_must_reference_existing_symbol — kind, optional scope (default tests/). Catches \"new test only validates a freshly-invented symbol\" patterns. Emit it whenever the bug class makes self-justifying test files plausible. "
             "DO NOT emit tests like \"all tests pass\" or \"behavior is correct\" — those are not structural. Tests must be checkable against diff text alone. "
             "DO NOT emit acceptance_tests for process_question, slack_message, jira_issue_plan, jira_issue_create, jira_issue_writeback, internal_api_request, internal_db_query — leave the list empty for those scenarios."
+            "Library contract discipline: when repository context or a domain playbook says OSMDroid/org.osmdroid is the map library, do NOT emit Google Maps-only APIs such as setOnMapClickListener in acceptance_tests, plans, or expected outputs. Use OSMDroid patterns instead: MapEventsOverlay, MapEventsReceiver, and singleTapConfirmedHelper. "
+            "Scope discipline for existing-feature integration: Do not propose a new reusable component file unless the Jira issue explicitly names that new file or repository evidence shows no existing target can host the change. Prefer minimal edits to evidence-backed existing files over broad multi-file rewrites. "
         )
 
 

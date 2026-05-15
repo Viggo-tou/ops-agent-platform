@@ -191,19 +191,30 @@ class MemoryService:
         review_payload: dict,
         provenance_event_id: str | None = None,
     ) -> int:
-        """R3a: persist each grounded high/medium finding as its own
-        memory entry so future tasks with similar code paths see the
-        kind of bugs the reviewer caught last time.
+        """Persist grounded high/medium semantic-review findings.
+
+        Semantic review findings are failure observations, not success
+        facts. Store them in the same Learning Loop pool as compile,
+        acceptance, and must-touch failures so later planner/codegen
+        prompts can retrieve them for the same task family.
 
         Returns the number of memory entries created. Drops low-severity
-        findings (advisory noise) and dedup-collapses near-identical
-        observations against existing scope memories.
+        findings so advisory noise does not dominate future prompts.
         """
         if not bool(getattr(self.settings, "memory_enabled", True)):
             return 0
+        from app.services.failure_classifier import detect_task_family
+
         findings = review_payload.get("findings") or []
         if not findings:
             return 0
+        plan_json = task.plan_json if isinstance(getattr(task, "plan_json", None), dict) else {}
+        task_family = detect_task_family(
+            request_text=getattr(task, "request_text", "") or "",
+            plan_json=plan_json,
+        )
+        completeness = int(review_payload.get("completeness_pct") or 0)
+        high_count = int(review_payload.get("high_severity_count") or 0)
         recorded = 0
         for f in findings:
             severity = (f.get("severity") or "").lower()
@@ -215,22 +226,55 @@ class MemoryService:
             category = (f.get("category") or "general").strip()
             if not description:
                 continue
+            line_start = f.get("line_start", 0)
+            line_end = f.get("line_end", 0)
             observation = (
                 f"semantic_review {severity}/{category} in {file}:"
-                f"{f.get('line_start', 0)}-{f.get('line_end', 0)}: "
+                f"{line_start}-{line_end}: "
                 f"{description}"
             )
-            resolution = suggested or None
-            mem = self.maybe_record(
+            lesson = (
+                "A previous same-family patch passed earlier deterministic "
+                "gates but semantic_review found an implementation gap. "
+                f"Finding: {description}. "
+                + (f"Reviewer suggested: {suggested}. " if suggested else "")
+                + "Future planner/codegen should treat this as a quality "
+                "checklist item and implement the behavior before approval."
+            )
+            failure_class = f"semantic_review_{_slug(category)}"[:64]
+            mem = self.write_failure_observation(
+                failure_class=failure_class or "semantic_review_quality_gap",
+                scope="review:semantic",
                 observation_text=observation,
-                resolution_text=resolution,
-                scope=f"gate:semantic_review:{_slug(category)}",
-                kind=GATE_MEMORY_KIND,
+                lesson=lesson,
+                task_family=task_family,
                 provenance_event_id=provenance_event_id,
                 provenance_task_id=task.id,
                 # Skip judge for high-severity — they're always worth
                 # remembering; medium goes through the normal judge.
-                skip_judge=(severity == "high"),
+                trust_level="auto_classified",
+                prompt_eligible=["planner_warning", "codegen_warning"],
+                evidence_refs={
+                    "task_id": task.id,
+                    "task_family": task_family,
+                    "semantic_review": {
+                        "completeness_pct": completeness,
+                        "high_severity_count": high_count,
+                        "provider_name": review_payload.get("provider_name"),
+                        "status": review_payload.get("status"),
+                    },
+                    "finding": {
+                        "file": file,
+                        "line_start": line_start,
+                        "line_end": line_end,
+                        "severity": severity,
+                        "category": category,
+                        "description": description,
+                        "evidence_quote": (f.get("evidence_quote") or "")[:1000],
+                        "suggested_fix": suggested,
+                    },
+                },
+                confidence=0.9 if severity == "high" else 0.75,
             )
             if mem is not None:
                 recorded += 1
