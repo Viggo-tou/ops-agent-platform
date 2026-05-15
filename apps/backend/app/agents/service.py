@@ -1477,6 +1477,7 @@ class PrimaryAgentPlanner:
         semantic_translation: GeneratedSemanticTranslation | None = None,
         planning_knowledge: dict[str, Any] | None = None,
         issue_context: dict[str, Any] | None = None,
+        fallback_issue_context: dict[str, Any] | None = None,
         candidate_files: list[dict] | None = None,
     ) -> PlanGenerationResult:
         """Generate a plan using the provider chain. On failure, cascade to the next provider.
@@ -1529,7 +1530,7 @@ class PrimaryAgentPlanner:
             scenario=scenario,
             semantic_translation=semantic_translation,
             planning_knowledge=planning_knowledge,
-            issue_context=issue_context,
+            issue_context=fallback_issue_context or issue_context,
             candidate_files=candidate_files,
         )
 

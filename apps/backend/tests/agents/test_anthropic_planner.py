@@ -149,6 +149,52 @@ class AnthropicPlannerTests(unittest.TestCase):
         self.assertTrue(result.used_fallback)
         self.assertIn("timed out", result.fallback_reason or "")
 
+    def test_generate_plan_timeout_fallback_keeps_issue_context(self) -> None:
+        settings = _settings("auto")
+        settings.planner_provider_timeout_seconds = 0.05
+
+        def slow_post(*_args, **_kwargs):
+            time.sleep(0.2)
+            raise AssertionError("slow provider should be timed out first")
+
+        with patch("app.agents.service.httpx.post", side_effect=slow_post):
+            result = PrimaryAgentPlanner(settings=settings).generate_plan(
+                task_id="task-1",
+                request_text="<planner_context>develop P69-21</planner_context>",
+                scenario="jira_issue_develop",
+                actor_name="tester",
+                issue_context=None,
+                fallback_issue_context={
+                    "summary": "OTP Verification Fix",
+                    "description": (
+                        "The current system only allowed a phone number to be "
+                        "used once."
+                    ),
+                },
+                candidate_files=[
+                    {
+                        "path": (
+                            "app/src/main/java/com/example/handyman/"
+                            "customer_pages/CustomerKYCPhoneNumber.kt"
+                        ),
+                        "score": 40.0,
+                    }
+                ],
+            )
+
+        self.assertEqual(result.provider_name, "mock")
+        self.assertEqual(result.plan.change_summary, "OTP Verification Fix")
+        self.assertIn("phone number", result.plan.change_explanation)
+        self.assertEqual(
+            result.plan.must_touch_files,
+            [
+                (
+                    "app/src/main/java/com/example/handyman/customer_pages/"
+                    "CustomerKYCPhoneNumber.kt"
+                )
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

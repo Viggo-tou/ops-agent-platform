@@ -2191,6 +2191,9 @@ class PrimaryOrchestrator:
                         None if context_packet_rendered else planning_knowledge_context
                     ),
                     issue_context=None if context_packet_rendered else issue_context,
+                    fallback_issue_context=(
+                        issue_context if context_packet_rendered else None
+                    ),
                     candidate_files=candidate_files,
                 )
         plan_document = planning_result.plan
