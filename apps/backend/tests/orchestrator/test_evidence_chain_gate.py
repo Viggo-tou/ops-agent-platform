@@ -473,6 +473,16 @@ def test_verified_phone_otp_contract_filters_contradictory_reservations() -> Non
         "auto_fixable": False,
         "blocking": True,
     }
+    speculative_security_item = {
+        "text": (
+            "Error handling is removed: the old code navigated to OTP even on "
+            "DB write failure. If the DB write had side effects, removing it "
+            "silently changes the security surface."
+        ),
+        "severity": "security",
+        "auto_fixable": False,
+        "blocking": True,
+    }
     missing_test_item = {
         "text": "No tests were added for the OTP flow.",
         "severity": "missing_test",
@@ -491,6 +501,7 @@ def test_verified_phone_otp_contract_filters_contradictory_reservations() -> Non
             bug_item,
             policy_item,
             speculative_policy_item,
+            speculative_security_item,
             missing_test_item,
             style_item,
         ],
@@ -502,6 +513,7 @@ def test_verified_phone_otp_contract_filters_contradictory_reservations() -> Non
         bug_item["text"],
         policy_item["text"],
         speculative_policy_item["text"],
+        speculative_security_item["text"],
     ]
     assert {item["suppressed_reason"] for item in suppressed} == {
         "contradicts_verified_phone_otp_contract"

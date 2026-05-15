@@ -459,6 +459,13 @@ def _phone_otp_reservation_contradicts_verified_contract(
         "phoneauthoptions" in text or "resend token" in text or "investigation" in text
     ):
         return True
+    if "db write" in text and (
+        "write failure" in text
+        or "side effect" in text
+        or "security surface" in text
+        or "error handling is removed" in text
+    ):
+        return True
     return any(
         marker in text
         for marker in (
