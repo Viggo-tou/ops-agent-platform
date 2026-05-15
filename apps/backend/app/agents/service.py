@@ -276,6 +276,58 @@ def _collect_external_text(value: Any) -> list[str]:
     return []
 
 
+def _file_path_is_explicitly_named(path: str, source_text: str) -> bool:
+    norm = str(path or "").strip().replace("\\", "/").strip("/")
+    if not norm:
+        return False
+    text = (source_text or "").casefold()
+    if not text:
+        return False
+    path_lower = norm.casefold()
+    leaf = path_lower.rsplit("/", 1)[-1]
+    return path_lower in text or leaf in text
+
+
+def _expected_new_file_is_artifact_bound(path: str, source_text: str) -> bool:
+    norm = str(path or "").strip().replace("\\", "/").strip("/")
+    leaf = norm.casefold().rsplit("/", 1)[-1]
+    text = (source_text or "").casefold()
+    if not leaf or not text:
+        return False
+    if leaf == "database.rules.json":
+        return "firebase" in text and "database" in text and "rule" in text
+    if leaf == "firestore.rules":
+        return "firestore" in text and "rule" in text
+    if leaf == "storage.rules":
+        return "storage" in text and "rule" in text
+    if leaf == "firebase.json":
+        return "firebase" in text and ("config" in text or "deploy" in text)
+    return False
+
+
+def _source_text_requests_client_code_work(source_text: str) -> bool:
+    text = (source_text or "").casefold()
+    return any(
+        marker in text
+        for marker in (
+            "app-side",
+            "client",
+            "login",
+            "auth integration",
+            "sign in",
+            "signin",
+            "signout",
+            "wire",
+            "use it",
+            ".kt",
+            ".java",
+            ".js",
+            ".ts",
+            ".tsx",
+        )
+    )
+
+
 def _expected_new_file_is_source_bound(path: str, source_text: str) -> bool:
     """Return True when a planned new path is explicitly grounded.
 
@@ -288,16 +340,13 @@ def _expected_new_file_is_source_bound(path: str, source_text: str) -> bool:
     migrations.
     """
     norm = str(path or "").strip().replace("\\", "/").strip("/")
-    if not norm:
-        return False
     text = (source_text or "").casefold()
-    if not text:
-        return False
-    path_lower = norm.casefold()
-    leaf = path_lower.rsplit("/", 1)[-1]
-    if path_lower in text or leaf in text:
+    if _file_path_is_explicitly_named(norm, text):
         return True
+    path_lower = norm.casefold()
     if "/migrations/" in f"/{path_lower}" and "migration" in text:
+        return True
+    if _expected_new_file_is_artifact_bound(norm, text):
         return True
     return False
 
@@ -336,6 +385,31 @@ def _source_bind_expected_new_files(
             demoted.append(path)
 
     if not demoted:
+        if kept and not _source_text_requests_client_code_work(external_text):
+            artifact_bound = any(
+                _expected_new_file_is_artifact_bound(path, external_text)
+                for path in kept
+            )
+            if artifact_bound:
+                kept_must_touch = [
+                    path for path in must_touch
+                    if _file_path_is_explicitly_named(path, external_text)
+                ]
+                demoted_must_touch = [
+                    path for path in must_touch
+                    if path not in kept_must_touch
+                ]
+                if demoted_must_touch:
+                    likely = list(plan_payload.likely_touch_files or [])
+                    for path in demoted_must_touch:
+                        if path not in likely:
+                            likely.append(path)
+                    return plan_payload.model_copy(
+                        update={
+                            "must_touch_files": kept_must_touch,
+                            "likely_touch_files": _trim_string_list(likely, limit=12),
+                        }
+                    ), []
         return plan_payload, []
 
     demoted_norm = {p.replace("\\", "/").strip("/") for p in demoted}

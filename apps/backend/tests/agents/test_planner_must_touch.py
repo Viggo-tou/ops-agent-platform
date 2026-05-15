@@ -12,10 +12,17 @@ BACKEND_ROOT = Path(__file__).resolve().parents[2]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from app.agents.schemas import FinalOutputContract, GeneratedPlanPayload, PlanStep, PlanTool  # noqa: E402
+from app.agents.schemas import (  # noqa: E402
+    FinalOutputContract,
+    GeneratedPlanPayload,
+    PlanAcceptanceTest,
+    PlanStep,
+    PlanTool,
+)
 from app.agents.service import (  # noqa: E402
     PrimaryAgentPlanner,
     _log_plan_target_warnings,
+    _source_bind_expected_new_files,
     _validate_must_touch_against_kb,
 )
 from app.core.enums import RiskLevel, RoleName, ToolPermissionCategory  # noqa: E402
@@ -164,3 +171,95 @@ def test_prompt_directive_includes_add_verb() -> None:
     prompt = PrimaryAgentPlanner._build_planning_instructions()
 
     assert "add to existing" in prompt
+
+
+def test_source_binding_demotes_unsourced_expected_new_on_existing_task() -> None:
+    payload = _payload(
+        must_touch_files=["app/forms/CustomerKYCAddressForm.kt"],
+        expected_new_files=["app/components/MapAddressPicker.kt"],
+        likely_touch_files=[],
+        acceptance_tests=[
+            PlanAcceptanceTest(
+                kind="diff_contains_pattern_in_file",
+                file="app/components/MapAddressPicker.kt",
+                pattern="MapAddressPicker",
+                rationale="planner invented helper target",
+            )
+        ],
+    )
+
+    rebound, demoted = _source_bind_expected_new_files(
+        payload,
+        request_text="P69-19: add map-based address selection to existing KYC forms.",
+        issue_context={
+            "summary": "Default address selection should use the existing form maps",
+            "description": "Update the current KYC address screens.",
+        },
+    )
+
+    assert demoted == ["app/components/MapAddressPicker.kt"]
+    assert rebound.expected_new_files == []
+    assert rebound.likely_touch_files == ["app/components/MapAddressPicker.kt"]
+    assert rebound.acceptance_tests == []
+
+
+def test_source_binding_keeps_explicitly_named_expected_new_file() -> None:
+    payload = _payload(
+        must_touch_files=["src/firebase.ts"],
+        expected_new_files=["database.rules.json"],
+    )
+
+    rebound, demoted = _source_bind_expected_new_files(
+        payload,
+        request_text="Create database.rules.json and wire the app to use it.",
+        issue_context={},
+    )
+
+    assert demoted == []
+    assert rebound.expected_new_files == ["database.rules.json"]
+
+
+def test_source_binding_keeps_semantic_firebase_rules_artifact() -> None:
+    payload = _payload(
+        must_touch_files=["app/src/main/java/com/example/handyman/utils/FirebaseMetrics.kt"],
+        expected_new_files=["database.rules.json"],
+        likely_touch_files=[],
+    )
+
+    rebound, demoted = _source_bind_expected_new_files(
+        payload,
+        request_text="develop P69-8",
+        issue_context={
+            "summary": "Privacy Update: Firebase rule",
+            "description": (
+                "The Firebase database rules need to be changed from public "
+                "to private to properly secure the data."
+            ),
+        },
+    )
+
+    assert demoted == []
+    assert rebound.expected_new_files == ["database.rules.json"]
+    assert rebound.must_touch_files == []
+    assert rebound.likely_touch_files == [
+        "app/src/main/java/com/example/handyman/utils/FirebaseMetrics.kt"
+    ]
+
+
+def test_source_binding_keeps_named_code_file_with_rules_artifact() -> None:
+    code_path = "app/src/main/java/com/example/handyman/utils/FirebaseMetrics.kt"
+    payload = _payload(
+        must_touch_files=[code_path],
+        expected_new_files=["database.rules.json"],
+        likely_touch_files=[],
+    )
+
+    rebound, demoted = _source_bind_expected_new_files(
+        payload,
+        request_text="Update Firebase database rules and FirebaseMetrics.kt.",
+        issue_context={},
+    )
+
+    assert demoted == []
+    assert rebound.expected_new_files == ["database.rules.json"]
+    assert rebound.must_touch_files == [code_path]
