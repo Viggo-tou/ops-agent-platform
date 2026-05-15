@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import hashlib
 import logging
@@ -1500,7 +1501,36 @@ class PrimaryAgentPlanner:
         for fallback_step, provider_name in enumerate(providers):
             started = time.perf_counter()
             try:
-                result = self._try_plan_provider(
+                if self.db is not None:
+                    try:
+                        record_event(
+                            self.db,
+                            task_id=task_id,
+                            event_type=EventType.TOOL_CALL_REQUESTED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.PLANNING,
+                            role=RoleName.PLANNER,
+                            tool_name=f"planner.{provider_name}",
+                            message=(
+                                "Planner provider call started "
+                                f"({provider_name})."
+                            ),
+                            payload={
+                                "provider": provider_name,
+                                "fallback_step": fallback_step,
+                                "timeout_seconds": self._planner_provider_timeout_seconds(
+                                    provider_name
+                                ),
+                                "prompt_fingerprint": prompt_fingerprint,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "planner provider start event emit failed "
+                            "(non-fatal): %s",
+                            exc,
+                        )
+                result = self._try_plan_provider_with_timeout(
                     provider_name=provider_name,
                     task_id=task_id,
                     request_text=request_text,
@@ -1521,6 +1551,37 @@ class PrimaryAgentPlanner:
                     fallback_step=fallback_step,
                     prompt_fingerprint=prompt_fingerprint,
                 )
+                if self.db is not None:
+                    try:
+                        record_event(
+                            self.db,
+                            task_id=task_id,
+                            event_type=EventType.TOOL_SUCCEEDED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.PLANNING,
+                            role=RoleName.PLANNER,
+                            tool_name=f"planner.{provider_name}",
+                            message=(
+                                "Planner provider call completed "
+                                f"({provider_name})."
+                            ),
+                            payload={
+                                "provider": provider_name,
+                                "fallback_step": fallback_step,
+                                "latency_ms": int(
+                                    (time.perf_counter() - started) * 1000
+                                ),
+                                "model_name": result.model_name
+                                or self._resolve_model_name(provider_name),
+                                "prompt_fingerprint": prompt_fingerprint,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "planner provider success event emit failed "
+                            "(non-fatal): %s",
+                            exc,
+                        )
                 return result
             except Exception as exc:
                 last_error = str(exc)
@@ -1535,6 +1596,37 @@ class PrimaryAgentPlanner:
                     prompt_fingerprint=prompt_fingerprint,
                     error_type=type(exc).__name__,
                 )
+                if self.db is not None:
+                    try:
+                        record_event(
+                            self.db,
+                            task_id=task_id,
+                            event_type=EventType.TOOL_FAILED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.PLANNING,
+                            role=RoleName.PLANNER,
+                            tool_name=f"planner.{provider_name}",
+                            message=(
+                                "Planner provider call failed "
+                                f"({provider_name}): {str(exc)[:240]}"
+                            ),
+                            payload={
+                                "provider": provider_name,
+                                "fallback_step": fallback_step,
+                                "latency_ms": int(
+                                    (time.perf_counter() - started) * 1000
+                                ),
+                                "error_type": type(exc).__name__,
+                                "error": str(exc)[:1000],
+                                "prompt_fingerprint": prompt_fingerprint,
+                            },
+                        )
+                    except Exception as event_exc:  # noqa: BLE001
+                        logger.warning(
+                            "planner provider failure event emit failed "
+                            "(non-fatal): %s",
+                            event_exc,
+                        )
                 continue  # cascade to next provider
 
         # All providers failed or none configured — use mock fallback
@@ -1589,6 +1681,76 @@ class PrimaryAgentPlanner:
                 actor_name=actor_name,
             ),
         )
+
+    def _planner_provider_timeout_seconds(self, provider_name: str) -> float:
+        configured = float(
+            getattr(self.settings, "planner_provider_timeout_seconds", 180.0)
+            or 180.0
+        )
+        if provider_name == "claude_code":
+            provider_cap = float(
+                getattr(self.settings, "claude_code_timeout_seconds", configured)
+                or configured
+            )
+            return min(configured, provider_cap) if configured > 0 else provider_cap
+        if provider_name == "minimax":
+            provider_cap = float(
+                getattr(self.settings, "minimax_planner_timeout_seconds", configured)
+                or configured
+            )
+            return min(configured, provider_cap) if configured > 0 else provider_cap
+        return configured
+
+    def _try_plan_provider_with_timeout(
+        self,
+        *,
+        provider_name: str,
+        task_id: str,
+        request_text: str,
+        scenario: str,
+        actor_name: str,
+        default_payload: dict[str, Any],
+        issue_context: dict[str, Any] | None = None,
+        candidate_files: list[dict] | None = None,
+        prior_failures_block: str = "",
+    ) -> PlanGenerationResult:
+        timeout_seconds = self._planner_provider_timeout_seconds(provider_name)
+        if timeout_seconds <= 0:
+            return self._try_plan_provider(
+                provider_name=provider_name,
+                task_id=task_id,
+                request_text=request_text,
+                scenario=scenario,
+                actor_name=actor_name,
+                default_payload=default_payload,
+                issue_context=issue_context,
+                candidate_files=candidate_files,
+                prior_failures_block=prior_failures_block,
+            )
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(
+            self._try_plan_provider,
+            provider_name=provider_name,
+            task_id=task_id,
+            request_text=request_text,
+            scenario=scenario,
+            actor_name=actor_name,
+            default_payload=default_payload,
+            issue_context=issue_context,
+            candidate_files=candidate_files,
+            prior_failures_block=prior_failures_block,
+        )
+        try:
+            return future.result(timeout=float(timeout_seconds))
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise TimeoutError(
+                "Planner provider "
+                f"{provider_name!r} timed out after {timeout_seconds:.1f}s"
+            ) from exc
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _try_plan_provider(
         self,

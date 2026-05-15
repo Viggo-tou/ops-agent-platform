@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,10 +20,12 @@ from app.agents.service import PrimaryAgentPlanner, build_fallback_plan_payload 
 def _settings(provider: str = "auto") -> SimpleNamespace:
     return SimpleNamespace(
         primary_agent_provider=provider,
+        planner_provider="anthropic" if provider == "auto" else provider,
         primary_agent_model="gpt-4o-mini",
         primary_agent_timeout_seconds=30.0,
         semantic_translator_model="MiniMax-Text-01",
         minimax_planner_timeout_seconds=90.0,
+        planner_provider_timeout_seconds=30.0,
         openai_api_key=None,
         openai_base_url="https://api.openai.com/v1",
         minimax_api_key=None,
@@ -30,7 +33,7 @@ def _settings(provider: str = "auto") -> SimpleNamespace:
         anthropic_api_key="sk-test",
         anthropic_base_url="https://api.anthropic.com",
         anthropic_model="claude-sonnet-4-20250514",
-        claude_code_command="npx",
+        claude_code_command="__missing_claude_code__",
         codex_command="codex",
     )
 
@@ -80,6 +83,26 @@ class AnthropicPlannerTests(unittest.TestCase):
         self.assertEqual(result.provider_name, "mock")
         self.assertTrue(result.used_fallback)
         self.assertIn("boom", result.fallback_reason or "")
+
+    def test_generate_plan_provider_timeout_falls_back(self) -> None:
+        settings = _settings("auto")
+        settings.planner_provider_timeout_seconds = 0.05
+
+        def slow_post(*_args, **_kwargs):
+            time.sleep(0.2)
+            raise AssertionError("slow provider should be timed out first")
+
+        with patch("app.agents.service.httpx.post", side_effect=slow_post):
+            result = PrimaryAgentPlanner(settings=settings).generate_plan(
+                task_id="task-1",
+                request_text="Where is the Firebase config?",
+                scenario="process_question",
+                actor_name="tester",
+            )
+
+        self.assertEqual(result.provider_name, "mock")
+        self.assertTrue(result.used_fallback)
+        self.assertIn("timed out", result.fallback_reason or "")
 
 
 if __name__ == "__main__":
