@@ -75,8 +75,20 @@ def get_db() -> Generator[Session, None, None]:
         db.close()
 
 
+def _session_is_sqlite(db: Session) -> bool:
+    try:
+        bind = db.get_bind()
+    except Exception:  # noqa: BLE001
+        bind = getattr(db, "bind", None)
+    dialect = getattr(bind, "dialect", None)
+    dialect_name = str(getattr(dialect, "name", "") or "").lower()
+    if dialect_name:
+        return dialect_name == "sqlite"
+    return is_sqlite
+
+
 def create_knowledge_fts_table(db: Session) -> None:
-    if not is_sqlite:
+    if not _session_is_sqlite(db):
         return
     if not hasattr(db, "execute"):
         return
@@ -108,7 +120,7 @@ def create_knowledge_fts_table(db: Session) -> None:
 
 
 def create_agent_memory_fts_table(db: Session) -> None:
-    if not is_sqlite:
+    if not _session_is_sqlite(db):
         return
     if not hasattr(db, "execute"):
         return
@@ -138,7 +150,7 @@ def upsert_knowledge_fts(
     content: str,
     card_text: str | None = None,
 ) -> None:
-    if not is_sqlite:
+    if not _session_is_sqlite(db):
         return
     db.execute(
         text("DELETE FROM knowledge_document_fts WHERE document_id = :id"),
@@ -166,7 +178,7 @@ def upsert_knowledge_fts(
 
 
 def backfill_knowledge_fts_if_empty(db: Session) -> int:
-    if not is_sqlite:
+    if not _session_is_sqlite(db):
         return 0
     if not hasattr(db, "execute"):
         return 0

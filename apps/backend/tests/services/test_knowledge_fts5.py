@@ -24,6 +24,7 @@ from app.services.knowledge import (  # noqa: E402
     KnowledgeService,
     SourceSpec,
     _build_fts5_query,
+    _build_postgres_websearch_query,
     _upsert_fts,
 )
 
@@ -49,9 +50,17 @@ def db_session():
         engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+def isolate_managed_sources(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import repository_registry
+
+    monkeypatch.setattr(repository_registry, "list_managed_sources", lambda: [])
+
+
 def _settings(**overrides: object) -> Settings:
     values = {
         "knowledge_source_name": "repo",
+        "knowledge_source_specs": None,
         "knowledge_source_path": str(BACKEND_ROOT),
         "knowledge_upload_root": str(BACKEND_ROOT / "missing-test-uploads"),
         "knowledge_synthesis_enabled": False,
@@ -258,3 +267,90 @@ def test_fts5_query_handles_empty_token_set(db_session) -> None:
 
     assert query == '"unlikelytoken12345"'
     assert result == []
+
+
+def test_postgres_websearch_query_is_not_fts5_syntax() -> None:
+    query = _build_postgres_websearch_query(
+        ["phone", "otp"],
+        {"verification", "phone"},
+        token_limit=3,
+    )
+
+    assert query == "phone otp verification"
+    assert "relative_path:" not in query
+    assert " OR " not in query
+
+
+def test_lexical_topk_dispatches_to_postgres_when_bound(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document = _add_doc(
+        db_session,
+        relative_path="src/PhoneOtp.kt",
+        content="phone otp verification",
+    )
+    db_session.commit()
+    service = _service(db_session)
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(service, "_dialect_name", lambda: "postgresql")
+
+    def fake_postgres_topk(
+        *,
+        source_names: list[str],
+        websearch_query: str,
+        query_tokens: list[str],
+        pool_size: int,
+    ) -> list[KnowledgeDocument]:
+        observed["source_names"] = source_names
+        observed["websearch_query"] = websearch_query
+        observed["query_tokens"] = query_tokens
+        observed["pool_size"] = pool_size
+        return [document]
+
+    monkeypatch.setattr(service, "_postgres_lexical_topk", fake_postgres_topk)
+
+    docs, strategy, query = service._lexical_topk(
+        source_names=["repo"],
+        query_tokens=["phone", "otp"],
+        expanded_tokens={"verification"},
+        fts_query='relative_path:("phone")',
+        pool_size=20,
+    )
+
+    assert docs == [document]
+    assert strategy == "postgres_tsvector"
+    assert query == "phone otp verification"
+    assert observed["source_names"] == ["repo"]
+    assert observed["pool_size"] == 20
+
+
+def test_lexical_topk_keeps_sqlite_fts5_path(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document = _add_doc(
+        db_session,
+        relative_path="src/Auth.py",
+        content="legacy login",
+    )
+    db_session.commit()
+    service = _service(db_session)
+
+    monkeypatch.setattr(service, "_dialect_name", lambda: "sqlite")
+    monkeypatch.setattr(
+        service,
+        "_fts5_topk",
+        lambda *, source_names, fts_query, pool_size: [document],
+    )
+
+    docs, strategy, query = service._lexical_topk(
+        source_names=["repo"],
+        query_tokens=["legacy", "login"],
+        expanded_tokens=set(),
+        fts_query='content:("legacy")',
+        pool_size=20,
+    )
+
+    assert docs == [document]
+    assert strategy == "sqlite_fts5"
+    assert query == 'content:("legacy")'

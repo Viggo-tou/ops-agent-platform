@@ -330,6 +330,12 @@ class Settings(BaseSettings):
     knowledge_rerank_snippet_chars: int = 600
     knowledge_fts5_enabled: bool = True
     knowledge_fts5_pool_multiplier: int = 5
+    # Postgres-native lexical retrieval. SQLite uses FTS5; Postgres uses
+    # websearch_to_tsquery/to_tsvector with the same candidate-pool contract.
+    # Keeping this behind a knob lets us shadow/rollback without changing the
+    # rest of the RAG pipeline.
+    knowledge_postgres_lexical_enabled: bool = True
+    knowledge_postgres_lexical_token_limit: int = 24
     # Query expansion: ask an LLM for additional likely-source tokens to
     # add to the retrieval token set, addressing the recall gap where
     # natural-language phrases don't share surface tokens with actual

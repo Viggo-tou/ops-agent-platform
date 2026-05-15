@@ -223,6 +223,31 @@ def _build_fts5_query(query_tokens: list[str], expanded_tokens: set[str]) -> str
     return f"(relative_path:({or_expr}) OR title:({or_expr}) OR content:({or_expr}) OR card_text:({or_expr}))"
 
 
+def _build_postgres_websearch_query(
+    query_tokens: list[str],
+    expanded_tokens: set[str],
+    *,
+    token_limit: int = 24,
+) -> str:
+    """Build a Postgres websearch query from code-friendly tokens.
+
+    FTS5's column-scoped MATCH syntax is SQLite-only. Postgres expects a
+    plain websearch string, so keep a compact stable token list and let the
+    SQL query weight path/title/content separately.
+    """
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for token in [*query_tokens, *sorted(expanded_tokens)]:
+        normalized = (token or "").strip().lower()
+        if len(normalized) < 2 or normalized in seen:
+            continue
+        seen.add(normalized)
+        tokens.append(normalized)
+        if len(tokens) >= max(1, token_limit):
+            break
+    return " ".join(tokens)
+
+
 def _upsert_fts(
     db: Session,
     *,
@@ -408,6 +433,8 @@ class KnowledgeService:
         fts5_pool_size: int | None = None
         fts5_match_count: int | None = None
         fts5_query: str | None = None
+        lexical_strategy: str | None = None
+        lexical_query: str | None = None
 
         # Query rewrite: ask LLM for additional likely-source tokens (e.g.
         # CamelCase identifiers, synonyms, adjacent concepts) to lift recall
@@ -429,12 +456,16 @@ class KnowledgeService:
             multiplier = max(1, int(getattr(self.settings, "knowledge_fts5_pool_multiplier", 5)))
             fts5_pool_size = max(top_k * multiplier, 20)
             fts5_query = _build_fts5_query(query_tokens, expanded_tokens)
-            scoring_candidates = self._fts5_topk(
+            scoring_candidates, lexical_strategy, lexical_query = self._lexical_topk(
                 source_names=source_names,
+                query_tokens=query_tokens,
+                expanded_tokens=expanded_tokens,
                 fts_query=fts5_query,
                 pool_size=fts5_pool_size,
             )
             fts5_match_count = len(scoring_candidates)
+            if not scoring_candidates and lexical_strategy == "postgres_tsvector":
+                scoring_candidates = documents
 
         scored_documents: list[ScoredDocument] = []
         for document in scoring_candidates:
@@ -596,6 +627,8 @@ class KnowledgeService:
                 fts5_pool_size=fts5_pool_size,
                 fts5_match_count=fts5_match_count,
                 fts5_query=fts5_query,
+                lexical_strategy=lexical_strategy,
+                lexical_query=lexical_query,
                 query_rewrite_enabled=query_rewrite_enabled_setting,
                 query_rewrite_added_tokens=query_rewrite_added_tokens_count,
                 synthesis_max_snippet_chars=synthesis_max_snippet,
@@ -1167,6 +1200,139 @@ class KnowledgeService:
         )
         by_id = {document.id: document for document in documents}
         return [by_id[document_id] for document_id in ids if document_id in by_id]
+
+    def _lexical_topk(
+        self,
+        *,
+        source_names: list[str],
+        query_tokens: list[str],
+        expanded_tokens: set[str],
+        fts_query: str,
+        pool_size: int,
+    ) -> tuple[list[KnowledgeDocument], str, str]:
+        dialect_name = self._dialect_name()
+        if (
+            dialect_name == "postgresql"
+            and bool(getattr(self.settings, "knowledge_postgres_lexical_enabled", True))
+        ):
+            token_limit = int(
+                getattr(self.settings, "knowledge_postgres_lexical_token_limit", 24)
+                or 24
+            )
+            pg_query = _build_postgres_websearch_query(
+                query_tokens,
+                expanded_tokens,
+                token_limit=token_limit,
+            )
+            return (
+                self._postgres_lexical_topk(
+                    source_names=source_names,
+                    websearch_query=pg_query,
+                    query_tokens=query_tokens,
+                    pool_size=pool_size,
+                ),
+                "postgres_tsvector",
+                pg_query,
+            )
+        return self._fts5_topk(
+            source_names=source_names,
+            fts_query=fts_query,
+            pool_size=pool_size,
+        ), "sqlite_fts5", fts_query
+
+    def _postgres_lexical_topk(
+        self,
+        *,
+        source_names: list[str],
+        websearch_query: str,
+        query_tokens: list[str],
+        pool_size: int,
+    ) -> list[KnowledgeDocument]:
+        if not source_names or not websearch_query.strip():
+            return []
+
+        placeholders = ", ".join(f":s{i}" for i in range(len(source_names)))
+        like_tokens = [
+            token
+            for token in query_tokens
+            if token and len(token) >= 3
+        ][:5]
+        like_clauses: list[str] = []
+        params: dict[str, object] = {
+            "query": websearch_query,
+            "limit": pool_size,
+        }
+        for index, source_name in enumerate(source_names):
+            params[f"s{index}"] = source_name
+        for index, token in enumerate(like_tokens):
+            key = f"like{index}"
+            params[key] = f"%{token}%"
+            like_clauses.append(
+                f"(relative_path ILIKE :{key} OR title ILIKE :{key})"
+            )
+        like_sql = " OR ".join(like_clauses) or "FALSE"
+
+        sql = text(
+            f"""
+            WITH query AS (
+                SELECT websearch_to_tsquery('simple', :query) AS tsq
+            ),
+            ranked AS (
+                SELECT
+                    kd.id AS document_id,
+                    ts_rank_cd(
+                        setweight(to_tsvector('simple', coalesce(kd.relative_path, '')), 'A') ||
+                        setweight(to_tsvector('simple', coalesce(kd.title, '')), 'A') ||
+                        setweight(to_tsvector('simple', coalesce(kd.content, '')), 'D'),
+                        query.tsq
+                    ) AS rank_score,
+                    CASE WHEN {like_sql} THEN 1 ELSE 0 END AS path_hit
+                FROM knowledge_document kd
+                CROSS JOIN query
+                WHERE kd.source_name IN ({placeholders})
+                  AND (
+                    (
+                        setweight(to_tsvector('simple', coalesce(kd.relative_path, '')), 'A') ||
+                        setweight(to_tsvector('simple', coalesce(kd.title, '')), 'A') ||
+                        setweight(to_tsvector('simple', coalesce(kd.content, '')), 'D')
+                    ) @@ query.tsq
+                    OR {like_sql}
+                  )
+            )
+            SELECT document_id
+            FROM ranked
+            ORDER BY path_hit DESC, rank_score DESC
+            LIMIT :limit
+            """
+        )
+        try:
+            rows = self.db.execute(sql, params).all()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "postgres lexical retrieval failed",
+                extra={"error": str(exc)[:300]},
+            )
+            return []
+        ids = [row[0] for row in rows]
+        if not ids:
+            return []
+        documents = list(
+            self.db.execute(
+                select(KnowledgeDocument).where(KnowledgeDocument.id.in_(ids))
+            ).scalars()
+        )
+        by_id = {document.id: document for document in documents}
+        return [by_id[document_id] for document_id in ids if document_id in by_id]
+
+    def _dialect_name(self) -> str:
+        bind = getattr(self.db, "bind", None)
+        if bind is None:
+            try:
+                bind = self.db.get_bind()
+            except Exception:  # noqa: BLE001
+                bind = None
+        dialect = getattr(bind, "dialect", None)
+        return str(getattr(dialect, "name", "") or "").lower()
 
     def _extension_counts(self, source_specs: list[SourceSpec]) -> Counter[str]:
         source_names = [spec.name for spec in source_specs]

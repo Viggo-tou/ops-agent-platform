@@ -78,6 +78,8 @@ class KnowledgeAnswerTrace(BaseModel):
     fts5_pool_size: int | None = Field(default=None, description="FTS5 candidate pool size before rerank")
     fts5_match_count: int | None = Field(default=None, description="FTS5 actual match count returned")
     fts5_query: str | None = Field(default=None, description="FTS5 MATCH expression used")
+    lexical_strategy: str | None = Field(default=None, description="Lexical retrieval backend used before rerank")
+    lexical_query: str | None = Field(default=None, description="Backend-specific lexical query text")
     query_rewrite_enabled: bool | None = Field(default=None, description="Whether LLM query-token expansion ran")
     query_rewrite_added_tokens: int | None = Field(default=None, description="Number of LLM-suggested tokens unioned into retrieval set")
     synthesis_max_snippet_chars: int | None = Field(default=None, description="Per-citation snippet cap fed to synthesiser")

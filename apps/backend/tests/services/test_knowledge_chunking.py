@@ -36,11 +36,15 @@ def _chunk_settings(**overrides: object) -> SimpleNamespace:
 def _service_settings(source_root: Path, upload_root: Path, **overrides: object) -> Settings:
     values = {
         "knowledge_source_name": "fixture",
+        "knowledge_source_specs": None,
         "knowledge_source_path": str(source_root),
         "knowledge_upload_root": str(upload_root),
         "knowledge_synthesis_enabled": False,
         "knowledge_rerank_enabled": False,
         "knowledge_query_rewrite_enabled": False,
+        "knowledge_retrieval_cache_enabled": False,
+        "knowledge_source_router_enabled": False,
+        "cc_agentic_enabled": False,
     }
     values.update(overrides)
     return Settings(**values)
@@ -300,6 +304,13 @@ def db_session():
         session.close()
         Base.metadata.drop_all(bind=engine)
         engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def isolate_managed_sources(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import repository_registry
+
+    monkeypatch.setattr(repository_registry, "list_managed_sources", lambda: [])
 
 
 def test_repository_sync_excludes_resource_and_binary_files(workspace_tmp: Path, db_session) -> None:
