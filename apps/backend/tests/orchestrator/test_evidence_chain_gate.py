@@ -258,6 +258,7 @@ def _orchestrator(root: Path, *, gate_enabled: bool = True) -> PrimaryOrchestrat
     settings = orchestrator.tool_gateway.settings
     settings.agent_workspace_root = str(root / "workspace")
     settings.sandbox_base_dir = str(root / "sandbox")
+    settings.sandbox_external_root = ""
     settings.knowledge_source_path = str(source_tree)
     settings.knowledge_max_file_bytes = 120_000
     settings.develop_require_jira_approval = True
@@ -418,6 +419,114 @@ def test_blocking_reservations_fail_before_jira_transition_approval() -> None:
         assert task.latest_result_json["status"] == TaskStatus.FAILED.value
         assert task.latest_result_json["decision"] == "reservation_blocked"
         assert task.latest_result_json["blocking_reservations"] == [blocking_item]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_goal_miss_blocking_reservation_runs_repair_before_approval() -> None:
+    root = _writable_mkdtemp()
+    try:
+        orchestrator = _orchestrator(root)
+        orchestrator._build_develop_sandbox = Mock(
+            return_value=SimpleNamespace(snapshot_id=lambda: "git:abc1234")
+        )
+        task = _task(
+            request_text=(
+                "Remove phone OTP one-time-use limit while preserving the "
+                "existing auth and database update flow."
+            )
+        )
+        plan = _plan(task.id)
+        _write_workspace(orchestrator, task, evidence_path="src/a.py")
+        sandbox_file = root / "sandbox" / task.id / "src" / "a.py"
+        sandbox_file.parent.mkdir(parents=True, exist_ok=True)
+        sandbox_file.write_text("old\n", encoding="utf-8")
+
+        blocking_goal_miss = {
+            "text": (
+                "The diff description claims to remove OTP one-time-use limit "
+                "but no such logic is visible in the diff. The changes add "
+                "auth.signOut() and reorder navigation vs DB update - this "
+                "does not clearly address the stated goal."
+            ),
+            "severity": "policy",
+            "auto_fixable": False,
+            "blocking": True,
+        }
+        first_report = SimpleNamespace(
+            reservations=[blocking_goal_miss["text"]],
+            to_dicts=lambda: [blocking_goal_miss],
+            auto_fixable=[],
+            blocking=[blocking_goal_miss],
+            provider="test",
+            model="none",
+        )
+        empty_report = SimpleNamespace(
+            reservations=[],
+            to_dicts=lambda: [],
+            auto_fixable=[],
+            blocking=[],
+            provider="test",
+            model="none",
+        )
+        repair_diff = _diff("src/a.py").replace("+new", "+newer")
+        added: list[object] = []
+        orchestrator.db.add = Mock(
+            side_effect=lambda obj: (
+                added.append(obj),
+                setattr(obj, "id", f"approval-{len(added)}"),
+            )[0]
+        )
+        orchestrator.tool_gateway.execute = Mock(
+            side_effect=[
+                _codegen_result("src/a.py"),
+                {"status": "patched", "method": "git_apply"},
+                _test_pass(),
+                _review_pass(),
+                {"diff": repair_diff, "files_changed": ["src/a.py"]},
+                {"status": "patched", "method": "git_apply"},
+                _test_pass(),
+                _review_pass(),
+            ]
+        )
+
+        with patch("app.orchestrator.service.record_event") as record_event, patch(
+            "app.orchestrator.service.set_task_status"
+        ), patch(
+            "app.services.reservations.build_reservations",
+            side_effect=[first_report, empty_report],
+        ), patch(
+            "app.services.semantic_review.evaluate_semantic_review",
+            return_value=_semantic_review_pass(),
+        ), patch(
+            "app.services.runtime_validation.validate_diff_semantics",
+            return_value=_runtime_report(passed=True),
+        ):
+            orchestrator._execute_develop_pipeline(
+                task=task,
+                actor_name="tester",
+                plan=plan,
+            )
+
+        apply_calls = [
+            call
+            for call in orchestrator.tool_gateway.execute.call_args_list
+            if call.kwargs.get("tool_name") == "sandbox.apply_patch"
+        ]
+        tool_names = [
+            call.kwargs.get("tool_name")
+            for call in record_event.call_args_list
+            if "tool_name" in call.kwargs
+        ]
+        approvals = [obj for obj in added if hasattr(obj, "action_name")]
+
+        assert len(apply_calls) == 2
+        assert "reservations.repair" in tool_names
+        assert approvals
+        assert task.latest_result_json["status"] == TaskStatus.AWAITING_APPROVAL.value
+        assert task.latest_result_json["pipeline_state"][
+            "reservation_repair_applied"
+        ] is True
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

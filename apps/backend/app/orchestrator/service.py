@@ -276,20 +276,80 @@ def _reservation_blocking_items(
     ]
 
 
+def _reservation_repair_category(item: dict | None) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    text = str(item.get("text") or "").strip()
+    if not text:
+        return None
+    normalized = text.lower()
+    if any(
+        marker in normalized
+        for marker in (
+            "does not clearly address",
+            "does not address",
+            "does not implement",
+            "not implement",
+            "no such logic",
+            "no executable",
+            "claims to",
+            "stated goal",
+            "only adds a comment",
+            "navigation-only",
+        )
+    ):
+        return "goal_miss"
+    if any(
+        marker in normalized
+        for marker in (
+            "auth.signout",
+            "signout()",
+            "unsafe workaround",
+            "workaround",
+        )
+    ):
+        return "unsafe_workaround"
+    if any(
+        marker in normalized
+        for marker in (
+            "after navigation",
+            "before navigation",
+            "navigation before",
+            "reorder navigation",
+            "reordered navigation",
+        )
+    ):
+        return "ordering_regression"
+    if (
+        bool(item.get("auto_fixable"))
+        and str(item.get("severity") or "").strip().lower()
+        in {"bug", "missing_test"}
+    ):
+        return "executable_quality"
+    return None
+
+
 def _reservation_repairable_items(
     reservations_detailed: list[dict] | tuple[dict, ...] | None,
 ) -> list[dict]:
     # Style-only reservations are useful warnings, but they should not trigger
-    # codegen or block a clean task. Bug and missing_test findings are concrete
-    # enough to feed into a bounded amend round.
+    # codegen or block a clean task. Concrete executable defects, goal misses,
+    # unsafe workarounds, and ordering regressions are specific enough to feed
+    # into one bounded amend round.
     return [
         item
         for item in reservations_detailed or []
-        if isinstance(item, dict)
-        and bool(item.get("auto_fixable"))
-        and str(item.get("severity") or "").strip().lower()
-        in {"bug", "missing_test"}
-        and str(item.get("text") or "").strip()
+        if isinstance(item, dict) and _reservation_repair_category(item) is not None
+    ]
+
+
+def _reservation_hard_blocking_items(
+    reservations_detailed: list[dict] | tuple[dict, ...] | None,
+) -> list[dict]:
+    return [
+        item
+        for item in _reservation_blocking_items(reservations_detailed)
+        if _reservation_repair_category(item) is None
     ]
 
 
@@ -304,7 +364,7 @@ def _reservation_should_attempt_repair(
         return False
     if repair_attempts >= max(0, int(max_repair_attempts)):
         return False
-    if _reservation_blocking_items(reservations_detailed):
+    if _reservation_hard_blocking_items(reservations_detailed):
         return False
     return bool(_reservation_repairable_items(reservations_detailed))
 
@@ -12762,22 +12822,50 @@ class PrimaryOrchestrator:
             previous_diff = previous_diff[:12_000] + "\n[truncated]"
         findings_lines = [
             (
-                f"  - [{str(item.get('severity') or 'bug').upper()}] "
+                "  - "
+                f"[{str(item.get('severity') or 'bug').upper()} / "
+                f"{_reservation_repair_category(item) or 'quality'}] "
                 f"{str(item.get('text') or '').strip()}"
             )
             for item in repairable
         ]
+        normalized_findings = "\n".join(
+            str(item.get("text") or "").strip().lower() for item in repairable
+        )
+        constraint_lines = [
+            "- Implement the requested behavior with executable code; comments, "
+            "renames, or navigation-only edits do not satisfy a goal-miss finding.",
+            "- Preserve already-correct behavior in the allowed files while fixing "
+            "only the listed reservations.",
+        ]
+        if "signout" in normalized_findings or "sign out" in normalized_findings:
+            constraint_lines.append(
+                "- Do not use auth.signOut()/signOut() as a workaround unless the "
+                "task explicitly requested sign-out; preserve the authenticated "
+                "user/session flow."
+            )
+        if "navigation" in normalized_findings:
+            constraint_lines.append(
+                "- Preserve or restore the existing write-before-navigation/order "
+                "unless the task explicitly requested a navigation-order change."
+            )
         prompt = (
             "RESERVATION QUALITY REPAIR (bounded, one pass):\n"
             "The patch passed compile and structural gates, but the final "
-            "reservations reviewer found concrete quality bugs or missing "
-            "tests. Fix ONLY the findings below. Do not broaden scope. Do "
-            "not rewrite files. Do not add unrelated behavior. If a finding "
-            "cannot be fixed safely inside the allowed files, return no diff.\n\n"
+            "reservations reviewer found concrete executable quality defects. "
+            "Fix ONLY the findings below. Do not broaden scope. Do not rewrite "
+            "files. Do not add unrelated behavior. If a finding cannot be fixed "
+            "safely inside the allowed files, return no diff.\n\n"
+            "TASK REQUEST:\n"
+            f"{task.request_text or ''}\n\n"
+            "PLAN SUMMARY:\n"
+            f"{getattr(plan, 'change_summary', '') or getattr(plan, 'objective', '')}\n\n"
             "ALLOWED FILES:\n"
             + "\n".join(f"- {path}" for path in allowed_files)
             + "\n\nRESERVATIONS TO FIX:\n"
             + "\n".join(findings_lines)
+            + "\n\nREPAIR CONSTRAINTS:\n"
+            + "\n".join(constraint_lines)
             + "\n\nPREVIOUS DIFF (do not undo unrelated correct changes):\n"
             f"```diff\n{previous_diff}\n```\n\n"
             "Output a small unified diff against the current sandbox files."
@@ -12797,6 +12885,9 @@ class PrimaryOrchestrator:
             payload={
                 "allowed_files": allowed_files,
                 "repairable_count": len(repairable),
+                "repair_categories": [
+                    _reservation_repair_category(item) for item in repairable
+                ],
             },
         )
 
@@ -13897,13 +13988,21 @@ class PrimaryOrchestrator:
         hard_gates = self._summarize_hard_gates(pipeline_state)
         blocking_reservations = _reservation_blocking_items(reservations_detailed)
         repairable_reservations = _reservation_repairable_items(reservations_detailed)
+        hard_blocking_reservations = _reservation_hard_blocking_items(
+            reservations_detailed
+        )
+        repairable_blocking_reservations = [
+            item for item in blocking_reservations if item not in hard_blocking_reservations
+        ]
         pipeline_state["reservation_gate"] = {
             "blocking_count": len(blocking_reservations),
+            "hard_blocking_count": len(hard_blocking_reservations),
             "repairable_count": len(repairable_reservations),
+            "repairable_blocking_count": len(repairable_blocking_reservations),
             "attempts": int(pipeline_state.get("reservation_repair_attempts") or 0),
         }
 
-        if blocking_reservations:
+        if hard_blocking_reservations:
             message = (
                 "Post-review reservations include blocking security/policy "
                 "concerns; Jira transition approval is blocked until the "
@@ -13917,6 +14016,7 @@ class PrimaryOrchestrator:
                 "reservations": reservations,
                 "reservations_detailed": reservations_detailed,
                 "blocking_reservations": blocking_reservations,
+                "hard_blocking_reservations": hard_blocking_reservations,
                 "hard_gates": hard_gates,
                 "evidence_chain": evidence_chain_payload,
                 "pipeline_state": pipeline_state,
@@ -13986,6 +14086,7 @@ class PrimaryOrchestrator:
                 "reservations": reservations,
                 "reservations_detailed": reservations_detailed,
                 "repairable_reservations": repairable_reservations,
+                "repairable_blocking_reservations": repairable_blocking_reservations,
                 "reservation_repair_attempts": reservation_repair_attempts,
                 "hard_gates": hard_gates,
                 "evidence_chain": evidence_chain_payload,
