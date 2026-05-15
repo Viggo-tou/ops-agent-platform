@@ -463,6 +463,16 @@ def test_verified_phone_otp_contract_filters_contradictory_reservations() -> Non
         "auto_fixable": False,
         "blocking": True,
     }
+    actual_rate_limit_policy_item = {
+        "text": (
+            "The removed pre-verification DB write likely triggered Firebase "
+            "rate limiting (too many writes for same phone); ensure this fix "
+            "truly unblocks resend vs. masking a deeper auth config issue."
+        ),
+        "severity": "policy",
+        "auto_fixable": False,
+        "blocking": True,
+    }
     speculative_policy_item = {
         "text": (
             "If the real fix requires something else, such as configuring "
@@ -519,6 +529,7 @@ def test_verified_phone_otp_contract_filters_contradictory_reservations() -> Non
         [
             bug_item,
             policy_item,
+            actual_rate_limit_policy_item,
             speculative_policy_item,
             speculative_security_item,
             verified_after_otp_policy_item,
@@ -533,6 +544,7 @@ def test_verified_phone_otp_contract_filters_contradictory_reservations() -> Non
     assert [item["text"] for item in suppressed] == [
         bug_item["text"],
         policy_item["text"],
+        actual_rate_limit_policy_item["text"],
         speculative_policy_item["text"],
         speculative_security_item["text"],
         verified_after_otp_policy_item["text"],

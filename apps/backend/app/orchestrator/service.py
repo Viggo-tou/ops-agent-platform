@@ -447,6 +447,17 @@ def _phone_otp_reservation_contradicts_verified_contract(
     ):
         return True
     if (
+        ("rate limiting" in text or "rate limit" in text or "auth config" in text)
+        and (
+            "removed" in text
+            or "removing" in text
+            or "db write" in text
+            or "database write" in text
+            or "pre-verification" in text
+        )
+    ):
+        return True
+    if (
         ("real fix requires" in text or "requires something else" in text)
         and (
             "phoneauthoptions" in text
