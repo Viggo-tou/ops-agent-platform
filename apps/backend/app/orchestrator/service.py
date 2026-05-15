@@ -54,6 +54,17 @@ from app.tools.gateway import ToolApprovalRequired, ToolGateway, ToolInvocationE
 logger = logging.getLogger("orchestrator")
 
 
+def _should_promote_evidence_must_touch_to_plan(plan: Any) -> bool:
+    """Let evidence-derived files become edit targets only when plan has none.
+
+    Candidate files from retrieval are useful context, but they must not
+    override an explicit create-file plan such as ``expected_new_files``.
+    """
+    return not bool(getattr(plan, "must_touch_files", None) or []) and not bool(
+        getattr(plan, "expected_new_files", None) or []
+    )
+
+
 def record_event(
     db: Session,
     *,
@@ -4565,7 +4576,7 @@ class PrimaryOrchestrator:
                         payload=evidence.to_payload(),
                     )
                     return
-                if evidence.must_touch_files and not getattr(plan, "must_touch_files", None):
+                if evidence.must_touch_files and _should_promote_evidence_must_touch_to_plan(plan):
                     plan.must_touch_files = evidence.must_touch_files
                 # Option B: pre-codegen source injection.
                 # The evidence_bundle's FTS5 anchor matching surfaced
