@@ -94,6 +94,17 @@ fun HandymanKYCAddressForm() {
     var note by remember { mutableStateOf("") }
 
     Column {
+        OutlinedTextField(
+            value = houseNumber,
+            onValueChange = { houseNumber = it },
+            label = { Text("House number") }
+        )
+        OutlinedTextField(
+            value = street,
+            onValueChange = { street = it },
+            label = { Text("Street") }
+        )
+
         Button(
             onClick = {
                 val addressData = mapOf(
@@ -230,6 +241,9 @@ def test_recipe_adds_coordinates_to_existing_kyc_payload_with_valid_commas():
     assert '"latitude" to latitude,' in result.content
     assert '"notes" to note,' in result.content
     assert "updateChildren(addressData)" in result.content
+    assert result.content.count('label = { Text("House number") }') == 1
+    assert result.content.count('label = { Text("Street") }') == 1
+    assert "Find typed address on map" in result.content
 
 
 def test_recipe_preserves_existing_map_and_only_repairs_geocoder_locale():

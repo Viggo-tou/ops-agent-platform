@@ -393,13 +393,24 @@ def _map_helper_block(*, post_code: str) -> str:
 
 def _insert_map_picker(content: str) -> str:
     names = _field_names(content)
-    block = _map_picker_block(post_code=names["post_code"], notes=names["notes"])
+    block = _map_picker_block(
+        post_code=names["post_code"],
+        notes=names["notes"],
+        include_manual_fields=not _has_manual_address_inputs(content),
+    )
     lines = content.splitlines()
     insert_at = _submit_button_line(lines)
     if insert_at <= 0:
         return content
     new_lines = lines[: insert_at - 1] + block.splitlines() + [""] + lines[insert_at - 1 :]
     return _join_like(content, new_lines)
+
+
+def _has_manual_address_inputs(content: str) -> bool:
+    return bool(
+        re.search(r"OutlinedTextField\s*\([^)]*value\s*=\s*houseNumber", content, re.DOTALL)
+        and re.search(r"OutlinedTextField\s*\([^)]*value\s*=\s*street", content, re.DOTALL)
+    )
 
 
 def _submit_button_line(lines: list[str]) -> int:
@@ -410,8 +421,9 @@ def _submit_button_line(lines: list[str]) -> int:
     return button_lines[-1] if button_lines else 0
 
 
-def _map_picker_block(*, post_code: str, notes: str) -> str:
-    return f"""        Spacer(modifier = Modifier.height(16.dp))
+def _map_picker_block(*, post_code: str, notes: str, include_manual_fields: bool) -> str:
+    manual_fields = (
+        f"""        Spacer(modifier = Modifier.height(16.dp))
         Text("Address details", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
         OutlinedTextField(
             value = houseNumber,
@@ -458,7 +470,15 @@ def _map_picker_block(*, post_code: str, notes: str) -> str:
         TextButton(onClick = {{ mapViewRef?.let {{ locateManualAddress(it) }} }}) {{
             Text("Find typed address on map")
         }}
-
+"""
+        if include_manual_fields
+        else """        Spacer(modifier = Modifier.height(16.dp))
+        TextButton(onClick = { mapViewRef?.let { locateManualAddress(it) } }) {
+            Text("Find typed address on map")
+        }
+"""
+    )
+    return f"""{manual_fields}
         Spacer(modifier = Modifier.height(16.dp))
         Text("Select address on map", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
         AndroidView(
