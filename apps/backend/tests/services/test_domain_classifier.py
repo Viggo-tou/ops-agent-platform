@@ -19,6 +19,7 @@ from app.services.domain_classifier import (  # noqa: E402
     synthesize_acceptance_tests_from_playbook,
     synthesize_must_touch_files_from_candidates,
 )
+from app.services.contract_coverage import required_contracts_from_playbook  # noqa: E402
 
 
 # ---- playbook loading ---------------------------------------------------
@@ -350,6 +351,39 @@ def test_phone_otp_synthetic_acceptance_uses_final_file_forbids():
             "app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCCodeOTP.kt",
         ),
     }
+
+
+def test_phone_otp_playbook_contract_coverage_patterns_are_file_scoped():
+    pb = classify_domain(
+        request_text=(
+            "OTP Verification Fix. Phone number can only be used once; allow "
+            "users to request a verification code for the same number again."
+        ),
+        project_tag="handymanapp",
+    )
+    assert pb is not None
+
+    contracts = {
+        contract.contract_id: contract
+        for contract in required_contracts_from_playbook(pb)
+    }
+
+    assert contracts[
+        "customer_postverification_phone_write"
+    ].verification_patterns == [
+        r'child\.ref\.child\("phoneNumber"\)\.setValue\(phoneNumber\)'
+    ]
+    assert contracts[
+        "customer_postverification_phone_write"
+    ].verifications[0].file_filter.endswith("CustomerKYCCodeOTP.kt")
+    assert contracts[
+        "handyman_postverification_phone_write"
+    ].verification_patterns == [
+        r'child\.ref\.child\("phoneNumber"\)\.setValue\(phoneNumber\)'
+    ]
+    assert contracts[
+        "handyman_postverification_phone_write"
+    ].verifications[0].file_filter.endswith("HandymanKYCCodeOTP.kt")
 
 
 def test_synthesize_acceptance_tests_preserves_existing_and_fills_missing():

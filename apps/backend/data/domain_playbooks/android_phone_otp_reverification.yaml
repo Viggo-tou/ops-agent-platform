@@ -39,7 +39,7 @@ required_contracts:
       The customer OTP code screen must persist phoneNumber only after Firebase
       accepts the OTP credential, together with the verified profile status.
     verifications:
-      - kind: diff_contains_pattern_in_file
+      - kind: diff_contains_pattern
         file_filter: app/src/main/java/com/example/handyman/customer_pages/CustomerKYCCodeOTP.kt
         pattern: 'child\.ref\.child\("phoneNumber"\)\.setValue\(phoneNumber\)'
 
@@ -62,7 +62,7 @@ required_contracts:
       The handyman OTP code screen must persist phoneNumber only after Firebase
       accepts the OTP credential, together with the verified profile status.
     verifications:
-      - kind: diff_contains_pattern_in_file
+      - kind: diff_contains_pattern
         file_filter: app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCCodeOTP.kt
         pattern: 'child\.ref\.child\("phoneNumber"\)\.setValue\(phoneNumber\)'
 
