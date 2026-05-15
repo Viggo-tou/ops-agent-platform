@@ -103,6 +103,7 @@ def test_kotlin_skips_external_sdk_imports():
 import android.util.Log
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
+import com.bumptech.glide.Glide
 import com.google.firebase.auth.FirebaseAuth
 import kotlin.collections.List
 import java.util.UUID
@@ -117,6 +118,7 @@ class A { fun f() {} }
     assert "Image" not in ref_names
     assert "clickable" not in ref_names
     assert "FirebaseAuth" not in ref_names
+    assert "Glide" not in ref_names
     assert "List" not in ref_names
     assert "UUID" not in ref_names
     # Internal project import IS kept.

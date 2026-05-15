@@ -11,6 +11,7 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from app.services.domain_classifier import (  # noqa: E402
     all_playbooks,
+    classify_android_map_location_subtype,
     classify_domain,
     evaluate_acceptance_completeness,
     format_playbook_for_planner_prompt,
@@ -31,6 +32,11 @@ def test_android_map_location_playbook_exists():
     )
 
 
+def test_android_job_default_address_playbook_exists():
+    playbooks = all_playbooks()
+    assert any(p.get("id") == "android_job_default_address" for p in playbooks)
+
+
 # ---- domain classifier --------------------------------------------------
 
 
@@ -46,15 +52,29 @@ def test_p69_19_request_text_matches_android_map_location():
     assert pb.get("id") == "android_map_location"
 
 
-def test_project_tag_match_without_keywords():
-    """If the request text is bare but the project_tag matches, the
-    playbook still fires (project_tags is an OR with summary_keywords)."""
+def test_project_tag_without_keywords_does_not_force_domain():
+    """The source tag is too broad to be a domain trigger by itself."""
     pb = classify_domain(
         request_text="finish jira p69-19",
         project_tag="handymanapp",
     )
+    assert pb is None
+
+
+def test_p69_17_issue_text_matches_job_default_address_playbook():
+    pb = classify_domain(
+        request_text=(
+            "Map Integration: Load default address when creating jobs. "
+            "Pre-fill job location map using user saved home address. "
+            "Updated work location is saved to the job instead of overwriting home address."
+        ),
+        project_tag="handymanapp",
+    )
     assert pb is not None
-    assert pb.get("id") == "android_map_location"
+    assert pb.get("id") == "android_job_default_address"
+    assert classify_android_map_location_subtype(
+        "Pre-fill job location map using user saved home address"
+    ) == "job_default_address"
 
 
 def test_keyword_match_without_project_tag():
@@ -307,6 +327,55 @@ def test_synthesize_must_touch_uses_signup_address_candidates():
         "app/src/main/java/com/example/handyman/customer_pages/CustomerKYCAddressForm.kt",
         "app/src/main/java/com/example/handyman/handyman_pages/HandymanSignup.kt",
         "app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCAddressForm.kt",
+    ]
+
+
+def test_synthesize_must_touch_uses_job_default_address_candidates():
+    pb = classify_domain(
+        request_text=(
+            "Load default address when creating jobs; pre-fill job location "
+            "from saved home address"
+        ),
+        project_tag="handymanapp",
+    )
+    candidates = [
+        {
+            "path": "app/src/main/java/com/example/handyman/CustomerJobDetailsFragment.kt",
+            "score": 25.0,
+            "matched_terms": ["details", "map", "address"],
+        },
+        {
+            "path": "app/src/main/java/com/example/handyman/JobPostingFragment.kt",
+            "score": 18.0,
+            "matched_terms": ["job", "address"],
+        },
+        {
+            "path": "app/src/main/java/com/example/handyman/JobPostingFlow.kt",
+            "score": 17.0,
+            "matched_terms": ["job", "location"],
+        },
+        {
+            "path": "app/src/main/java/com/example/handyman/JobPostingViewModel.kt",
+            "score": 12.0,
+            "matched_terms": ["location"],
+        },
+    ]
+
+    must_touch = synthesize_must_touch_files_from_candidates(
+        playbook=pb,
+        candidate_files=candidates,
+        issue_text=(
+            "Load default address when creating jobs; pre-fill job location "
+            "from saved home address"
+        ),
+        existing_must_touch=[],
+        expected_new_files=[],
+    )
+
+    assert must_touch == [
+        "app/src/main/java/com/example/handyman/JobPostingFragment.kt",
+        "app/src/main/java/com/example/handyman/JobPostingFlow.kt",
+        "app/src/main/java/com/example/handyman/JobPostingViewModel.kt",
     ]
 
 

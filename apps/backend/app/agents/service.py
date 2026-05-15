@@ -1059,7 +1059,10 @@ def build_domain_fast_path_plan(
     orchestrator gates still run after this plan is materialized.
     """
     domain_id = str((matched_playbook or {}).get("id") or "").strip()
-    if scenario != "jira_issue_develop" or domain_id != "android_map_location":
+    if scenario != "jira_issue_develop" or domain_id not in {
+        "android_map_location",
+        "android_job_default_address",
+    }:
         return None
 
     issue_text_parts = [request_text or ""]
@@ -1092,6 +1095,59 @@ def build_domain_fast_path_plan(
         acceptance_tests = []
         must_touch_files = []
 
+    try:
+        from app.services.domain_classifier import classify_android_map_location_subtype
+
+        domain_subtype = classify_android_map_location_subtype(issue_text)
+    except Exception:  # noqa: BLE001
+        domain_subtype = "generic_map_location"
+
+    if domain_id == "android_job_default_address" or domain_subtype == "job_default_address":
+        objective = (
+            "Pre-fill the Android job creation location step from the user's "
+            "saved home/account address."
+        )
+        change_summary = (
+            "Load the saved user address into the job posting location state "
+            "and keep later work-location edits on the job payload."
+        )
+        change_explanation = (
+            "Read the current user's saved address from the existing session/"
+            "Firebase profile path on a fresh job; populate locationAddress "
+            "and map coordinates only when the user has not edited them; "
+            "geocode the saved address off the main thread with Locale; "
+            "preserve the existing JobPostingFlow map picker and job payload "
+            "sink so updated work locations are saved to the job, not back to "
+            "the user's home address."
+        )
+        assumptions = [
+            "The job posting flow is the edit target, not signup/KYC profile editing.",
+            "The user's saved home address already exists in the User profile fields.",
+            "If no saved address exists, the current manual/map job-location flow remains usable.",
+        ]
+    else:
+        objective = (
+            "Implement the Android map-location address picker in the "
+            "existing signup and KYC address flows."
+        )
+        change_summary = (
+            "Add OSMDroid map address selection to existing Android forms."
+        )
+        change_explanation = (
+            "Use OSMDroid MapView and MapEventsOverlay for tap selection; "
+            "run Geocoder calls on Dispatchers.IO with Locale.getDefault(); "
+            "sync selected coordinates and address fields into existing "
+            "form state and persistence payloads; preserve existing "
+            "Firebase loops and payload fields; avoid duplicate manual "
+            "address inputs and avoid new helper files unless the source "
+            "explicitly names them."
+        )
+        assumptions = [
+            "The existing signup and KYC address screens are the edit targets.",
+            "The project already provides OSMDroid dependencies.",
+            "The generated patch should modify existing flows instead of creating a detached component.",
+        ]
+
     base_payload = build_fallback_plan_payload(
         request_text,
         scenario=scenario,
@@ -1102,27 +1158,10 @@ def build_domain_fast_path_plan(
     payload_data = base_payload.model_dump(mode="python")
     payload_data.update(
         {
-            "objective": (
-                "Implement the Android map-location address picker in the "
-                "existing signup and KYC address flows."
-            ),
-            "change_summary": (
-                "Add OSMDroid map address selection to existing Android forms."
-            ),
-            "change_explanation": (
-                "Use OSMDroid MapView and MapEventsOverlay for tap selection; "
-                "run Geocoder calls on Dispatchers.IO with Locale.getDefault(); "
-                "sync selected coordinates and address fields into existing "
-                "form state and persistence payloads; preserve existing "
-                "Firebase loops and payload fields; avoid duplicate manual "
-                "address inputs and avoid new helper files unless the source "
-                "explicitly names them."
-            ),
-            "assumptions": [
-                "The existing signup and KYC address screens are the edit targets.",
-                "The project already provides OSMDroid dependencies.",
-                "The generated patch should modify existing flows instead of creating a detached component.",
-            ],
+            "objective": objective,
+            "change_summary": change_summary,
+            "change_explanation": change_explanation,
+            "assumptions": assumptions,
             "missing_information": [],
             "must_touch_files": must_touch_files,
             "expected_new_files": [],

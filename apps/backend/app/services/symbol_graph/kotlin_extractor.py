@@ -38,6 +38,7 @@ _EXTERNAL_IMPORT_PREFIXES: tuple[str, ...] = (
     "android.",
     "androidx.",
     "com.google.",
+    "com.bumptech.",
     "com.android.",
     "kotlin.",
     "kotlinx.",

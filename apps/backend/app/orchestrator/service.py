@@ -1381,7 +1381,7 @@ class PrimaryOrchestrator:
                 format_playbook_for_planner_prompt,
             )
             playbook = classify_domain(
-                request_text=task.request_text or "",
+                request_text=planning_request_text or task.request_text or "",
                 project_tag=getattr(task, "source_name", None),
             )
             if playbook:

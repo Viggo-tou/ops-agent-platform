@@ -1,0 +1,81 @@
+# Android job-default-address domain playbook.
+#
+# Narrow subtype of Android map/location work for Jira issues like P69-17:
+# when creating a new job, initialize the work-location form/map from the
+# current user's saved home/account address, while keeping any edited work
+# location on the job record rather than writing back to the profile.
+
+id: android_job_default_address
+
+triggers:
+  summary_keywords:
+    - "default address"
+    - "saved home address"
+    - "home address"
+    - "saved account address"
+    - "job location"
+    - "work location"
+    - "creating jobs"
+    - "create jobs"
+    - "pre-fill"
+    - prefill
+  project_tags: []
+
+required_contracts:
+  - id: saved_home_address_loaded
+    signal: >
+      The job creation flow must read the current user's saved home/account
+      address before the first job-location step is shown. The source should
+      be the existing user profile/session path, not a hard-coded address.
+    verifications:
+      - kind: diff_contains_pattern
+        pattern: "SessionManager|getLoggedInUserId|getReference\\(\"User\"\\)|child\\(userId\\)\\.get\\("
+
+  - id: job_location_prefilled
+    signal: >
+      The saved home address must prefill the job-location form state when
+      the user has not already edited the work location.
+    verifications:
+      - kind: diff_contains_pattern
+        pattern: "locationAddress\\s*=\\s*homeAddress|viewModel\\.locationAddress\\s*=\\s*homeAddress|homeAddress"
+      - kind: final_context_contains_pattern
+        anchor: changed_hunk
+        scope: same_function
+        pattern: "locationAddress"
+
+  - id: saved_address_geocoded_to_map
+    signal: >
+      When a saved home address exists, the job map should be centered or
+      pinned from that address by geocoding it into latitude/longitude.
+    verifications:
+      - kind: diff_contains_pattern
+        pattern: "getFromLocationName\\s*\\(.*homeAddress|latitude\\s*=|longitude\\s*="
+
+  - id: work_location_saved_to_job_only
+    signal: >
+      User edits to the work location must be saved with the job payload,
+      not written back over the user's saved home/profile address.
+    verifications:
+      - kind: final_context_contains_pattern
+        anchor: changed_hunk
+        scope: same_function
+        pattern: "jobLocation\\s*=\\s*viewModel\\.locationAddress|latitude\\s*=\\s*viewModel\\.latitude|longitude\\s*=\\s*viewModel\\.longitude"
+    forbidden_patterns:
+      - "lastLatitude"
+      - "lastLongitude"
+      - "lastAddress"
+      - "getReference\\(\"User\"\\).*updateChildren"
+
+  - id: missing_home_address_safe
+    signal: >
+      The flow must not crash when no saved home address exists or when
+      profile/geocoder lookup fails; the user should still be able to enter
+      a work location manually.
+    verifications:
+      - kind: diff_contains_pattern
+        pattern: "try\\s*\\{|catch\\s*\\(|runCatching|isBlank\\(\\)"
+
+completeness_rule:
+  minimum_contracts_referenced: 3
+  on_failure: PLAN_UNDER_SPECIFIED
+  retry_planner_once: true

@@ -148,9 +148,19 @@ def classify_domain(
             project_tag or "",
             project_tags if isinstance(project_tags, list) else [],
         )
-        if kw_match or tag_match:
+        if kw_match:
             return pb
     return None
+
+
+def classify_android_map_location_subtype(issue_text: str) -> str:
+    """Classify the map/location family into the narrow workflow shape."""
+    text = _normalize_text(issue_text)
+    if _looks_like_job_default_address_issue(text):
+        return "job_default_address"
+    if _looks_like_signup_address_issue(text):
+        return "signup_address_map"
+    return "generic_map_location"
 
 
 # ---- Feature-task detection ----------------------------------------------
@@ -485,6 +495,24 @@ def synthesize_must_touch_files_from_candidates(
         return []
 
     domain_id = str(playbook.get("id") or "").strip()
+    if domain_id in {"android_job_default_address", "android_map_location"} and _is_job_default_address_issue(issue_text):
+        preferred = [
+            (cand, path, score, index)
+            for cand, path, score, index in filtered
+            if _is_job_default_address_path(path)
+        ]
+        if preferred:
+            preferred.sort(
+                key=lambda item: (
+                    _job_default_address_path_rank(item[1]),
+                    -item[2],
+                    item[3],
+                )
+            )
+            return _unique_paths([path for _cand, path, _score, _index in preferred])[
+                :max_files
+            ]
+
     if domain_id == "android_map_location" and _is_signup_address_issue(issue_text):
         preferred = [
             (cand, path, score, index)
@@ -552,6 +580,42 @@ def _is_source_candidate_path(path: str) -> bool:
 
 def _is_signup_address_issue(issue_text: str) -> bool:
     text = _normalize_text(issue_text)
+    return _looks_like_signup_address_issue(text)
+
+
+def _is_job_default_address_issue(issue_text: str) -> bool:
+    text = _normalize_text(issue_text)
+    return _looks_like_job_default_address_issue(text)
+
+
+def _looks_like_job_default_address_issue(text: str) -> bool:
+    if "address" not in text:
+        return False
+    job_hints = (
+        "job",
+        "job location",
+        "work location",
+        "creating jobs",
+        "create jobs",
+        "new job",
+    )
+    default_hints = (
+        "default",
+        "pre-fill",
+        "prefill",
+        "saved home address",
+        "home address",
+        "saved account address",
+        "saved address",
+    )
+    return any(hint in text for hint in job_hints) and any(
+        hint in text for hint in default_hints
+    )
+
+
+def _looks_like_signup_address_issue(text: str) -> bool:
+    if _looks_like_job_default_address_issue(text):
+        return False
     if "address" not in text:
         return False
     signup_hints = (
@@ -563,6 +627,30 @@ def _is_signup_address_issue(issue_text: str) -> bool:
         "kyc",
     )
     return any(hint in text for hint in signup_hints)
+
+
+def _is_job_default_address_path(path: str) -> bool:
+    name = Path(path).name.lower()
+    return name in {
+        "jobpostingfragment.kt",
+        "jobpostingflow.kt",
+        "jobpostingviewmodel.kt",
+        "job.kt",
+    }
+
+
+def _job_default_address_path_rank(path: str) -> int:
+    lower = path.lower()
+    ordered = (
+        "jobpostingfragment.kt",
+        "jobpostingflow.kt",
+        "jobpostingviewmodel.kt",
+        "job.kt",
+    )
+    for index, marker in enumerate(ordered):
+        if lower.endswith(marker):
+            return index
+    return 99
 
 
 def _is_signup_address_path(path: str) -> bool:

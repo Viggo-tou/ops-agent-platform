@@ -8,6 +8,38 @@ Status values: `todo`, `doing`, `blocked`, `done`.
 
 ## P0
 
+### T-LEARNING-LOOP-V3 Cold-start playbook promotion (opened 2026-05-15)
+
+Status: proposed
+
+Spec: `docs/ai/tasks/T-LEARNING-LOOP-V3-COLD-START-PLAYBOOK-PROMOTION.md`
+
+Goal:
+
+- Unknown or first-time task types must run through a cold-start workflow, not
+  a broad deterministic recipe.
+- Successful/failed runs may synthesize draft playbooks, but drafts are
+  advisory only until promoted by repeated verified approvals.
+- Promoted playbooks carry source/dependency fingerprints and demote
+  automatically on drift, repeated failures, or neighboring-subtype collision.
+
+Why now:
+
+- P69-19 became stable after domain recipe + gates.
+- P69-17 proved that stability alone is not enough: a broad map/location
+  playbook can be semantically wrong for a nearby job-default-address subtype.
+- The loop needs a principled path from "no history" to "trusted playbook"
+  without turning one run into a permanent template.
+
+Acceptance summary:
+
+- No exact promoted subtype -> cold-start mode.
+- Draft playbook -> prompt warning/checklist only, no deterministic fast path.
+- Promotion requires repeated normal approvals and clean deterministic gates.
+- Fingerprint or failure drift -> automatic demotion.
+
+---
+
 ### T-LEARNING-LOOP-V1 Failure-observation memory closes the learning loop (opened 2026-05-12)
 
 Status: in progress (Phase 1 — schema + classifier + first 3 hook scopes)
