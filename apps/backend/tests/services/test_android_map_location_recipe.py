@@ -184,11 +184,23 @@ def test_recipe_adds_osmdroid_map_picker_and_wires_signup_payload():
     assert "AndroidView(" in result.content
     assert "MapEventsOverlay(object : MapEventsReceiver" in result.content
     assert "singleTapConfirmedHelper" in result.content
-    assert "Geocoder(ctx, Locale.getDefault())" in result.content
+    assert "Geocoder(map.context, Locale.getDefault())" in result.content
+    assert "getFromLocationName(query, 1)" in result.content
     assert "withContext(Dispatchers.IO)" in result.content
+    assert "try {" in result.content
+    assert "catch (e: Exception)" in result.content
+    assert 'Log.e("MapPicker", "Reverse geocoding failed", e)' in result.content
+    assert 'Log.e("MapPicker", "Forward geocoding failed", e)' in result.content
+    assert "DisposableEffect(mapViewRef)" in result.content
+    assert "mapViewRef?.onPause()" in result.content
+    assert "mapViewRef?.onDetach()" in result.content
+    assert "OutlinedTextField(" in result.content
+    assert "Find typed address on map" in result.content
     assert '"houseNumber" to houseNumber' in result.content
     assert '"latitude" to latitude' in result.content
     assert '"longitude" to longitude' in result.content
+    assert 'notes = ""' not in result.content
+    assert 'note = ""' not in result.content
     assert "eventsOverlay" not in result.content
     assert "streetNumber" not in result.content
     assert result.contract_coverage is not None

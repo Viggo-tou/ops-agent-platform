@@ -85,6 +85,12 @@ def try_generate_android_map_location_recipe(
 
     if not _has_map_ui(content):
         before = content
+        content = _ensure_map_helpers(content)
+        if content != before:
+            applied.append("ensure_map_geocode_helpers")
+
+    if not _has_map_ui(content):
+        before = content
         content = _insert_map_picker(content)
         if content != before:
             applied.append("insert_osmdroid_map_picker")
@@ -175,6 +181,8 @@ def _needed_imports(content: str) -> list[str]:
     if not _has_map_ui(content):
         imports.extend(
             [
+                "import android.util.Log",
+                "import androidx.compose.runtime.DisposableEffect",
                 "import androidx.compose.ui.viewinterop.AndroidView",
                 "import kotlinx.coroutines.Dispatchers",
                 "import kotlinx.coroutines.launch",
@@ -232,8 +240,23 @@ def _ensure_address_state(content: str) -> str:
     ):
         if not re.search(rf"\bvar\s+{re.escape(var_name)}\s+by\s+remember\b", content):
             needed.append(f"    var {var_name} by remember {{ mutableStateOf({default}) }}")
+    needs_map_ref = (not _has_map_ui(content)) or "mapViewRef" in content
+    if needs_map_ref and not re.search(r"\bvar\s+mapViewRef\s+by\s+remember\s*\{", content):
+        needed.append("    var mapViewRef by remember { mutableStateOf<MapView?>(null) }")
     if not re.search(r"\bval\s+coroutineScope\s*=\s*rememberCoroutineScope\(\)", content):
         needed.append("    val coroutineScope = rememberCoroutineScope()")
+    if needs_map_ref and "DisposableEffect(mapViewRef)" not in content:
+        needed.extend(
+            [
+                "    DisposableEffect(mapViewRef) {",
+                "        onDispose {",
+                "            mapViewRef?.onPause()",
+                "            mapViewRef?.onDetach()",
+                "            mapViewRef = null",
+                "        }",
+                "    }",
+            ]
+        )
     if not needed:
         return content
 
@@ -280,6 +303,94 @@ def _ensure_geocoder_locale(content: str) -> str:
     )
 
 
+def _ensure_map_helpers(content: str) -> str:
+    if "fun reverseGeocodeAddress(" in content and "fun locateManualAddress(" in content:
+        return content
+    names = _field_names(content)
+    helper = _map_helper_block(post_code=names["post_code"])
+    lines = content.splitlines()
+    insert_after = _coroutine_scope_line(lines)
+    if insert_after <= 0:
+        insert_after = _last_state_line(lines)
+    if insert_after <= 0:
+        return content
+    new_lines = lines[:insert_after] + [""] + helper.splitlines() + lines[insert_after:]
+    return _join_like(content, new_lines)
+
+
+def _coroutine_scope_line(lines: list[str]) -> int:
+    for idx, line in enumerate(lines, start=1):
+        if re.search(r"\bval\s+coroutineScope\s*=\s*rememberCoroutineScope\(\)", line):
+            return idx
+    return 0
+
+
+def _map_helper_block(*, post_code: str) -> str:
+    return f"""    fun reverseGeocodeAddress(point: GeoPoint, marker: Marker, map: MapView) {{
+        latitude = point.latitude
+        longitude = point.longitude
+        marker.position = point
+        marker.title = "Selected address"
+        map.invalidate()
+        coroutineScope.launch {{
+            try {{
+                val addresses = withContext(Dispatchers.IO) {{
+                    Geocoder(map.context, Locale.getDefault())
+                        .getFromLocation(point.latitude, point.longitude, 1)
+                }}
+                addresses?.firstOrNull()?.let {{ addr ->
+                    houseNumber = addr.subThoroughfare ?: houseNumber
+                    street = addr.thoroughfare ?: street
+                    area = addr.subLocality ?: area
+                    division = addr.adminArea ?: division
+                    district = addr.subAdminArea ?: district
+                    thana = addr.locality ?: thana
+                    city = addr.locality ?: city
+                    country = addr.countryName ?: country
+                    {post_code} = addr.postalCode ?: {post_code}
+                }}
+            }} catch (e: Exception) {{
+                Log.e("MapPicker", "Reverse geocoding failed", e)
+            }}
+        }}
+    }}
+
+    fun locateManualAddress(map: MapView) {{
+        val query = listOf(houseNumber, street, area, city, country)
+            .map {{ it.trim() }}
+            .filter {{ it.isNotBlank() }}
+            .joinToString(", ")
+        if (query.isBlank()) return
+        coroutineScope.launch {{
+            try {{
+                val results = withContext(Dispatchers.IO) {{
+                    Geocoder(map.context, Locale.getDefault())
+                        .getFromLocationName(query, 1)
+                }}
+                results?.firstOrNull()?.let {{ addr ->
+                    latitude = addr.latitude
+                    longitude = addr.longitude
+                    val point = GeoPoint(latitude, longitude)
+                    val marker = map.overlays.filterIsInstance<Marker>().firstOrNull()
+                        ?: Marker(map).also {{
+                            it.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                            map.overlays.add(it)
+                        }}
+                    marker.position = point
+                    marker.title = "Selected address"
+                    map.controller.animateTo(point)
+                    map.controller.setZoom(16.0)
+                    map.invalidate()
+                }}
+            }} catch (e: Exception) {{
+                Log.e("MapPicker", "Forward geocoding failed", e)
+            }}
+        }}
+    }}
+
+"""
+
+
 def _insert_map_picker(content: str) -> str:
     names = _field_names(content)
     block = _map_picker_block(post_code=names["post_code"], notes=names["notes"])
@@ -301,10 +412,59 @@ def _submit_button_line(lines: list[str]) -> int:
 
 def _map_picker_block(*, post_code: str, notes: str) -> str:
     return f"""        Spacer(modifier = Modifier.height(16.dp))
+        Text("Address details", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+        OutlinedTextField(
+            value = houseNumber,
+            onValueChange = {{ houseNumber = it }},
+            label = {{ Text("House number") }},
+            modifier = Modifier.fillMaxWidth()
+        )
+        OutlinedTextField(
+            value = street,
+            onValueChange = {{ street = it }},
+            label = {{ Text("Street") }},
+            modifier = Modifier.fillMaxWidth()
+        )
+        OutlinedTextField(
+            value = area,
+            onValueChange = {{ area = it }},
+            label = {{ Text("Area") }},
+            modifier = Modifier.fillMaxWidth()
+        )
+        OutlinedTextField(
+            value = city,
+            onValueChange = {{ city = it }},
+            label = {{ Text("City") }},
+            modifier = Modifier.fillMaxWidth()
+        )
+        OutlinedTextField(
+            value = country,
+            onValueChange = {{ country = it }},
+            label = {{ Text("Country") }},
+            modifier = Modifier.fillMaxWidth()
+        )
+        OutlinedTextField(
+            value = {post_code},
+            onValueChange = {{ {post_code} = it }},
+            label = {{ Text("Postcode") }},
+            modifier = Modifier.fillMaxWidth()
+        )
+        OutlinedTextField(
+            value = {notes},
+            onValueChange = {{ {notes} = it }},
+            label = {{ Text("Notes") }},
+            modifier = Modifier.fillMaxWidth()
+        )
+        TextButton(onClick = {{ mapViewRef?.let {{ locateManualAddress(it) }} }}) {{
+            Text("Find typed address on map")
+        }}
+
+        Spacer(modifier = Modifier.height(16.dp))
         Text("Select address on map", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
         AndroidView(
             factory = {{ ctx ->
                 MapView(ctx).apply {{
+                    mapViewRef = this
                     setTileSource(TileSourceFactory.MAPNIK)
                     setMultiTouchControls(true)
                     controller.setZoom(14.0)
@@ -321,29 +481,7 @@ def _map_picker_block(*, post_code: str, notes: str) -> str:
                     overlays.add(MapEventsOverlay(object : MapEventsReceiver {{
                         override fun singleTapConfirmedHelper(p: GeoPoint?): Boolean {{
                             val point = p ?: return false
-                            latitude = point.latitude
-                            longitude = point.longitude
-                            marker.position = point
-                            marker.title = "Selected address"
-                            this@apply.invalidate()
-                            coroutineScope.launch {{
-                                val addresses = withContext(Dispatchers.IO) {{
-                                    Geocoder(ctx, Locale.getDefault())
-                                        .getFromLocation(point.latitude, point.longitude, 1)
-                                }}
-                                addresses?.firstOrNull()?.let {{ addr ->
-                                    houseNumber = addr.subThoroughfare ?: houseNumber
-                                    street = addr.thoroughfare ?: street
-                                    area = addr.subLocality ?: area
-                                    division = addr.adminArea ?: division
-                                    district = addr.subAdminArea ?: district
-                                    thana = addr.locality ?: thana
-                                    city = addr.locality ?: city
-                                    country = addr.countryName ?: country
-                                    {post_code} = addr.postalCode ?: {post_code}
-                                    {notes} = ""
-                                }}
-                            }}
+                            reverseGeocodeAddress(point, marker, this@apply)
                             return true
                         }}
 
