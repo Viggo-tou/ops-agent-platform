@@ -21,6 +21,7 @@ from app.agents.schemas import (  # noqa: E402
 )
 from app.agents.service import (  # noqa: E402
     PrimaryAgentPlanner,
+    build_fallback_plan_payload,
     _log_plan_target_warnings,
     _source_bind_expected_new_files,
     _validate_must_touch_against_kb,
@@ -263,3 +264,23 @@ def test_source_binding_keeps_named_code_file_with_rules_artifact() -> None:
     assert demoted == []
     assert rebound.expected_new_files == ["database.rules.json"]
     assert rebound.must_touch_files == [code_path]
+
+
+def test_fallback_plan_infers_firebase_rules_artifact() -> None:
+    plan = build_fallback_plan_payload(
+        "develop P69-8",
+        scenario="jira_issue_develop",
+        issue_context={
+            "summary": "Privacy Update: Firebase rule",
+            "description": (
+                "The Firebase database rules need to be changed from public "
+                "to private to properly secure the data."
+            ),
+        },
+        candidate_files=[
+            {"relative_path": "app/src/main/java/com/example/handyman/utils/FirebaseMetrics.kt"}
+        ],
+    )
+
+    assert plan.expected_new_files == ["database.rules.json"]
+    assert plan.must_touch_files == []

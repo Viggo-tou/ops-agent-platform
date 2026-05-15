@@ -328,6 +328,20 @@ def _source_text_requests_client_code_work(source_text: str) -> bool:
     )
 
 
+def _infer_expected_new_artifacts_from_source_text(source_text: str) -> list[str]:
+    text = (source_text or "").casefold()
+    inferred: list[str] = []
+    if "firebase" in text and "database" in text and "rule" in text:
+        inferred.append("database.rules.json")
+    if "firestore" in text and "rule" in text:
+        inferred.append("firestore.rules")
+    if "storage" in text and "rule" in text:
+        inferred.append("storage.rules")
+    if "firebase" in text and ("config" in text or "deploy" in text):
+        inferred.append("firebase.json")
+    return list(dict.fromkeys(inferred))
+
+
 def _expected_new_file_is_source_bound(path: str, source_text: str) -> bool:
     """Return True when a planned new path is explicitly grounded.
 
@@ -628,6 +642,12 @@ def build_fallback_plan_payload(
         codegen_permission = registry.get_permission_category(codegen_tool)
         issue_summary = str(issue_context.get("summary") or "").strip() if issue_context else ""
         issue_description = str(issue_context.get("description") or "").strip() if issue_context else ""
+        external_text = "\n".join(
+            part for part in (request_text, issue_summary, issue_description) if part
+        )
+        expected_new_paths = _infer_expected_new_artifacts_from_source_text(external_text)
+        if expected_new_paths and not _source_text_requests_client_code_work(external_text):
+            must_touch_paths = []
         develop_change_summary = issue_summary or change_summary
         explanation_lines = [
             change_explanation,
@@ -655,6 +675,7 @@ def build_fallback_plan_payload(
             else [],
             affected_code_locations=develop_affected_code_locations,
             must_touch_files=must_touch_paths,
+            expected_new_files=expected_new_paths,
             tools=[
                 PlanTool(
                     tool_name=codegen_tool,
