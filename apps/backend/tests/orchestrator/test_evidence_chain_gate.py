@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import tempfile
@@ -384,7 +385,7 @@ def test_plan_target_backfill_promotes_evidence_mentioned_files() -> None:
     ]
 
 
-def test_blocking_reservations_fail_before_jira_transition_approval() -> None:
+def test_blocking_reservations_request_human_approval_before_jira_transition() -> None:
     root = _writable_mkdtemp()
     try:
         orchestrator = _orchestrator(root)
@@ -415,11 +416,19 @@ def test_blocking_reservations_fail_before_jira_transition_approval() -> None:
         )
 
         approvals = [obj for obj in added if hasattr(obj, "action_name")]
-        assert approvals == []
-        assert task.pending_approval is False
-        assert task.latest_result_json["status"] == TaskStatus.FAILED.value
-        assert task.latest_result_json["decision"] == "reservation_blocked"
-        assert task.latest_result_json["blocking_reservations"] == [blocking_item]
+        assert len(approvals) == 1
+        approval = approvals[0]
+        assert approval.action_name == "reservation_security_policy_review"
+        assert approval.status == ApprovalStatus.PENDING
+        assert task.pending_approval is True
+        assert task.latest_result_json["status"] == TaskStatus.AWAITING_APPROVAL.value
+        assert task.latest_result_json["result"]["reason"] == "reservation_blocked"
+        assert task.latest_result_json["result"]["blocking_reservations"] == [blocking_item]
+        assert "pipeline_state" not in approval.request_payload_json
+        assert "pipeline_state" not in task.latest_result_json["result"]
+        assert task.latest_result_json["pipeline_state"]["reservation_blocked"]["reason"] == "reservation_blocked"
+        json.dumps(approval.request_payload_json)
+        json.dumps(task.latest_result_json)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

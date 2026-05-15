@@ -9,6 +9,7 @@ import time
 import traceback
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import is_dataclass, replace
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,61 @@ def _should_promote_evidence_must_touch_to_plan(plan: Any) -> bool:
     return not bool(getattr(plan, "must_touch_files", None) or []) and not bool(
         getattr(plan, "expected_new_files", None) or []
     )
+
+
+def _json_safe_for_persistence(value: Any, *, _seen: set[int] | None = None) -> Any:
+    """Convert nested pipeline data to JSON-safe primitives.
+
+    Pipeline state is assembled from many gates and provider responses. A
+    single accidental object reference or self-reference should not poison the
+    SQLAlchemy session at the checkpoint boundary.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+
+    seen = _seen if _seen is not None else set()
+    obj_id = id(value)
+    if obj_id in seen:
+        return "<circular>"
+
+    to_payload = getattr(value, "to_payload", None)
+    if callable(to_payload):
+        try:
+            return _json_safe_for_persistence(to_payload(), _seen=seen)
+        except Exception:  # noqa: BLE001
+            return str(value)
+
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return _json_safe_for_persistence(model_dump(mode="json"), _seen=seen)
+        except Exception:  # noqa: BLE001
+            return str(value)
+
+    if isinstance(value, dict):
+        seen.add(obj_id)
+        try:
+            return {
+                str(k): _json_safe_for_persistence(v, _seen=seen)
+                for k, v in value.items()
+            }
+        finally:
+            seen.discard(obj_id)
+
+    if isinstance(value, (list, tuple, set)):
+        seen.add(obj_id)
+        try:
+            return [_json_safe_for_persistence(item, _seen=seen) for item in value]
+        finally:
+            seen.discard(obj_id)
+
+    return str(value)
 
 
 def record_event(
@@ -567,15 +623,32 @@ def _semantic_review_should_block_on_exhausted(
     sr_report: object | None,
     settings: object,
 ) -> bool:
+    return _semantic_review_exhausted_block_reason(sr_report, settings) is not None
+
+
+def _semantic_review_exhausted_block_reason(
+    sr_report: object | None,
+    settings: object,
+) -> str | None:
     if sr_report is None:
-        return False
+        return None
+    if bool(getattr(sr_report, "passed", False)):
+        return None
     sr_high_count = _semantic_review_high_count(sr_report)
     sr_completeness = int(getattr(sr_report, "completeness_pct", 0) or 0)
     sr_blocks = bool(
-        getattr(settings, "semantic_review_high_blocks_on_exhausted", True)
+        getattr(
+            settings,
+            "semantic_review_blocks_on_exhausted",
+            getattr(settings, "semantic_review_high_blocks_on_exhausted", True),
+        )
     )
     sr_threshold = int(getattr(settings, "semantic_review_pass_threshold", 80) or 80)
-    return sr_blocks and sr_high_count > 0 and sr_completeness < sr_threshold
+    if not sr_blocks or sr_completeness >= sr_threshold:
+        return None
+    if sr_high_count > 0:
+        return "semantic_review_unresolved_high"
+    return "semantic_review_low_completeness"
 
 
 def _semantic_review_high_findings(sr_report: object | None) -> list[dict[str, object]]:
@@ -644,6 +717,93 @@ def _semantic_review_related_context_paths(files_changed: object) -> list[str]:
                 seen.add(candidate)
                 related.append(candidate)
     return related
+
+
+def _build_semantic_review_spec_text(
+    *,
+    task: object,
+    plan: object,
+) -> str:
+    """Build the reviewer spec from the user's request and plan contract.
+
+    The semantic reviewer must judge the diff against the actual development
+    contract, not just a ticket shell like "develop P69-8". Include the
+    planner's target files and acceptance hints so artifact-only tasks do not
+    get mis-scored for lacking unrelated application code.
+    """
+    translation = (
+        getattr(task, "translation_json", None)
+        if isinstance(getattr(task, "translation_json", None), dict)
+        else {}
+    )
+    search_queries = translation.get("search_queries") or []
+    grounding_terms = translation.get("grounding_terms") or []
+
+    must_touch = [
+        str(path).strip()
+        for path in (getattr(plan, "must_touch_files", []) or [])
+        if str(path).strip()
+    ]
+    expected_new = [
+        str(path).strip()
+        for path in (getattr(plan, "expected_new_files", []) or [])
+        if str(path).strip()
+    ]
+
+    acceptance_lines: list[str] = []
+    for test in (getattr(plan, "acceptance_tests", []) or [])[:10]:
+        if isinstance(test, dict):
+            kind = str(test.get("kind") or "").strip()
+            file = str(test.get("file") or "").strip()
+            pattern = str(test.get("pattern") or "").strip()
+            rationale = str(test.get("rationale") or "").strip()
+        else:
+            kind = str(getattr(test, "kind", "") or "").strip()
+            file = str(getattr(test, "file", "") or "").strip()
+            pattern = str(getattr(test, "pattern", "") or "").strip()
+            rationale = str(getattr(test, "rationale", "") or "").strip()
+        bits = [bit for bit in (kind, file, pattern, rationale) if bit]
+        if bits:
+            acceptance_lines.append(" - " + " | ".join(bits)[:500])
+
+    contract_lines = [
+        "PLAN TARGET CONTRACT:",
+        " - must_touch_files: " + (", ".join(must_touch) if must_touch else "(none)"),
+        " - expected_new_files: "
+        + (", ".join(expected_new) if expected_new else "(none)"),
+    ]
+    if expected_new and not must_touch:
+        contract_lines.append(
+            " - artifact_only: true (do not require application source-code "
+            "changes unless the SPEC explicitly asks for them)"
+        )
+    if acceptance_lines:
+        contract_lines.append(" - acceptance_tests:")
+        contract_lines.extend(acceptance_lines)
+
+    spec_parts = [
+        str(getattr(plan, "objective", "") or ""),
+        str(getattr(plan, "change_summary", "") or ""),
+        str(getattr(plan, "change_explanation", "") or ""),
+        str(getattr(plan, "request_summary", "") or "")[:3000],
+        "\n".join(contract_lines),
+        str(search_queries[0])[:3000] if search_queries else "",
+        str(translation.get("normalized_request") or ""),
+        (
+            "Spec keywords: " + ", ".join(str(g) for g in grounding_terms[:20])
+            if grounding_terms else ""
+        ),
+        str(getattr(task, "request_text", "") or ""),
+    ]
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for part in spec_parts:
+        normalized = part.strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            deduped.append(normalized)
+    return "\n\n".join(deduped)
 
 
 _PLAN_BACKFILL_SOURCE_SUFFIXES = (
@@ -2873,6 +3033,21 @@ class PrimaryOrchestrator:
                 pipeline_state["semantic_review_done"] = True
                 pipeline_state.pop("evidence_chain_validated", None)
                 pipeline_state.pop("evidence_chain", None)
+                self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+                self._workspace_write_checkpoint(
+                    task,
+                    stage_completed="approval",
+                    next_stage="review_post",
+                    resume_args={"approval_id": approval_id},
+                )
+                self._execute_develop_pipeline(
+                    task=task, actor_name=actor_name, plan=plan_document, approval_id=approval_id
+                )
+                return
+            pending_reservation_id = pipeline_state.get("pending_reservation_approval_id")
+            if pending_reservation_id == approval_id:
+                pipeline_state.pop("pending_reservation_approval_id", None)
+                pipeline_state["reservation_acknowledged"] = True
                 self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
                 self._workspace_write_checkpoint(
                     task,
@@ -7636,44 +7811,10 @@ class PrimaryOrchestrator:
                 )
                 _SR_PASS_THRESHOLD = 80
                 _SR_MAX_REPAIR = 2
-                _sr_translation = (
-                    task.translation_json
-                    if isinstance(task.translation_json, dict) else {}
+                _sr_spec_text = _build_semantic_review_spec_text(
+                    task=task,
+                    plan=plan,
                 )
-                # Build a rich spec from every available source. Previously
-                # only used plan.objective (often generic boilerplate like
-                # "Implement the Jira issue by generating code...") plus
-                # the bare ticket key, which produced reviews like "no spec
-                # provided". The full ticket body lives in translation.
-                # search_queries[0] (the planner's expanded prompt) and
-                # grounding_terms are also signal-rich. Cap the joined
-                # text to keep the LLM prompt within budget.
-                _sr_search_qs = _sr_translation.get("search_queries") or []
-                _sr_search_q0 = (
-                    str(_sr_search_qs[0])[:3000] if _sr_search_qs else ""
-                )
-                _sr_grounding = _sr_translation.get("grounding_terms") or []
-                _sr_grounding_str = (
-                    "Spec keywords: " + ", ".join(str(g) for g in _sr_grounding[:20])
-                    if _sr_grounding else ""
-                )
-                _sr_spec_parts = [
-                    str(getattr(plan, "objective", "") or ""),
-                    _sr_search_q0,
-                    str(_sr_translation.get("normalized_request") or ""),
-                    _sr_grounding_str,
-                    str(task.request_text or ""),
-                ]
-                # Dedup adjacent duplicates (common when the user request
-                # is just the ticket key and translation echoes it).
-                _seen: set[str] = set()
-                _dedup: list[str] = []
-                for part in _sr_spec_parts:
-                    norm = part.strip()
-                    if norm and norm not in _seen:
-                        _seen.add(norm)
-                        _dedup.append(norm)
-                _sr_spec_text = "\n\n".join(_dedup)
 
                 # Read post-edit content of the changed files for the
                 # reviewer's context.
@@ -8236,10 +8377,11 @@ class PrimaryOrchestrator:
                 # hard-block into AWAITING_APPROVAL when configured.
                 if sr_report is not None:
                     pipeline_state["semantic_review"] = sr_report.to_payload()
-                if _semantic_review_should_block_on_exhausted(
+                sr_block_reason = _semantic_review_exhausted_block_reason(
                     sr_report,
                     self.tool_gateway.settings,
-                ):
+                )
+                if sr_block_reason:
                     sr_high_count = _semantic_review_high_count(sr_report)
                     sr_completeness = int(
                         getattr(sr_report, "completeness_pct", 0) or 0
@@ -8252,12 +8394,20 @@ class PrimaryOrchestrator:
                         )
                         or 80
                     )
+                    if sr_block_reason == "semantic_review_unresolved_high":
+                        detail = (
+                            f"{sr_high_count} high-severity finding(s) unresolved"
+                        )
+                    else:
+                        detail = (
+                            "low completeness with no actionable grounded "
+                            "repair finding"
+                        )
                     message = (
                         "semantic_review exhausted with "
-                        f"{sr_high_count} high-severity finding(s) unresolved "
+                        f"{detail} "
                         f"(completeness {sr_completeness}% < {sr_threshold}%); "
-                        "hard-blocking on awaiting_approval per "
-                        "semantic_review_high_blocks_on_exhausted=True"
+                        "routing to awaiting_approval before Jira transition."
                     )
                     self._request_semantic_review_approval(
                         task=task,
@@ -8268,6 +8418,7 @@ class PrimaryOrchestrator:
                         sr_high_count=sr_high_count,
                         sr_completeness=sr_completeness,
                         sr_threshold=sr_threshold,
+                        reason_code=sr_block_reason,
                     )
                     return
                 pipeline_state["semantic_review_done"] = True
@@ -13757,12 +13908,19 @@ class PrimaryOrchestrator:
             else:
                 persistable[k] = v
         latest_result = dict(task.latest_result_json) if isinstance(task.latest_result_json, dict) else {}
-        latest_result["pipeline_state"] = persistable
-        task.latest_result_json = latest_result
+        latest_result["pipeline_state"] = _json_safe_for_persistence(persistable)
+        task.latest_result_json = _json_safe_for_persistence(latest_result)
         try:
             self.db.flush()
-        except Exception:
-            pass  # best-effort persistence; don't break the pipeline
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "pipeline_state_persist_failed",
+                extra={"task_id": getattr(task, "id", None), "error": str(exc)[:300]},
+            )
+            try:
+                self.db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
 
     @staticmethod
     def _is_missing_test_pipeline_config_error(error_message: str) -> bool:
@@ -14229,8 +14387,8 @@ class PrimaryOrchestrator:
         if hard_blocking_reservations:
             message = (
                 "Post-review reservations include blocking security/policy "
-                "concerns; Jira transition approval is blocked until the "
-                "implementation is changed or the task is re-scoped."
+                "concerns; human approval is required before the pipeline "
+                "can continue to Jira transition."
             )
             payload = {
                 "decision": "reservation_blocked",
@@ -14243,25 +14401,36 @@ class PrimaryOrchestrator:
                 "hard_blocking_reservations": hard_blocking_reservations,
                 "hard_gates": hard_gates,
                 "evidence_chain": evidence_chain_payload,
-                "pipeline_state": pipeline_state,
             }
+            if pipeline_state.get("reservation_acknowledged"):
+                warnings = pipeline_state.setdefault("warnings", [])
+                if isinstance(warnings, list):
+                    warnings.append(
+                        {
+                            "kind": "reservation_acknowledged",
+                            "message": (
+                                "Blocking security/policy reservations were "
+                                "acknowledged by a human reviewer."
+                            ),
+                        }
+                    )
+            else:
+                self._request_reservation_approval(
+                    task=task,
+                    plan=plan,
+                    pipeline_state=pipeline_state,
+                    message=message,
+                    payload=payload,
+                )
+                commit_checkpoint(self.db, label="awaiting_approval_reservation_blocked")
+                return
             self._record_playbook_promotion_candidate(
                 task=task,
                 plan=plan,
                 pipeline_state=pipeline_state,
-                approval_action="reservation_blocked",
+                approval_action="reservation_acknowledged",
                 approval_id=None,
             )
-            self._fail_develop_pipeline(
-                task=task,
-                message=message,
-                event_type=EventType.REVIEW_FAILED,
-                stage=WorkflowStage.REVIEW,
-                role=RoleName.REVIEWER,
-                payload=payload,
-            )
-            commit_checkpoint(self.db, label="reservation_blocked")
-            return
 
         reservation_repair_attempts = int(
             pipeline_state.get("reservation_repair_attempts") or 0
@@ -14785,6 +14954,135 @@ class PrimaryOrchestrator:
         )
         commit_checkpoint(self.db, label="awaiting_approval_plan_codegen_conflict")
 
+    def _request_reservation_approval(
+        self,
+        *,
+        task: Task,
+        plan: GeneratedPlan,
+        pipeline_state: dict[str, object],
+        message: str,
+        payload: dict[str, object],
+    ) -> None:
+        """Park for human decision on blocking security/policy reservations."""
+        safe_payload = {
+            key: value
+            for key, value in payload.items()
+            if key != "pipeline_state"
+        }
+        approval_payload = {
+            "reason": "reservation_blocked",
+            "plan_id": getattr(plan, "plan_id", None),
+            **safe_payload,
+            "message": message,
+        }
+        approval_payload = _json_safe_for_persistence(approval_payload)
+
+        approval = Approval(
+            task_id=task.id,
+            action_name="reservation_security_policy_review",
+            status=ApprovalStatus.PENDING,
+            requested_by_role=RoleName.REVIEWER,
+            approver_role=ActorRole.TEAM_LEAD.value,
+            requested_by_actor_name=task.actor_name,
+            risk_level=task.risk_level,
+            risk_category=task.risk_category,
+            reason=(
+                "Post-review reservations include blocking security/policy "
+                "concerns; human acknowledgement is required."
+            ),
+            request_payload_json=approval_payload,
+            policy_snapshot_json={
+                "decision": "require_approval",
+                "source": "develop_reservation_security_policy",
+                "tool_name": "reservation_security_policy_review",
+                "actor_name": task.actor_name,
+                "actor_role": task.actor_role.value,
+                "risk_level": task.risk_level.value,
+                "risk_category": task.risk_category.value,
+                "required_approver_role": ActorRole.TEAM_LEAD.value,
+            },
+        )
+        self.db.add(approval)
+        self.db.flush()
+
+        pipeline_state["pending_reservation_approval_id"] = approval.id
+        pipeline_state["reservation_blocked"] = approval_payload
+        self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
+
+        task.pending_approval = True
+        task.latest_result_json = _json_safe_for_persistence({
+            "status": TaskStatus.AWAITING_APPROVAL.value,
+            "message": message,
+            "approval_id": approval.id,
+            "result": approval_payload,
+            "pipeline_state": pipeline_state,
+        })
+        self._write_task_checkpoint(
+            task,
+            stage="awaiting_approval",
+            output_payload=self._task_checkpoint_payload(
+                task,
+                approval_id=approval.id,
+                pipeline_state=pipeline_state,
+                plan_json=task.plan_json,
+            ),
+            sandbox_snapshot_id=self._build_develop_sandbox(task).snapshot_id(),
+        )
+
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.REVIEW_FAILED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            tool_name="reservations.review",
+            message=message,
+            payload=approval_payload,
+        )
+        set_task_status(
+            self.db,
+            task=task,
+            new_status=TaskStatus.AWAITING_APPROVAL,
+            new_stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            source=EventSource.ORCHESTRATOR,
+            message="Awaiting human approval for security/policy reservations.",
+        )
+        record_event(
+            self.db,
+            task_id=task.id,
+            event_type=EventType.APPROVAL_REQUESTED,
+            source=EventSource.ORCHESTRATOR,
+            stage=WorkflowStage.REVIEW,
+            role=RoleName.REVIEWER,
+            tool_name="reservation_security_policy_review",
+            message="Approval requested for blocking security/policy reservations.",
+            payload={
+                "approval_id": approval.id,
+                "action_name": approval.action_name,
+                "approver_role": approval.approver_role,
+                "blocking_count": len(payload.get("blocking_reservations") or []),
+                "hard_blocking_count": len(payload.get("hard_blocking_reservations") or []),
+            },
+        )
+        self._record_playbook_promotion_candidate(
+            task=task,
+            plan=plan,
+            pipeline_state=pipeline_state,
+            approval_action=approval.action_name,
+            approval_id=approval.id,
+        )
+        self._workspace_append_audit(
+            task,
+            "reservation_security_policy_review",
+            {
+                "approval_id": approval.id,
+                "blocking_count": len(payload.get("blocking_reservations") or []),
+                "hard_blocking_count": len(payload.get("hard_blocking_reservations") or []),
+            },
+        )
+
     def _request_semantic_review_approval(
         self,
         *,
@@ -14796,11 +15094,30 @@ class PrimaryOrchestrator:
         sr_high_count: int,
         sr_completeness: int,
         sr_threshold: int,
+        reason_code: str = "semantic_review_unresolved_high",
     ) -> None:
-        """Park the task for human ACK when semantic_review exhausts with high findings."""
+        """Park the task for human ACK when semantic_review exhausts below threshold."""
+        reason_code = (
+            reason_code
+            if reason_code in {
+                "semantic_review_unresolved_high",
+                "semantic_review_low_completeness",
+            }
+            else "semantic_review_unresolved_high"
+        )
+        reason_text = (
+            "Semantic review repair budget exhausted with unresolved "
+            "high-severity findings; human acknowledgement is required."
+            if reason_code == "semantic_review_unresolved_high"
+            else (
+                "Semantic review scored below the completeness threshold "
+                "after repair options were exhausted; human quality review "
+                "is required."
+            )
+        )
         findings_high = _semantic_review_high_findings(sr_report)[:8]
         approval_payload = {
-            "reason": "semantic_review_unresolved_high",
+            "reason": reason_code,
             "plan_id": getattr(plan, "plan_id", None),
             "high_severity_count": sr_high_count,
             "completeness_pct": sr_completeness,
@@ -14814,22 +15131,19 @@ class PrimaryOrchestrator:
 
         approval = Approval(
             task_id=task.id,
-            action_name="semantic_review_unresolved_high",
+            action_name=reason_code,
             status=ApprovalStatus.PENDING,
             requested_by_role=RoleName.REVIEWER,
             approver_role=ActorRole.TEAM_LEAD.value,
             requested_by_actor_name=task.actor_name,
             risk_level=task.risk_level,
             risk_category=task.risk_category,
-            reason=(
-                "Semantic review repair budget exhausted with unresolved "
-                "high-severity findings; human acknowledgement is required."
-            ),
-            request_payload_json=approval_payload,
+            reason=reason_text,
+            request_payload_json=_json_safe_for_persistence(approval_payload),
             policy_snapshot_json={
                 "decision": "require_approval",
-                "source": "develop_semantic_review_unresolved_high",
-                "tool_name": "semantic_review_unresolved_high",
+                "source": f"develop_{reason_code}",
+                "tool_name": reason_code,
                 "actor_name": task.actor_name,
                 "actor_role": task.actor_role.value,
                 "risk_level": task.risk_level.value,
@@ -14845,13 +15159,13 @@ class PrimaryOrchestrator:
         self._preserve_develop_pipeline_state(task=task, pipeline_state=pipeline_state)
 
         task.pending_approval = True
-        task.latest_result_json = {
+        task.latest_result_json = _json_safe_for_persistence({
             "status": TaskStatus.AWAITING_APPROVAL.value,
             "message": message,
             "approval_id": approval.id,
             "result": approval_payload,
             "pipeline_state": pipeline_state,
-        }
+        })
         self._write_task_checkpoint(
             task,
             stage="awaiting_approval",
@@ -14891,8 +15205,8 @@ class PrimaryOrchestrator:
             source=EventSource.ORCHESTRATOR,
             stage=WorkflowStage.REVIEW,
             role=RoleName.REVIEWER,
-            tool_name="semantic_review.unresolved_high",
-            message="Approval requested after semantic_review exhausted with high findings.",
+            tool_name=reason_code,
+            message="Approval requested after semantic_review exhausted below threshold.",
             payload={
                 "approval_id": approval.id,
                 "action_name": approval.action_name,
@@ -14911,7 +15225,7 @@ class PrimaryOrchestrator:
         )
         self._workspace_append_audit(
             task,
-            "semantic_review.unresolved_high",
+            reason_code,
             {
                 "approval_id": approval.id,
                 "high_severity_count": sr_high_count,
@@ -14919,7 +15233,7 @@ class PrimaryOrchestrator:
                 "threshold": sr_threshold,
             },
         )
-        commit_checkpoint(self.db, label="awaiting_approval_semantic_review_high")
+        commit_checkpoint(self.db, label=f"awaiting_approval_{reason_code}")
 
     def _fail_develop_pipeline(
         self,

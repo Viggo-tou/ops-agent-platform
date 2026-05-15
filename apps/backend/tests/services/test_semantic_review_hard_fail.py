@@ -10,13 +10,54 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.orchestrator.service import (  # noqa: E402
+    _build_semantic_review_spec_text,
     _semantic_review_actionable_quality_findings,
+    _semantic_review_exhausted_block_reason,
     _semantic_review_filter_after_verified_gates,
     _semantic_review_high_count,
     _semantic_review_should_attempt_quality_refine,
     _semantic_review_should_attempt_repair,
     _semantic_review_should_block_on_exhausted,
 )
+
+
+def test_semantic_review_spec_includes_artifact_target_contract():
+    task = SimpleNamespace(
+        request_text="develop P69-8",
+        translation_json={
+            "normalized_request": "develop P69-8",
+            "search_queries": ["develop P69-8"],
+            "grounding_terms": ["develop", "P69-8"],
+        },
+    )
+    plan = SimpleNamespace(
+        objective="Implement the Jira issue.",
+        request_summary="Privacy Update: Firebase rule",
+        change_summary=(
+            "The Firebase database rules need to be changed from public "
+            "to private."
+        ),
+        change_explanation=(
+            "Create or update database.rules.json to enforce private access."
+        ),
+        must_touch_files=[],
+        expected_new_files=["database.rules.json"],
+        acceptance_tests=[
+            {
+                "kind": "diff_contains_pattern_in_file",
+                "file": "database.rules.json",
+                "pattern": '".read"',
+                "rationale": "Rules file carries the privacy change.",
+            }
+        ],
+    )
+
+    text = _build_semantic_review_spec_text(task=task, plan=plan)
+
+    assert "public to private" in text
+    assert "expected_new_files: database.rules.json" in text
+    assert "artifact_only: true" in text
+    assert "diff_contains_pattern_in_file" in text
 
 
 def test_high_finding_blocks_when_enabled():
@@ -30,6 +71,10 @@ def test_high_finding_blocks_when_enabled():
     )
 
     assert _semantic_review_should_block_on_exhausted(sr_report, settings) is True
+    assert (
+        _semantic_review_exhausted_block_reason(sr_report, settings)
+        == "semantic_review_unresolved_high"
+    )
 
 
 def test_high_finding_passes_when_disabled():
@@ -43,6 +88,41 @@ def test_high_finding_passes_when_disabled():
     )
 
     assert _semantic_review_should_block_on_exhausted(sr_report, settings) is False
+
+
+def test_low_completeness_blocks_even_without_grounded_high_findings():
+    settings = SimpleNamespace(
+        semantic_review_blocks_on_exhausted=True,
+        semantic_review_pass_threshold=80,
+    )
+    sr_report = SimpleNamespace(
+        passed=False,
+        high_severity_count=lambda: 0,
+        completeness_pct=45,
+        findings=[],
+    )
+
+    assert _semantic_review_should_block_on_exhausted(sr_report, settings) is True
+    assert (
+        _semantic_review_exhausted_block_reason(sr_report, settings)
+        == "semantic_review_low_completeness"
+    )
+
+
+def test_semantic_review_pass_does_not_block_on_exhausted():
+    settings = SimpleNamespace(
+        semantic_review_blocks_on_exhausted=True,
+        semantic_review_pass_threshold=80,
+    )
+    sr_report = SimpleNamespace(
+        passed=True,
+        high_severity_count=lambda: 0,
+        completeness_pct=90,
+        findings=[],
+    )
+
+    assert _semantic_review_should_block_on_exhausted(sr_report, settings) is False
+    assert _semantic_review_exhausted_block_reason(sr_report, settings) is None
 
 
 def test_semantic_review_does_not_repair_without_grounded_findings():

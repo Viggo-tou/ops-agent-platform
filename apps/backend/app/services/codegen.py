@@ -765,6 +765,154 @@ class CodeGenerator:
                 f"were emitted as new files: {must_touch_created}."
             )
 
+    @classmethod
+    def _normalize_expected_new_file_result(
+        cls,
+        result: CodegenResult,
+        *,
+        expected_new_files: list[str],
+        source_repo_path: str | None,
+    ) -> CodegenResult:
+        """Repair safe new-file diff headers for planner-declared artifacts.
+
+        LLMs often produce the correct content for a declared new file but use
+        the modify-existing-file header shape (`--- a/path`) instead of
+        `--- /dev/null`. That is a mechanical patch-format problem, not a code
+        judgment. Keep the model responsible for content and let the harness
+        normalize the executable diff boundary when the edit is provably a pure
+        create-file hunk.
+        """
+        normalized, changed = cls._normalize_expected_new_file_diff_headers(
+            result.diff,
+            expected_new_files=expected_new_files,
+            source_repo_path=source_repo_path,
+        )
+        if not changed:
+            return result
+
+        files_changed = DiffReviewer.parse_changed_files(normalized) or result.files_changed
+        return result.model_copy(
+            update={
+                "diff": normalized,
+                "files_changed": files_changed,
+            }
+        )
+
+    @classmethod
+    def _normalize_expected_new_file_diff_headers(
+        cls,
+        diff: str,
+        *,
+        expected_new_files: list[str],
+        source_repo_path: str | None,
+    ) -> tuple[str, bool]:
+        """Convert safe expected-new sections to git-applyable new-file diffs."""
+        if not diff or not diff.strip() or not expected_new_files:
+            return diff, False
+
+        expected = [
+            cls._normalize_diff_path(path)
+            for path in expected_new_files
+            if isinstance(path, str) and path.strip()
+        ]
+        if not expected:
+            return diff, False
+
+        repo = Path(source_repo_path) if source_repo_path else None
+        normalized_diff = diff.replace("\r\n", "\n").replace("\r", "\n")
+        sections = re.split(r"(?=^diff --git )", normalized_diff, flags=re.MULTILINE)
+        changed = False
+        rewritten_sections: list[str] = []
+
+        for section in sections:
+            if not section:
+                continue
+            rewritten, section_changed = cls._normalize_expected_new_file_section(
+                section,
+                expected_new_files=expected,
+                source_repo_path=repo,
+            )
+            rewritten_sections.append(rewritten)
+            changed = changed or section_changed
+
+        if not changed:
+            return diff, False
+
+        out = "".join(rewritten_sections)
+        if out and not out.endswith("\n"):
+            out += "\n"
+        return out, True
+
+    @classmethod
+    def _normalize_expected_new_file_section(
+        cls,
+        section: str,
+        *,
+        expected_new_files: list[str],
+        source_repo_path: Path | None,
+    ) -> tuple[str, bool]:
+        if not section.startswith("diff --git "):
+            return section, False
+
+        lines = section.splitlines(keepends=True)
+        if not lines:
+            return section, False
+        header = lines[0].rstrip("\n")
+        match = re.match(r"^diff --git a/(.+?) b/(.+?)$", header)
+        if match is None:
+            return section, False
+
+        a_path = cls._normalize_diff_path(match.group(1))
+        b_path = cls._normalize_diff_path(match.group(2))
+        if not any(cls._paths_match(b_path, expected) for expected in expected_new_files):
+            return section, False
+        if source_repo_path is not None and (source_repo_path / b_path).exists():
+            return section, False
+        if "new file mode " in section and re.search(r"^--- /dev/null$", section, re.MULTILINE):
+            return section, False
+        if cls._diff_section_has_removed_payload(section):
+            return section, False
+        if not re.search(r"^@@ -0(?:,0)? \+\d+(?:,\d+)? @@", section, re.MULTILINE):
+            return section, False
+
+        old_header_pattern = re.compile(rf"^--- a/{re.escape(a_path)}$", re.MULTILINE)
+        new_header_pattern = re.compile(rf"^\+\+\+ b/{re.escape(b_path)}$", re.MULTILINE)
+        if old_header_pattern.search(section) is None or new_header_pattern.search(section) is None:
+            return section, False
+
+        rewritten_lines: list[str] = []
+        inserted_mode = False
+        for idx, raw in enumerate(lines):
+            stripped = raw.rstrip("\n")
+            newline = "\n" if raw.endswith("\n") else ""
+            if idx == 1 and "new file mode " not in section:
+                rewritten_lines.append("new file mode 100644\n")
+                inserted_mode = True
+            if stripped == f"--- a/{a_path}":
+                rewritten_lines.append(f"--- /dev/null{newline}")
+                continue
+            rewritten_lines.append(raw)
+
+        if not inserted_mode and "new file mode " not in section:
+            return section, False
+        return "".join(rewritten_lines), True
+
+    @staticmethod
+    def _diff_section_has_removed_payload(section: str) -> bool:
+        for line in section.splitlines():
+            if line.startswith("--- "):
+                continue
+            if line.startswith("-"):
+                return True
+        return False
+
+    @staticmethod
+    def _normalize_diff_path(path: str) -> str:
+        value = str(path or "").strip().replace("\\", "/")
+        if value.startswith("a/") or value.startswith("b/"):
+            value = value[2:]
+        return value.strip("/")
+
     def generate_patch(
         self,
         *,
@@ -894,6 +1042,11 @@ class CodeGenerator:
                 _logger.info(
                     "Provider %s primary call returned in %.1fs",
                     provider, time.monotonic() - _provider_t0,
+                )
+                result = self._normalize_expected_new_file_result(
+                    result,
+                    expected_new_files=expected_new_files,
+                    source_repo_path=source_repo_path,
                 )
                 if enforce:
                     self._validate_diff_paths_within_allowed(
@@ -1069,6 +1222,11 @@ class CodeGenerator:
                                 actor_name=actor_name,
                                 fallback_step=provider_idx,
                                 override_prompt=retry_prompt,
+                            )
+                            result = self._normalize_expected_new_file_result(
+                                result,
+                                expected_new_files=expected_new_files,
+                                source_repo_path=source_repo_path,
                             )
                             _logger.info(
                                 "Retry call returned in %.1fs (provider=%s, error_kind=%s, retry=%d/%d)",

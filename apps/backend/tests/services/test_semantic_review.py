@@ -19,6 +19,7 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from app.services.semantic_review import (  # noqa: E402
     SemanticReviewError,
+    _SYSTEM_PROMPT,
     _extract_json_object,
     _files_in_diff,
     _is_finding_grounded,
@@ -285,12 +286,14 @@ def test_evaluate_empty_diff_passes_trivially():
 
 
 def test_evaluate_invalid_json_raises():
-    with pytest.raises(SemanticReviewError):
-        evaluate_semantic_review(
-            spec_text="x", diff=_SAMPLE_DIFF, file_contents=None,
-            settings=_settings(), pass_threshold=80,
-            llm_caller=lambda _p: "not json {{{",
-        )
+    report = evaluate_semantic_review(
+        spec_text="x", diff=_SAMPLE_DIFF, file_contents=None,
+        settings=_settings(), pass_threshold=80,
+        llm_caller=lambda _p: "not json {{{",
+    )
+
+    assert report.is_unavailable is True
+    assert report.unavailable_reason == "invalid_json"
 
 
 def test_repair_prompt_lines_render():
@@ -344,6 +347,11 @@ def test_build_user_prompt_includes_spec_diff_files():
     assert "loadHomeAddress" in p
     assert "class Foo" in p
     assert "JSON" in p.upper() or "json" in p
+
+
+def test_system_prompt_respects_artifact_only_contracts():
+    assert "expected_new_files" in _SYSTEM_PROMPT
+    assert "do not require unrelated feature code or tests" in _SYSTEM_PROMPT
 
 
 def test_build_user_prompt_caps_file_content():

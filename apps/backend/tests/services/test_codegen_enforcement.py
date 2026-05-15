@@ -22,6 +22,7 @@ from app.agents.schemas import (  # noqa: E402
 from app.core.enums import ActorRole, EventType, RiskLevel, RoleName, TaskStatus, ToolPermissionCategory, WorkflowStage  # noqa: E402
 from app.orchestrator.service import PrimaryOrchestrator  # noqa: E402
 from app.services.codegen import CodeGenerator, CodegenError  # noqa: E402
+from app.services.codegen_self_validate import validate_diff_applies  # noqa: E402
 
 
 def _settings() -> SimpleNamespace:
@@ -138,6 +139,93 @@ def test_expected_new_file_passes() -> None:
     assert result.files_changed == ["new.py"]
 
 
+def test_expected_new_wrong_header_normalized_to_create_file(tmp_path: Path) -> None:
+    bad_diff = (
+        "diff --git a/database.rules.json b/database.rules.json\n"
+        "--- a/database.rules.json\n"
+        "+++ b/database.rules.json\n"
+        "@@ -0,0 +1,6 @@\n"
+        "+{\n"
+        "+  \"rules\": {\n"
+        "+    \".read\": \"auth != null\",\n"
+        "+    \".write\": \"auth != null\"\n"
+        "+  }\n"
+        "+}\n"
+    )
+
+    normalized, changed = CodeGenerator._normalize_expected_new_file_diff_headers(
+        bad_diff,
+        expected_new_files=["database.rules.json"],
+        source_repo_path=str(tmp_path),
+    )
+
+    assert changed is True
+    assert "new file mode 100644" in normalized
+    assert "--- /dev/null" in normalized
+    assert "--- a/database.rules.json" not in normalized
+    ok, err = validate_diff_applies(normalized, tmp_path)
+    assert ok, err
+
+
+def test_expected_new_normalizer_ignores_unplanned_path() -> None:
+    bad_diff = (
+        "diff --git a/other.json b/other.json\n"
+        "--- a/other.json\n"
+        "+++ b/other.json\n"
+        "@@ -0,0 +1 @@\n"
+        "+{}\n"
+    )
+
+    normalized, changed = CodeGenerator._normalize_expected_new_file_diff_headers(
+        bad_diff,
+        expected_new_files=["database.rules.json"],
+        source_repo_path=None,
+    )
+
+    assert changed is False
+    assert normalized == bad_diff
+
+
+def test_expected_new_normalizer_ignores_real_modifications() -> None:
+    diff = (
+        "diff --git a/database.rules.json b/database.rules.json\n"
+        "--- a/database.rules.json\n"
+        "+++ b/database.rules.json\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-{\"rules\": true}\n"
+        "+{\"rules\": {\".read\": \"auth != null\"}}\n"
+    )
+
+    normalized, changed = CodeGenerator._normalize_expected_new_file_diff_headers(
+        diff,
+        expected_new_files=["database.rules.json"],
+        source_repo_path=None,
+    )
+
+    assert changed is False
+    assert normalized == diff
+
+
+def test_expected_new_normalizer_ignores_existing_file(tmp_path: Path) -> None:
+    (tmp_path / "database.rules.json").write_text("{}\n", encoding="utf-8")
+    bad_diff = (
+        "diff --git a/database.rules.json b/database.rules.json\n"
+        "--- a/database.rules.json\n"
+        "+++ b/database.rules.json\n"
+        "@@ -0,0 +1 @@\n"
+        "+{}\n"
+    )
+
+    normalized, changed = CodeGenerator._normalize_expected_new_file_diff_headers(
+        bad_diff,
+        expected_new_files=["database.rules.json"],
+        source_repo_path=str(tmp_path),
+    )
+
+    assert changed is False
+    assert normalized == bad_diff
+
+
 def test_empty_allowed_skips_enforcement() -> None:
     result = _generate_with_mocked_codex(
         plan_json={"objective": "Update whatever is needed."},
@@ -217,6 +305,7 @@ def test_jira_develop_drift_triggers_tool_failed_and_failure_diagnosis() -> None
         retry_count=0,
         risk_level=RiskLevel.MEDIUM,
         risk_category=RiskLevel.MEDIUM,
+        source_name="repo",
     )
     orchestrator = PrimaryOrchestrator(db=Mock())
     orchestrator.tool_gateway.settings.sandbox_base_dir = str(BACKEND_ROOT)
