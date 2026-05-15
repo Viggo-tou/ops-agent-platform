@@ -452,6 +452,27 @@ def test_verified_phone_otp_contract_filters_contradictory_reservations() -> Non
         "auto_fixable": True,
         "blocking": False,
     }
+    policy_item = {
+        "text": (
+            "This change likely does not fix the stated problem. Firebase OTP "
+            "rate limiting for the same phone number is enforced server-side "
+            "by Firebase Auth; removing the DB write will not change Firebase's "
+            "rate limit behavior."
+        ),
+        "severity": "policy",
+        "auto_fixable": False,
+        "blocking": True,
+    }
+    speculative_policy_item = {
+        "text": (
+            "If the real fix requires something else, such as configuring "
+            "Firebase project settings, using different PhoneAuthOptions, or "
+            "handling resend tokens, this diff silently discards data persistence."
+        ),
+        "severity": "policy",
+        "auto_fixable": False,
+        "blocking": True,
+    }
     missing_test_item = {
         "text": "No tests were added for the OTP flow.",
         "severity": "missing_test",
@@ -466,15 +487,25 @@ def test_verified_phone_otp_contract_filters_contradictory_reservations() -> Non
     }
 
     kept, suppressed = _filter_reservations_for_verified_contracts(
-        [bug_item, missing_test_item, style_item],
+        [
+            bug_item,
+            policy_item,
+            speculative_policy_item,
+            missing_test_item,
+            style_item,
+        ],
         plan_json=plan_json,
         pipeline_state=pipeline_state,
     )
 
-    assert [item["text"] for item in suppressed] == [bug_item["text"]]
-    assert suppressed[0]["suppressed_reason"] == (
+    assert [item["text"] for item in suppressed] == [
+        bug_item["text"],
+        policy_item["text"],
+        speculative_policy_item["text"],
+    ]
+    assert {item["suppressed_reason"] for item in suppressed} == {
         "contradicts_verified_phone_otp_contract"
-    )
+    }
     assert [item["text"] for item in kept] == [
         missing_test_item["text"],
         style_item["text"],

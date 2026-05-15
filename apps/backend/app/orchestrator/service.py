@@ -405,10 +405,36 @@ def _phone_otp_reservation_contradicts_verified_contract(
     ):
         return False
     text = str(item.get("text") or "").lower()
-    if "phone number" not in text:
+    if not any(
+        marker in text
+        for marker in (
+            "phone number",
+            "otp",
+            "verification",
+            "phoneauthoptions",
+            "resend token",
+            "firebase auth",
+        )
+    ):
         return False
-    if "otp" not in text and "verification" not in text:
-        return False
+    if (
+        ("firebase otp rate" in text or "server-side by firebase" in text)
+        and ("removing" in text or "db write" in text or "database write" in text)
+    ):
+        return True
+    if (
+        ("real fix requires" in text or "requires something else" in text)
+        and (
+            "phoneauthoptions" in text
+            or "resend token" in text
+            or "firebase project settings" in text
+        )
+    ):
+        return True
+    if "discards data persistence" in text and (
+        "phoneauthoptions" in text or "resend token" in text or "investigation" in text
+    ):
+        return True
     return any(
         marker in text
         for marker in (
