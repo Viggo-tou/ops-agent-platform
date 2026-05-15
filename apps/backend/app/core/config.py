@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     primary_agent_model: str = "gpt-4o-mini"
     primary_agent_timeout_seconds: float = 30.0
     minimax_planner_timeout_seconds: float = 90.0
-    planner_provider_timeout_seconds: float = 180.0
+    planner_provider_timeout_seconds: float = 120.0
     knowledge_synthesis_enabled: bool = True
     knowledge_synthesis_provider: Literal["minimax", "deepseek"] = "minimax"
     knowledge_synthesis_model: str = "MiniMax-M2.7"
