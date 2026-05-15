@@ -26,6 +26,7 @@ from app.core.enums import (
 from app.orchestrator.service import (
     PrimaryOrchestrator,
     _backfill_plan_targets_from_candidate_mentions,
+    _filter_reservations_for_verified_contracts,
 )
 from app.schemas.evidence import EvidenceItem
 from app.services.semantic_review import SemanticReviewReport
@@ -421,6 +422,65 @@ def test_blocking_reservations_fail_before_jira_transition_approval() -> None:
         assert task.latest_result_json["blocking_reservations"] == [blocking_item]
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_verified_phone_otp_contract_filters_contradictory_reservations() -> None:
+    plan_json = {
+        "domain_playbook_id": "android_phone_otp_reverification",
+        "acceptance_tests": [
+            {
+                "kind": "final_file_forbids_pattern_in_file",
+                "contract_id": "customer_no_preverification_phone_write",
+                "file": (
+                    "app/src/main/java/com/example/handyman/customer_pages/"
+                    "CustomerKYCPhoneNumber.kt"
+                ),
+                "pattern": r'child\("phoneNumber"\)\.setValue\s*\(',
+            }
+        ],
+    }
+    pipeline_state = {
+        "acceptance_check_done": True,
+        "compile_gate": {"passed": True},
+    }
+    bug_item = {
+        "text": (
+            "Phone number is no longer saved to database before OTP screen - "
+            "if OTP screen relies on DB value, this will cause missing data."
+        ),
+        "severity": "bug",
+        "auto_fixable": True,
+        "blocking": False,
+    }
+    missing_test_item = {
+        "text": "No tests were added for the OTP flow.",
+        "severity": "missing_test",
+        "auto_fixable": True,
+        "blocking": False,
+    }
+    style_item = {
+        "text": "Indentation in CustomerKYCPhoneNumber.kt is uneven.",
+        "severity": "style",
+        "auto_fixable": True,
+        "blocking": False,
+    }
+
+    kept, suppressed = _filter_reservations_for_verified_contracts(
+        [bug_item, missing_test_item, style_item],
+        plan_json=plan_json,
+        pipeline_state=pipeline_state,
+    )
+
+    assert [item["text"] for item in suppressed] == [bug_item["text"]]
+    assert suppressed[0]["suppressed_reason"] == (
+        "contradicts_verified_phone_otp_contract"
+    )
+    assert [item["text"] for item in kept] == [
+        missing_test_item["text"],
+        style_item["text"],
+    ]
+    assert kept[0]["severity"] == "style"
+    assert kept[0]["downgraded_reason"] == "structural_acceptance_tests_passed"
 
 
 def test_goal_miss_blocking_reservation_runs_repair_before_approval() -> None:

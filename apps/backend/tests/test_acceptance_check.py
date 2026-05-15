@@ -227,6 +227,87 @@ Geocoder(ctx, Locale.getDefault()).getFromLocationName(homeAddress, 1)
     assert report.passed
 
 
+def test_final_file_forbids_pattern_in_file_passes_after_removal():
+    file_path = (
+        "app/src/main/java/com/example/handyman/customer_pages/"
+        "CustomerKYCPhoneNumber.kt"
+    )
+    diff = f"""\
+diff --git a/{file_path} b/{file_path}
+--- a/{file_path}
++++ b/{file_path}
+@@ -20,8 +20,7 @@ fun CustomerKYCPhoneNumber() {{
+-    FirebaseDatabase.getInstance().getReference("User")
+-        .orderByChild("email").equalTo(currentEmail)
+-    userSnapshot.ref.child("phoneNumber").setValue(phoneNumber)
++    navController.navigate("customerKycCodeOTP/$verificationId/$phoneNumber")
+ }}
+"""
+    patched = {
+        file_path: """\
+fun CustomerKYCPhoneNumber() {
+    navController.navigate("customerKycCodeOTP/$verificationId/$phoneNumber")
+}
+"""
+    }
+
+    report = evaluate_acceptance(
+        diff,
+        [
+            AcceptanceTest(
+                kind="final_file_forbids_pattern_in_file",
+                file=file_path,
+                pattern=(
+                    r'child\("phoneNumber"\)\.setValue\s*\('
+                    r'|orderByChild\("email"\)\.equalTo\(currentEmail\)'
+                ),
+            )
+        ],
+        patched_files=patched,
+    )
+
+    assert report.passed
+    assert "absent from final" in report.results[0].reason
+
+
+def test_final_file_forbids_pattern_in_file_fails_when_pattern_remains():
+    file_path = (
+        "app/src/main/java/com/example/handyman/customer_pages/"
+        "CustomerKYCPhoneNumber.kt"
+    )
+    diff = f"""\
+diff --git a/{file_path} b/{file_path}
+--- a/{file_path}
++++ b/{file_path}
+@@ -20,6 +20,7 @@ fun CustomerKYCPhoneNumber() {{
++    Log.d("otp", "requesting code")
+     userSnapshot.ref.child("phoneNumber").setValue(phoneNumber)
+ }}
+"""
+    patched = {
+        file_path: """\
+fun CustomerKYCPhoneNumber() {
+    userSnapshot.ref.child("phoneNumber").setValue(phoneNumber)
+}
+"""
+    }
+
+    report = evaluate_acceptance(
+        diff,
+        [
+            AcceptanceTest(
+                kind="final_file_forbids_pattern_in_file",
+                file=file_path,
+                pattern=r'child\("phoneNumber"\)\.setValue\s*\(',
+            )
+        ],
+        patched_files=patched,
+    )
+
+    assert not report.passed
+    assert "remains in final" in report.results[0].reason
+
+
 def test_diff_contains_pattern_in_file_wrong_file_fails():
     tests = [
         AcceptanceTest(

@@ -336,6 +336,7 @@ _SUPPORTED_SYNTHETIC_ACCEPTANCE_KINDS = {
     "diff_contains_pattern_in_file",
     "import_added",
     "forbids_pattern_in_diff",
+    "final_file_forbids_pattern_in_file",
 }
 
 
@@ -407,7 +408,10 @@ def synthesize_acceptance_tests_from_playbook(
             # contracts whose evidence may already exist in a touched file.
             test["kind"] = "diff_contains_pattern_in_file"
             test["file"] = file_filter
-        elif kind == "diff_contains_pattern_in_file" and file_filter:
+        elif kind in {
+            "diff_contains_pattern_in_file",
+            "final_file_forbids_pattern_in_file",
+        } and file_filter:
             test["file"] = file_filter
         out.append(test)
         matched.add(contract_id)
@@ -530,6 +534,24 @@ def synthesize_must_touch_files_from_candidates(
             preferred.sort(
                 key=lambda item: (
                     _signup_address_path_rank(item[1]),
+                    -item[2],
+                    item[3],
+                )
+            )
+            return _unique_paths([path for _cand, path, _score, _index in preferred])[
+                :max_files
+            ]
+
+    if domain_id == "android_phone_otp_reverification":
+        preferred = [
+            (cand, path, score, index)
+            for cand, path, score, index in filtered
+            if _is_phone_otp_request_path(path)
+        ]
+        if preferred:
+            preferred.sort(
+                key=lambda item: (
+                    _phone_otp_request_path_rank(item[1]),
                     -item[2],
                     item[3],
                 )
@@ -681,6 +703,26 @@ def _signup_address_path_rank(path: str) -> int:
         return 10
     if "kycaddressform" in lower:
         return 11
+    return 99
+
+
+def _is_phone_otp_request_path(path: str) -> bool:
+    name = Path(path).name.lower()
+    return name in {
+        "customerkycphonenumber.kt",
+        "handymankycphonenumber.kt",
+    } or bool(re.search(r"(customer|handyman).*kycphonenumber\.kt$", name))
+
+
+def _phone_otp_request_path_rank(path: str) -> int:
+    lower = path.lower()
+    ordered = (
+        "customer_pages/customerkycphonenumber.kt",
+        "handyman_pages/handymankycphonenumber.kt",
+    )
+    for index, marker in enumerate(ordered):
+        if marker in lower:
+            return index
     return 99
 
 

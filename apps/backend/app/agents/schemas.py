@@ -56,6 +56,7 @@ class PlanAcceptanceTest(BaseModel):
         "no_new_file_outside",
         "import_added",
         "forbids_pattern_in_diff",
+        "final_file_forbids_pattern_in_file",
         "test_must_reference_existing_symbol",
     ]
     contract_id: str | None = Field(default=None, max_length=100)

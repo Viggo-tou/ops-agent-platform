@@ -1,0 +1,67 @@
+# Android phone OTP re-verification domain playbook.
+#
+# This playbook covers Android/Firebase flows where a user may request a
+# verification SMS for the same phone number more than once. The request-code
+# screen must not reserve or persist the phone number before the OTP credential
+# has been verified.
+
+id: android_phone_otp_reverification
+
+triggers:
+  summary_keywords:
+    - otp
+    - "verification code"
+    - "phone verification"
+    - "phone number"
+    - "phone number to be used once"
+    - "request a verification code"
+    - "verification sms"
+    - "sms code"
+  project_tags: []
+
+required_contracts:
+  - id: customer_no_preverification_phone_write
+    signal: >
+      The customer phone request screen must not query the profile row and
+      write phoneNumber before Firebase has sent and verified an OTP. It should
+      only request the OTP and navigate to the OTP entry screen with the
+      verification id and phone number.
+    verifications:
+      - kind: final_file_forbids_pattern_in_file
+        file_filter: app/src/main/java/com/example/handyman/customer_pages/CustomerKYCPhoneNumber.kt
+        pattern: 'child\("phoneNumber"\)\.setValue\s*\(|orderByChild\("email"\)\.equalTo\(currentEmail\)'
+      - kind: diff_contains_pattern
+        file_filter: app/src/main/java/com/example/handyman/customer_pages/CustomerKYCPhoneNumber.kt
+        pattern: 'navController\.navigate\("customerKycCodeOTP/\$verificationId/\$phoneNumber"\)'
+
+  - id: handyman_no_preverification_phone_write
+    signal: >
+      The handyman phone request screen must not query the profile row and
+      write phoneNumber before Firebase has sent and verified an OTP. It should
+      only request the OTP and navigate to the OTP entry screen with the
+      verification id and phone number.
+    verifications:
+      - kind: final_file_forbids_pattern_in_file
+        file_filter: app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCPhoneNumber.kt
+        pattern: 'child\("phoneNumber"\)\.setValue\s*\(|orderByChild\("email"\)\.equalTo\(currentEmail\)'
+      - kind: diff_contains_pattern
+        file_filter: app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCPhoneNumber.kt
+        pattern: 'navController\.navigate\("handymanKycCodeOTP/\$verificationId/\$phoneNumber"\)'
+
+  - id: otp_verification_remains_source_of_truth
+    signal: >
+      The OTP code screen remains the source of truth for verification. It
+      should keep Firebase credential validation and mark the profile verified
+      after the code is accepted, not during the request-code step.
+    verifications:
+      - kind: diff_contains_pattern
+        pattern: 'linkWithCredential|signInWithCredential|isPhoneVerified|FirebaseAuthUserCollisionException|already'
+      - kind: final_context_contains_pattern
+        anchor: changed_hunk
+        scope: window:240
+        pattern: 'linkWithCredential|signInWithCredential|isPhoneVerified'
+
+completeness_rule:
+  minimum_contracts_referenced: 2
+  on_failure: PLAN_UNDER_SPECIFIED
+  retry_planner_once: true

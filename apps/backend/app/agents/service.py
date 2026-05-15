@@ -1135,6 +1135,7 @@ def build_domain_fast_path_plan(
     if scenario != "jira_issue_develop" or domain_id not in {
         "android_map_location",
         "android_job_default_address",
+        "android_phone_otp_reverification",
     }:
         return None
 
@@ -1175,7 +1176,25 @@ def build_domain_fast_path_plan(
     except Exception:  # noqa: BLE001
         domain_subtype = "generic_map_location"
 
-    if domain_id == "android_job_default_address" or domain_subtype == "job_default_address":
+    if domain_id == "android_phone_otp_reverification":
+        objective = (
+            "Fix the Android Firebase phone OTP request flow so the same "
+            "phone number can request verification codes again."
+        )
+        change_summary = "Remove pre-verification phone-number reservation."
+        change_explanation = (
+            "In the customer and handyman phone-number request-code screens, "
+            "do not query the profile row or write phoneNumber when Firebase "
+            "only sends the OTP code. Navigate to the OTP entry screen with "
+            "the verification id and phone number, and leave credential "
+            "validation plus verified profile updates in the OTP code screens."
+        )
+        assumptions = [
+            "The request-code screens are the edit targets, not the OTP credential screens.",
+            "Persisting phone verification state belongs after Firebase accepts the OTP credential.",
+            "Repeated SMS requests for the same phone number should not be blocked by a pre-verification database write.",
+        ]
+    elif domain_id == "android_job_default_address" or domain_subtype == "job_default_address":
         objective = (
             "Pre-fill the Android job creation location step from the user's "
             "saved home/account address."
@@ -1242,8 +1261,13 @@ def build_domain_fast_path_plan(
         }
     )
     payload = GeneratedPlanPayload.model_validate(payload_data)
+    provider_name = (
+        "harness:android_phone_otp_plan"
+        if domain_id == "android_phone_otp_reverification"
+        else "harness:android_map_location_plan"
+    )
     provider = {
-        "name": "harness:android_map_location_plan",
+        "name": provider_name,
         "model": "deterministic-v1",
         "domain_playbook_id": domain_id,
     }
@@ -1254,7 +1278,7 @@ def build_domain_fast_path_plan(
     )
     return PlanGenerationResult(
         plan=plan,
-        provider_name="harness:android_map_location_plan",
+        provider_name=provider_name,
         model_name="deterministic-v1",
         used_fallback=False,
         fallback_reason=None,
@@ -2784,6 +2808,7 @@ class PrimaryAgentPlanner:
             "no_new_file_outside",
             "import_added",
             "forbids_pattern_in_diff",
+            "final_file_forbids_pattern_in_file",
             "test_must_reference_existing_symbol",
         }
         raw_acceptance = sanitized.get("acceptance_tests")
@@ -2909,7 +2934,8 @@ class PrimaryAgentPlanner:
             "(e) no_new_file_outside — kind, scope (glob). Use when the issue scopes the change to a directory. Example: scope=\"django/db/models/**\" — patch must not create files outside that subtree. "
             "(f) import_added — kind, file, pattern (the imported name). Use when the fix demonstrably requires a new import. "
             "(g) forbids_pattern_in_diff — kind, pattern (regex), optional file. Use to BAN a shape that would indicate a hallucinated bypass. Example for an ORM/query bug where the fix must edit executable code (not introduce a new flag): kind=forbids_pattern_in_diff, pattern=\"^[A-Z_]+ = (True|False)$\", rationale=\"this issue is in query-construction logic, not in module-level configuration; a new boolean settings flag is not a valid fix\". "
-            "(h) test_must_reference_existing_symbol — kind, optional scope (default tests/). Catches \"new test only validates a freshly-invented symbol\" patterns. Emit it whenever the bug class makes self-justifying test files plausible. "
+            "(h) final_file_forbids_pattern_in_file — kind, file, pattern (regex). Use for deletion/removal fixes where the final touched file must no longer contain an unsafe call or workaround. "
+            "(i) test_must_reference_existing_symbol — kind, optional scope (default tests/). Catches \"new test only validates a freshly-invented symbol\" patterns. Emit it whenever the bug class makes self-justifying test files plausible. "
             "DO NOT emit tests like \"all tests pass\" or \"behavior is correct\" — those are not structural. Tests must be checkable against diff text alone. "
             "DO NOT emit acceptance_tests for process_question, slack_message, jira_issue_plan, jira_issue_create, jira_issue_writeback, internal_api_request, internal_db_query — leave the list empty for those scenarios."
             "Library contract discipline: when repository context or a domain playbook says OSMDroid/org.osmdroid is the map library, do NOT emit Google Maps-only APIs such as setOnMapClickListener in acceptance_tests, plans, or expected outputs. Use OSMDroid patterns instead: MapEventsOverlay, MapEventsReceiver, and singleTapConfirmedHelper. "

@@ -98,6 +98,51 @@ def test_apply_structural_edit_adds_import_and_replaces_call_block():
     assert "diff --git a/CustomerSignup.kt b/CustomerSignup.kt" in result.diff
 
 
+def test_replace_block_dedents_model_content_with_low_indent_closing_brace():
+    source = """\
+fun Screen() {
+    object : PhoneAuthProvider.OnVerificationStateChangedCallbacks() {
+        override fun onCodeSent(
+            verificationId: String,
+            token: PhoneAuthProvider.ForceResendingToken
+        ) {
+            save()
+        }
+    }
+}
+"""
+    plan = {
+        "file": "Screen.kt",
+        "edits": [
+            {
+                "operation": "replace_block",
+                "anchor_line": 3,
+                "anchor_substring": "override fun onCodeSent(",
+                "content": (
+                    "                    override fun onCodeSent(\n"
+                    "                        verificationId: String,\n"
+                    "                        token: PhoneAuthProvider.ForceResendingToken\n"
+                    "                    ) {\n"
+                    "                        isLoading = false\n"
+                    "                        navController.navigate(\"otp/$verificationId\")\n"
+                    "}"
+                ),
+            }
+        ],
+    }
+
+    result = apply_structural_edit_plan(
+        file_path="Screen.kt",
+        original_content=source,
+        plan=plan,
+    )
+
+    assert result.ok, result.errors
+    assert "\n        override fun onCodeSent(" in result.content
+    assert "\n                            verificationId" not in result.content
+    assert "navController.navigate" in result.content
+
+
 def test_apply_structural_edit_rejects_ambiguous_anchor_without_line_pin():
     source = "fun A(){\n    call()\n    call()\n}\n"
     plan = {

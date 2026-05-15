@@ -175,6 +175,73 @@ def test_sanitize_normalises_optional_fields_to_none_when_blank():
     assert entry["scope"] is None
 
 
+def test_sanitize_rewrites_osmdroid_google_maps_click_listener_pattern():
+    """Round11c regression: planner emitted setOnMapClickListener as a hard
+    acceptance pattern for an OSMDroid task. That is a Google Maps-shaped
+    API and pushes codegen toward uncompilable code.
+    """
+    raw = _base_payload(
+        request_summary="finish Jira P69-19 android_map_location org.osmdroid",
+        change_explanation="Use org.osmdroid MapView for address picking.",
+        acceptance_tests=[
+            {
+                "kind": "diff_contains_pattern",
+                "pattern": "setOnMapClickListener",
+                "rationale": "tap selects a location",
+            }
+        ],
+    )
+
+    sanitized = PrimaryAgentPlanner._sanitize_plan_payload(raw)
+
+    assert sanitized["acceptance_tests"][0]["pattern"] == (
+        "MapEventsOverlay|MapEventsReceiver|singleTapConfirmedHelper"
+    )
+    assert "OSMDroid" in sanitized["acceptance_tests"][0]["rationale"]
+
+
+def test_sanitize_demotes_unsourced_android_map_new_component():
+    """Broad android map plans should not create a helper component by
+    default when the issue only says to integrate the feature into existing
+    forms. That extra new-file batch was a Round11c latency/quality driver.
+    """
+    raw = _base_payload(
+        request_summary="finish Jira P69-19: add map-based address selection",
+        change_summary="Add map-based address selection to existing signup forms.",
+        change_explanation="Create a new reusable MapAddressPicker component.",
+        must_touch_files=[
+            "app/CustomerKYCAddressForm.kt",
+            "app/CustomerSignup.kt",
+            "app/HandymanKYCAddressForm.kt",
+            "app/HandymanSignup.kt",
+        ],
+        expected_new_files=["app/components/MapAddressPicker.kt"],
+    )
+
+    sanitized = PrimaryAgentPlanner._sanitize_plan_payload(raw)
+
+    assert sanitized["expected_new_files"] == []
+    assert "app/components/MapAddressPicker.kt" in sanitized["likely_touch_files"]
+
+
+def test_sanitize_keeps_explicitly_requested_android_map_new_file():
+    raw = _base_payload(
+        request_summary=(
+            "Create app/components/MapAddressPicker.kt for the address picker."
+        ),
+        change_summary="Add map-based address selection to existing signup forms.",
+        must_touch_files=[
+            "app/CustomerKYCAddressForm.kt",
+            "app/CustomerSignup.kt",
+        ],
+        expected_new_files=["app/components/MapAddressPicker.kt"],
+    )
+
+    sanitized = PrimaryAgentPlanner._sanitize_plan_payload(raw)
+
+    assert sanitized["expected_new_files"] == ["app/components/MapAddressPicker.kt"]
+
+
 def test_sanitize_strips_test_paths_from_must_touch_for_develop():
     """Class E counter-measure at planner level: the v8 task 4 planner
     emitted test files in must_touch (e.g. ['tests/.../tests.py',
@@ -247,6 +314,14 @@ def test_planning_instructions_mention_acceptance_tests():
         "no_new_file_outside",
         "import_added",
         "forbids_pattern_in_diff",
+        "final_file_forbids_pattern_in_file",
         "test_must_reference_existing_symbol",
     ):
         assert kind in text, f"missing kind {kind} in instructions"
+
+
+def test_planning_instructions_include_osmdroid_and_scope_discipline():
+    text = PrimaryAgentPlanner._build_planning_instructions()
+    assert "setOnMapClickListener" in text
+    assert "MapEventsOverlay" in text
+    assert "Do not propose a new reusable component file" in text

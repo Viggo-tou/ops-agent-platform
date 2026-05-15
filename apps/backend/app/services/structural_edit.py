@@ -1113,15 +1113,28 @@ def _indent_block(lines: list[str], indent: str) -> list[str]:
     if not lines:
         return []
     min_indent: int | None = None
+    first_indent: int | None = None
     for line in lines:
         if not line.strip():
             continue
         width = len(line) - len(line.lstrip())
+        if first_indent is None:
+            first_indent = width
         min_indent = width if min_indent is None else min(min_indent, width)
     trim = min_indent or 0
+    if trim == 0 and first_indent:
+        # LLMs sometimes emit a nested replacement block plus one low-indent
+        # closing brace. Trimming by the true minimum would preserve all nested
+        # whitespace and double-indent the replacement in the target file.
+        trim = first_indent
     out: list[str] = []
     for line in lines:
-        out.append(indent + (line[trim:] if line.strip() else ""))
+        if not line.strip():
+            out.append("")
+            continue
+        width = len(line) - len(line.lstrip())
+        body = line[trim:] if width >= trim else line.lstrip()
+        out.append(indent + body)
     return out
 
 

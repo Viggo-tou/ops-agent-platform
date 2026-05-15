@@ -155,3 +155,62 @@ def test_job_default_address_fast_path_uses_job_posting_targets() -> None:
         "job_location_prefilled",
         "saved_address_geocoded_to_map",
     }.issubset(contract_ids)
+
+
+def test_phone_otp_fast_path_uses_request_code_targets() -> None:
+    playbook = classify_domain(
+        request_text=(
+            "OTP Verification Fix. The current system only allowed a phone "
+            "number to be used once; users should be able to request a "
+            "verification code for their number again."
+        ),
+        project_tag="handymanapp",
+    )
+
+    result = build_domain_fast_path_plan(
+        task_id="44444444-4444-4444-4444-444444444444",
+        request_text="develop P69-21",
+        scenario="jira_issue_develop",
+        matched_playbook=playbook,
+        issue_context={
+            "summary": "OTP Verification Fix",
+            "description": (
+                "The current system only allowed a phone number to be used "
+                "once. Remove that limit for verification-code requests."
+            ),
+        },
+        candidate_files=[
+            _candidate(
+                "app/src/main/java/com/example/handyman/customer_pages/CustomerKYCCodeOTP.kt",
+                10.0,
+            ),
+            _candidate(
+                "app/src/main/java/com/example/handyman/customer_pages/CustomerKYCPhoneNumber.kt",
+                4.0,
+            ),
+            _candidate(
+                "app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCCodeOTP.kt",
+                9.0,
+            ),
+            _candidate(
+                "app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCPhoneNumber.kt",
+                3.0,
+            ),
+        ],
+    )
+
+    assert result is not None
+    assert result.provider_name == "harness:android_phone_otp_plan"
+    assert result.plan.must_touch_files == [
+        "app/src/main/java/com/example/handyman/customer_pages/CustomerKYCPhoneNumber.kt",
+        "app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCPhoneNumber.kt",
+    ]
+    assert "request-code screens" in result.plan.change_explanation
+
+    contract_ids = {
+        test.contract_id for test in result.plan.acceptance_tests if test.contract_id
+    }
+    assert {
+        "customer_no_preverification_phone_write",
+        "handyman_no_preverification_phone_write",
+    }.issubset(contract_ids)

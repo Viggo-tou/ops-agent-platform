@@ -37,6 +37,13 @@ def test_android_job_default_address_playbook_exists():
     assert any(p.get("id") == "android_job_default_address" for p in playbooks)
 
 
+def test_android_phone_otp_reverification_playbook_exists():
+    playbooks = all_playbooks()
+    assert any(
+        p.get("id") == "android_phone_otp_reverification" for p in playbooks
+    )
+
+
 # ---- domain classifier --------------------------------------------------
 
 
@@ -75,6 +82,21 @@ def test_p69_17_issue_text_matches_job_default_address_playbook():
     assert classify_android_map_location_subtype(
         "Pre-fill job location map using user saved home address"
     ) == "job_default_address"
+
+
+def test_p69_21_issue_text_matches_phone_otp_playbook():
+    pb = classify_domain(
+        request_text=(
+            "OTP Verification Fix. The current system only allowed a phone "
+            "number to be used once. This is a problem because users might "
+            "uninstall and reinstall the app; therefore, the OTP system must "
+            "be fixed properly so there is no limit on how many times a user "
+            "can request a verification code for their number."
+        ),
+        project_tag="handymanapp",
+    )
+    assert pb is not None
+    assert pb.get("id") == "android_phone_otp_reverification"
 
 
 def test_keyword_match_without_project_tag():
@@ -287,6 +309,41 @@ def test_job_default_synthetic_acceptance_uses_touched_file_final_context():
     }
 
 
+def test_phone_otp_synthetic_acceptance_uses_final_file_forbids():
+    pb = classify_domain(
+        request_text=(
+            "OTP Verification Fix. Phone number can only be used once; allow "
+            "users to request a verification code for the same number again."
+        ),
+        project_tag="handymanapp",
+    )
+    assert pb is not None
+
+    tests = synthesize_acceptance_tests_from_playbook(
+        playbook=pb,
+        acceptance_tests=[],
+    )
+    verdict = evaluate_acceptance_completeness(
+        playbook=pb,
+        acceptance_tests=tests,
+    )
+
+    assert verdict["ok"] is True
+    assert {
+        t["contract_id"]: (t["kind"], t.get("file"))
+        for t in tests
+    } == {
+        "customer_no_preverification_phone_write": (
+            "final_file_forbids_pattern_in_file",
+            "app/src/main/java/com/example/handyman/customer_pages/CustomerKYCPhoneNumber.kt",
+        ),
+        "handyman_no_preverification_phone_write": (
+            "final_file_forbids_pattern_in_file",
+            "app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCPhoneNumber.kt",
+        ),
+    }
+
+
 def test_synthesize_acceptance_tests_preserves_existing_and_fills_missing():
     pb = classify_domain(
         request_text="map picker", project_tag="handymanapp"
@@ -409,6 +466,55 @@ def test_synthesize_must_touch_uses_job_default_address_candidates():
     assert must_touch == [
         "app/src/main/java/com/example/handyman/JobPostingFragment.kt",
         "app/src/main/java/com/example/handyman/JobPostingFlow.kt",
+    ]
+
+
+def test_synthesize_must_touch_uses_phone_otp_request_pages():
+    pb = classify_domain(
+        request_text=(
+            "OTP Verification Fix. Phone number can only be used once; allow "
+            "users to request a verification code for the same number again."
+        ),
+        project_tag="handymanapp",
+    )
+    assert pb is not None
+    candidates = [
+        {
+            "path": "app/src/main/java/com/example/handyman/customer_pages/CustomerKYCCodeOTP.kt",
+            "score": 40.0,
+            "matched_terms": ["otp", "code", "phone"],
+        },
+        {
+            "path": "app/src/main/java/com/example/handyman/customer_pages/CustomerKYCPhoneNumber.kt",
+            "score": 26.0,
+            "matched_terms": ["phone", "otp"],
+        },
+        {
+            "path": "app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCCodeOTP.kt",
+            "score": 38.0,
+            "matched_terms": ["otp", "code", "phone"],
+        },
+        {
+            "path": "app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCPhoneNumber.kt",
+            "score": 25.0,
+            "matched_terms": ["phone", "otp"],
+        },
+    ]
+
+    must_touch = synthesize_must_touch_files_from_candidates(
+        playbook=pb,
+        candidate_files=candidates,
+        issue_text=(
+            "OTP Verification Fix. Phone number can only be used once; allow "
+            "users to request a verification code for the same number again."
+        ),
+        existing_must_touch=[],
+        expected_new_files=[],
+    )
+
+    assert must_touch == [
+        "app/src/main/java/com/example/handyman/customer_pages/CustomerKYCPhoneNumber.kt",
+        "app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCPhoneNumber.kt",
     ]
 
 

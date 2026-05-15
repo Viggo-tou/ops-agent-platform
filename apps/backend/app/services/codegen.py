@@ -212,7 +212,14 @@ Schema:
       "content": "replacement or inserted Kotlin code"
     }
   ],
-  "preserves_intents": ["short intent ids or symbol names"]
+  "preserves_intents": ["short intent ids or symbol names"],
+  "contract_coverage": {
+    "implemented_contracts": [
+      {"contract_id": "id", "file_path": "relative/path.kt", "evidence_quote": "short exact quote from changed code"}
+    ],
+    "verified_no_change_contracts": [],
+    "unimplemented_contracts": []
+  }
 }
 
 Rules:
@@ -223,6 +230,7 @@ Rules:
 5. Use exact anchors from the current file. Do not invent line context.
 6. Prefer small semantic edits: add imports, add state declarations, insert a UI block, replace a broken call/block.
 7. If the requested change cannot be made within the single allowed Kotlin file, output {"status":"no_patch","file":"...","edits":[]}.
+8. When <required_contract_signals> are present, include contract_coverage and claim only contracts supported by the JSON edits or by unchanged final-file evidence in the allowed file.
 """
 
 

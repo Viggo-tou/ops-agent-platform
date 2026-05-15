@@ -369,6 +369,104 @@ def _reservation_should_attempt_repair(
     return bool(_reservation_repairable_items(reservations_detailed))
 
 
+def _structural_acceptance_verified(
+    *,
+    plan_json: dict | None,
+    pipeline_state: dict[str, object] | None,
+) -> bool:
+    if not isinstance(plan_json, dict) or not isinstance(pipeline_state, dict):
+        return False
+    acceptance_tests = plan_json.get("acceptance_tests") or []
+    if not isinstance(acceptance_tests, list) or not acceptance_tests:
+        return False
+    if not bool(pipeline_state.get("acceptance_check_done")):
+        return False
+    if bool(pipeline_state.get("acceptance_check_failed")):
+        return False
+    compile_gate = pipeline_state.get("compile_gate")
+    if isinstance(compile_gate, dict) and compile_gate.get("passed") is False:
+        return False
+    return True
+
+
+def _phone_otp_reservation_contradicts_verified_contract(
+    item: dict,
+    *,
+    plan_json: dict | None,
+    pipeline_state: dict[str, object] | None,
+) -> bool:
+    if not isinstance(plan_json, dict):
+        return False
+    if str(plan_json.get("domain_playbook_id") or "") != "android_phone_otp_reverification":
+        return False
+    if not _structural_acceptance_verified(
+        plan_json=plan_json,
+        pipeline_state=pipeline_state,
+    ):
+        return False
+    text = str(item.get("text") or "").lower()
+    if "phone number" not in text:
+        return False
+    if "otp" not in text and "verification" not in text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "database before",
+            "db value",
+            "before otp",
+            "before verification",
+            "otp screen relies",
+            "no longer saved",
+            "not saved to database",
+        )
+    )
+
+
+def _filter_reservations_for_verified_contracts(
+    reservations_detailed: list[dict] | tuple[dict, ...] | None,
+    *,
+    plan_json: dict | None,
+    pipeline_state: dict[str, object] | None,
+) -> tuple[list[dict], list[dict]]:
+    """Drop or downgrade reviewer notes contradicted by verified contracts."""
+    if not reservations_detailed:
+        return [], []
+
+    verified_acceptance = _structural_acceptance_verified(
+        plan_json=plan_json,
+        pipeline_state=pipeline_state,
+    )
+    kept: list[dict] = []
+    suppressed: list[dict] = []
+    for raw_item in reservations_detailed:
+        if not isinstance(raw_item, dict):
+            continue
+        item = dict(raw_item)
+        if _phone_otp_reservation_contradicts_verified_contract(
+            item,
+            plan_json=plan_json,
+            pipeline_state=pipeline_state,
+        ):
+            suppressed.append(
+                {
+                    **item,
+                    "suppressed_reason": "contradicts_verified_phone_otp_contract",
+                }
+            )
+            continue
+        if (
+            verified_acceptance
+            and str(item.get("severity") or "").lower() == "missing_test"
+        ):
+            item["severity"] = "style"
+            item["blocking"] = False
+            item["auto_fixable"] = True
+            item["downgraded_reason"] = "structural_acceptance_tests_passed"
+        kept.append(item)
+    return kept, suppressed
+
+
 def _semantic_review_should_block_on_exhausted(
     sr_report: object | None,
     settings: object,
@@ -13940,8 +14038,26 @@ class PrimaryOrchestrator:
             )
             reservations = _reservations_report.reservations
             reservations_detailed = _reservations_report.to_dicts()  # type: ignore[assignment]
-            auto_count = len(_reservations_report.auto_fixable)
-            block_count = len(_reservations_report.blocking)
+            reservations_detailed, suppressed_reservations = (
+                _filter_reservations_for_verified_contracts(
+                    reservations_detailed,
+                    plan_json=(
+                        task.plan_json if isinstance(task.plan_json, dict) else None
+                    ),
+                    pipeline_state=pipeline_state,
+                )
+            )
+            reservations = [
+                str(item.get("text") or "")
+                for item in reservations_detailed
+                if str(item.get("text") or "").strip()
+            ]
+            auto_count = sum(
+                1 for item in reservations_detailed if bool(item.get("auto_fixable"))
+            )
+            block_count = sum(
+                1 for item in reservations_detailed if bool(item.get("blocking"))
+            )
             _reservation_event = record_event(
                 self.db,
                 task_id=task.id,
@@ -13963,6 +14079,7 @@ class PrimaryOrchestrator:
                     "blocking_count": block_count,
                     "provider": _reservations_report.provider,
                     "model": _reservations_report.model,
+                    "suppressed_reservations": suppressed_reservations,
                 },
             )
             self._record_reservation_quality_memory(
