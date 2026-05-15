@@ -12415,7 +12415,9 @@ class PrimaryOrchestrator:
         try:
             from app.services.playbook_promotion import (
                 build_playbook_promotion_candidate,
+                build_playbook_promotion_rollup,
                 write_playbook_promotion_candidate,
+                write_playbook_promotion_rollup,
             )
 
             plan_json = (
@@ -12435,6 +12437,15 @@ class PrimaryOrchestrator:
                 candidate=candidate,
                 settings=self.tool_gateway.settings,
             )
+            rollup = build_playbook_promotion_rollup(
+                candidate=candidate,
+                settings=self.tool_gateway.settings,
+            )
+            rollup_path = write_playbook_promotion_rollup(
+                task=task,
+                rollup=rollup,
+                settings=self.tool_gateway.settings,
+            )
             self._workspace_append_audit(
                 task,
                 "learning.playbook_promotion_candidate",
@@ -12443,6 +12454,17 @@ class PrimaryOrchestrator:
                     "status": candidate.get("status"),
                     "promotion_eligible": candidate.get("promotion_eligible"),
                     "approval_action": approval_action,
+                },
+            )
+            self._workspace_append_audit(
+                task,
+                "learning.playbook_promotion_rollup",
+                {
+                    "artifact_path": rollup_path,
+                    "status": rollup.get("status"),
+                    "verified_approval_count": rollup.get("verified_approval_count"),
+                    "quality_score_floor": rollup.get("quality_score_floor"),
+                    "promotion_blockers": rollup.get("promotion_blockers") or [],
                 },
             )
             record_event(
@@ -12464,6 +12486,28 @@ class PrimaryOrchestrator:
                     "domain_playbook_id": candidate.get("domain_playbook_id"),
                     "promotion_blockers": candidate.get("promotion_blockers") or [],
                     "approval_action": approval_action,
+                },
+            )
+            record_event(
+                self.db,
+                task_id=task.id,
+                event_type=EventType.TOOL_SUCCEEDED,
+                source=EventSource.ORCHESTRATOR,
+                stage=WorkflowStage.REVIEW,
+                role=RoleName.REVIEWER,
+                tool_name="learning.playbook_promotion_rollup",
+                message=(
+                    "Learning loop updated repeated-run promotion rollup "
+                    f"({rollup.get('status')})."
+                ),
+                payload={
+                    "artifact_path": rollup_path,
+                    "status": rollup.get("status"),
+                    "domain_playbook_id": rollup.get("domain_playbook_id"),
+                    "verified_approval_count": rollup.get("verified_approval_count"),
+                    "min_verified_approvals": rollup.get("min_verified_approvals"),
+                    "quality_score_floor": rollup.get("quality_score_floor"),
+                    "promotion_blockers": rollup.get("promotion_blockers") or [],
                 },
             )
         except Exception as exc:  # noqa: BLE001
