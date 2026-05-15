@@ -48,7 +48,8 @@ class AnthropicPlannerTests(unittest.TestCase):
                     "path": (
                         "app/src/main/java/com/example/handyman/customer_pages/"
                         "CustomerKYCPhoneNumber.kt"
-                    )
+                    ),
+                    "score": 40.0,
                 },
                 {"path": "app/src/main/res/xml/backup_rules.xml"},
                 {"path": "app/src/test/java/com/example/handyman/ExampleUnitTest.kt"},
@@ -56,7 +57,15 @@ class AnthropicPlannerTests(unittest.TestCase):
                     "path": (
                         "app/src/main/java/com/example/handyman/handyman_pages/"
                         "HandymanKYCPhoneNumber.kt"
-                    )
+                    ),
+                    "score": 39.0,
+                },
+                {
+                    "path": (
+                        "app/src/main/java/com/example/handyman/customer_pages/"
+                        "CustomerKYCCodeOTP.kt"
+                    ),
+                    "score": 28.0,
                 },
             ],
         )

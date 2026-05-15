@@ -190,7 +190,7 @@ _FALLBACK_PLAN_SOURCE_EXTENSIONS = frozenset(
 def _fallback_plan_candidate_source_paths(
     candidate_files: list[dict[str, Any]] | None,
     *,
-    limit: int = 6,
+    limit: int = 4,
 ) -> list[str]:
     """Promote preplan candidates into fallback plan targets.
 
@@ -200,7 +200,7 @@ def _fallback_plan_candidate_source_paths(
     source. Keep this conservative: production source files only, no tests,
     build files, resources, or IDE metadata.
     """
-    paths: list[str] = []
+    candidates: list[tuple[str, float]] = []
     seen: set[str] = set()
     for candidate in candidate_files or []:
         if not isinstance(candidate, dict):
@@ -227,8 +227,26 @@ def _fallback_plan_candidate_source_paths(
             continue
         if "/src/main/" not in lowered and lowered.startswith("app/"):
             continue
-        paths.append(path)
+        metadata = candidate.get("metadata")
+        score_value = candidate.get("score")
+        if isinstance(metadata, dict) and score_value is None:
+            score_value = metadata.get("score")
+        try:
+            score = float(score_value or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        candidates.append((path, score))
         seen.add(path)
+    if not candidates:
+        return []
+
+    top_score = max(score for _path, score in candidates)
+    score_floor = top_score * 0.75 if top_score > 0 else None
+    paths: list[str] = []
+    for path, score in candidates:
+        if score_floor is not None and score < score_floor:
+            continue
+        paths.append(path)
         if len(paths) >= limit:
             break
     return paths
