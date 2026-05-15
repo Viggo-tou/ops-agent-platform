@@ -177,6 +177,47 @@ def test_prompt_eligible_filter_excludes_non_planner_rows(db: Session) -> None:
     assert audit == []
 
 
+def test_planner_reclassifies_familyless_memory_row(db: Session) -> None:
+    svc = MemoryService(db)
+    svc.write_failure_observation(
+        failure_class="semantic_review_low_completeness",
+        scope="review:semantic",
+        observation_text=(
+            "semantic_review low completeness: analytics dummy data and "
+            "role simplification remain unimplemented."
+        ),
+        lesson=(
+            "Before planning, cover hardcoded username, session cache, "
+            "analytics dummy data, and admin role simplification."
+        ),
+        task_family=None,
+        trust_level="auto_classified",
+        prompt_eligible=["planner_warning", "codegen_warning"],
+        evidence_refs={
+            "semantic_review": {
+                "summary": (
+                    "analytics dummy data and role simplification remain "
+                    "unimplemented."
+                )
+            }
+        },
+    )
+    db.commit()
+    planner = _planner_with_db(db)
+
+    rendered, audit = planner._build_prior_failures_block(
+        request_text=(
+            "Remove hardcoded username, dummy analytics data, stale session "
+            "cache, and master admin role titles."
+        ),
+        scenario="jira_issue_develop",
+        candidate_files=[],
+    )
+
+    assert "semantic_review_low_completeness" in rendered
+    assert audit[0]["task_family"] == "android_session_data_cleanup"
+
+
 # ---------------------------------------------------------------------------
 # Acceptance #4 — trust_level ranking
 # ---------------------------------------------------------------------------

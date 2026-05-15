@@ -333,6 +333,162 @@ def _semantic_review_should_attempt_quality_refine(
     return bool(_semantic_review_actionable_quality_findings(sr_report))
 
 
+_SEMANTIC_REPAIR_SOURCE_EXTENSIONS = {
+    ".kt",
+    ".kts",
+    ".java",
+    ".py",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+}
+
+_SEMANTIC_REPAIR_TERM_STOPWORDS = {
+    "about",
+    "activity",
+    "added",
+    "address",
+    "changes",
+    "cleared",
+    "component",
+    "current",
+    "ensure",
+    "file",
+    "files",
+    "finding",
+    "firebase",
+    "fragment",
+    "initialization",
+    "locate",
+    "logic",
+    "previous",
+    "remove",
+    "replace",
+    "review",
+    "source",
+    "updated",
+    "values",
+}
+
+
+def _semantic_finding_value(finding: object, field: str) -> str:
+    if isinstance(finding, dict):
+        return str(finding.get(field) or "")
+    return str(getattr(finding, field, "") or "")
+
+
+def _semantic_review_discover_repair_files(
+    sandbox_dir: Path,
+    findings: list[object] | tuple[object, ...],
+    *,
+    existing_paths: list[str] | tuple[str, ...] | set[str] | None = None,
+    max_files: int = 3,
+) -> list[str]:
+    """Find narrowly relevant extra source files for semantic repair.
+
+    Semantic review can catch a missed surface that was not part of the
+    first diff. Repair still needs bounded scope, so we only add files that
+    contain low-frequency terms from grounded findings.
+    """
+    root = Path(sandbox_dir)
+    if not root.is_dir():
+        return []
+    grounded_findings = []
+    for finding in findings or []:
+        severity = _semantic_finding_value(finding, "severity").lower()
+        evidence_quote = _semantic_finding_value(finding, "evidence_quote").strip()
+        if severity not in {"high", "medium"}:
+            continue
+        if len(evidence_quote) < 5:
+            continue
+        grounded_findings.append(finding)
+    if not grounded_findings:
+        return []
+    text = "\n".join(
+        part
+        for finding in grounded_findings
+        for part in (
+            _semantic_finding_value(finding, "description"),
+            _semantic_finding_value(finding, "suggested_fix"),
+            _semantic_finding_value(finding, "category"),
+        )
+        if part
+    )
+    raw_terms = [
+        token.lower()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9_]{4,}", text)
+        if token.lower() not in _SEMANTIC_REPAIR_TERM_STOPWORDS
+    ]
+    terms = list(dict.fromkeys(raw_terms))[:12]
+    if not terms:
+        return []
+
+    existing = {
+        str(path).strip().replace("\\", "/")
+        for path in (existing_paths or [])
+        if str(path).strip()
+    }
+    docs: list[tuple[str, str]] = []
+    for file_path in root.rglob("*"):
+        if not file_path.is_file():
+            continue
+        rel = file_path.relative_to(root).as_posix()
+        lowered = rel.lower()
+        if rel in existing:
+            continue
+        if Path(lowered).suffix not in _SEMANTIC_REPAIR_SOURCE_EXTENSIONS:
+            continue
+        if any(
+            marker in lowered
+            for marker in (
+                "/src/test/",
+                "/androidtest/",
+                "/build/",
+                "/generated/",
+                "/.gradle/",
+                "/.idea/",
+            )
+        ):
+            continue
+        try:
+            body = file_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        docs.append((rel, (rel + "\n" + body[:80_000]).lower()))
+        if len(docs) >= 2000:
+            break
+    if not docs:
+        return []
+
+    doc_count = len(docs)
+    max_df = max(3, int(doc_count * 0.15))
+    doc_freq = {
+        term: sum(1 for _rel, corpus in docs if term in corpus)
+        for term in terms
+    }
+    focused_terms = [
+        term for term in terms if 0 < doc_freq.get(term, 0) <= max_df
+    ]
+    if not focused_terms:
+        return []
+
+    scored: list[tuple[float, str]] = []
+    for rel, corpus in docs:
+        path_text = rel.lower()
+        score = 0.0
+        for term in focused_terms:
+            if term in path_text:
+                score += 8.0
+            hits = min(4, corpus.count(term))
+            if hits:
+                score += hits * 2.0
+        if score > 0:
+            scored.append((score, rel))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [rel for _score, rel in scored[: max(1, max_files)]]
+
+
 def _reservation_blocking_items(
     reservations_detailed: list[dict] | tuple[dict, ...] | None,
 ) -> list[dict]:
@@ -8186,6 +8342,31 @@ class PrimaryOrchestrator:
                         sr_allowed_files = sorted(
                             _diff_sections_by_file(previous_diff_text)
                         )
+                    sr_extra_scope = _semantic_review_discover_repair_files(
+                        _sr_sandbox_dir,
+                        list(sr_report.findings or []),
+                        existing_paths=sr_allowed_files,
+                        max_files=3,
+                    )
+                    if sr_extra_scope:
+                        sr_allowed_files = list(
+                            dict.fromkeys([*sr_allowed_files, *sr_extra_scope])
+                        )
+                        record_event(
+                            self.db,
+                            task_id=task.id,
+                            event_type=EventType.TOOL_SUCCEEDED,
+                            source=EventSource.ORCHESTRATOR,
+                            stage=WorkflowStage.REVIEW,
+                            role=RoleName.REVIEWER,
+                            tool_name="semantic_review.repair_scope_expand",
+                            message=(
+                                "Expanded semantic repair edit scope with "
+                                f"{len(sr_extra_scope)} source file(s) "
+                                "matched from grounded finding terms."
+                            ),
+                            payload={"files_added": sr_extra_scope},
+                        )
                     if not sr_allowed_files:
                         record_event(
                             self.db,
@@ -12400,7 +12581,10 @@ class PrimaryOrchestrator:
         boundary (before any worker thread fires).
         """
         try:
-            from app.services.failure_classifier import detect_task_family
+            from app.services.failure_classifier import (
+                detect_memory_task_family,
+                detect_task_family,
+            )
             from app.services.memory import MemoryService
 
             plan_dict = task.plan_json if isinstance(task.plan_json, dict) else {}
@@ -12419,12 +12603,12 @@ class PrimaryOrchestrator:
                     memory_kind="failure_observation",
                     prompt_context="codegen_warning",
                     text_hint=(task.request_text or "")[:200],
-                    top_n=5,
+                    top_n=20,
                 )
                 # Strict family filter — codegen is too tight to absorb
                 # cross-family noise.
                 for r in rows:
-                    if r.task_family == inferred_family:
+                    if detect_memory_task_family(r) == inferred_family:
                         candidates.append(r)
             if not candidates:
                 return "", []
@@ -12467,7 +12651,7 @@ class PrimaryOrchestrator:
             audit = [{
                 "memory_id": m.id,
                 "failure_class": m.failure_class,
-                "task_family": m.task_family,
+                "task_family": detect_memory_task_family(m),
                 "trust_level": m.trust_level,
                 "score": float(trust_rank.get(m.trust_level or "", 0)),
             } for m in top]
@@ -12616,6 +12800,11 @@ class PrimaryOrchestrator:
         file_path = str(finding.get("file") or "").strip()
         description = str(finding.get("description") or memory.observation or "").strip()
         suggested = str(finding.get("suggested_fix") or "").strip()
+        obligations = [
+            str(item).strip()
+            for item in (finding.get("obligations") or [])
+            if str(item).strip()
+        ]
         completeness = semantic.get("completeness_pct")
         header = (
             f"SEMANTIC REVIEW WARNING: A previous task in this family "
@@ -12631,6 +12820,10 @@ class PrimaryOrchestrator:
         lines.append(
             f"  - [{severity}/{category}] {target}{description[:500]}"
         )
+        if obligations:
+            lines.append("    Reported missing/partial obligations:")
+            for item in obligations[:6]:
+                lines.append(f"    - {item[:300]}")
         if suggested:
             lines.append(f"    Reviewer suggested: {suggested[:500]}")
         lines.append(
@@ -15178,7 +15371,7 @@ class PrimaryOrchestrator:
             sandbox_snapshot_id=self._build_develop_sandbox(task).snapshot_id(),
         )
 
-        record_event(
+        semantic_block_event = record_event(
             self.db,
             task_id=task.id,
             event_type=EventType.REVIEW_FAILED,
@@ -15189,6 +15382,25 @@ class PrimaryOrchestrator:
             message=message,
             payload=approval_payload,
         )
+        if reason_code == "semantic_review_low_completeness":
+            try:
+                MemoryService(
+                    self.db,
+                    self.tool_gateway.settings,
+                ).record_semantic_review_low_completeness(
+                    task=task,
+                    review_payload=(
+                        sr_report.to_payload()
+                        if hasattr(sr_report, "to_payload")
+                        else approval_payload.get("semantic_review") or {}
+                    ),
+                    provenance_event_id=getattr(semantic_block_event, "id", None),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "semantic low-completeness memory write failed",
+                    extra={"task_id": task.id, "error": str(exc)[:300]},
+                )
         set_task_status(
             self.db,
             task=task,

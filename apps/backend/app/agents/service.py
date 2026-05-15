@@ -190,7 +190,7 @@ _FALLBACK_PLAN_SOURCE_EXTENSIONS = frozenset(
 def _fallback_plan_candidate_source_paths(
     candidate_files: list[dict[str, Any]] | None,
     *,
-    limit: int = 4,
+    limit: int = 6,
 ) -> list[str]:
     """Promote preplan candidates into fallback plan targets.
 
@@ -200,7 +200,16 @@ def _fallback_plan_candidate_source_paths(
     source. Keep this conservative: production source files only, no tests,
     build files, resources, or IDE metadata.
     """
-    candidates: list[tuple[str, float]] = []
+    low_signal_terms = {
+        "data",
+        "file",
+        "files",
+        "show",
+        "out",
+        "user",
+        "users",
+    }
+    candidates: list[tuple[str, float, list[str]]] = []
     seen: set[str] = set()
     for candidate in candidate_files or []:
         if not isinstance(candidate, dict):
@@ -235,20 +244,41 @@ def _fallback_plan_candidate_source_paths(
             score = float(score_value or 0.0)
         except (TypeError, ValueError):
             score = 0.0
-        candidates.append((path, score))
+        raw_terms = candidate.get("matched_terms") or []
+        terms = [
+            str(term).strip().lower()
+            for term in raw_terms
+            if str(term).strip()
+            and str(term).strip().lower() not in low_signal_terms
+        ]
+        candidates.append((path, score, list(dict.fromkeys(terms))))
         seen.add(path)
     if not candidates:
         return []
 
-    top_score = max(score for _path, score in candidates)
+    top_score = max(score for _path, score, _terms in candidates)
     score_floor = top_score * 0.75 if top_score > 0 else None
     paths: list[str] = []
-    for path, score in candidates:
-        if score_floor is not None and score < score_floor:
-            continue
-        paths.append(path)
+    selected: set[str] = set()
+    covered_terms: set[str] = set()
+    for path, score, terms in candidates:
         if len(paths) >= limit:
             break
+        adds_term = bool(set(terms) - covered_terms)
+        if score_floor is not None and score < score_floor and not adds_term:
+            continue
+        if path in selected:
+            continue
+        paths.append(path)
+        selected.add(path)
+        covered_terms.update(terms)
+    for path, _score, _terms in candidates:
+        if len(paths) >= limit:
+            break
+        if path in selected:
+            continue
+        paths.append(path)
+        selected.add(path)
     return paths
 
 
@@ -1459,7 +1489,10 @@ class PrimaryAgentPlanner:
         if self.db is None or not bool(getattr(self.settings, "memory_enabled", True)):
             return "", []
         try:
-            from app.services.failure_classifier import detect_task_family
+            from app.services.failure_classifier import (
+                detect_memory_task_family,
+                detect_task_family,
+            )
             from app.services.memory import MemoryService
 
             inferred_family = detect_task_family(
@@ -1482,7 +1515,7 @@ class PrimaryAgentPlanner:
                     memory_kind="failure_observation",
                     prompt_context="planner_warning",
                     text_hint=(request_text or "")[:200],
-                    top_n=10,
+                    top_n=20,
                 )
                 candidates.extend(got)
             # Deduplicate by memory id (an aggressive scope sweep can
@@ -1502,8 +1535,9 @@ class PrimaryAgentPlanner:
             req_lower = (request_text or "").lower()
             scored: list[tuple[float, Any]] = []
             for m in unique:
+                memory_family = detect_memory_task_family(m)
                 family_match = (
-                    5.0 if (inferred_family and m.task_family == inferred_family) else 0.0
+                    5.0 if (inferred_family and memory_family == inferred_family) else 0.0
                 )
                 scope_match = 3.0 if m.scope in self._SCOPE_FOR_PLANNER else 0.0
                 # Lightweight keyword overlap on observation text.
@@ -1541,7 +1575,11 @@ class PrimaryAgentPlanner:
             # a much higher score floor (verified trust + scope match +
             # keyword similarity together).
             if inferred_family:
-                eligible = [(s, m) for (s, m) in scored if m.task_family == inferred_family]
+                eligible = [
+                    (s, m)
+                    for (s, m) in scored
+                    if detect_memory_task_family(m) == inferred_family
+                ]
                 threshold = 1.0
             else:
                 eligible = scored
@@ -1556,7 +1594,7 @@ class PrimaryAgentPlanner:
                 lines.append(
                     f"{idx}. [{m.trust_level or 'auto_classified'}] "
                     f"{m.failure_class or 'unspecified'} / "
-                    f"{m.task_family or 'cross-family'} "
+                    f"{detect_memory_task_family(m) or 'cross-family'} "
                     f"(scope: {m.scope})"
                 )
                 # Observation = what happened; resolution = the lesson.
@@ -1571,7 +1609,7 @@ class PrimaryAgentPlanner:
                 audit_rows.append({
                     "memory_id": m.id,
                     "failure_class": m.failure_class,
-                    "task_family": m.task_family,
+                    "task_family": detect_memory_task_family(m),
                     "trust_level": m.trust_level,
                     "score": round(float(score), 2),
                 })

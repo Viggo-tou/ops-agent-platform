@@ -486,6 +486,22 @@ _FAMILY_KEYWORDS = (
     ("android_map_location", ("map-based", "map picker", "geocod", "osmdroid", "mapview", "android.*location")),
     ("android_kyc_address", ("kyc", "address form", "address picker")),
     ("android_signup", ("signup", "sign up", "registration", "kyc")),
+    (
+        "android_session_data_cleanup",
+        (
+            "hardcoded",
+            "dummy data",
+            "analytics",
+            "previous logged-in user",
+            "logged-in user",
+            "session",
+            "cache",
+            "admin role",
+            "staff",
+            "role simplification",
+            "master admin",
+        ),
+    ),
     ("firebase_persistence", ("firebase", "updatechildren", "setvalue", "firestore")),
     ("python_refactor", ("refactor", "rename", "extract function", "deduplicate")),
     ("python_bugfix", ("bug fix", "fix bug", "resolve bug")),
@@ -503,10 +519,34 @@ def detect_task_family(request_text: str, plan_json: dict[str, Any] | None = Non
 
     haystack_parts: list[str] = [request_text or ""]
     if isinstance(plan_json, dict):
-        for key in ("objective", "change_summary", "request_summary"):
+        for key in (
+            "objective",
+            "change_summary",
+            "change_explanation",
+            "request_summary",
+            "summary",
+            "description",
+            "issue_summary",
+            "normalized_request",
+        ):
             v = plan_json.get(key)
             if isinstance(v, str):
                 haystack_parts.append(v)
+        semantic = plan_json.get("semantic_review")
+        if isinstance(semantic, dict):
+            for key in ("summary", "description"):
+                v = semantic.get(key)
+                if isinstance(v, str):
+                    haystack_parts.append(v)
+        finding = plan_json.get("finding")
+        if isinstance(finding, dict):
+            for key in ("description", "suggested_fix"):
+                v = finding.get(key)
+                if isinstance(v, str):
+                    haystack_parts.append(v)
+            obligations = finding.get("obligations")
+            if isinstance(obligations, list):
+                haystack_parts.extend(str(item) for item in obligations if item)
         files = plan_json.get("must_touch_files") or []
         if isinstance(files, list):
             haystack_parts.extend(f for f in files if isinstance(f, str))
@@ -522,3 +562,35 @@ def detect_task_family(request_text: str, plan_json: dict[str, Any] | None = Non
                 if kw in haystack:
                     return family
     return None
+
+
+def detect_memory_task_family(memory: Any) -> str | None:
+    """Best-effort family detection for existing memory rows.
+
+    Some historical ``failure_observation`` rows were written before the
+    classifier knew enough plan/review fields, so ``task_family`` may be
+    empty even though the row text contains clear family signals. Retrieval
+    uses this helper to avoid dropping those rows while keeping the same
+    keyword rules as the write path.
+    """
+    explicit = getattr(memory, "task_family", None)
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+
+    evidence = getattr(memory, "evidence_refs", None)
+    if not isinstance(evidence, dict):
+        evidence = {}
+    evidence_family = evidence.get("task_family")
+    if isinstance(evidence_family, str) and evidence_family.strip():
+        return evidence_family.strip()
+
+    text = "\n".join(
+        str(part)
+        for part in (
+            getattr(memory, "failure_class", "") or "",
+            getattr(memory, "observation", "") or "",
+            getattr(memory, "resolution", "") or "",
+        )
+        if part
+    )
+    return detect_task_family(request_text=text, plan_json=evidence)

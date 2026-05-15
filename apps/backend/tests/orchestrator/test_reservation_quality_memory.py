@@ -235,6 +235,152 @@ def test_semantic_review_failure_memory_injects_codegen_checklist(db: Session) -
     assert audit[0]["task_family"] == "android_map_location"
 
 
+def test_semantic_low_completeness_memory_injects_obligation_checklist(db: Session) -> None:
+    task = SimpleNamespace(
+        id="task-low-completeness",
+        session_id="session-low-completeness",
+        actor_name="tester",
+        actor_role=ActorRole.EMPLOYEE,
+        risk_level=RiskLevel.MEDIUM,
+        risk_category=RiskCategory.CHANGE_MANAGEMENT,
+        request_text=(
+            "Develop P69-10 hardcoded username analytics dummy data "
+            "and role simplification cleanup"
+        ),
+        scenario="jira_issue_develop",
+        status=TaskStatus.EXECUTING,
+        workflow_stage=WorkflowStage.ACTION,
+        translation_json=None,
+        plan_json={
+            "objective": "Clean hardcoded values and analytics dummy data.",
+            "change_summary": "Data and Role Cleanup",
+            "must_touch_files": [
+                "app/src/main/java/com/example/handyman/chatbox/MainActivity.kt"
+            ],
+        },
+        latest_result_json=None,
+        governance_json=None,
+        pending_approval=False,
+        retry_count=0,
+        source_name="handymanapp",
+    )
+    MemoryService(db).record_semantic_review_low_completeness(
+        task=task,  # type: ignore[arg-type]
+        review_payload={
+            "status": "failed",
+            "provider_name": "deepseek",
+            "completeness_pct": 45,
+            "pass_threshold": 80,
+            "high_severity_count": 0,
+            "summary": (
+                "Partial implementation: hardcoded username overridden but may still flash; "
+                "analytics dummy data and role simplification remain completely unimplemented."
+            ),
+            "findings": [],
+        },
+        provenance_event_id="event-low-completeness",
+    )
+    db.commit()
+
+    orch = PrimaryOrchestrator(db=db)
+    directive, audit = orch._build_codegen_failure_warnings(task=task, plan=_plan())
+
+    assert "SEMANTIC REVIEW WARNING" in directive
+    assert "low_completeness" in directive
+    assert "analytics dummy data" in directive
+    assert "role simplification" in directive
+    assert audit[0]["failure_class"] == "semantic_review_low_completeness"
+    assert audit[0]["task_family"] == "android_session_data_cleanup"
+
+
+def test_codegen_memory_reclassifies_familyless_low_completeness_row(db: Session) -> None:
+    MemoryService(db).write_failure_observation(
+        failure_class="semantic_review_low_completeness",
+        scope="review:semantic",
+        observation_text=(
+            "semantic_review low completeness: analytics dummy data and role "
+            "simplification remain unimplemented."
+        ),
+        lesson=(
+            "Treat as an unverified checklist: hardcoded username, session "
+            "cache, analytics dummy data, and admin role simplification all "
+            "need coverage."
+        ),
+        task_family=None,
+        trust_level="auto_classified",
+        prompt_eligible=["planner_warning", "codegen_warning"],
+        evidence_refs={
+            "semantic_review": {
+                "completeness_pct": 45,
+                "summary": (
+                    "analytics dummy data and role simplification remain "
+                    "completely unimplemented."
+                ),
+            },
+            "finding": {
+                "category": "low_completeness",
+                "description": "role simplification remains unimplemented.",
+                "obligations": [
+                    "analytics dummy data remains completely unimplemented",
+                    "role simplification remains completely unimplemented",
+                ],
+            },
+        },
+    )
+    for idx in range(8):
+        MemoryService(db).write_failure_observation(
+            failure_class=f"semantic_review_irrelevant_{idx}",
+            scope="review:semantic",
+            observation_text=(
+                f"develop P69-10 unrelated Android map-location semantic warning {idx}"
+            ),
+            lesson="This row should lose to the same-family reclassification filter.",
+            task_family="android_map_location",
+            trust_level="auto_classified",
+            prompt_eligible=["planner_warning", "codegen_warning"],
+            evidence_refs={"finding": {"description": "osmdroid map warning"}},
+        )
+    db.commit()
+
+    task = SimpleNamespace(
+        id="task-familyless-low-completeness",
+        session_id="session-low-completeness",
+        actor_name="tester",
+        actor_role=ActorRole.EMPLOYEE,
+        risk_level=RiskLevel.MEDIUM,
+        risk_category=RiskCategory.CHANGE_MANAGEMENT,
+        request_text="develop P69-10",
+        scenario="jira_issue_develop",
+        status=TaskStatus.EXECUTING,
+        workflow_stage=WorkflowStage.ACTION,
+        translation_json=None,
+        plan_json={
+            "objective": "Implement referenced Jira issue.",
+            "change_explanation": (
+                "Hardcoded values, dummy analytics data, caching issues, "
+                "and master admin role simplification must be cleaned up."
+            ),
+            "must_touch_files": [
+                "app/src/main/java/com/example/handyman/chatbox/MainActivity.kt"
+            ],
+        },
+        latest_result_json=None,
+        governance_json=None,
+        pending_approval=False,
+        retry_count=0,
+        source_name="handymanapp",
+    )
+
+    directive, audit = PrimaryOrchestrator(db=db)._build_codegen_failure_warnings(
+        task=task,  # type: ignore[arg-type]
+        plan=_plan(),
+    )
+
+    assert "SEMANTIC REVIEW WARNING" in directive
+    assert "analytics dummy data" in directive
+    assert audit[0]["task_family"] == "android_session_data_cleanup"
+
+
 def test_codegen_warning_keeps_quality_reservation_when_two_pattern_rows_exist(db: Session) -> None:
     _seed_acceptance_failure(db)
     MemoryService(db).write_failure_observation(

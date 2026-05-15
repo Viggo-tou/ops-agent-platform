@@ -471,3 +471,69 @@ def test_semantic_review_findings_write_failure_observation(db: Session) -> None
     assert row.prompt_eligible == ["planner_warning", "codegen_warning"]
     assert "reverseGeocodeAddress" in row.evidence_refs["finding"]["suggested_fix"]
     assert "success_fact" not in row.memory_kind
+
+
+def test_semantic_low_completeness_summary_writes_warning_memory(db: Session) -> None:
+    task = SimpleNamespace(
+        id="task-low-completeness",
+        request_text="develop P69-10",
+        plan_json={
+            "objective": "Implement the referenced Jira issue.",
+            "change_summary": "Data and Role Cleanup",
+            "must_touch_files": [
+                "app/src/main/java/com/example/handyman/HandymanJobBoardFragment.kt",
+                "app/src/main/java/com/example/handyman/chatbox/MainActivity.kt",
+            ],
+        },
+    )
+    review_payload = {
+        "status": "failed",
+        "provider_name": "deepseek",
+        "completeness_pct": 45,
+        "pass_threshold": 80,
+        "high_severity_count": 0,
+        "findings_dropped_no_evidence": 1,
+        "summary": (
+            "Partial implementation: hardcoded username overridden but may still flash; "
+            "caching issues partly addressed; analytics dummy data and role "
+            "simplification remain completely unimplemented."
+        ),
+        "findings": [],
+    }
+
+    row = MemoryService(db).record_semantic_review_low_completeness(
+        task=task,  # type: ignore[arg-type]
+        review_payload=review_payload,
+        provenance_event_id="event-low-completeness",
+    )
+    db.commit()
+
+    assert row is not None
+    assert row.memory_kind == "failure_observation"
+    assert row.failure_class == "semantic_review_low_completeness"
+    assert row.scope == "review:semantic"
+    assert row.task_family == "android_session_data_cleanup"
+    assert row.confidence == pytest.approx(0.65)
+    assert row.prompt_eligible == ["planner_warning", "codegen_warning"]
+    assert row.evidence_refs["finding"]["ungrounded_summary"] is True
+    obligations = row.evidence_refs["finding"]["obligations"]
+    assert any("analytics dummy data" in item for item in obligations)
+    assert "not a recipe" in row.resolution
+
+
+def test_detects_android_session_data_cleanup_family() -> None:
+    assert (
+        detect_task_family(
+            "develop P69-10",
+            {
+                "change_explanation": (
+                    "Hardcoded values, dummy analytics data, session cache "
+                    "issues, and master admin role simplification."
+                ),
+                "must_touch_files": [
+                    "app/src/main/java/com/example/handyman/chatbox/MainActivity.kt"
+                ],
+            },
+        )
+        == "android_session_data_cleanup"
+    )

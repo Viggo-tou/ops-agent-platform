@@ -95,8 +95,11 @@ def _semantic_review_blockers(
     blockers: list[str] = []
     semantic = pipeline_state.get("semantic_review")
     semantic_blocked = pipeline_state.get("semantic_review_blocked")
-    if approval_action == "semantic_review_unresolved_high":
-        blockers.append("semantic_review_unresolved_high")
+    if approval_action in {
+        "semantic_review_unresolved_high",
+        "semantic_review_low_completeness",
+    }:
+        blockers.append(approval_action)
     if isinstance(semantic, dict):
         high = int(semantic.get("high_severity_count") or 0)
         if high > 0:

@@ -208,9 +208,14 @@ class MemoryService:
         findings = review_payload.get("findings") or []
         if not findings:
             return 0
+        review_summary = _clean_text(str(review_payload.get("summary") or ""), limit=1200)
         plan_json = task.plan_json if isinstance(getattr(task, "plan_json", None), dict) else {}
         task_family = detect_task_family(
-            request_text=getattr(task, "request_text", "") or "",
+            request_text="\n".join(
+                part
+                for part in (getattr(task, "request_text", "") or "", review_summary)
+                if part
+            ),
             plan_json=plan_json,
         )
         completeness = int(review_payload.get("completeness_pct") or 0)
@@ -279,6 +284,94 @@ class MemoryService:
             if mem is not None:
                 recorded += 1
         return recorded
+
+    def record_semantic_review_low_completeness(
+        self,
+        *,
+        task: Task,
+        review_payload: dict,
+        provenance_event_id: str | None = None,
+    ) -> AgentMemory | None:
+        """Persist a low-completeness semantic-review summary.
+
+        This path is deliberately weaker than grounded findings: the reviewer
+        had enough signal to score the implementation below threshold, but no
+        diff-grounded finding survived. Store it as an auto-classified warning
+        checklist, not as a verified fix recipe.
+        """
+        if not bool(getattr(self.settings, "memory_enabled", True)):
+            return None
+        try:
+            completeness = int(review_payload.get("completeness_pct") or 0)
+            threshold = int(review_payload.get("pass_threshold") or 80)
+        except (TypeError, ValueError):
+            return None
+        if completeness >= threshold:
+            return None
+        summary = _clean_text(str(review_payload.get("summary") or ""), limit=1200)
+        if not summary:
+            return None
+
+        from app.services.failure_classifier import detect_task_family
+
+        plan_json = task.plan_json if isinstance(getattr(task, "plan_json", None), dict) else {}
+        task_family = detect_task_family(
+            request_text="\n".join(
+                part
+                for part in (getattr(task, "request_text", "") or "", summary)
+                if part
+            ),
+            plan_json=plan_json,
+        )
+        obligations = _extract_quality_obligations(summary)
+        obligation_text = "; ".join(obligations) if obligations else summary
+        observation = (
+            f"semantic_review low completeness ({completeness}% < {threshold}%) "
+            f"for task_family={task_family or 'unknown'}: {summary}"
+        )
+        lesson = (
+            "A previous same-family patch compiled and reached review, but "
+            "semantic_review scored it below the completeness threshold with "
+            "no grounded repair finding. Treat this as an unverified quality "
+            "checklist, not a recipe. Before returning a diff, cover every "
+            f"missing or partial obligation named by the reviewer: {obligation_text}"
+        )
+        return self.write_failure_observation(
+            failure_class="semantic_review_low_completeness",
+            scope="review:semantic",
+            observation_text=observation,
+            lesson=lesson,
+            task_family=task_family,
+            provenance_event_id=provenance_event_id,
+            provenance_task_id=task.id,
+            trust_level="auto_classified",
+            prompt_eligible=["planner_warning", "codegen_warning"],
+            evidence_refs={
+                "task_id": task.id,
+                "task_family": task_family,
+                "semantic_review": {
+                    "status": review_payload.get("status"),
+                    "provider_name": review_payload.get("provider_name"),
+                    "completeness_pct": completeness,
+                    "pass_threshold": threshold,
+                    "summary": summary,
+                    "findings_dropped_no_evidence": review_payload.get(
+                        "findings_dropped_no_evidence"
+                    ),
+                    "high_severity_count": review_payload.get("high_severity_count"),
+                },
+                "finding": {
+                    "file": "",
+                    "severity": "medium",
+                    "category": "low_completeness",
+                    "description": summary,
+                    "suggested_fix": obligation_text,
+                    "obligations": obligations,
+                    "ungrounded_summary": True,
+                },
+            },
+            confidence=0.65,
+        )
 
     def maybe_record_gate_event(self, *, event: Event, task: Task | None = None) -> AgentMemory | None:
         event_type = event.event_type
@@ -1073,6 +1166,44 @@ def _clean_text(value: object, *, limit: int) -> str:
 
 def _single_line(value: object) -> str:
     return " ".join(str(value or "").strip().split())
+
+
+def _extract_quality_obligations(summary: str) -> list[str]:
+    markers = (
+        "unimplemented",
+        "not implemented",
+        "missing",
+        "omits",
+        "omitted",
+        "does not",
+        "doesn't",
+        "lacks",
+        "partial",
+        "partly",
+        "still",
+        "remain",
+        "incomplete",
+    )
+    chunks = re.split(r"[.;]\s+|\n+", summary or "")
+    out: list[str] = []
+    seen: set[str] = set()
+    for chunk in chunks:
+        cleaned = _clean_text(chunk, limit=300)
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        if not any(marker in lowered for marker in markers):
+            continue
+        key = lowered
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cleaned)
+        if len(out) >= 8:
+            break
+    if not out and summary.strip():
+        out.append(_clean_text(summary, limit=300))
+    return out
 
 
 def _event_type_value(event_type: EventType | str) -> str:
