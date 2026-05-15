@@ -71,7 +71,7 @@ def validate_diff_semantics(
     findings: list[ValidationFinding] = []
 
     findings.extend(_check_case_sensitive_comparisons(diff, context_files))
-    findings.extend(_check_replacement_completeness(diff, context_files))
+    findings.extend(_check_replacement_completeness(diff, context_files, request_text))
 
     # Escalate to block when too many warnings of the same rule accumulate
     rule_counts: dict[str, int] = {}
@@ -132,6 +132,7 @@ def _check_case_sensitive_comparisons(
 def _check_replacement_completeness(
     diff: str,
     context_files: dict[str, str],
+    request_text: str = "",
 ) -> list[ValidationFinding]:
     """Check that string replacements are complete across all context files.
 
@@ -161,7 +162,8 @@ def _check_replacement_completeness(
         if not is_wholesale:
             for line in current_hunk_minus:
                 for m in re.findall(r'["\']([^"\']{3,})["\']', line):
-                    removed_strings.add(m)
+                    if _should_track_removed_string(m, request_text):
+                        removed_strings.add(m)
         for line in current_hunk_plus:
             for m in re.findall(r'["\']([^"\']{3,})["\']', line):
                 added_strings.add(m)
@@ -202,6 +204,27 @@ def _check_replacement_completeness(
                     )
                 )
     return findings
+
+
+def _should_track_removed_string(value: str, request_text: str = "") -> bool:
+    """Return True for string literals likely meant as global replacements.
+
+    This rule is a coarse guard against incomplete delete/rename tasks, but
+    short domain labels such as Firebase root names ("User", "Handyman") are
+    often removed only because a local query block was deleted. Treat them as
+    global anchors only when the user explicitly named them.
+    """
+    text = (value or "").strip()
+    if len(text) < 5:
+        return False
+    request_lower = (request_text or "").lower()
+    if request_lower and text.lower() in request_lower:
+        return True
+    if re.search(r"[\d_\-./\\\s]", text):
+        return True
+    if re.fullmatch(r"[A-Z][a-z]+", text):
+        return False
+    return len(text) >= 8
 
 
 @dataclass(frozen=True)
