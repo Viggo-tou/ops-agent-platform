@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
 import shutil
@@ -873,6 +874,220 @@ def _semantic_review_related_context_paths(files_changed: object) -> list[str]:
                 seen.add(candidate)
                 related.append(candidate)
     return related
+
+
+def _semantic_review_diff_text(pipeline_state: dict[str, object] | None) -> str:
+    if not isinstance(pipeline_state, dict):
+        return ""
+    for key in ("final_tree_diff", "diff", "raw_diff"):
+        value = pipeline_state.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def _semantic_review_hash_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _semantic_review_plan_signature(plan_json: dict | None) -> str | None:
+    """Stable contract signature for reusing verified semantic-review verdicts.
+
+    Semantic review is intentionally expensive and occasionally non-deterministic.
+    A cached verdict is only reusable when the generated diff and the deterministic
+    development contract are identical: same domain/provider, same target files,
+    same required contracts, and same structural acceptance tests.
+    """
+    if not isinstance(plan_json, dict):
+        return None
+    provider = plan_json.get("provider")
+    provider_name = (
+        str(provider.get("name") or "").strip()
+        if isinstance(provider, dict)
+        else ""
+    )
+
+    def _clean_paths(value: object) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return sorted(
+            {
+                str(item).strip().replace("\\", "/")
+                for item in value
+                if str(item or "").strip()
+            }
+        )
+
+    contract_ids: list[str] = []
+    for raw in plan_json.get("required_contracts") or []:
+        if isinstance(raw, dict):
+            cid = raw.get("contract_id") or raw.get("id") or raw.get("name")
+        else:
+            cid = raw
+        text = str(cid or "").strip()
+        if text:
+            contract_ids.append(text)
+
+    payload = {
+        "domain": str(
+            plan_json.get("domain_playbook_id")
+            or plan_json.get("domain_id")
+            or ""
+        ).strip(),
+        "provider_name": provider_name,
+        "must_touch_files": _clean_paths(plan_json.get("must_touch_files")),
+        "expected_new_files": _clean_paths(plan_json.get("expected_new_files")),
+        "required_contract_ids": sorted(set(contract_ids)),
+        "acceptance_tests": plan_json.get("acceptance_tests") or [],
+    }
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return _semantic_review_hash_text(text)
+
+
+def _semantic_review_payload_is_verified_pass(
+    payload: object,
+    *,
+    pass_threshold: int,
+) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("status") not in (None, "passed"):
+        return False
+    if payload.get("passed") is not True:
+        return False
+    try:
+        completeness = int(payload.get("completeness_pct") or 0)
+    except (TypeError, ValueError):
+        return False
+    if completeness < pass_threshold:
+        return False
+    try:
+        high_count = int(payload.get("high_severity_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    if high_count != 0:
+        return False
+    findings = payload.get("findings")
+    return not findings
+
+
+def _semantic_review_report_from_payload(payload: dict[str, object]) -> object | None:
+    try:
+        from app.services.semantic_review import (
+            SemanticReviewFinding,
+            SemanticReviewReport,
+        )
+
+        findings = []
+        for raw in payload.get("findings") or []:
+            if not isinstance(raw, dict):
+                continue
+            findings.append(
+                SemanticReviewFinding(
+                    file=str(raw.get("file") or ""),
+                    line_start=int(raw.get("line_start") or 0),
+                    line_end=int(raw.get("line_end") or 0),
+                    severity=str(raw.get("severity") or "low"),
+                    category=str(raw.get("category") or "general"),
+                    description=str(raw.get("description") or ""),
+                    evidence_quote=str(raw.get("evidence_quote") or ""),
+                    suggested_fix=str(raw.get("suggested_fix") or ""),
+                )
+            )
+        return SemanticReviewReport(
+            passed=bool(payload.get("passed")),
+            completeness_pct=int(payload.get("completeness_pct") or 0),
+            summary=str(payload.get("summary") or ""),
+            findings=tuple(findings),
+            pass_threshold=int(payload.get("pass_threshold") or 80),
+            total_findings_raw=int(payload.get("total_findings_raw") or 0),
+            findings_dropped_no_evidence=int(
+                payload.get("findings_dropped_no_evidence") or 0
+            ),
+            provider_name=str(payload.get("provider_name") or "cache"),
+            status=str(
+                payload.get("status")
+                or ("passed" if payload.get("passed") else "failed")
+            ),
+            unavailable_reason=str(payload.get("unavailable_reason") or ""),
+            raw_preview=str(payload.get("raw_preview") or ""),
+            review_attempts=int(payload.get("review_attempts") or 0),
+            repair_attempted=bool(payload.get("repair_attempted")),
+        )
+    except Exception:
+        return None
+
+
+def _semantic_review_lookup_verified_cache(
+    db: object,
+    *,
+    current_task_id: str,
+    plan_json: dict | None,
+    pipeline_state: dict[str, object] | None,
+    pass_threshold: int,
+    max_candidates: int = 200,
+) -> dict[str, object] | None:
+    """Find a prior passed semantic review for the exact same contract+diff.
+
+    This is deliberately conservative: only passed, finding-free reviews are
+    reusable, and only after deterministic gates in the current run have passed.
+    """
+    if not _semantic_review_verified_gates_passed(pipeline_state):
+        return None
+    diff_text = _semantic_review_diff_text(pipeline_state)
+    if not diff_text.strip():
+        return None
+    plan_sig = _semantic_review_plan_signature(plan_json)
+    if not plan_sig:
+        return None
+    diff_hash = _semantic_review_hash_text(diff_text)
+
+    try:
+        query = db.query(Task).order_by(Task.created_at.desc()).limit(max_candidates)
+        candidates = list(query)
+    except Exception:
+        return None
+
+    best: dict[str, object] | None = None
+    best_score = -1
+    for candidate in candidates:
+        candidate_id = str(getattr(candidate, "id", "") or "")
+        if candidate_id == str(current_task_id):
+            continue
+        candidate_plan = getattr(candidate, "plan_json", None)
+        if _semantic_review_plan_signature(candidate_plan) != plan_sig:
+            continue
+        latest = getattr(candidate, "latest_result_json", None)
+        if not isinstance(latest, dict):
+            continue
+        state = latest.get("pipeline_state")
+        if not isinstance(state, dict):
+            continue
+        if not _semantic_review_verified_gates_passed(state):
+            continue
+        candidate_diff = _semantic_review_diff_text(state)
+        if not candidate_diff or _semantic_review_hash_text(candidate_diff) != diff_hash:
+            continue
+        payload = state.get("semantic_review")
+        if not _semantic_review_payload_is_verified_pass(
+            payload,
+            pass_threshold=pass_threshold,
+        ):
+            continue
+        try:
+            score = int(payload.get("completeness_pct") or 0)  # type: ignore[union-attr]
+        except (TypeError, ValueError):
+            score = 0
+        if score > best_score:
+            best_score = score
+            best = {
+                "source_task_id": candidate_id,
+                "semantic_review": dict(payload),  # type: ignore[arg-type]
+                "diff_hash": diff_hash,
+                "plan_signature": plan_sig,
+                "completeness_pct": score,
+            }
+    return best
 
 
 def _build_semantic_review_spec_text(
@@ -7997,6 +8212,45 @@ class PrimaryOrchestrator:
                             except Exception:
                                 pass
 
+                    if sr_round == 0:
+                        _sr_cache_hit = _semantic_review_lookup_verified_cache(
+                            self.db,
+                            current_task_id=str(task.id),
+                            plan_json=(
+                                task.plan_json if isinstance(task.plan_json, dict) else None
+                            ),
+                            pipeline_state=pipeline_state,
+                            pass_threshold=_SR_PASS_THRESHOLD,
+                        )
+                        if _sr_cache_hit:
+                            _sr_cached_report = _semantic_review_report_from_payload(
+                                _sr_cache_hit.get("semantic_review")  # type: ignore[arg-type]
+                            )
+                            if _sr_cached_report is not None:
+                                pipeline_state["semantic_review_cache_hit"] = {
+                                    "source_task_id": _sr_cache_hit.get("source_task_id"),
+                                    "diff_hash": _sr_cache_hit.get("diff_hash"),
+                                    "plan_signature": _sr_cache_hit.get("plan_signature"),
+                                    "completeness_pct": _sr_cache_hit.get("completeness_pct"),
+                                }
+                                record_event(
+                                    self.db,
+                                    task_id=task.id,
+                                    event_type=EventType.TOOL_SUCCEEDED,
+                                    source=EventSource.ORCHESTRATOR,
+                                    stage=WorkflowStage.REVIEW,
+                                    role=RoleName.REVIEWER,
+                                    tool_name="semantic_review.cache_hit",
+                                    message=(
+                                        "Reused prior verified semantic_review "
+                                        "for identical contract and diff."
+                                    ),
+                                    payload=pipeline_state["semantic_review_cache_hit"],
+                                )
+
+                                def evaluate_semantic_review(*_args, **_kwargs):  # type: ignore[no-redef]
+                                    return _sr_cached_report
+
                     try:
                         sr_report = evaluate_semantic_review(
                             spec_text=_sr_spec_text,
@@ -8112,6 +8366,9 @@ class PrimaryOrchestrator:
                         payload={
                             **sr_report.to_payload(),
                             "sr_repair_round": sr_round,
+                            "cache_hit": pipeline_state.get(
+                                "semantic_review_cache_hit"
+                            ),
                         },
                     )
                     # R3a: persist findings to AgentMemory so future tasks
