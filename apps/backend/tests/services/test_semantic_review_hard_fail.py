@@ -15,6 +15,7 @@ from app.orchestrator.service import (  # noqa: E402
     _semantic_review_exhausted_block_reason,
     _semantic_review_filter_after_verified_gates,
     _semantic_review_high_count,
+    _semantic_review_promote_ungrounded_low_score_after_verified_gates,
     _semantic_review_should_attempt_quality_refine,
     _semantic_review_should_attempt_repair,
     _semantic_review_should_block_on_exhausted,
@@ -402,6 +403,66 @@ diff --git a/app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCAd
     assert filtered.completeness_pct == 80
     assert "contradicted by the verified final diff" in filtered.summary
     assert "persistence payload is incomplete" not in filtered.summary
+
+
+def test_semantic_low_score_with_only_ungrounded_findings_does_not_block_after_verified_gates():
+    pipeline_state = {
+        "compile_gate": {"passed": True},
+        "contract_coverage_verdict": {"ok": True},
+        "acceptance_check_done": True,
+        "symbol_graph_done": True,
+        "symbol_graph": {"passed": True},
+    }
+    sr_report = SimpleNamespace(
+        passed=False,
+        status="failed",
+        pass_threshold=80,
+        completeness_pct=70,
+        summary="Reviewer claimed a must-touch file was not changed.",
+        findings=[],
+        total_findings_raw=1,
+        findings_dropped_no_evidence=1,
+        high_severity_count=lambda: 0,
+    )
+
+    promoted, changed = _semantic_review_promote_ungrounded_low_score_after_verified_gates(
+        sr_report,
+        pipeline_state=pipeline_state,
+    )
+
+    assert changed is True
+    assert promoted.passed is True
+    assert promoted.status == "passed"
+    assert promoted.completeness_pct == 80
+    assert "no grounded finding" in promoted.summary
+
+
+def test_semantic_low_score_without_verified_gates_still_blocks():
+    pipeline_state = {
+        "compile_gate": {"passed": True},
+        "contract_coverage_verdict": {"ok": False},
+        "acceptance_check_done": True,
+        "symbol_graph_done": True,
+        "symbol_graph": {"passed": True},
+    }
+    sr_report = SimpleNamespace(
+        passed=False,
+        status="failed",
+        pass_threshold=80,
+        completeness_pct=70,
+        findings=[],
+        total_findings_raw=1,
+        findings_dropped_no_evidence=1,
+        high_severity_count=lambda: 0,
+    )
+
+    promoted, changed = _semantic_review_promote_ungrounded_low_score_after_verified_gates(
+        sr_report,
+        pipeline_state=pipeline_state,
+    )
+
+    assert changed is False
+    assert promoted.passed is False
 
 
 def test_semantic_quality_refine_requires_grounded_medium_finding():

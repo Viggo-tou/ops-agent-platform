@@ -215,7 +215,7 @@ def test_planner_reclassifies_familyless_memory_row(db: Session) -> None:
     )
 
     assert "semantic_review_low_completeness" in rendered
-    assert audit[0]["task_family"] == "android_session_data_cleanup"
+    assert audit[0]["task_family"] == "react_dashboard_session_data_cleanup"
 
 
 # ---------------------------------------------------------------------------

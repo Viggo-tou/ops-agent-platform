@@ -15,6 +15,7 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from app.services import verification_profile as verification_profile_service  # noqa: E402
 from app.services.verification_profile import (  # noqa: E402
+    NODE_DEPENDENCY_INFRA_REASONS,
     VerificationProfile,
     _resolve_executable,
     parse_compiler_errors,
@@ -69,7 +70,7 @@ def test_resolves_python_from_pyproject_toml(work_dir: Path) -> None:
     profile = resolve_verification_profile(work_dir, has_tests_yaml=False)
 
     assert profile.repo_type == "python"
-    assert profile.compile_command == ["python", "-m", "compileall", "."]
+    assert profile.compile_command == ["python", "-m", "compileall", "-q", "-x", r"\\.git", "."]
 
 
 def test_resolves_node_ts_from_tsconfig(work_dir: Path) -> None:
@@ -121,6 +122,94 @@ def test_parse_python_syntax_error_extracts_file_line() -> None:
     assert errors[0].file_path == "apps/backend/app/foo.py"
     assert errors[0].line_number == 12
     assert "SyntaxError" in errors[0].message
+
+
+def test_parse_node_eslint_block_extracts_file_line(work_dir: Path) -> None:
+    rel = Path("src/pages/UserVerification.js")
+    target = work_dir / rel
+    target.parent.mkdir(parents=True)
+    target.write_text("export default function UserVerification() {}\n", encoding="utf-8")
+    output = f"""Failed to compile.
+
+[eslint]
+{rel.as_posix()}
+  Line 42:41:  React Hook "useState" is called conditionally. React Hooks must be called in the exact same order in every component render  react-hooks/rules-of-hooks
+  Line 53:3:  React Hook "useEffect" is called conditionally. React Hooks must be called in the exact same order in every component render  react-hooks/rules-of-hooks
+"""
+
+    errors = parse_compiler_errors(output, "node_js", repo_root=work_dir)
+
+    assert [error.file_path for error in errors] == [rel.as_posix(), rel.as_posix()]
+    assert [error.line_number for error in errors] == [42, 53]
+    assert errors[0].column == 41
+    assert "rules-of-hooks" in errors[0].message
+
+
+def test_parse_node_eslint_flat_summary_extracts_file_line(work_dir: Path) -> None:
+    rel = Path("src/pages/UserVerification.js")
+    target = work_dir / rel
+    target.parent.mkdir(parents=True)
+    target.write_text("export default function UserVerification() {}\n", encoding="utf-8")
+    output = (
+        "[eslint] src\\pages\\UserVerification.js "
+        "Line 42:41: React Hook \"useState\" is called conditionally. "
+        "React Hooks must be called in the exact same order in every component render "
+        "react-hooks/rules-of-hooks "
+        "Line 53:3: React Hook \"useEffect\" is called conditionally. "
+        "React Hooks must be called in the exact same order in every component render "
+        "react-hooks/rules-of-hooks Search for the keywords to learn more about each error."
+    )
+
+    errors = parse_compiler_errors(output, "node_js", repo_root=work_dir)
+
+    assert [error.file_path for error in errors] == [rel.as_posix(), rel.as_posix()]
+    assert [error.line_number for error in errors] == [42, 53]
+    assert errors[1].column == 3
+    assert "useEffect" in errors[1].message
+
+
+def test_parse_node_eslint_syntax_error_extracts_file_line(work_dir: Path) -> None:
+    rel = Path("src/data/mockUsers.js")
+    target = work_dir / rel
+    target.parent.mkdir(parents=True)
+    target.write_text("const mockUsers = [\n  {\n];\n", encoding="utf-8")
+    output = (
+        '[eslint] src\\data\\mockUsers.js Syntax error: Unexpected token, '
+        'expected "," (22:0) (22:undefined)'
+    )
+
+    errors = parse_compiler_errors(output, "node_js", repo_root=work_dir)
+
+    assert len(errors) == 1
+    assert errors[0].file_path == rel.as_posix()
+    assert errors[0].line_number == 22
+    assert errors[0].column == 0
+    assert errors[0].message == 'Syntax error: Unexpected token, expected ","'
+
+
+def test_parse_react_default_import_error_locates_import_site(work_dir: Path) -> None:
+    source = work_dir / "src" / "pages" / "Dashboard.js"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        'import UserContext from "../context/UserContext";\n'
+        "export default function Dashboard() { return null; }\n",
+        encoding="utf-8",
+    )
+    context = work_dir / "src" / "context" / "UserContext.js"
+    context.parent.mkdir(parents=True)
+    context.write_text("export const useUser = () => null;\n", encoding="utf-8")
+    output = (
+        "Failed to compile. Attempted import error: '../context/UserContext' "
+        "does not contain a default export (imported as 'UserContext')."
+    )
+
+    errors = parse_compiler_errors(output, "node_js", repo_root=work_dir)
+
+    assert len(errors) == 1
+    assert errors[0].file_path == "src/pages/Dashboard.js"
+    assert errors[0].line_number == 1
+    assert errors[0].column == 1
+    assert "does not contain a default export" in errors[0].message
 
 
 def test_compile_only_path_skipped_when_repo_type_unknown(work_dir: Path) -> None:
@@ -255,6 +344,102 @@ def test_run_compile_check_invokes_via_cmd_exe_on_windows_bat_wrapper(work_dir: 
     assert result.passed
     assert commands[0].startswith(expected_prefix)
     assert ":app:compileDebugKotlin" in commands[0]
+
+
+def test_run_compile_check_hydrates_missing_node_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+    work_dir: Path,
+) -> None:
+    (work_dir / "package.json").write_text('{"scripts":{"build":"react-scripts build"}}\n', encoding="utf-8")
+    (work_dir / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    commands: list[str] = []
+
+    class FakeSandbox:
+        def __init__(self, root: Path):
+            self.work_dir = root
+
+        def run(self, command, **kwargs):  # noqa: ANN001, ANN003
+            commands.append(command)
+            if "npm ci" in command:
+                (self.work_dir / "node_modules" / ".bin").mkdir(parents=True)
+                return {"stdout": "installed", "stderr": "", "exit_code": 0, "timed_out": False, "duration_ms": 30}
+            return {"stdout": "built", "stderr": "", "exit_code": 0, "timed_out": False, "duration_ms": 12}
+
+    monkeypatch.setattr(verification_profile_service.shutil, "which", lambda executable: f"/tools/{executable}")
+    profile = _compile_profile("node_js", ["npm", "run", "build"])
+
+    result = run_compile_check(
+        sandbox=FakeSandbox(work_dir),
+        profile=profile,
+        timeout_seconds=10,
+    )
+
+    assert result.passed
+    assert len(commands) == 2
+    assert "npm ci" in commands[0]
+    assert "npm run build" in commands[1]
+
+
+def test_run_compile_check_reports_node_dependency_install_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    work_dir: Path,
+) -> None:
+    (work_dir / "package.json").write_text('{"scripts":{"build":"react-scripts build"}}\n', encoding="utf-8")
+    (work_dir / "package-lock.json").write_text("{}\n", encoding="utf-8")
+
+    class FakeSandbox:
+        def __init__(self, root: Path):
+            self.work_dir = root
+
+        def run(self, command, **kwargs):  # noqa: ANN001, ANN003
+            return {"stdout": "", "stderr": "registry unavailable", "exit_code": 1, "timed_out": False, "duration_ms": 40}
+
+    monkeypatch.setattr(verification_profile_service.shutil, "which", lambda executable: f"/tools/{executable}")
+    profile = _compile_profile("node_js", ["npm", "run", "build"])
+
+    result = run_compile_check(
+        sandbox=FakeSandbox(work_dir),
+        profile=profile,
+        timeout_seconds=10,
+    )
+
+    assert not result.passed
+    assert result.reason in NODE_DEPENDENCY_INFRA_REASONS
+    assert result.errors[0]["type"] == "node_dependency_install"
+
+
+def test_run_compile_check_reports_node_build_timeout_as_infra(
+    monkeypatch: pytest.MonkeyPatch,
+    work_dir: Path,
+) -> None:
+    (work_dir / "package.json").write_text('{"scripts":{"build":"react-scripts build"}}\n', encoding="utf-8")
+    (work_dir / "node_modules").mkdir()
+
+    class FakeSandbox:
+        def __init__(self, root: Path):
+            self.work_dir = root
+
+        def run(self, command, **kwargs):  # noqa: ANN001, ANN003
+            return {
+                "stdout": "Creating an optimized production build...",
+                "stderr": "",
+                "exit_code": -1,
+                "timed_out": True,
+                "duration_ms": 240000,
+            }
+
+    monkeypatch.setattr(verification_profile_service.shutil, "which", lambda executable: f"/tools/{executable}")
+    profile = _compile_profile("node_js", ["npm", "run", "build"])
+
+    result = run_compile_check(
+        sandbox=FakeSandbox(work_dir),
+        profile=profile,
+        timeout_seconds=10,
+    )
+
+    assert not result.passed
+    assert result.reason == "node_compile_timed_out"
+    assert result.reason in NODE_DEPENDENCY_INFRA_REASONS
 
 
 def _compile_profile(repo_type: str, compile_command: list[str]) -> VerificationProfile:

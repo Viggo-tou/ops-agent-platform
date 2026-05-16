@@ -37,6 +37,28 @@ def _engine_is_sqlite(db: Session) -> bool:
         return False
 
 
+def _is_misclassified_runtime_validation_row(memory: AgentMemory) -> bool:
+    """Hide legacy rows where a runtime gate failure was stored as another class.
+
+    Earlier versions inferred must-touch/provider failures from sparse terminal
+    state. When a later runtime validation failed, the final result no longer
+    carried the pipeline file list, so the learning loop wrote misleading
+    failure_observation rows. They should not be retrieved into future prompts.
+    """
+    if memory.failure_class not in {"must_touch_incomplete_diff", "provider_empty_response"}:
+        return False
+    refs = memory.evidence_refs if isinstance(memory.evidence_refs, dict) else {}
+    message = " ".join(
+        str(value or "")
+        for value in (
+            refs.get("pipeline_message"),
+            memory.observation,
+            memory.resolution,
+        )
+    ).lower()
+    return "runtime validation" in message or "runtime_validation" in message
+
+
 @dataclass(frozen=True)
 class MemoryCandidate:
     scope: str
@@ -209,7 +231,10 @@ class MemoryService:
         if not findings:
             return 0
         review_summary = _clean_text(str(review_payload.get("summary") or ""), limit=1200)
-        plan_json = task.plan_json if isinstance(getattr(task, "plan_json", None), dict) else {}
+        plan_json = dict(task.plan_json) if isinstance(getattr(task, "plan_json", None), dict) else {}
+        source_name = getattr(task, "source_name", None)
+        if isinstance(source_name, str) and source_name.strip():
+            plan_json.setdefault("source_name", source_name.strip())
         task_family = detect_task_family(
             request_text="\n".join(
                 part
@@ -314,7 +339,10 @@ class MemoryService:
 
         from app.services.failure_classifier import detect_task_family
 
-        plan_json = task.plan_json if isinstance(getattr(task, "plan_json", None), dict) else {}
+        plan_json = dict(task.plan_json) if isinstance(getattr(task, "plan_json", None), dict) else {}
+        source_name = getattr(task, "source_name", None)
+        if isinstance(source_name, str) and source_name.strip():
+            plan_json.setdefault("source_name", source_name.strip())
         task_family = detect_task_family(
             request_text="\n".join(
                 part
@@ -623,6 +651,15 @@ class MemoryService:
                 AgentMemory.created_at.desc(),
             ).limit(top_n * 3)
             memories = list(self.db.scalars(stmt))
+        if memory_kind is not None:
+            stmt = select(AgentMemory).where(AgentMemory.scope == scope)
+            if kind:
+                stmt = stmt.where(AgentMemory.kind == kind)
+            stmt = stmt.where(AgentMemory.memory_kind == memory_kind)
+            stmt = stmt.order_by(AgentMemory.created_at.desc()).limit(top_n * 3)
+            recent = list(self.db.scalars(stmt))
+            seen_ids = {m.id for m in memories}
+            memories.extend(m for m in recent if m.id not in seen_ids)
 
         # T-LEARNING-LOOP-V1 post-filter on the new axes. Done in Python
         # rather than SQL because (a) the new columns are nullable on
@@ -630,6 +667,8 @@ class MemoryService:
         # candidate list is already small.
         if memory_kind is not None:
             memories = [m for m in memories if (m.memory_kind or "success_fact") == memory_kind]
+        if memory_kind == "failure_observation":
+            memories = [m for m in memories if not _is_misclassified_runtime_validation_row(m)]
         if task_family is not None:
             memories = [m for m in memories if (m.task_family or "") == task_family]
         if prompt_context is not None:
@@ -644,6 +683,8 @@ class MemoryService:
                 return prompt_context in allowed_list
             memories = [m for m in memories if _allowed(m)]
 
+        if memory_kind == "failure_observation":
+            memories.sort(key=lambda m: m.created_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
         memories = memories[:top_n]
         now = datetime.now(timezone.utc)
         for memory in memories:

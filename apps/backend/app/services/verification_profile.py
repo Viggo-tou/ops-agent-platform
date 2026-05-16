@@ -87,9 +87,41 @@ ANDROID_KOTLIN_ERROR = re.compile(r"^e:\s+(?:file://)?(.+):(\d+):(\d+)\s+(.*)$",
 PYTHON_TUPLE_ERROR = re.compile(r"\*\*\*.*?\('([^']+)',\s*(\d+)", re.MULTILINE | re.DOTALL)
 PYTHON_FILE_LINE_ERROR = re.compile(r'File "([^"]+)", line (\d+)')
 TS_ERROR = re.compile(r"^([^(]+)\((\d+),(\d+)\):\s+error\s+(\S+):\s+(.*)$", re.MULTILINE)
+ESLINT_FILE_BLOCK = re.compile(
+    r"(?:^\[eslint\]\s*)?^(?P<file>[^\r\n]+?\.(?:js|jsx|ts|tsx))\s*$"
+    r"(?P<body>(?:\r?\n\s+Line\s+\d+:\d+:\s+.+)+)",
+    re.MULTILINE,
+)
+ESLINT_LINE = re.compile(r"^\s+Line\s+(\d+):(\d+):\s+(.+?)\s*$", re.MULTILINE)
+ESLINT_FLAT = re.compile(
+    r"\[eslint\]\s+(?P<file>\S+?\.(?:js|jsx|ts|tsx))\s+"
+    r"(?P<body>Line\s+\d+:\d+:\s+.+?)(?=\s+Search for|\s+Browserslist|\Z)",
+    re.DOTALL,
+)
+ESLINT_FLAT_LINE = re.compile(
+    r"Line\s+(\d+):(\d+):\s+(.+?)(?=\s+Line\s+\d+:\d+:|\Z)",
+    re.DOTALL,
+)
+ESLINT_SYNTAX_ERROR = re.compile(
+    r"\[eslint\]\s+(?P<file>\S+?\.(?:js|jsx|ts|tsx))\s+"
+    r"Syntax error:\s+(?P<message>.+?)(?=\s+\(\d+:\d+\))"
+    r"\s+\((?P<line>\d+):(?P<column>\d+)\)",
+    re.DOTALL,
+)
+REACT_DEFAULT_IMPORT_ERROR = re.compile(
+    r"Attempted import error:\s+'(?P<module>[^']+)'\s+does not contain a default export "
+    r"\(imported as '(?P<name>[^']+)'\)"
+)
 RUST_LOCATION = re.compile(r"^\s*-->\s+([^:]+):(\d+):(\d+)", re.MULTILINE)
 GO_ERROR = re.compile(r"^([^:\s]+\.go):(\d+):(?:(\d+):)?\s+(.*)$", re.MULTILINE)
 GRADLE_WRAPPERS = {"gradlew", "gradlew.bat"}
+NODE_DEPENDENCY_INFRA_REASONS = frozenset(
+    {
+        "node_dependency_install_failed",
+        "node_dependency_install_timed_out",
+        "node_compile_timed_out",
+    }
+)
 
 
 def resolve_verification_profile(
@@ -277,6 +309,17 @@ def run_compile_check(
                 reason="kotlinc_syntax_precheck_failed",
             )
 
+    if profile.repo_type in {"node_js", "node_ts"}:
+        dependency_result = _ensure_node_dependencies(
+            sandbox=sandbox,
+            sandbox_workdir=sandbox_workdir,
+            repo_type=profile.repo_type,
+            timeout_seconds=min(max(30, timeout_seconds), 180),
+            max_output_bytes=max_output_bytes,
+        )
+        if dependency_result is not None:
+            return dependency_result
+
     command = subprocess.list2cmdline(compile_command)
     env = {"GRADLE_OPTS": "-Dorg.gradle.daemon=false"} if profile.repo_type == "android_gradle" else None
     raw_result = sandbox.run(
@@ -295,6 +338,9 @@ def run_compile_check(
         error.to_dict(profile.repo_type)
         for error in parse_compiler_errors(output, profile.repo_type, repo_root=sandbox_workdir)
     ]
+    reason = None
+    if profile.repo_type in {"node_js", "node_ts"} and timed_out and not errors:
+        reason = "node_compile_timed_out"
     if not passed and not errors:
         excerpt = _first_output_excerpt(output)
         errors = [
@@ -317,7 +363,7 @@ def run_compile_check(
         errors=errors,
         timed_out=timed_out,
         duration_ms=int(raw_result.get("duration_ms", 0)),
-        reason=None,
+        reason=reason,
     )
 
 
@@ -472,7 +518,126 @@ def _parse_typescript_errors(stdout: str, *, repo_root: Path | None) -> list[Com
                 severity="error",
             )
         )
+    errors.extend(_parse_eslint_errors(stdout, repo_root=repo_root))
+    errors.extend(_parse_react_default_import_errors(stdout, repo_root=repo_root))
     return errors
+
+
+def _parse_eslint_errors(stdout: str, *, repo_root: Path | None) -> list[CompileError]:
+    """Parse CRA/ESLint diagnostics so scoped repair can target the file.
+
+    Create React App prints ESLint failures as a file header followed by
+    indented ``Line X:Y`` rows, while task summaries sometimes flatten the
+    same output into one line. Support both forms; otherwise compile repair
+    sees ``file=None`` and queues zero repair jobs for ordinary React errors.
+    """
+    errors: list[CompileError] = []
+    for match in ESLINT_FILE_BLOCK.finditer(stdout):
+        file_path = _normalize_error_path(match.group("file"), repo_root=repo_root)
+        for line_match in ESLINT_LINE.finditer(match.group("body")):
+            errors.append(
+                CompileError(
+                    file_path=file_path,
+                    line_number=int(line_match.group(1)),
+                    column=int(line_match.group(2)),
+                    message=line_match.group(3).strip(),
+                    severity="error",
+                )
+            )
+    if errors:
+        return errors
+
+    for match in ESLINT_SYNTAX_ERROR.finditer(" ".join(stdout.split())):
+        errors.append(
+            CompileError(
+                file_path=_normalize_error_path(match.group("file"), repo_root=repo_root),
+                line_number=int(match.group("line")),
+                column=int(match.group("column")),
+                message=f"Syntax error: {' '.join(match.group('message').split())}",
+                severity="error",
+            )
+        )
+    if errors:
+        return errors
+
+    for match in ESLINT_FLAT.finditer(" ".join(stdout.split())):
+        file_path = _normalize_error_path(match.group("file"), repo_root=repo_root)
+        for line_match in ESLINT_FLAT_LINE.finditer(match.group("body")):
+            errors.append(
+                CompileError(
+                    file_path=file_path,
+                    line_number=int(line_match.group(1)),
+                    column=int(line_match.group(2)),
+                    message=" ".join(line_match.group(3).split()),
+                    severity="error",
+                )
+            )
+    return errors
+
+
+def _parse_react_default_import_errors(stdout: str, *, repo_root: Path | None) -> list[CompileError]:
+    if repo_root is None:
+        return []
+    errors: list[CompileError] = []
+    for match in REACT_DEFAULT_IMPORT_ERROR.finditer(stdout):
+        module = match.group("module")
+        name = match.group("name")
+        source = _find_default_import_site(repo_root, imported_name=name, module_specifier=module)
+        message = match.group(0).strip()
+        errors.append(
+            CompileError(
+                file_path=source[0] if source else None,
+                line_number=source[1] if source else None,
+                column=source[2] if source else None,
+                message=message,
+                severity="error",
+            )
+        )
+    return errors
+
+
+def _find_default_import_site(
+    repo_root: Path,
+    *,
+    imported_name: str,
+    module_specifier: str,
+) -> tuple[str, int, int] | None:
+    if not imported_name or not module_specifier:
+        return None
+    escaped_name = re.escape(imported_name)
+    escaped_module = re.escape(module_specifier)
+    import_re = re.compile(
+        rf"^\s*import\s+{escaped_name}\s+from\s+['\"]{escaped_module}['\"]",
+        re.MULTILINE,
+    )
+    for path in _iter_source_files(repo_root):
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        found = import_re.search(text)
+        if not found:
+            continue
+        line = text.count("\n", 0, found.start()) + 1
+        line_start = text.rfind("\n", 0, found.start()) + 1
+        column = found.start() - line_start + 1
+        return (_normalize_error_path(str(path), repo_root=repo_root), line, column)
+    return None
+
+
+def _iter_source_files(repo_root: Path):
+    skipped_dirs = {"node_modules", ".git", "build", "dist", "coverage"}
+    suffixes = {".js", ".jsx", ".ts", ".tsx"}
+    try:
+        for path in repo_root.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in suffixes:
+                continue
+            parts = {part.lower() for part in path.relative_to(repo_root).parts[:-1]}
+            if parts & skipped_dirs:
+                continue
+            yield path
+    except OSError:
+        return
 
 
 def _parse_rust_errors(stdout: str, *, repo_root: Path | None) -> list[CompileError]:
@@ -567,6 +732,72 @@ def _node_js_compile_command(root: Path, scripts: dict[str, str]) -> list[str]:
     if (root / "index.js").is_file():
         return ["node", "--check", "index.js"]
     return ["npm", "test", "--", "--runInBand"]
+
+
+def _ensure_node_dependencies(
+    *,
+    sandbox: object,
+    sandbox_workdir: Path,
+    repo_type: str,
+    timeout_seconds: int,
+    max_output_bytes: int,
+) -> CompileCheckResult | None:
+    """Install Node dependencies only when the sandbox lacks node_modules.
+
+    Local sandboxes normally link ``node_modules`` from the source repository.
+    Remote or freshly-cloned repositories may not have that cache, so the
+    compile verifier hydrates dependencies before running the real build.
+    Install failures are infrastructure failures, not code compile errors; the
+    orchestrator must not send them to compile repair.
+    """
+    if not (sandbox_workdir / "package.json").is_file():
+        return None
+    if (sandbox_workdir / "node_modules").exists():
+        return None
+
+    if (sandbox_workdir / "package-lock.json").is_file() or (sandbox_workdir / "npm-shrinkwrap.json").is_file():
+        install_command = ["npm", "ci", "--prefer-offline", "--no-audit", "--fund=false"]
+    else:
+        install_command = ["npm", "install", "--prefer-offline", "--no-audit", "--fund=false"]
+
+    command = subprocess.list2cmdline(install_command)
+    raw_result = sandbox.run(
+        command,
+        timeout_seconds=timeout_seconds,
+        max_output_bytes=max_output_bytes,
+    )
+    stdout = str(raw_result.get("stdout", ""))
+    stderr = str(raw_result.get("stderr", ""))
+    output = (stdout + ("\n" if stdout and stderr else "") + stderr)[:max_output_bytes]
+    exit_code = int(raw_result.get("exit_code", -1))
+    timed_out = bool(raw_result.get("timed_out", False))
+    if exit_code == 0 and not timed_out:
+        return None
+
+    reason = "node_dependency_install_timed_out" if timed_out else "node_dependency_install_failed"
+    excerpt = _first_output_excerpt(output)
+    message = excerpt or f"{command} exited {exit_code}"
+    return CompileCheckResult(
+        passed=False,
+        status="failed",
+        repo_type=repo_type,
+        command=install_command,
+        output=output,
+        errors=[
+            {
+                "file": None,
+                "line": None,
+                "column": None,
+                "error": message,
+                "message": message,
+                "severity": "error",
+                "type": "node_dependency_install",
+            }
+        ],
+        timed_out=timed_out,
+        duration_ms=int(raw_result.get("duration_ms", 0)),
+        reason=reason,
+    )
 
 
 def _node_test_command(scripts: dict[str, str], has_tests_yaml: bool) -> list[str] | None:

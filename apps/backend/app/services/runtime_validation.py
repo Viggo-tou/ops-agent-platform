@@ -94,13 +94,18 @@ def _check_case_sensitive_comparisons(
     seen: set[tuple[str, str, str]] = set()
 
     current_file = ""
+    normalized_vars_by_file: dict[str, set[str]] = {}
     for line in diff.splitlines():
         if line.startswith("+++ b/"):
             current_file = line[6:]
         elif line.startswith("+") and not line.startswith("+++"):
             added = line[1:]
+            normalized_vars = normalized_vars_by_file.setdefault(current_file, set())
+            _remember_case_normalized_variables(added, normalized_vars)
             matches = re.findall(r'===\s*["\']([^"\']+)["\']', added)
             for match in matches:
+                if _comparison_uses_case_normalization(added, match, normalized_vars):
+                    continue
                 original = context_files.get(current_file, "")
                 if not original:
                     continue
@@ -127,6 +132,41 @@ def _check_case_sensitive_comparisons(
                             )
                         )
     return findings
+
+
+def _remember_case_normalized_variables(line: str, normalized_vars: set[str]) -> None:
+    """Track local variables derived from case-normalized string expressions."""
+    match = re.search(
+        r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*[^;]*(?:\.toLowerCase\(\)|\.toUpperCase\(\)|\.lower\(\))",
+        line,
+    )
+    if match:
+        normalized_vars.add(match.group(1))
+
+
+def _comparison_uses_case_normalization(
+    line: str,
+    literal: str,
+    normalized_vars: set[str],
+) -> bool:
+    """Return True when a strict comparison is already case-insensitive.
+
+    This keeps the runtime gate focused on raw string comparisons. A lowercase
+    literal is correct when the compared expression has already been normalized,
+    either inline or through a local variable such as `const role =
+    user.role.toLowerCase()`.
+    """
+    match = re.search(
+        rf"(?P<lhs>.*?)===\s*[\"']{re.escape(literal)}[\"']",
+        line,
+    )
+    if not match:
+        return False
+    lhs = match.group("lhs")
+    if re.search(r"\.(?:toLowerCase|toUpperCase|lower)\(\)", lhs):
+        return True
+    identifiers = re.findall(r"\b[A-Za-z_$][\w$]*\b", lhs)
+    return any(identifier in normalized_vars for identifier in identifiers)
 
 
 def _check_replacement_completeness(

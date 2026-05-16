@@ -45,8 +45,17 @@ _STOPWORDS = frozenset({
     "add", "added", "adding", "make", "makes", "making", "see", "also",
     "way", "ways", "via", "any", "all", "both", "each", "more", "some",
     "into", "during", "after", "before", "between", "above", "below",
-    "p69", "jira", "issue", "ticket", "task",
+    "p69", "jira", "issue", "ticket", "task", "summary", "description",
 })
+_QUOTED_RE = re.compile(r"""['"`]([^'"`\n]{2,80})['"`]""")
+_SEMANTIC_EXPANSIONS: dict[str, tuple[str, ...]] = {
+    "cache": ("localstorage", "currentuser", "getitem"),
+    "caching": ("localstorage", "currentuser", "getitem"),
+    "logged": ("localstorage", "currentuser", "session"),
+    "login": ("localstorage", "currentuser", "session"),
+    "previous": ("localstorage", "currentuser"),
+    "dummy": ("mock",),
+}
 
 # Extension priorities (lower = preferred). Android Kotlin apps put
 # logic in .kt; layouts in .xml; gradle in .gradle. Web apps reverse
@@ -80,7 +89,7 @@ class CandidateFile:
     extension: str
 
 
-def _extract_keywords(text: str, *, max_keywords: int = 20) -> list[str]:
+def _extract_keywords(text: str, *, max_keywords: int = 32) -> list[str]:
     """Split text into lowercase keywords, drop stopwords + short
     tokens. Preserves CamelCase boundaries by splitting on transitions
     so "MapAddressPicker" → ["map", "address", "picker"]. Also keeps
@@ -89,8 +98,14 @@ def _extract_keywords(text: str, *, max_keywords: int = 20) -> list[str]:
     """
     if not text:
         return []
-    # CamelCase + non-alphanumeric splitter.
-    parts = re.findall(r"[A-Za-z][a-z]+|[A-Z]{2,}|[a-z]{3,}", text)
+    # Quoted Jira anchors (e.g. "master admin", "Admin", "Staff") are
+    # usually higher signal than boilerplate prose. Put their tokens first so
+    # they survive the max_keywords cap.
+    parts: list[str] = []
+    for phrase in _QUOTED_RE.findall(text):
+        parts.extend(re.findall(r"[A-Za-z][a-z]+|[A-Z]{2,}|[a-z]{3,}", phrase))
+    # CamelCase + non-alphanumeric splitter for the rest of the issue text.
+    parts.extend(re.findall(r"[A-Za-z][a-z]+|[A-Z]{2,}|[a-z]{3,}", text))
     out: list[str] = []
     seen: set[str] = set()
     for raw in parts:
@@ -103,6 +118,10 @@ def _extract_keywords(text: str, *, max_keywords: int = 20) -> list[str]:
             continue
         seen.add(token)
         out.append(token)
+        for expanded in _SEMANTIC_EXPANSIONS.get(token, ()):
+            if expanded not in seen and expanded not in _STOPWORDS:
+                seen.add(expanded)
+                out.append(expanded)
         if len(out) >= max_keywords:
             break
     return out
@@ -162,6 +181,64 @@ def _score_content_lite(
         if count > 0:
             score += count * 0.5 * weight
             matched.append(kw)
+    if (
+        any(kw in keywords for kw in ("cache", "caching", "previous", "logged"))
+        and "localstorage.getitem" in sample.replace(" ", "")
+        and "currentuser" in sample
+    ):
+        score += 6.0
+        matched.extend(["localstorage", "currentuser"])
+    return score, matched
+
+
+def _source_structure_adjustment(
+    *,
+    path: str,
+    content: str,
+    keywords: list[str],
+) -> tuple[float, list[str]]:
+    """Boost source-of-truth state files over many passive consumers.
+
+    React dashboards often have many pages reading ``localStorage``. For
+    cache/session issues, the fallback target should prefer the context or
+    login/dashboard entry points instead of touching every page that happens
+    to read ``currentUser``.
+    """
+    wants_session_fix = any(
+        kw in keywords
+        for kw in ("cache", "caching", "previous", "logged", "login", "session")
+    )
+    if not wants_session_fix:
+        return 0.0, []
+
+    path_lower = path.lower().replace("\\", "/")
+    sample = content[:20_000].lower().replace(" ", "")
+    if "currentuser" not in sample:
+        return 0.0, []
+
+    score = 0.0
+    matched: list[str] = []
+    if (
+        "createcontext" in sample
+        or "userprovider" in sample
+        or path_lower.endswith("context/usercontext.js")
+        or path_lower.endswith("context/usercontext.jsx")
+        or path_lower.endswith("context/usercontext.tsx")
+    ):
+        score += 18.0
+        matched.extend(["session_owner", "currentuser"])
+    elif path_lower.endswith(("/login.js", "/login.jsx", "/login.tsx")):
+        score += 10.0
+        matched.extend(["login", "currentuser"])
+    elif path_lower.endswith(("/dashboard.js", "/dashboard.jsx", "/dashboard.tsx")):
+        score += 8.0
+        matched.extend(["dashboard", "currentuser"])
+    elif (
+        "localstorage.getitem(\"currentuser\")" in sample
+        or "localstorage.getitem('currentuser')" in sample
+    ):
+        score += 2.0
+        matched.extend(["localstorage", "currentuser"])
     return score, matched
 
 
@@ -300,8 +377,19 @@ def preplan_discover_files(
             matched = list(dict.fromkeys(path_matches + content_matches))
             total = (path_score + content_score) * ext_boost
 
+        structure_score, structure_matches = _source_structure_adjustment(
+            path=doc.relative_path,
+            content=doc.content or "",
+            keywords=keywords,
+        )
+        if structure_score:
+            matched = list(dict.fromkeys(matched + structure_matches))
+            total += structure_score * ext_boost
+
         # Build a short human-readable reason for the planner prompt.
-        if path_matches:
+        if structure_score:
+            reason = f"state/session owner signal {', '.join(structure_matches[:4])}"
+        elif path_matches:
             reason = f"filename matches {', '.join(path_matches[:4])}"
         elif content_matches:
             reason = f"content references {', '.join(content_matches[:4])}"

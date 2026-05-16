@@ -60,6 +60,26 @@ class FailureClassification:
 # ---- Individual classifiers ---------------------------------------------
 
 
+def _message_belongs_to_specific_downstream_gate(message: str) -> bool:
+    msg = (message or "").lower()
+    return any(
+        marker in msg
+        for marker in (
+            "acceptance gate failed",
+            "contract_coverage_lie",
+            "contract_coverage_contradicted",
+            "contract_coverage_unverified",
+            "compile_repair",
+            "compile_gate",
+            "compile verification failed",
+            "runtime validation",
+            "runtime_validation",
+            "semantic_review",
+            "semantic review",
+        )
+    )
+
+
 def classify_must_touch_incomplete_diff(
     *,
     plan_must_touch: list[str],
@@ -96,13 +116,7 @@ def classify_must_touch_incomplete_diff(
         and ("were not successfully patched" in msg or "missing" in msg)
     )
     # If the message explicitly belongs to another gate, defer.
-    fires_other_gate = (
-        "acceptance gate failed" in msg
-        or "contract_coverage_lie" in msg
-        or "contract_coverage_contradicted" in msg
-        or "contract_coverage_unverified" in msg
-        or "compile_repair" in msg
-    )
+    fires_other_gate = _message_belongs_to_specific_downstream_gate(msg)
     if not explicit_keyword and fires_other_gate:
         return None
     if not (missing or explicit_keyword):
@@ -321,6 +335,7 @@ def classify_provider_response_issue(
     codegen_provider: str | None,
     diff_chars: int | None,
     expected_min_files: int = 1,
+    pipeline_failed_message: str = "",
     task_family: str | None = None,
     task_id: str | None = None,
 ) -> FailureClassification | None:
@@ -331,6 +346,8 @@ def classify_provider_response_issue(
     """
     mode = (plan_provider_mode or "").lower()
     if mode in ("fallback_after_all_providers_failed", "fallback_after_primary_failed"):
+        if _message_belongs_to_specific_downstream_gate(pipeline_failed_message):
+            return None
         return FailureClassification(
             failure_class="provider_empty_response",
             scope="provider:liveness",
@@ -467,6 +484,7 @@ def classify(
                 "codegen_provider": codegen_provider,
                 "diff_chars": diff_chars,
                 "expected_min_files": len(plan_must_touch or []),
+                "pipeline_failed_message": pipeline_failed_message,
                 "task_family": task_family,
                 "task_id": task_id,
             },
@@ -486,6 +504,22 @@ _FAMILY_KEYWORDS = (
     ("android_map_location", ("map-based", "map picker", "geocod", "osmdroid", "mapview", "android.*location")),
     ("android_kyc_address", ("kyc", "address form", "address picker")),
     ("android_signup", ("signup", "sign up", "registration", "kyc")),
+    (
+        "react_dashboard_session_data_cleanup",
+        (
+            "dashboard",
+            "react",
+            "currentuser",
+            "localstorage",
+            "usercontext",
+            "adminsettings",
+            "serviceanalytics",
+            "analytics",
+            "dummy data",
+            "master admin",
+            "role simplification",
+        ),
+    ),
     (
         "android_session_data_cleanup",
         (
@@ -518,6 +552,7 @@ def detect_task_family(request_text: str, plan_json: dict[str, Any] | None = Non
     import re as _re
 
     haystack_parts: list[str] = [request_text or ""]
+    plan_paths: list[str] = []
     if isinstance(plan_json, dict):
         for key in (
             "objective",
@@ -532,6 +567,9 @@ def detect_task_family(request_text: str, plan_json: dict[str, Any] | None = Non
             v = plan_json.get(key)
             if isinstance(v, str):
                 haystack_parts.append(v)
+        source_name = plan_json.get("source_name")
+        if isinstance(source_name, str):
+            haystack_parts.append(source_name)
         semantic = plan_json.get("semantic_review")
         if isinstance(semantic, dict):
             for key in ("summary", "description"):
@@ -540,19 +578,69 @@ def detect_task_family(request_text: str, plan_json: dict[str, Any] | None = Non
                     haystack_parts.append(v)
         finding = plan_json.get("finding")
         if isinstance(finding, dict):
-            for key in ("description", "suggested_fix"):
+            for key in ("file", "category", "description", "suggested_fix"):
                 v = finding.get(key)
                 if isinstance(v, str):
                     haystack_parts.append(v)
+                    if key == "file":
+                        plan_paths.append(v)
             obligations = finding.get("obligations")
             if isinstance(obligations, list):
                 haystack_parts.extend(str(item) for item in obligations if item)
+        missing_files = plan_json.get("missing_files")
+        if isinstance(missing_files, list):
+            missing_path_strings = [str(item) for item in missing_files if item]
+            plan_paths.extend(missing_path_strings)
+            haystack_parts.extend(missing_path_strings)
         files = plan_json.get("must_touch_files") or []
         if isinstance(files, list):
-            haystack_parts.extend(f for f in files if isinstance(f, str))
+            file_paths = [f for f in files if isinstance(f, str)]
+            plan_paths.extend(file_paths)
+            haystack_parts.extend(file_paths)
     haystack = " ".join(haystack_parts).lower()
     if not haystack.strip():
         return None
+    path_blob = " ".join(plan_paths).lower().replace("\\", "/")
+    has_react_surface = (
+        "hosteddashboard" in haystack
+        or "src/pages/" in path_blob
+        or "src/context/" in path_blob
+        or any(path_blob.endswith(ext) for ext in (".js", ".jsx", ".ts", ".tsx"))
+    )
+    has_android_surface = (
+        "handymanapp" in haystack
+        or "app/src/main/" in path_blob
+        or ".kt" in path_blob
+        or "android" in haystack
+        or "kotlin" in haystack
+    )
+    session_cleanup_terms = (
+        "hardcoded",
+        "dummy data",
+        "analytics",
+        "previous logged-in user",
+        "logged-in user",
+        "session",
+        "cache",
+        "currentuser",
+        "localstorage",
+        "admin role",
+        "staff",
+        "role simplification",
+        "master admin",
+    )
+    if any(term in haystack for term in session_cleanup_terms):
+        if has_react_surface and not has_android_surface:
+            return "react_dashboard_session_data_cleanup"
+        if has_react_surface and (
+            "dashboard" in haystack
+            or "serviceanalytics" in haystack
+            or "adminsettings" in haystack
+            or "usercontext" in haystack
+        ):
+            return "react_dashboard_session_data_cleanup"
+        if has_android_surface:
+            return "android_session_data_cleanup"
     for family, keywords in _FAMILY_KEYWORDS:
         for kw in keywords:
             try:
@@ -573,13 +661,27 @@ def detect_memory_task_family(memory: Any) -> str | None:
     uses this helper to avoid dropping those rows while keeping the same
     keyword rules as the write path.
     """
-    explicit = getattr(memory, "task_family", None)
-    if isinstance(explicit, str) and explicit.strip():
-        return explicit.strip()
-
     evidence = getattr(memory, "evidence_refs", None)
     if not isinstance(evidence, dict):
         evidence = {}
+    explicit = getattr(memory, "task_family", None)
+    if isinstance(explicit, str) and explicit.strip():
+        explicit_value = explicit.strip()
+        if explicit_value == "android_session_data_cleanup":
+            corrected = detect_task_family(
+                request_text="\n".join(
+                    str(part)
+                    for part in (
+                        getattr(memory, "observation", "") or "",
+                        getattr(memory, "resolution", "") or "",
+                    )
+                    if part
+                ),
+                plan_json=evidence,
+            )
+            if corrected and corrected != explicit_value:
+                return corrected
+        return explicit_value
     evidence_family = evidence.get("task_family")
     if isinstance(evidence_family, str) and evidence_family.strip():
         return evidence_family.strip()

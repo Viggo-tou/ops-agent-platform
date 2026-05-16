@@ -146,6 +146,25 @@ def test_select_glob_match_via_applies_to(tmp_path):
     assert "other" in names  # also matches via language=python
 
 
+def test_select_react_playbook_by_js_file_glob(tmp_path):
+    _write_playbook(
+        tmp_path,
+        "react-hooks",
+        language="javascript",
+        applies_to=["src/**/*.js", "src/**/*.tsx"],
+        priority="high",
+        body="Never place hooks after conditional returns.",
+    )
+    rebuild_index(tmp_path)
+
+    selected = select_playbooks(
+        language="unknown",
+        file_paths=["src/pages/UserVerification.js"],
+    )
+
+    assert [p.name for p in selected] == ["react-hooks"]
+
+
 def test_select_priority_ordering(tmp_path):
     _write_playbook(tmp_path, "low_one", language="python", priority="low")
     _write_playbook(tmp_path, "high_one", language="python", priority="high")
@@ -212,3 +231,4 @@ def test_default_codegen_dir_loads_shipped_playbooks():
     # The two checked-in playbooks live in docs/agent-playbooks/codegen/
     assert "python" in names
     assert "diff-discipline" in names
+    assert "react-hooks" in names

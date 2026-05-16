@@ -298,7 +298,7 @@ def test_codegen_memory_reclassifies_familyless_low_completeness_row(db: Session
         failure_class="semantic_review_low_completeness",
         scope="review:semantic",
         observation_text=(
-            "semantic_review low completeness: analytics dummy data and role "
+            "develop P69-10 semantic_review low completeness: analytics dummy data and role "
             "simplification remain unimplemented."
         ),
         lesson=(
@@ -310,6 +310,9 @@ def test_codegen_memory_reclassifies_familyless_low_completeness_row(db: Session
         trust_level="auto_classified",
         prompt_eligible=["planner_warning", "codegen_warning"],
         evidence_refs={
+            "missing_files": [
+                "app/src/main/java/com/example/handyman/chatbox/MainActivity.kt"
+            ],
             "semantic_review": {
                 "completeness_pct": 45,
                 "summary": (
@@ -379,6 +382,90 @@ def test_codegen_memory_reclassifies_familyless_low_completeness_row(db: Session
     assert "SEMANTIC REVIEW WARNING" in directive
     assert "analytics dummy data" in directive
     assert audit[0]["task_family"] == "android_session_data_cleanup"
+
+
+def test_codegen_warning_injects_multiple_dashboard_semantic_findings(db: Session) -> None:
+    svc = MemoryService(db)
+    for failure_class, description, suggested, file_path in (
+        (
+            "semantic_review_api_mismatch",
+            "Role check uses Admin but mockUsers role is lowercase admin.",
+            "Normalize role comparison to case-insensitive or align stored roles.",
+            "src/pages/AdminSettings.js",
+        ),
+        (
+            "semantic_review_orphan_ui",
+            "Logout function is defined in UserContext but never called.",
+            "Wire the logout action into a header/navigation component or avoid unused API.",
+            "src/context/UserContext.js",
+        ),
+    ):
+        svc.write_failure_observation(
+            failure_class=failure_class,
+            scope="review:semantic",
+            observation_text=f"semantic_review high in {file_path}: {description}",
+            lesson=suggested,
+            # Historical rows used this broad Android label for dashboard
+            # cleanup. Retrieval should correct it from file/source evidence.
+            task_family="android_session_data_cleanup",
+            trust_level="auto_classified",
+            prompt_eligible=["planner_warning", "codegen_warning"],
+            evidence_refs={
+                "finding": {
+                    "file": file_path,
+                    "severity": "high",
+                    "category": failure_class.replace("semantic_review_", ""),
+                    "description": description,
+                    "suggested_fix": suggested,
+                },
+                "semantic_review": {
+                    "completeness_pct": 50,
+                    "high_severity_count": 2,
+                },
+            },
+        )
+    db.commit()
+    task = SimpleNamespace(
+        id="task-dashboard-semantic",
+        session_id="session-dashboard-semantic",
+        actor_name="tester",
+        actor_role=ActorRole.EMPLOYEE,
+        risk_level=RiskLevel.MEDIUM,
+        risk_category=RiskCategory.CHANGE_MANAGEMENT,
+        request_text="develop P69-10 dashboard data and role cleanup",
+        scenario="jira_issue_develop",
+        status=TaskStatus.EXECUTING,
+        workflow_stage=WorkflowStage.ACTION,
+        translation_json=None,
+        plan_json={
+            "objective": "Clean dashboard hardcoded data and roles.",
+            "must_touch_files": [
+                "src/context/UserContext.js",
+                "src/pages/AdminSettings.js",
+                "src/pages/ServiceAnalytics.js",
+            ],
+        },
+        latest_result_json=None,
+        governance_json=None,
+        pending_approval=False,
+        retry_count=0,
+        source_name="hosteddashboard",
+    )
+
+    directive, audit = PrimaryOrchestrator(db=db)._build_codegen_failure_warnings(
+        task=task,  # type: ignore[arg-type]
+        plan=_plan(),
+    )
+
+    assert "Role check uses Admin" in directive
+    assert "Logout function is defined" in directive
+    assert {item["failure_class"] for item in audit} == {
+        "semantic_review_api_mismatch",
+        "semantic_review_orphan_ui",
+    }
+    assert {item["task_family"] for item in audit} == {
+        "react_dashboard_session_data_cleanup"
+    }
 
 
 def test_codegen_warning_keeps_quality_reservation_when_two_pattern_rows_exist(db: Session) -> None:

@@ -35,6 +35,7 @@ from app.services.failure_classifier import (  # noqa: E402
     classify_acceptance_test_pattern_missing,
     classify_must_touch_incomplete_diff,
     classify_contract_coverage_failure,
+    detect_memory_task_family,
     detect_task_family,
 )
 from app.services.memory import MemoryService  # noqa: E402
@@ -391,6 +392,20 @@ def test_must_touch_classifier_defers_to_acceptance_gate_message(db: Session) ->
     )
 
 
+def test_must_touch_classifier_defers_to_runtime_validation_message(db: Session) -> None:
+    """Runtime validation failures must not be re-labeled as must_touch misses."""
+    result = classify_must_touch_incomplete_diff(
+        plan_must_touch=["src/pages/AdminSettings.js", "src/context/UserContext.js"],
+        files_actually_patched=[],
+        pipeline_failed_message="Runtime validation: Runtime validation failed: 3 blocking issue(s)",
+        provider="deepseek-v4-pro",
+        task_family="react_dashboard_session_data_cleanup",
+        task_id="runtime-gate-replay",
+    )
+
+    assert result is None
+
+
 def test_dispatcher_prefers_acceptance_over_must_touch(db: Session) -> None:
     """End-to-end: feed round-9 conditions through classify() dispatcher
     and verify the output is acceptance_test_pattern_missing alone, not
@@ -420,6 +435,56 @@ def test_dispatcher_prefers_acceptance_over_must_touch(db: Session) -> None:
         f"Expected dispatcher to defer must_touch on acceptance failures. "
         f"Got: {failure_classes}"
     )
+
+
+def test_dispatcher_does_not_record_provider_liveness_for_downstream_runtime_gate(
+    db: Session,
+) -> None:
+    """Planner fallback is a metric, not a terminal failure class here."""
+    results = classify(
+        plan_must_touch=["src/pages/AdminSettings.js", "src/context/UserContext.js"],
+        files_actually_patched=[],
+        pipeline_failed_message="Runtime validation: Runtime validation failed: 3 blocking issue(s)",
+        plan_provider_mode="fallback_after_all_providers_failed",
+        plan_provider_name="mock",
+        codegen_provider="deepseek",
+        task_family="react_dashboard_session_data_cleanup",
+        task_id="runtime-gate-replay",
+    )
+
+    assert [c.failure_class for c in results] == []
+
+
+def test_memory_query_filters_misclassified_runtime_validation_rows(db: Session) -> None:
+    svc = MemoryService(db)
+    svc.write_failure_observation(
+        failure_class="must_touch_incomplete_diff",
+        scope="gate:must_touch",
+        observation_text=(
+            "[must_touch_incomplete_diff] task=runtime-gate family=react_dashboard "
+            "Pipeline message: Runtime validation failed"
+        ),
+        lesson="Stale row from a runtime-validation misclassification.",
+        task_family="react_dashboard_session_data_cleanup",
+        provenance_task_id="runtime-gate",
+        trust_level="auto_classified",
+        prompt_eligible=["planner_warning", "codegen_warning"],
+        evidence_refs={
+            "task_id": "runtime-gate",
+            "pipeline_message": "Runtime validation: Runtime validation failed: 3 blocking issue(s)",
+        },
+    )
+    db.commit()
+
+    rows = svc.query(
+        scope="gate:must_touch",
+        memory_kind="failure_observation",
+        task_family="react_dashboard_session_data_cleanup",
+        prompt_context="codegen_warning",
+        top_n=3,
+    )
+
+    assert rows == []
 
 
 def test_semantic_review_findings_write_failure_observation(db: Session) -> None:
@@ -537,3 +602,48 @@ def test_detects_android_session_data_cleanup_family() -> None:
         )
         == "android_session_data_cleanup"
     )
+
+
+def test_detects_react_dashboard_session_data_cleanup_family() -> None:
+    assert (
+        detect_task_family(
+            "develop P69-10",
+            {
+                "source_name": "hosteddashboard",
+                "change_explanation": (
+                    "Hardcoded username, dummy analytics data, previous "
+                    "logged-in user cache, and master admin role simplification."
+                ),
+                "must_touch_files": [
+                    "src/context/UserContext.js",
+                    "src/pages/AdminSettings.js",
+                    "src/pages/ServiceAnalytics.js",
+                ],
+            },
+        )
+        == "react_dashboard_session_data_cleanup"
+    )
+
+
+def test_memory_family_correction_prevents_dashboard_android_contamination() -> None:
+    memory = SimpleNamespace(
+        task_family="android_session_data_cleanup",
+        failure_class="semantic_review_api_mismatch",
+        observation=(
+            "semantic_review high/api_mismatch in src/pages/AdminSettings.js: "
+            "Role check uses Admin but mockUsers role is lowercase admin."
+        ),
+        resolution="Normalize dashboard role comparisons consistently.",
+        evidence_refs={
+            "finding": {
+                "file": "src/pages/AdminSettings.js",
+                "category": "api_mismatch",
+                "description": (
+                    "Role check uses string Admin but the mockUsers role is "
+                    "lowercase admin."
+                ),
+            }
+        },
+    )
+
+    assert detect_memory_task_family(memory) == "react_dashboard_session_data_cleanup"

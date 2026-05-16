@@ -47,7 +47,11 @@ from app.core.enums import (  # noqa: E402
 )
 from app.models.base import Base  # noqa: E402
 import app.models  # noqa: F401, E402
-from app.orchestrator.service import PrimaryOrchestrator  # noqa: E402
+from app.orchestrator.service import (  # noqa: E402
+    PrimaryOrchestrator,
+    _dedupe_compile_errors_by_file,
+    _extract_protected_symbols,
+)
 from app.services.failure_classifier import (  # noqa: E402
     classify_acceptance_test_pattern_missing,
     classify_must_touch_incomplete_diff,
@@ -195,6 +199,7 @@ def test_codegen_warning_returns_concrete_patterns(db: Session) -> None:
     assert audit[0]["memory_id"] == seeded.id
     assert audit[0]["failure_class"] == "acceptance_test_pattern_missing"
     assert audit[0]["task_family"] == "android_map_location"
+    assert "singleTapConfirmedHelper|setOnMarkerDragListener" in audit[0]["missing_patterns"]
 
 
 # ---- Test 2 — prompt_context whitelist filter --------------------------
@@ -285,7 +290,55 @@ def test_codegen_warning_flows_into_task_description(db: Session) -> None:
     assert "ADDED LINES" in body
 
 
+
 # ---- Test 5 — no family inferred → no injection -----------------------
+
+
+def test_memory_missing_patterns_extract_repair_protected_symbols() -> None:
+    first_attempt = """diff --git a/app/src/main/java/com/example/handyman/customer_pages/CustomerSignup.kt b/app/src/main/java/com/example/handyman/customer_pages/CustomerSignup.kt
+--- a/app/src/main/java/com/example/handyman/customer_pages/CustomerSignup.kt
++++ b/app/src/main/java/com/example/handyman/customer_pages/CustomerSignup.kt
+@@ -1,3 +1,20 @@
+ package com.example.handyman.customer_pages
++import org.osmdroid.events.MapEventsOverlay
++import org.osmdroid.events.MapEventsReceiver
++import org.osmdroid.views.MapView
++val mapView = MapView(context)
++mapView.overlays.add(MapEventsOverlay(object : MapEventsReceiver {
++    override fun singleTapConfirmedHelper(p: GeoPoint?): Boolean {
++        val addresses = geocoder.getFromLocation(p.latitude, p.longitude, 1)
++        return true
++    }
++}))
+"""
+    protected = _extract_protected_symbols(
+        first_attempt,
+        "app/src/main/java/com/example/handyman/customer_pages/CustomerSignup.kt",
+        acceptance_patterns=[],
+        memory_patterns=[
+            "singleTapConfirmedHelper|setOnMarkerDragListener",
+            r"getFromLocation\s*\(",
+            r"org\.osmdroid\.",
+        ],
+    )
+    assert "singleTapConfirmedHelper" in protected
+    assert "getFromLocation" in protected
+    assert "MapEventsReceiver" in protected
+    assert "MapView" in protected
+
+
+def test_dedupe_compile_errors_by_file_merges_duplicate_file_queue() -> None:
+    deduped = _dedupe_compile_errors_by_file(
+        [
+            {"file": "app/F.kt", "error": "Unresolved reference A"},
+            {"file": "app/F.kt", "error": "Unresolved reference B"},
+            {"file": "app/G.kt", "error": "Type mismatch"},
+        ]
+    )
+    assert [e["file"] for e in deduped] == ["app/F.kt", "app/G.kt"]
+    assert "Unresolved reference A" in deduped[0]["error"]
+    assert "Unresolved reference B" in deduped[0]["error"]
+    assert len(deduped[0]["related_errors"]) == 2
 
 
 def test_no_family_match_returns_empty(db: Session) -> None:
