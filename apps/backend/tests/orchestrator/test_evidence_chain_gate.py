@@ -570,6 +570,74 @@ def test_verified_phone_otp_contract_filters_contradictory_reservations() -> Non
     assert kept[0]["downgraded_reason"] == "structural_acceptance_tests_passed"
 
 
+def test_verified_android_map_location_contract_filters_reviewer_contradictions() -> None:
+    plan_json = {
+        "domain_playbook_id": "android_map_location",
+        "required_contracts": [
+            {"contract_id": "map_ui_present"},
+            {"contract_id": "user_can_select_location"},
+            {"contract_id": "location_updates_form_state"},
+            {"contract_id": "persisted_to_storage"},
+            {"contract_id": "geocoder_lifecycle_safe"},
+        ],
+        "acceptance_tests": [
+            {
+                "kind": "diff_contains_pattern",
+                "contract_id": "geocoder_lifecycle_safe",
+                "pattern": r"Geocoder\s*\([^,)]+,\s*Locale",
+            }
+        ],
+    }
+    pipeline_state = {
+        "acceptance_check_done": True,
+        "compile_gate": {"passed": True},
+        "diff": """
++                    Geocoder(map.context, Locale.getDefault())
++    fun isValidCoordinate(lat: Double, lng: Double): Boolean {
++        return lat in -90.0..90.0 && lng in -180.0..180.0
++    }
++                val safeLatitude = if (isValidCoordinate(latitude, longitude)) latitude else 0.0
++                val safeLongitude = if (isValidCoordinate(latitude, longitude)) longitude else 0.0
+""",
+    }
+    locale_policy_item = {
+        "text": (
+            "Geocoder Locale.getDefault() is device locale dependent and may "
+            "not prefer Bangladesh results."
+        ),
+        "severity": "policy",
+        "auto_fixable": False,
+        "blocking": True,
+    }
+    coordinate_policy_item = {
+        "text": "Lat/lng values are stored without explicit range validation.",
+        "severity": "policy",
+        "auto_fixable": False,
+        "blocking": True,
+    }
+    real_security_item = {
+        "text": "Map selection exposes precise home location without a consent copy.",
+        "severity": "security",
+        "auto_fixable": False,
+        "blocking": True,
+    }
+
+    kept, suppressed = _filter_reservations_for_verified_contracts(
+        [locale_policy_item, coordinate_policy_item, real_security_item],
+        plan_json=plan_json,
+        pipeline_state=pipeline_state,
+    )
+
+    assert [item["text"] for item in suppressed] == [
+        locale_policy_item["text"],
+        coordinate_policy_item["text"],
+    ]
+    assert {item["suppressed_reason"] for item in suppressed} == {
+        "contradicts_verified_android_map_location_contract"
+    }
+    assert kept == [real_security_item]
+
+
 def test_goal_miss_blocking_reservation_runs_repair_before_approval() -> None:
     root = _writable_mkdtemp()
     try:

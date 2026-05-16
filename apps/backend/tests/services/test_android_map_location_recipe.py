@@ -199,18 +199,26 @@ def test_recipe_adds_osmdroid_map_picker_and_wires_signup_payload():
     assert "getFromLocationName(query, 1)" in result.content
     assert "withContext(Dispatchers.IO)" in result.content
     assert "map.invalidate()\n                    reverseGeocodeAddress(point, marker, map)" in result.content
+    assert "fun isValidCoordinate(lat: Double, lng: Double): Boolean" in result.content
+    assert "lat in -90.0..90.0 && lng in -180.0..180.0" in result.content
+    assert "val safeLatitude = if (isValidCoordinate(latitude, longitude))" in result.content
+    assert '"latitude" to safeLatitude' in result.content
+    assert '"longitude" to safeLongitude' in result.content
+    assert "Invalid map coordinate" in result.content
+    assert "No address found for this location" in result.content
+    assert "No valid map location found" in result.content
     assert "try {" in result.content
     assert "catch (e: Exception)" in result.content
     assert 'Log.e("MapPicker", "Reverse geocoding failed", e)' in result.content
     assert 'Log.e("MapPicker", "Forward geocoding failed", e)' in result.content
-    assert "DisposableEffect(mapViewRef)" in result.content
+    assert "DisposableEffect(Unit)" in result.content
     assert "mapViewRef?.onPause()" in result.content
     assert "mapViewRef?.onDetach()" in result.content
+    assert "onResume()" in result.content
+    assert "houseNumber = houseNumber.ifBlank" in result.content
     assert "OutlinedTextField(" in result.content
     assert "Find typed address on map" in result.content
     assert '"houseNumber" to houseNumber' in result.content
-    assert '"latitude" to latitude' in result.content
-    assert '"longitude" to longitude' in result.content
     assert 'notes = ""' not in result.content
     assert 'note = ""' not in result.content
     assert "eventsOverlay" not in result.content
@@ -238,8 +246,8 @@ def test_recipe_adds_coordinates_to_existing_kyc_payload_with_valid_commas():
     assert validate_kotlin_structure(result.content) == []
     assert "var latitude by remember { mutableStateOf(0.0) }" in result.content
     assert "var longitude by remember { mutableStateOf(0.0) }" in result.content
-    assert '"longitude" to longitude,' in result.content
-    assert '"latitude" to latitude,' in result.content
+    assert '"longitude" to safeLongitude,' in result.content
+    assert '"latitude" to safeLatitude,' in result.content
     assert '"notes" to note,' in result.content
     assert "updateChildren(addressData)" in result.content
     assert result.content.count('label = { Text("House number") }') == 1

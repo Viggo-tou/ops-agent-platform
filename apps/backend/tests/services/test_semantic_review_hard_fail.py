@@ -347,6 +347,63 @@ def test_semantic_review_keeps_unbound_state_finding_when_only_some_fields_are_s
     assert _semantic_review_high_count(filtered) == 1
 
 
+def test_semantic_review_drops_android_map_payload_finding_when_diff_has_payload():
+    pipeline_state = {
+        "codegen_provider": "harness:android_map_location_recipe",
+        "compile_gate": {"passed": True},
+        "contract_coverage_verdict": {"ok": True, "verdict_kind": "complete"},
+        "acceptance_check_done": True,
+        "symbol_graph_done": True,
+        "symbol_graph": {"passed": True},
+        "diff": """
+diff --git a/app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCAddressForm.kt b/app/src/main/java/com/example/handyman/handyman_pages/HandymanKYCAddressForm.kt
++                val safeLatitude = if (isValidCoordinate(latitude, longitude)) latitude else 0.0
++                val safeLongitude = if (isValidCoordinate(latitude, longitude)) longitude else 0.0
+                 val addressData = mapOf(
++                    "longitude" to safeLongitude,
++                    "latitude" to safeLatitude,
+                 )
+                 query.get().addOnSuccessListener { snapshot ->
+""",
+    }
+    sr_report = SimpleNamespace(
+        passed=False,
+        status="failed",
+        pass_threshold=80,
+        completeness_pct=75,
+        summary="Reviewer says the persistence payload is incomplete.",
+        findings=[
+            {
+                "file": (
+                    "app/src/main/java/com/example/handyman/handyman_pages/"
+                    "HandymanKYCAddressForm.kt"
+                ),
+                "severity": "medium",
+                "category": "unbound_field",
+                "description": (
+                    "The diff does not show updating the Firebase persistence "
+                    "payload with latitude and longitude."
+                ),
+                "evidence_quote": "+        latitude = addr.latitude\n+        longitude = addr.longitude",
+                "suggested_fix": "Update the Firebase mapOf payload.",
+            }
+        ],
+    )
+
+    filtered, dropped = _semantic_review_filter_after_verified_gates(
+        sr_report,
+        pipeline_state=pipeline_state,
+    )
+
+    assert len(dropped) == 1
+    assert filtered.findings == []
+    assert filtered.passed is True
+    assert filtered.status == "passed"
+    assert filtered.completeness_pct == 80
+    assert "contradicted by the verified final diff" in filtered.summary
+    assert "persistence payload is incomplete" not in filtered.summary
+
+
 def test_semantic_quality_refine_requires_grounded_medium_finding():
     sr_report = SimpleNamespace(
         passed=True,

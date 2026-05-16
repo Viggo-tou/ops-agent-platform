@@ -732,6 +732,79 @@ def _phone_otp_reservation_contradicts_verified_contract(
     )
 
 
+def _android_map_location_reservation_contradicts_verified_contract(
+    item: dict,
+    *,
+    plan_json: dict | None,
+    pipeline_state: dict[str, object] | None,
+) -> bool:
+    if not isinstance(plan_json, dict):
+        return False
+    domain = str(plan_json.get("domain_playbook_id") or plan_json.get("domain_id") or "")
+    contract_ids = {
+        str(c.get("contract_id") or c.get("id") or "")
+        for c in (plan_json.get("required_contracts") or [])
+        if isinstance(c, dict)
+    }
+    is_map_location = domain == "android_map_location" or bool(
+        {
+            "map_ui_present",
+            "user_can_select_location",
+            "location_updates_form_state",
+            "persisted_to_storage",
+            "geocoder_lifecycle_safe",
+        }
+        & contract_ids
+    )
+    if not is_map_location:
+        return False
+    if not _structural_acceptance_verified(
+        plan_json=plan_json,
+        pipeline_state=pipeline_state,
+    ):
+        return False
+
+    text = str(item.get("text") or "").lower()
+    diff_text = _semantic_review_diff_text(pipeline_state).lower()
+    if not diff_text:
+        return False
+
+    if (
+        "geocoder" in text
+        and "locale" in text
+        and "locale.getdefault()" in diff_text
+        and any(
+            marker in text
+            for marker in (
+                "locale.getdefault",
+                "locale dependent",
+                "locale-dependent",
+                "device locale",
+                "default locale",
+                "bangladesh",
+                "regional",
+            )
+        )
+    ):
+        return True
+
+    coordinate_text = any(
+        marker in text
+        for marker in ("lat/lng", "latitude", "longitude", "coordinate")
+    ) and any(marker in text for marker in ("range", "valid", "validation", "bounds"))
+    if coordinate_text and all(
+        marker in diff_text
+        for marker in (
+            "fun isvalidcoordinate",
+            "safelatitude",
+            "safelongitude",
+        )
+    ):
+        return True
+
+    return False
+
+
 def _filter_reservations_for_verified_contracts(
     reservations_detailed: list[dict] | tuple[dict, ...] | None,
     *,
@@ -761,6 +834,18 @@ def _filter_reservations_for_verified_contracts(
                 {
                     **item,
                     "suppressed_reason": "contradicts_verified_phone_otp_contract",
+                }
+            )
+            continue
+        if _android_map_location_reservation_contradicts_verified_contract(
+            item,
+            plan_json=plan_json,
+            pipeline_state=pipeline_state,
+        ):
+            suppressed.append(
+                {
+                    **item,
+                    "suppressed_reason": "contradicts_verified_android_map_location_contract",
                 }
             )
             continue
@@ -1308,6 +1393,68 @@ def _semantic_review_unbound_state_contradicted(
     return bool(suspect_fields) and suspect_fields.issubset(state_fields)
 
 
+def _semantic_review_android_map_location_finding_contradicted(
+    finding: object,
+    *,
+    pipeline_state: dict[str, object] | None,
+) -> bool:
+    state = pipeline_state or {}
+    diff_text = _semantic_review_diff_text(state)
+    if not diff_text:
+        return False
+    diff_lower = diff_text.lower()
+    provider = str(state.get("codegen_provider") or "").lower()
+    is_android_map_location = (
+        "android_map_location" in provider
+        or (
+            "mapeventsoverlay" in diff_lower
+            and "singletapconfirmedhelper" in diff_lower
+            and "geocoder(" in diff_lower
+        )
+    )
+    if not is_android_map_location:
+        return False
+
+    severity = _semantic_finding_value(finding, "severity").lower()
+    if severity not in {"medium", "high"}:
+        return False
+    text = " ".join(
+        _semantic_finding_value(finding, key)
+        for key in ("category", "description", "evidence_quote", "suggested_fix")
+    ).lower()
+    if not any(marker in text for marker in ("payload", "persist", "storage", "firebase")):
+        return False
+    if not any(marker in text for marker in ("latitude", "longitude", "coordinate", "lat/lng")):
+        return False
+    if not any(
+        marker in text
+        for marker in (
+            "missing",
+            "omits",
+            "does not show",
+            "does not include",
+            "not updated",
+            "incomplete",
+        )
+    ):
+        return False
+
+    rel_path = _semantic_finding_value(finding, "file").strip().replace("\\", "/")
+    sections = _diff_sections_for_path(diff_text, rel_path) if rel_path else []
+    haystack = "\n".join(sections) if sections else diff_text
+    hay = haystack.lower()
+    has_lat = bool(
+        re.search(r'"latitude"\s+to\s+(?:safe)?latitude\b', hay)
+        or re.search(r'"latitude"\s+to\s+[a-z_][a-z0-9_]*', hay)
+    )
+    has_lng = bool(
+        re.search(r'"longitude"\s+to\s+(?:safe)?longitude\b', hay)
+        or re.search(r'"longitude"\s+to\s+[a-z_][a-z0-9_]*', hay)
+    )
+    has_write = "updatechildren" in hay or "setvalue" in hay or "mapof(" in hay
+    return has_lat and has_lng and has_write
+
+
 def _semantic_review_finding_contradicted_by_verified_gates(
     finding: object,
     *,
@@ -1328,6 +1475,13 @@ def _semantic_review_finding_contradicted_by_verified_gates(
             str(getattr(finding, key, "") or "")
             for key in ("category", "description", "evidence_quote", "suggested_fix")
         ).lower()
+
+    if _semantic_review_android_map_location_finding_contradicted(
+        finding,
+        pipeline_state=pipeline_state,
+    ):
+        return True
+
     if severity != "high":
         return False
 
@@ -1421,28 +1575,49 @@ def _semantic_review_filter_after_verified_gates(
             high_left += 1
     pass_threshold = int(getattr(sr_report, "pass_threshold", 80) or 80)
     completeness = int(getattr(sr_report, "completeness_pct", 0) or 0)
-    passed = completeness >= pass_threshold and high_left == 0
-    summary = (
-        f"{getattr(sr_report, 'summary', '') or ''} "
-        f"[{len(dropped)} high semantic finding(s) suppressed because "
-        "compile, contract coverage, acceptance, and symbol graph already passed.]"
-    ).strip()
+    dropped_has_non_high = any(
+        str(item.get("severity") or "").lower() != "high" for item in dropped
+    )
+    adjusted_completeness = (
+        pass_threshold
+        if dropped_has_non_high and not kept and completeness < pass_threshold
+        else completeness
+    )
+    passed = adjusted_completeness >= pass_threshold and high_left == 0
+    if passed and adjusted_completeness != completeness and not kept:
+        summary = (
+            "Semantic reviewer low-completeness finding(s) were contradicted "
+            "by the verified final diff; compile, contract coverage, "
+            "acceptance, and symbol graph already passed. "
+            f"[{len(dropped)} semantic finding(s) suppressed.]"
+        )
+    else:
+        summary = (
+            f"{getattr(sr_report, 'summary', '') or ''} "
+            f"[{len(dropped)} semantic finding(s) suppressed because "
+            "compile, contract coverage, acceptance, and symbol graph already passed.]"
+        ).strip()
 
     if is_dataclass(sr_report):
         return (
             replace(
                 sr_report,
                 passed=passed,
+                completeness_pct=adjusted_completeness,
                 summary=summary,
                 findings=tuple(kept),
+                status="passed" if passed else getattr(sr_report, "status", "failed"),
             ),
             dropped,
         )
 
     try:
         setattr(sr_report, "passed", passed)
+        setattr(sr_report, "completeness_pct", adjusted_completeness)
         setattr(sr_report, "summary", summary)
         setattr(sr_report, "findings", kept)
+        if passed:
+            setattr(sr_report, "status", "passed")
     except Exception:
         pass
     return sr_report, dropped

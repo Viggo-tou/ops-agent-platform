@@ -182,6 +182,7 @@ def _needed_imports(content: str) -> list[str]:
         imports.extend(
             [
                 "import android.util.Log",
+                "import android.widget.Toast",
                 "import androidx.compose.runtime.DisposableEffect",
                 "import androidx.compose.ui.viewinterop.AndroidView",
                 "import kotlinx.coroutines.Dispatchers",
@@ -245,10 +246,10 @@ def _ensure_address_state(content: str) -> str:
         needed.append("    var mapViewRef by remember { mutableStateOf<MapView?>(null) }")
     if not re.search(r"\bval\s+coroutineScope\s*=\s*rememberCoroutineScope\(\)", content):
         needed.append("    val coroutineScope = rememberCoroutineScope()")
-    if needs_map_ref and "DisposableEffect(mapViewRef)" not in content:
+    if needs_map_ref and "DisposableEffect(" not in content:
         needed.extend(
             [
-                "    DisposableEffect(mapViewRef) {",
+                "    DisposableEffect(Unit) {",
                 "        onDispose {",
                 "            mapViewRef?.onPause()",
                 "            mapViewRef?.onDetach()",
@@ -326,7 +327,15 @@ def _coroutine_scope_line(lines: list[str]) -> int:
 
 
 def _map_helper_block(*, post_code: str) -> str:
-    return f"""    fun reverseGeocodeAddress(point: GeoPoint, marker: Marker, map: MapView) {{
+    return f"""    fun isValidCoordinate(lat: Double, lng: Double): Boolean {{
+        return lat in -90.0..90.0 && lng in -180.0..180.0
+    }}
+
+    fun reverseGeocodeAddress(point: GeoPoint, marker: Marker, map: MapView) {{
+        if (!isValidCoordinate(point.latitude, point.longitude)) {{
+            Toast.makeText(map.context, "Invalid map coordinate", Toast.LENGTH_SHORT).show()
+            return
+        }}
         latitude = point.latitude
         longitude = point.longitude
         marker.position = point
@@ -338,19 +347,23 @@ def _map_helper_block(*, post_code: str) -> str:
                     Geocoder(map.context, Locale.getDefault())
                         .getFromLocation(point.latitude, point.longitude, 1)
                 }}
-                addresses?.firstOrNull()?.let {{ addr ->
-                    houseNumber = addr.subThoroughfare ?: houseNumber
-                    street = addr.thoroughfare ?: street
-                    area = addr.subLocality ?: area
-                    division = addr.adminArea ?: division
-                    district = addr.subAdminArea ?: district
-                    thana = addr.locality ?: thana
-                    city = addr.locality ?: city
-                    country = addr.countryName ?: country
-                    {post_code} = addr.postalCode ?: {post_code}
+                val addr = addresses?.firstOrNull()
+                if (addr == null) {{
+                    Toast.makeText(map.context, "No address found for this location", Toast.LENGTH_SHORT).show()
+                }} else {{
+                    houseNumber = houseNumber.ifBlank {{ addr.subThoroughfare.orEmpty() }}
+                    street = street.ifBlank {{ addr.thoroughfare.orEmpty() }}
+                    area = area.ifBlank {{ addr.subLocality.orEmpty() }}
+                    division = division.ifBlank {{ addr.adminArea.orEmpty() }}
+                    district = district.ifBlank {{ addr.subAdminArea.orEmpty() }}
+                    thana = thana.ifBlank {{ addr.locality.orEmpty() }}
+                    city = city.ifBlank {{ addr.locality.orEmpty() }}
+                    country = country.ifBlank {{ addr.countryName.orEmpty() }}
+                    {post_code} = {post_code}.ifBlank {{ addr.postalCode.orEmpty() }}
                 }}
             }} catch (e: Exception) {{
                 Log.e("MapPicker", "Reverse geocoding failed", e)
+                Toast.makeText(map.context, "Could not read address from map", Toast.LENGTH_SHORT).show()
             }}
         }}
     }}
@@ -367,7 +380,10 @@ def _map_helper_block(*, post_code: str) -> str:
                     Geocoder(map.context, Locale.getDefault())
                         .getFromLocationName(query, 1)
                 }}
-                results?.firstOrNull()?.let {{ addr ->
+                val addr = results?.firstOrNull()
+                if (addr == null || !isValidCoordinate(addr.latitude, addr.longitude)) {{
+                    Toast.makeText(map.context, "No valid map location found", Toast.LENGTH_SHORT).show()
+                }} else {{
                     latitude = addr.latitude
                     longitude = addr.longitude
                     val point = GeoPoint(latitude, longitude)
@@ -385,6 +401,7 @@ def _map_helper_block(*, post_code: str) -> str:
                 }}
             }} catch (e: Exception) {{
                 Log.e("MapPicker", "Forward geocoding failed", e)
+                Toast.makeText(map.context, "Could not find that address", Toast.LENGTH_SHORT).show()
             }}
         }}
     }}
@@ -488,6 +505,7 @@ def _map_picker_block(*, post_code: str, notes: str, include_manual_fields: bool
                     mapViewRef = this
                     setTileSource(TileSourceFactory.MAPNIK)
                     setMultiTouchControls(true)
+                    onResume()
                     controller.setZoom(14.0)
                     val startPoint = GeoPoint(
                         if (latitude != 0.0) latitude else 23.6850,
@@ -548,7 +566,33 @@ def _wire_payload_fields(content: str) -> str:
     new_content = re.sub(r'("longitude"\s+to\s+)0(?:\.0)?\b', r"\1longitude", new_content)
     new_content = _ensure_payload_entry(new_content, "latitude", "latitude")
     new_content = _ensure_payload_entry(new_content, "longitude", "longitude")
+    new_content = _ensure_coordinate_payload_guard(new_content)
     return new_content
+
+
+def _ensure_coordinate_payload_guard(content: str) -> str:
+    if "val safeLatitude = if (isValidCoordinate(latitude, longitude))" in content:
+        return content
+    if "fun isValidCoordinate(" not in content:
+        return content
+    lines = content.splitlines()
+    map_ranges = _mapof_ranges(lines)
+    for start, end in map_ranges:
+        has_lat = any(re.search(r'"latitude"\s+to\s+latitude\b', lines[idx]) for idx in range(start, end))
+        has_lng = any(re.search(r'"longitude"\s+to\s+longitude\b', lines[idx]) for idx in range(start, end))
+        if not (has_lat and has_lng):
+            continue
+        indent = re.match(r"^(\s*)", lines[start]).group(1)  # type: ignore[union-attr]
+        guard = [
+            f"{indent}val safeLatitude = if (isValidCoordinate(latitude, longitude)) latitude else 0.0",
+            f"{indent}val safeLongitude = if (isValidCoordinate(latitude, longitude)) longitude else 0.0",
+        ]
+        lines[start:start] = guard
+        for idx in range(start + len(guard), end + len(guard)):
+            lines[idx] = re.sub(r'("latitude"\s+to\s+)latitude\b', r"\1safeLatitude", lines[idx])
+            lines[idx] = re.sub(r'("longitude"\s+to\s+)longitude\b', r"\1safeLongitude", lines[idx])
+        return _join_like(content, lines)
+    return content
 
 
 def _ensure_payload_entry(content: str, key: str, var_name: str) -> str:
